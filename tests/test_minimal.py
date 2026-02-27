@@ -103,7 +103,9 @@ class MinimalWarningSystem:
             else:
                 del self.warnings[username]
         
-        warning = UserWarning(
+        # use our local TestUserWarning so we don't accidentally
+        # invoke the builtin exception type
+        warning = TestUserWarning(
             username=username,
             ip_count=ip_count,
             ips=ips,

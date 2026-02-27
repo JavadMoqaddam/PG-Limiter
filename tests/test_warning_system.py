@@ -175,6 +175,35 @@ class TestTrustScore:
         expected_trust = 100 - (violations * 20)
         
         assert expected_trust <= 0
+    
+    def test_subnet_penalty_16_range(self):
+        """When multiple /24 subnets fall inside same /16 with same ISP,
+        they should not trigger extra subnet penalties beyond one group.
+        Previously the logic would penalize each /24 separately which
+        produced unexpectedly low trust scores for legitimate users.
+        """
+        from utils.warning_system.user_warning import UserWarning
+        
+        # create a warning representing two ips from same /16 but different
+        # /24s
+        warning = UserWarning(
+            username="user",
+            ip_count=2,
+            ips={"173.135.1.1", "173.135.2.2"},
+            warning_time=time.time(),
+            monitoring_end_time=time.time() + 180
+        )
+        warning.isp_names = {"GoodISP"}
+        # ip_subnets is normally filled by EnhancedWarningSystem._extract_subnets
+        warning.ip_subnets = {"173.135.1.x", "173.135.2.x"}
+        warning.inbound_protocols = set()
+        warning.previous_warnings_12h = 0
+        warning.previous_warnings_24h = 0
+        # calculate trust
+        score = warning.calculate_trust_score()
+        # with two subnets in same /16 and only one ISP there should be no
+        # penalty (starting score 50 -> remains 50)
+        assert score >= 50
 
 
 class TestSubnetGrouping:
@@ -254,3 +283,28 @@ class TestWarningPersistence:
         )
         
         assert "loaded_user" in system.warning_history
+
+    @pytest.mark.asyncio
+    async def test_clear_all_trust_affects_other_modules(self, tmp_path):
+        """Resetting trust should clear the single shared warning_system
+        instance; other modules (like check_usage) import the same object and
+        therefore will observe the change.
+        """
+        from utils.warning_system import warning_system as shared_system
+        import utils.check_usage as cu
+        
+        # add a dummy warning so that there is some trust data
+        await shared_system.add_warning(
+            username="foo",
+            ip_count=1,
+            ips={"1.1.1.1"},
+            user_limit=2
+        )
+        assert "foo" in shared_system.warnings
+        # the check_usage module should see the same entry
+        assert "foo" in cu.warning_system.warnings
+        
+        # clear everything
+        await shared_system.clear_all_trust_data()
+        assert not shared_system.warnings
+        assert not cu.warning_system.warnings

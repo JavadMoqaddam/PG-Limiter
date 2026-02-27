@@ -14,7 +14,7 @@ from utils.logs import logger
 from utils.panel_api import disable_user
 from utils.read_config import read_config, get_config_value
 from utils.types import PanelType, UserType, EnhancedUserInfo
-from utils.warning_system import EnhancedWarningSystem
+from utils.warning_system import warning_system  # global shared instance
 from utils.isp_detector import ISPDetector
 from utils.ip_history_tracker import ip_history_tracker
 from utils.user_group_filter import should_limit_user, get_filter_status_text
@@ -22,8 +22,9 @@ from utils.admin_filter import should_limit_user_by_admin
 
 ACTIVE_USERS: dict[str, UserType] | dict = {}
 
-# Initialize warning system and ISP detector
-warning_system = EnhancedWarningSystem()
+# Use global warning system instance imported above
+# (previously a separate instance; having two caused reset button to
+# clear one copy but leave the other untouched)
 isp_detector = None  # Will be initialized when needed
 
 # Pattern to match usernames ending with .X.User where X is a number (e.g., amir.2.User)

@@ -418,7 +418,23 @@ class EnhancedWarningSystem:
             trust_details.append(f"📲 Multi-device ISP pattern")
         
         if len(ip_subnets) > 1 and len(isp_names) == 1:
-            trust_details.append(f"🟠 {len(ip_subnets)} subnets, same ISP")
+            # show /24 count but also indicate collapsed /16 groups if they
+            # exist.  this mirrors the penalty logic above.
+            grouped_16 = set()
+            for s in ip_subnets:
+                parts = s.split('.')
+                if len(parts) >= 2:
+                    grouped_16.add(f"{parts[0]}.{parts[1]}")
+                else:
+                    grouped_16.add(s)
+            if len(grouped_16) == 1:
+                trust_details.append(
+                    f"🟠 {len(ip_subnets)} /24 subnets (same /16), same ISP"
+                )
+            else:
+                trust_details.append(
+                    f"🟠 {len(ip_subnets)} subnets ({len(grouped_16)} /16 groups), same ISP"
+                )
         
         if previous_warnings_12h > 0:
             trust_details.append(f"⚠️ {previous_warnings_12h} disables in last 12h")

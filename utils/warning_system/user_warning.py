@@ -250,10 +250,31 @@ class UserWarning:
         subnet_count = len(self.ip_subnets)
         isp_count = len(self.isp_names)
         
+        # when multiple /24 subnets are seen but they all belong to the
+        # same /16 range and come from the same ISP, we should treat them
+        # as a single network for the purpose of trust penalties.  this was
+        # requested by users who saw scores drop simply because their ips
+        # covered different /24s inside the same /16 (for example
+        # 173.135.1.x and 173.135.2.x).  the old logic counted each /24 as a
+        # separate subnet and applied a -15 penalty per subnet, which made
+        # high‑trust users look suspicious.  we now collapse by the first two
+        # octets when isp_count==1.
+        
         if subnet_count > 1 and isp_count == 1:
-            penalty = (subnet_count - 1) * 15
+            # group subnets by /16 prefix
+            grouped_16 = set()
+            for s in self.ip_subnets:
+                parts = s.split('.')
+                if len(parts) >= 2:
+                    grouped_16.add(f"{parts[0]}.{parts[1]}")
+                else:
+                    grouped_16.add(s)
+            group_count = len(grouped_16)
+            penalty = (group_count - 1) * 15
             score -= penalty
-            trust_logger.debug(f"Trust [{self.username}]: -{penalty} ({subnet_count} subnets, same ISP)")
+            trust_logger.debug(
+                f"Trust [{self.username}]: -{penalty} ({group_count} /16 groups, same ISP)"
+            )
         
         if isp_pattern in ("sim_swap", "possible_sim_swap"):
             score -= 8
