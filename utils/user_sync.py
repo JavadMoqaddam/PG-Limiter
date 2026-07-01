@@ -243,6 +243,9 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
                         if not username:
                             continue
                         
+                        # Get numeric ID
+                        panel_id = user_data.get("id")
+                        
                         # Extract user details
                         status = user_data.get("status", "active")
                         
@@ -293,6 +296,7 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
                         await UserCRUD.create_or_update(
                             db,
                             username=username,
+                            panel_id=panel_id,
                             status=status,
                             owner_id=owner_id,
                             owner_username=owner_username,
@@ -501,6 +505,7 @@ async def fetch_and_sync_single_user(username: str, panel_data: Optional[PanelTy
             return None
         
         # Extract user details (same logic as sync_users_to_database)
+        panel_id = user_data.get("id")
         status = user_data.get("status", "active")
         
         # Get admin/owner info
@@ -554,6 +559,7 @@ async def fetch_and_sync_single_user(username: str, panel_data: Optional[PanelTy
             user = await UserCRUD.create_or_update(
                 db,
                 username=username,
+                panel_id=panel_id,
                 status=status,
                 owner_id=owner_id,
                 owner_username=owner_username,

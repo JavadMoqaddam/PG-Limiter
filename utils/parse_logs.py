@@ -292,6 +292,10 @@ async def parse_logs(log: str, node_id: int = None, node_name: str = None) -> di
     cdn_inbounds = data.get("cdn_inbounds", [])
     use_xff = data.get("cdn_use_xff", True)
     
+    from db.database import get_db
+    from db.crud.users import UserCRUD
+    local_id_cache = {}
+    
     lines = log.splitlines()
     for line in lines:
         if "accepted" not in line:
@@ -356,6 +360,19 @@ async def parse_logs(log: str, node_id: int = None, node_name: str = None) -> di
             # Skip empty usernames or invalid emails
             if not email or not email.strip() or email in INVALID_EMAILS:
                 continue
+                
+            # Translate numeric ID to username
+            if email.isdigit():
+                if email in local_id_cache:
+                    email = local_id_cache[email]
+                else:
+                    async with get_db() as db:
+                        real_username = await UserCRUD.get_username_by_panel_id(db, int(email))
+                    if real_username:
+                        local_id_cache[email] = real_username
+                        email = real_username
+                    else:
+                        continue
         else:
             continue
 

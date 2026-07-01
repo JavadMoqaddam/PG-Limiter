@@ -36,6 +36,7 @@ class User(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(255), unique=True, nullable=False, index=True)
+    panel_id = Column(Integer, unique=True, nullable=True, index=True)  # Numeric ID from panel
     
     # User status from panel
     status = Column(String(50), default="active")  # active, disabled, limited, expired

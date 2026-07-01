@@ -28,6 +28,7 @@ class UserCRUD:
     async def create_or_update(
         db: AsyncSession,
         username: str,
+        panel_id: Optional[int] = None,
         status: str = "active",
         owner_id: Optional[int] = None,
         owner_username: Optional[str] = None,
@@ -44,6 +45,8 @@ class UserCRUD:
         
         if user:
             db_users_logger.debug(f"✏️ Updating existing user: {username}")
+            if panel_id is not None:
+                user.panel_id = panel_id
             user.status = status
             user.owner_id = owner_id
             user.owner_username = owner_username
@@ -57,6 +60,7 @@ class UserCRUD:
             db_users_logger.debug(f"➕ Creating new user: {username}")
             user = User(
                 username=username,
+                panel_id=panel_id,
                 status=status,
                 owner_id=owner_id,
                 owner_username=owner_username,
@@ -82,6 +86,16 @@ class UserCRUD:
         else:
             db_users_logger.debug(f"⚠️ User not found: {username}")
         return user
+        
+    @staticmethod
+    async def get_username_by_panel_id(db: AsyncSession, panel_id: int) -> Optional[str]:
+        """Get username by panel numeric ID."""
+        db_users_logger.debug(f"🔍 Getting username for panel ID: {panel_id}")
+        result = await db.execute(select(User.username).where(User.panel_id == panel_id))
+        username = result.scalar_one_or_none()
+        if username:
+            db_users_logger.debug(f"✅ Found username {username} for panel ID {panel_id}")
+        return username
     
     @staticmethod
     async def get_all(db: AsyncSession) -> List[User]:
@@ -509,6 +523,7 @@ class UserCRUD:
             await UserCRUD.create_or_update(
                 db,
                 username=data.get("username"),
+                panel_id=data.get("id"),
                 status=data.get("status", "active"),
                 owner_id=data.get("owner_id") or data.get("admin_id"),
                 owner_username=data.get("owner_username") or data.get("admin_username"),
