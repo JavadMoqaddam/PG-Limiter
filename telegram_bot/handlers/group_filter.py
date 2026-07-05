@@ -376,7 +376,7 @@ async def handle_group_filter_menu_callback(query, _context: ContextTypes.DEFAUL
     if group_limits:
         limits_text = "\n\n🎯 <b>Group Limits:</b>"
         for gid, limit in group_limits.items():
-            name = next((g.get("name", "Unknown") for g in groups if g.get("id") == gid), "Unknown")
+            name = next((g.get("name", "Unknown") for g in groups if str(g.get("id")) == str(gid)), "Unknown")
             limits_text += f"\n  • {name} (ID: {gid}) ➡️ Limit: {limit}"
     try:
         await query.edit_message_text(
@@ -532,6 +532,8 @@ async def handle_group_limit_menu_callback(query, _context: ContextTypes.DEFAULT
         gid = group.get("id", 0)
         name = group.get("name", "Unknown")
         current_limit = group_limits.get(gid)
+        if current_limit is None:
+            current_limit = group_limits.get(str(gid))
         limit_display = f" | Limit: {current_limit}" if current_limit is not None else ""
         
         keyboard.append([

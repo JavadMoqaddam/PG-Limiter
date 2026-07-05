@@ -23,7 +23,7 @@ class DisabledUsers:
     """
 
     def __init__(self, filename=".disable_users.json"):
-        self.filename = filename
+        self.filename = "/var/lib/pg-limiter/disable_users.json"
         self.disabled_users = {}  # {username: disabled_timestamp}
         self.enable_at = {}  # {username: enable_at_timestamp} - custom enable time
         self.load_disabled_users()
@@ -72,7 +72,7 @@ class DisabledUsers:
             if input().lower() == "y":
                 print("Deleting ...")
                 logger.info("remove .disable_users.json file")
-                os.remove(".disable_users.json")
+                os.remove(self.filename)
             self.disabled_users = {}
             self.enable_at = {}
             DISABLED_USERS = set()

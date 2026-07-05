@@ -1151,19 +1151,13 @@ async def handle_force_delete_callback(query, context: ContextTypes.DEFAULT_TYPE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-async def subnet_ip_grouping_toggle_callback(query, context: ContextTypes.DEFAULT_TYPE):
-    """Handle subnet IP grouping toggle callback."""
+async def subnet_ip_grouping_menu_callback(query, context: ContextTypes.DEFAULT_TYPE):
+    """Handle subnet IP grouping menu display."""
     config_data = await read_config()
     current_status = config_data.get("subnet_ip_grouping", False)
     
-    # Toggle the status
-    new_status = not current_status
-    await save_config_value("subnet_ip_grouping", str(new_status).lower())
-    
-    status_emoji = "✅" if new_status else "❌"
-    status_text = "enabled" if new_status else "disabled"
-    
-    await query.answer(f"Subnet IP Grouping {status_text}")
+    status_emoji = "✅" if current_status else "❌"
+    status_text = "enabled" if current_status else "disabled"
     
     await query.edit_message_text(
         text=(
@@ -1184,7 +1178,7 @@ async def subnet_ip_grouping_toggle_callback(query, context: ContextTypes.DEFAUL
         ),
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                f"{'❌ Disable' if new_status else '✅ Enable'} Subnet Grouping",
+                f"{'❌ Disable' if current_status else '✅ Enable'} Subnet Grouping",
                 callback_data=CallbackData.SUBNET_IP_GROUPING_TOGGLE
             )],
             [InlineKeyboardButton("« Back to Settings", callback_data=CallbackData.SETTINGS_MENU)]
@@ -1193,25 +1187,35 @@ async def subnet_ip_grouping_toggle_callback(query, context: ContextTypes.DEFAUL
     )
 
 
+async def subnet_ip_grouping_toggle_callback(query, context: ContextTypes.DEFAULT_TYPE):
+    """Handle subnet IP grouping toggle callback."""
+    config_data = await read_config()
+    current_status = config_data.get("subnet_ip_grouping", False)
+    
+    # Toggle the status
+    new_status = not current_status
+    await save_config_value("subnet_ip_grouping", str(new_status).lower())
+    
+    status_text = "enabled" if new_status else "disabled"
+    await query.answer(f"Subnet IP Grouping {status_text}")
+    
+    # Reload the menu
+    await subnet_ip_grouping_menu_callback(query, context)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # HIGH TRUST IP GROUPING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-async def high_trust_ip_grouping_toggle_callback(query, context: ContextTypes.DEFAULT_TYPE):
-    """Handle high trust IP grouping toggle callback."""
+async def high_trust_ip_grouping_menu_callback(query, context: ContextTypes.DEFAULT_TYPE):
+    """Handle high trust IP grouping menu display."""
     config_data = await read_config()
     current_status = config_data.get("high_trust_ip_grouping", False)
     threshold = config_data.get("high_trust_threshold", 20)
     
-    # Toggle the status
-    new_status = not current_status
-    await save_config_value("high_trust_ip_grouping", str(new_status).lower())
-    
-    status_emoji = "✅" if new_status else "❌"
-    status_text = "enabled" if new_status else "disabled"
-    
-    await query.answer(f"High Trust IP Grouping {status_text}")
+    status_emoji = "✅" if current_status else "❌"
+    status_text = "enabled" if current_status else "disabled"
     
     await query.edit_message_text(
         text=(
@@ -1235,7 +1239,7 @@ async def high_trust_ip_grouping_toggle_callback(query, context: ContextTypes.DE
         ),
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                f"{'❌ Disable' if new_status else '✅ Enable'} High Trust Mode",
+                f"{'❌ Disable' if current_status else '✅ Enable'} High Trust Mode",
                 callback_data=CallbackData.HIGH_TRUST_IP_GROUPING_TOGGLE
             )],
             [InlineKeyboardButton("« Back to Settings", callback_data=CallbackData.SETTINGS_MENU)]
@@ -1243,6 +1247,21 @@ async def high_trust_ip_grouping_toggle_callback(query, context: ContextTypes.DE
         parse_mode="HTML"
     )
 
+
+async def high_trust_ip_grouping_toggle_callback(query, context: ContextTypes.DEFAULT_TYPE):
+    """Handle high trust IP grouping toggle callback."""
+    config_data = await read_config()
+    current_status = config_data.get("high_trust_ip_grouping", False)
+    
+    # Toggle the status
+    new_status = not current_status
+    await save_config_value("high_trust_ip_grouping", str(new_status).lower())
+    
+    status_text = "enabled" if new_status else "disabled"
+    await query.answer(f"High Trust Mode {status_text}")
+    
+    # Reload the menu
+    await high_trust_ip_grouping_menu_callback(query, context)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRUST DATA RESET

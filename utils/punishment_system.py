@@ -102,7 +102,7 @@ class PunishmentSystem:
     DEFAULT_WINDOW_HOURS = 168  # 7 days
     
     def __init__(self, filename=".violation_history.json"):
-        self.filename = filename
+        self.filename = "/var/lib/pg-limiter/violation_history.json"
         self.violations: dict[str, list[ViolationRecord]] = {}  # username -> list of violations
         self.steps: list[PunishmentStep] = self.DEFAULT_STEPS.copy()
         self.window_hours: int = self.DEFAULT_WINDOW_HOURS

@@ -193,9 +193,11 @@ class CallbackData:
     CDN_USE_XFF_TOGGLE = "cdn_use_xff_toggle"
     
     # Subnet IP Grouping (relaxed mode)
+    SUBNET_IP_GROUPING_MENU = "subnet_ip_grouping_menu"
     SUBNET_IP_GROUPING_TOGGLE = "subnet_ip_grouping_toggle"
     
     # High Trust IP Grouping (for trusted users, same node+inbound = 1 device)
+    HIGH_TRUST_IP_GROUPING_MENU = "high_trust_ip_grouping_menu"
     HIGH_TRUST_IP_GROUPING_TOGGLE = "high_trust_ip_grouping_toggle"
     
     # Trust data reset

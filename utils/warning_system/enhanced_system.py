@@ -39,8 +39,8 @@ class EnhancedWarningSystem:
     MIN_DEVICE_DURATION = 120  # 2 minutes
     
     def __init__(self, filename=".user_warnings.json", history_filename=".warning_history.json"):
-        self.filename = filename
-        self.history_filename = history_filename
+        self.filename = "/var/lib/pg-limiter/user_warnings.json"
+        self.history_filename = "/var/lib/pg-limiter/warning_history.json"
         self.warnings: Dict[str, UserWarning] = {}
         self.warning_history: Dict[str, list] = {}
         self.monitoring_period = 180  # 3 minutes in seconds
