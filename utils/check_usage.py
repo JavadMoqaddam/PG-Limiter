@@ -113,6 +113,74 @@ def extract_limit_from_username(username: str) -> int | None:
     return None
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEW: Smart Batching for Group Limits (Performance Optimized)
+# ═══════════════════════════════════════════════════════════════════════════════
+async def get_group_limits_batch(usernames: list[str], config_data: dict, panel_data: PanelType) -> dict[str, int]:
+    """
+    Smart Batching: Fetches group limits for MULTIPLE users in ONE query.
+    Handles multi-group logic by taking the maximum limit.
+    """
+    group_limits = config_data.get("group_limits", {})
+    if not group_limits or not usernames:
+        return {}
+
+    result_limits = {}
+    users_group_mapping = {}
+    
+    # 1. Fetch group_ids from local DB in ONE query (Smart Batching)
+    try:
+        from db.database import get_db
+        from db.models import User
+        from sqlalchemy import select
+        
+        async with get_db() as db:
+            # Select only username and group_ids for the active users to save memory
+            chunk_size = 900
+            for i in range(0, len(usernames), chunk_size):
+                chunk = usernames[i:i + chunk_size]
+                stmt = select(User.username, User.group_ids).where(User.username.in_(chunk))
+                result = await db.execute(stmt)
+                
+                for row in result:
+                    users_group_mapping[row.username] = row.group_ids
+    except Exception as e:
+        logger.error(f"Batch fetch group_ids failed: {e}")
+        
+    # 2. Process limits (and fallback to API only if user is completely missing from local DB)
+    for username in usernames:
+        max_limit = -1
+        gids = users_group_mapping.get(username)
+        
+        # If user not found in local DB, fallback to panel API
+        if gids is None:
+            try:
+                from utils.panel_api import get_user
+                user_info = await get_user(panel_data, username)
+                if user_info and isinstance(user_info, dict):
+                    gids = user_info.get("group_ids", [])
+                    # Handle older panel versions that might use group_id
+                    if not gids and "group_id" in user_info and user_info["group_id"] is not None:
+                        gids = [user_info["group_id"]]
+            except Exception:
+                gids = []
+        
+        # Calculate the max limit if user is in multiple groups
+        if gids:
+            for gid in gids:
+                # Check integer and string keys
+                limit = group_limits.get(gid)
+                if limit is None:
+                    limit = group_limits.get(str(gid))
+                    
+                if limit is not None and limit > max_limit:
+                    max_limit = limit
+        
+        if max_limit > -1:
+            result_limits[username] = max_limit
+            
+    return result_limits
+
 def group_ips_by_subnet(ip_list: list[str]) -> tuple[list[str], dict[str, list[str]]]:
     """
     Group IPs by their /24 subnet and return formatted representations.
@@ -220,7 +288,6 @@ def _build_ip_details(user_info: EnhancedUserInfo, original_user: UserType, show
     unique_devices = set()  # Track unique (IP, inbound) combinations
     cdn_inbound_seen = set()  # Track CDN inbounds we've already counted
     cdn_node_seen = set()  # Track CDN nodes we've already counted
-    
     if not original_user or not original_user.device_info or not original_user.device_info.connections:
         # Fallback: count IPs as devices if no connection info
         return [], len(user_info.formatted_ips)
@@ -534,6 +601,10 @@ async def check_ip_used() -> dict:
         reverse=True
     )
     
+    # ---- NEW: Get Group Limits in ONE Query (Batching) ----
+    active_usernames_for_batch = [email for email in ACTIVE_USERS.keys() if email and email.strip()]
+    batched_group_limits = await get_group_limits_batch(active_usernames_for_batch, config_data, panel_data)
+    # -------------------------------------------------------
     # Build combined message for all users with >= general_limit devices
     combined_message_parts = []
     users_needing_limit = []  # Users without special limit who need action messages
@@ -551,6 +622,7 @@ async def check_ip_used() -> dict:
         user_limit = special_limit.get(email, general_limit)
         has_special_limit = email in special_limit
         is_except = email in except_users
+        has_group_limit = False
         
         # Auto-set limit from username pattern if user doesn't have a special limit
         # First check database limit patterns (prefix/postfix), then fallback to regex patterns
@@ -576,6 +648,12 @@ async def check_ip_used() -> dict:
                     logger.info(f"✅ Auto-set limit for {email} to {username_limit} based on username pattern")
                 except Exception as e:
                     logger.error(f"Failed to auto-set limit for {email}: {e}")
+            else:
+                # Check Group Limit (From Batched Cache)
+                group_limit = batched_group_limits.get(email)
+                if group_limit is not None:
+                    user_limit = group_limit
+                    has_group_limit = True
         
         # Skip users who are not exceeding their limit
         # A user violates when device_count > user_limit
@@ -611,6 +689,8 @@ async def check_ip_used() -> dict:
             limit_indicator = "🔓"
         elif has_special_limit:
             limit_indicator = f"🎯{user_limit}"
+        elif has_group_limit:
+            limit_indicator = f"👥{user_limit}"
         else:
             limit_indicator = f"📊{user_limit}"
             # Add to list of users needing limit setting
@@ -619,7 +699,6 @@ async def check_ip_used() -> dict:
                 "device_count": device_count,
                 "ip_count": ip_count
             })
-        
         # Build user block with IP details for combined message
         # Format: 👤 Username
         #         📱 2 🌐 2 🎯 2
@@ -630,6 +709,8 @@ async def check_ip_used() -> dict:
             limit_str = "🔓"
         elif has_special_limit:
             limit_str = f"🎯 {user_limit}"
+        elif has_group_limit:
+            limit_str = f"👥 {user_limit}"
         else:
             limit_str = f"📊 {user_limit}"
         
@@ -788,6 +869,10 @@ async def check_users_usage(panel_data: PanelType):
     # This prevents double processing in the same cycle
     processed_users = disabled_users | warned_users
     
+    # ---- NEW: Get Group Limits in ONE Query (Batching) ----
+    active_usernames = list(all_users_actual_ips.keys())
+    batched_group_limits = await get_group_limits_batch(active_usernames, config_data, panel_data)
+    # -------------------------------------------------------
     # Check current violations for ALL users (not just those in all_users_log)
     # Track users skipped due to group filter or admin filter
     group_filtered_users = set()
@@ -821,6 +906,11 @@ async def check_users_usage(panel_data: PanelType):
                     user_limit_number = pattern_limit
                     # Also save to special_limit cache
                     special_limit[user_name] = pattern_limit
+                else:
+                    # Check Group Limit (From Batched Cache)
+                    group_limit = batched_group_limits.get(user_name)
+                    if group_limit is not None:
+                        user_limit_number = group_limit
             
             if len(unique_ips) > user_limit_number:
                 # Get user data and ISP info for this user

@@ -12,7 +12,7 @@ from telegram.ext import (
 from telegram_bot.handlers.admin import check_admin_privilege
 from telegram_bot.utils import write_json_file
 from telegram_bot.keyboards import create_back_to_main_keyboard
-from telegram_bot.constants import CallbackData
+from telegram_bot.constants import CallbackData, SET_GROUP_LIMIT
 from utils.read_config import read_config
 
 
@@ -337,6 +337,7 @@ def create_group_filter_keyboard(config_data: dict, groups: list):
     
     # Back button
     keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.GROUP_FILTER_MENU)])
+    keyboard.append([InlineKeyboardButton("🎯 Set Group Limit", callback_data=CallbackData.GROUP_LIMIT_SET)])
     keyboard.append([InlineKeyboardButton("« Back to Settings", callback_data=CallbackData.SETTINGS_MENU)])
     
     return InlineKeyboardMarkup(keyboard), mode_desc
@@ -370,11 +371,18 @@ async def handle_group_filter_menu_callback(query, _context: ContextTypes.DEFAUL
     enabled = filter_config.get("enabled", False)
     status = "✅ Enabled" if enabled else "❌ Disabled"
     
+    group_limits = config_data.get("group_limits", {})
+    limits_text = ""
+    if group_limits:
+        limits_text = "\n\n🎯 <b>Group Limits:</b>"
+        for gid, limit in group_limits.items():
+            name = next((g.get("name", "Unknown") for g in groups if g.get("id") == gid), "Unknown")
+            limits_text += f"\n  • {name} (ID: {gid}) ➡️ Limit: {limit}"
     try:
         await query.edit_message_text(
             text=f"🔍 <b>Group Filter</b>\n\n"
                  f"<b>Status:</b> {status}\n"
-                 f"<b>Mode:</b> {mode_desc}\n\n"
+                 f"<b>Mode:</b> {mode_desc}{limits_text}\n\n"
                  f"Select groups to include/exclude:",
             reply_markup=keyboard,
             parse_mode="HTML"
@@ -507,4 +515,118 @@ async def group_filter_remove(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         await _send_response(update, f"❌ Error: {str(e)}")
     
+    return ConversationHandler.END
+# ═══════════════════════════════════════════════════════════════════════════════
+# CALLBACK HANDLERS FOR GROUP LIMITS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_group_limit_menu_callback(query, _context: ContextTypes.DEFAULT_TYPE):
+    """Handle callback to show groups for setting limits."""
+    from telegram.error import BadRequest
+    
+    groups, config_data = await _get_groups_from_panel()
+    group_limits = config_data.get("group_limits", {})
+    
+    keyboard = []
+    for group in groups:
+        gid = group.get("id", 0)
+        name = group.get("name", "Unknown")
+        current_limit = group_limits.get(gid)
+        limit_display = f" | Limit: {current_limit}" if current_limit is not None else ""
+        
+        keyboard.append([
+            InlineKeyboardButton(
+                f"👥 {name}{limit_display}",
+                callback_data=f"set_glimit:{gid}"
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.GROUP_LIMIT_SET)])
+    keyboard.append([InlineKeyboardButton("« Back", callback_data=CallbackData.GROUP_FILTER_MENU)])
+    
+    try:
+        await query.edit_message_text(
+            text="🎯 <b>Set Group Limit</b>\n\nSelect a group to configure its connection limit:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+    except BadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+
+
+async def handle_set_group_limit_callback(query, context: ContextTypes.DEFAULT_TYPE, group_id: int):
+    """Prompt user for the limit number for a specific group."""
+    from telegram.error import BadRequest
+    
+    groups, _ = await _get_groups_from_panel()
+    group_name = next((g.get("name", "Unknown") for g in groups if g.get("id") == group_id), "Unknown")
+    
+    context.user_data['limit_group_id'] = group_id
+    context.user_data['limit_group_name'] = group_name
+    
+    keyboard = [[InlineKeyboardButton("« Cancel / Back", callback_data=CallbackData.GROUP_LIMIT_SET)]]
+    
+    try:
+        await query.edit_message_text(
+            text=f"🎯 <b>Set Limit for Group: {group_name}</b>\n\n"
+                 f"Please send the maximum allowed devices for this group (e.g. <code>2</code>).\n"
+                 f"<i>(Send <code>0</code> to remove the limit for this group)</i>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+    except BadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+            
+    return SET_GROUP_LIMIT
+
+
+async def receive_group_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive the group limit number and save it."""
+    try:
+        limit_val = int(update.message.text.strip())
+        if limit_val < 0:
+            raise ValueError("Limit cannot be negative.")
+    except ValueError:
+        await update.message.reply_html("❌ Please send a valid positive number or 0.")
+        return SET_GROUP_LIMIT
+        
+    group_id = context.user_data.get('limit_group_id')
+    group_name = context.user_data.get('limit_group_name', 'Unknown')
+    
+    if group_id is None:
+        await update.message.reply_html("❌ Session expired. Please try again from the menu.")
+        return ConversationHandler.END
+        
+    try:
+        import json
+        from utils.read_config import save_config_value, read_config, invalidate_config_cache
+        
+        config_data = await read_config()
+        group_limits = config_data.get("group_limits", {})
+        
+        if limit_val == 0:
+            if group_id in group_limits:
+                del group_limits[group_id]
+            elif str(group_id) in group_limits:
+                del group_limits[str(group_id)]
+            msg = f"✅ Limit removed for group <b>{group_name}</b>."
+        else:
+            group_limits[group_id] = limit_val
+            msg = f"✅ Limit for group <b>{group_name}</b> set to <b>{limit_val}</b>."
+        
+        # Save as JSON string
+        await save_config_value("group_limits", json.dumps(group_limits))
+        await invalidate_config_cache()
+        
+        # Send confirmation and clear user_data
+        await update.message.reply_html(msg)
+        
+        context.user_data.pop('limit_group_id', None)
+        context.user_data.pop('limit_group_name', None)
+        
+    except Exception as e:
+        await update.message.reply_html(f"❌ Error saving group limit: {str(e)}")
+        
     return ConversationHandler.END

@@ -275,6 +275,18 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
             x.strip() for x in admin_usernames_str.split(",") if x.strip()
         ]
     
+    # Group limits settings - mapping of group IDs to connection limits
+    config["group_limits"] = {}
+    group_limits_str = db_config.get("group_limits", "")
+    if group_limits_str:
+        try:
+            import json
+            parsed_limits = json.loads(group_limits_str)
+            if isinstance(parsed_limits, dict):
+                config["group_limits"] = {int(k): int(v) for k, v in parsed_limits.items()}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+    
     # CDN mode settings - list of inbound protocols that should be treated as CDN
     # When an inbound is in CDN mode, all IPs from that inbound count as 1 device
     config["cdn_inbounds"] = []
@@ -425,6 +437,7 @@ def get_config_value(config: dict, key: str, default: Any = None) -> Any:
         "GENERAL_LIMIT": lambda c: c.get("limits", {}).get("general"),
         "SPECIAL_LIMIT": lambda c: c.get("limits", {}).get("special"),
         "SPECIAL_LIMITS": lambda c: c.get("limits", {}).get("special"),
+        "GROUP_LIMITS": lambda c: c.get("group_limits"),
         "EXCEPT_USERS": lambda c: c.get("except_users"),
         "CHECK_INTERVAL": lambda c: c.get("check_interval"),
         "TIME_TO_ACTIVE_USERS": lambda c: c.get("time_to_active_users"),

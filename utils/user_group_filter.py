@@ -206,7 +206,9 @@ async def should_limit_user(panel_data, username: str, config_data: dict) -> tup
     user_group_ids = await get_user_groups(panel_data, username)
     
     # Check if user belongs to any of the filter groups
-    user_in_filter_groups = any(gid in filter_group_ids for gid in user_group_ids)
+    str_filter_ids = [str(x) for x in filter_group_ids]
+    str_user_group_ids = [str(x) for x in user_group_ids]
+    user_in_filter_groups = any(gid in str_filter_ids for gid in str_user_group_ids)
     
     if filter_mode == "include":
         # Include mode: only limit users in specified groups

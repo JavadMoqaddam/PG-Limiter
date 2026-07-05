@@ -177,6 +177,9 @@ from telegram_bot.handlers.group_filter import (
     handle_group_filter_toggle_callback,
     handle_group_filter_mode_callback,
     handle_group_filter_toggle_group_callback,
+    handle_group_limit_menu_callback,
+    handle_set_group_limit_callback,
+    receive_group_limit,
 )
 from telegram_bot.handlers.admin_filter import (
     admin_filter_status,
@@ -895,6 +898,9 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         await handle_group_filter_menu_callback(query, context)
         return
     
+    if data == CallbackData.GROUP_LIMIT_SET:
+        await handle_group_limit_menu_callback(query, context)
+        return
     if data == CallbackData.GROUP_FILTER_TOGGLE:
         await handle_group_filter_toggle_callback(query, context)
         return
@@ -913,6 +919,12 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         await handle_group_filter_toggle_group_callback(query, context, group_id)
         return
     
+    # Handle set group limit callbacks
+    if data.startswith("set_glimit:"):
+        group_id = int(data.split(":")[1])
+        await handle_set_group_limit_callback(query, context, group_id)
+        context.user_data["waiting_for"] = "group_limit"
+        return
     # Admin filter callbacks
     if data == CallbackData.ADMIN_FILTER_MENU:
         await handle_admin_filter_menu_callback(query, context)
@@ -1329,6 +1341,11 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     reply_markup=create_back_to_main_keyboard()
                 )
             context.user_data.pop("selected_user", None)
+        context.user_data["waiting_for"] = None
+        return
+    # Handle group limit input
+    if waiting_for == "group_limit":
+        await receive_group_limit(update, context)
         context.user_data["waiting_for"] = None
         return
     

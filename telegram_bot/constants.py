@@ -27,7 +27,8 @@ Contains callback data constants and conversation states.
     SET_CDN_INBOUND,
     SET_NODE_SETTINGS,
     WAITING_GROUP_ID,
-) = range(22)
+    SET_GROUP_LIMIT,
+) = range(23)
 
 
 class CallbackData:
@@ -156,6 +157,7 @@ class CallbackData:
     GROUP_FILTER_TOGGLE = "group_filter_toggle"
     GROUP_FILTER_MODE_INCLUDE = "group_filter_mode_include"
     GROUP_FILTER_MODE_EXCLUDE = "group_filter_mode_exclude"
+    GROUP_LIMIT_SET = "group_limit_set"
     
     # Admin filter
     ADMIN_FILTER_MENU = "admin_filter_menu"
