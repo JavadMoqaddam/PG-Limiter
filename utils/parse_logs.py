@@ -8,6 +8,8 @@ import re
 import sys
 import time
 
+from cachetools import TTLCache
+
 from utils.check_usage import ACTIVE_USERS
 from utils.read_config import read_config
 from utils.types import ConnectionInfo, DeviceInfo, UserType
@@ -18,7 +20,7 @@ except ImportError:
     print("Module 'httpx' is not installed use: 'pip install httpx' to install it")
     sys.exit()
 
-INVALID_EMAILS = [
+INVALID_EMAILS = {
     "API]",
     "Found",
     "(normal)",
@@ -27,13 +29,15 @@ INVALID_EMAILS = [
     "address",
     "INFO",
     "request",
-]
+}
 INVALID_IPS = {
     "1.1.1.1",
     "8.8.8.8",
 }
-VALID_IPS = []
+
+VALID_IPS = TTLCache(maxsize=50000, ttl=86400)
 CACHE = {}
+LOCAL_ID_CACHE = TTLCache(maxsize=30000, ttl=600)
 
 # API endpoints with fallback order (from most reliable to least)
 API_ENDPOINTS = [
@@ -294,7 +298,6 @@ async def parse_logs(log: str, node_id: int = None, node_name: str = None) -> di
     
     from db.database import get_db
     from db.crud.users import UserCRUD
-    local_id_cache = {}
     
     lines = log.splitlines()
     for line in lines:
@@ -346,7 +349,7 @@ async def parse_logs(log: str, node_id: int = None, node_name: str = None) -> di
                 if ip_location != "None":
                     country = await check_ip(ip)
                     if country and country == ip_location:
-                        VALID_IPS.append(ip)
+                        VALID_IPS[ip] = True
                     elif country and country != ip_location:
                         INVALID_IPS.add(ip)
                         continue
@@ -363,13 +366,13 @@ async def parse_logs(log: str, node_id: int = None, node_name: str = None) -> di
                 
             # Translate numeric ID to username
             if email.isdigit():
-                if email in local_id_cache:
-                    email = local_id_cache[email]
+                if email in LOCAL_ID_CACHE:
+                    email = LOCAL_ID_CACHE[email]
                 else:
                     async with get_db() as db:
                         real_username = await UserCRUD.get_username_by_panel_id(db, int(email))
                     if real_username:
-                        local_id_cache[email] = real_username
+                        LOCAL_ID_CACHE[email] = real_username
                         email = real_username
                     else:
                         continue
