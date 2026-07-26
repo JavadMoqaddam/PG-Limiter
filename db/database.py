@@ -112,9 +112,19 @@ if DATABASE_URL.startswith("sqlite"):
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
-        connect_args={"check_same_thread": False},
+        connect_args={"check_same_thread": False, "timeout": 30.0},
         poolclass=StaticPool,
     )
+    
+    from sqlalchemy import event
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
+        cursor.execute("PRAGMA busy_timeout=30000;")
+        cursor.close()
 else:
     db_logger.debug(f"📦 Using external database: {DATABASE_URL}")
     engine = create_async_engine(
