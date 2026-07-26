@@ -181,6 +181,44 @@ async def get_group_limits_batch(usernames: list[str], config_data: dict, panel_
             
     return result_limits
 
+
+async def get_active_users_metadata_batch(usernames: list[str]) -> dict[str, dict]:
+    """
+    Fetch group_ids, owner_username, is_excepted, and special_limit for multiple users in ONE SQL query.
+    Returns: {username: {"group_ids": [...], "owner_username": "...", "is_excepted": bool, "special_limit": int}}
+    """
+    if not usernames:
+        return {}
+    metadata = {}
+    try:
+        from db.database import get_db
+        from db.models import User
+        from sqlalchemy import select
+        
+        async with get_db() as db:
+            chunk_size = 900
+            for i in range(0, len(usernames), chunk_size):
+                chunk = usernames[i:i + chunk_size]
+                stmt = select(
+                    User.username,
+                    User.group_ids,
+                    User.owner_username,
+                    User.is_excepted,
+                    User.special_limit
+                ).where(User.username.in_(chunk))
+                result = await db.execute(stmt)
+                for row in result:
+                    metadata[row.username] = {
+                        "group_ids": row.group_ids or [],
+                        "owner_username": row.owner_username,
+                        "is_excepted": bool(row.is_excepted),
+                        "special_limit": row.special_limit
+                    }
+    except Exception as e:
+        logger.error(f"Batch fetch active users metadata failed: {e}")
+    return metadata
+
+
 def group_ips_by_subnet(ip_list: list[str]) -> tuple[list[str], dict[str, list[str]]]:
     """
     Group IPs by their /24 subnet and return formatted representations.
@@ -494,21 +532,46 @@ async def check_ip_used() -> dict:
         isp_info_batch = {}
         logger.info("📊 No IPs to look up (no active connections)")
     
-    # Pre-filter users based on group and admin filter settings
-    # This ensures we don't show logs or send action messages for filtered users
-    logger.debug("🔍 Applying user filters...")
-    for email in list(ACTIVE_USERS.keys()):
+    # Pre-filter users based on group and admin filter settings (In-Memory Batch)
+    logger.debug("🔍 Applying user filters (In-Memory Batch)...")
+    active_usernames_list = [u for u in ACTIVE_USERS.keys() if u and u.strip()]
+    users_metadata = await get_active_users_metadata_batch(active_usernames_list)
+    
+    group_filter = config_data.get("group_filter", {})
+    group_filter_enabled = group_filter.get("enabled", False)
+    group_filter_mode = group_filter.get("mode", "include")
+    group_filter_ids = [str(x) for x in group_filter.get("group_ids", [])]
+    
+    admin_filter = config_data.get("admin_filter", {})
+    admin_filter_enabled = admin_filter.get("enabled", False)
+    admin_filter_mode = admin_filter.get("mode", "include")
+    admin_filter_names = admin_filter.get("admin_usernames", [])
+    
+    for email in active_usernames_list:
+        user_meta = users_metadata.get(email, {})
+        
         # Check group filter
-        should_limit_group, _ = await should_limit_user(panel_data, email, config_data)
-        if not should_limit_group:
-            filtered_users.add(email)
-            continue
+        if group_filter_enabled and group_filter_ids:
+            user_gids = [str(x) for x in user_meta.get("group_ids", [])]
+            user_in_group = any(g in group_filter_ids for g in user_gids)
+            if group_filter_mode == "include" and not user_in_group:
+                filtered_users.add(email)
+                continue
+            elif group_filter_mode == "exclude" and user_in_group:
+                filtered_users.add(email)
+                continue
         
         # Check admin filter
-        should_limit_admin, _ = await should_limit_user_by_admin(panel_data, email, config_data)
-        if not should_limit_admin:
-            filtered_users.add(email)
-            continue
+        if admin_filter_enabled and admin_filter_names:
+            user_admin = user_meta.get("owner_username")
+            if user_admin is not None:
+                user_in_admin = user_admin in admin_filter_names
+                if admin_filter_mode == "include" and not user_in_admin:
+                    filtered_users.add(email)
+                    continue
+                elif admin_filter_mode == "exclude" and user_in_admin:
+                    filtered_users.add(email)
+                    continue
     
     if filtered_users:
         logger.info(f"Filters applied: {len(filtered_users)} users excluded from monitoring")
@@ -869,9 +932,20 @@ async def check_users_usage(panel_data: PanelType):
     # This prevents double processing in the same cycle
     processed_users = disabled_users | warned_users
     
-    # ---- NEW: Get Group Limits in ONE Query (Batching) ----
+    # ---- NEW: Get Group Limits & Metadata in ONE Query (Batching) ----
     active_usernames = list(all_users_actual_ips.keys())
     batched_group_limits = await get_group_limits_batch(active_usernames, config_data, panel_data)
+    users_metadata_usage = await get_active_users_metadata_batch(active_usernames)
+    
+    group_filter_data = config_data.get("group_filter", {})
+    group_filter_enabled_u = group_filter_data.get("enabled", False)
+    group_filter_mode_u = group_filter_data.get("mode", "include")
+    group_filter_ids_u = [str(x) for x in group_filter_data.get("group_ids", [])]
+    
+    admin_filter_data = config_data.get("admin_filter", {})
+    admin_filter_enabled_u = admin_filter_data.get("enabled", False)
+    admin_filter_mode_u = admin_filter_data.get("mode", "include")
+    admin_filter_names_u = admin_filter_data.get("admin_usernames", [])
     # -------------------------------------------------------
     # Check current violations for ALL users (not just those in all_users_log)
     # Track users skipped due to group filter or admin filter
@@ -880,17 +954,26 @@ async def check_users_usage(panel_data: PanelType):
     
     for user_name, unique_ips in all_users_actual_ips.items():
         if user_name not in except_users and user_name not in processed_users:
-            # Check group filter - skip users not in monitored groups
-            should_limit, skip_reason = await should_limit_user(panel_data, user_name, config_data)
-            if not should_limit:
-                group_filtered_users.add(user_name)
-                continue
+            user_meta = users_metadata_usage.get(user_name, {})
             
-            # Check admin filter - skip users whose admin is not monitored
-            should_limit_admin, admin_skip_reason = await should_limit_user_by_admin(panel_data, user_name, config_data)
-            if not should_limit_admin:
-                admin_filtered_users.add(user_name)
-                continue
+            # Check group filter (In-Memory)
+            if group_filter_enabled_u and group_filter_ids_u:
+                user_gids = [str(x) for x in user_meta.get("group_ids", [])]
+                user_in_group = any(g in group_filter_ids_u for g in user_gids)
+                should_limit = user_in_group if group_filter_mode_u == "include" else not user_in_group
+                if not should_limit:
+                    group_filtered_users.add(user_name)
+                    continue
+            
+            # Check admin filter (In-Memory)
+            if admin_filter_enabled_u and admin_filter_names_u:
+                user_admin = user_meta.get("owner_username")
+                if user_admin is not None:
+                    user_in_admin = user_admin in admin_filter_names_u
+                    should_limit_admin = user_in_admin if admin_filter_mode_u == "include" else not user_in_admin
+                    if not should_limit_admin:
+                        admin_filtered_users.add(user_name)
+                        continue
             
             user_limit_number = int(special_limit.get(user_name, limit_number))
             
