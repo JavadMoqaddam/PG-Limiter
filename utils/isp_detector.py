@@ -62,6 +62,14 @@ class ISPDetector:
         elif token:
             logger.info(f"ISPDetector initialized with token: {token[:20]}...")
     
+    def update_token(self, token: Optional[str]):
+        """Update ipinfo token dynamically"""
+        if token:
+            self.token = token
+            self.use_fallback_only = False
+            self.rate_limited = False
+            logger.info(f"🔑 ISPDetector token updated: {token[:20]}...")
+    
     async def _get_session(self):
         """Get or create the shared aiohttp session"""
         if self._session is None or self._session.closed:

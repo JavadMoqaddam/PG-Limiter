@@ -317,13 +317,9 @@ async def ipinfo_token_handler(update: Update, _context: ContextTypes.DEFAULT_TY
 
 
 async def save_ipinfo_token(token: str):
-    """Save the ipinfo.io token to the config file."""
+    """Save the ipinfo.io token to database for persistent storage across restarts."""
     try:
-        config = await read_json_file()
-        if "api" not in config:
-            config["api"] = {}
-        config["api"]["ipinfo_token"] = token
-        await write_json_file(config)
+        await save_config_value("ipinfo_token", token)
         return True
     except Exception as e:
         print(f"Error saving ipinfo token: {e}")

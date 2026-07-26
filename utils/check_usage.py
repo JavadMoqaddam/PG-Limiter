@@ -479,14 +479,16 @@ async def check_ip_used() -> dict:
         panel_config.get("domain", "")
     )
     
-    # Initialize ISP detector with token from config
+    # Initialize or update ISP detector with token from config
+    ipinfo_token = config_data.get("ipinfo_token") or config_data.get("api", {}).get("ipinfo_token", "")
+    use_fallback_api = config_data.get("api", {}).get("use_fallback_isp_api", False)
     if isp_detector is None:
-        ipinfo_token = config_data.get("api", {}).get("ipinfo_token", "")
-        use_fallback_api = config_data.get("api", {}).get("use_fallback_isp_api", False)
         logger.info(f"Loading IPINFO_TOKEN from config: {'Present' if ipinfo_token else 'NOT FOUND'}")
         if use_fallback_api:
             logger.info("Using fallback ISP API (ip-api.com) for all requests")
         isp_detector = ISPDetector(token=ipinfo_token if ipinfo_token else None, use_fallback_only=use_fallback_api)
+    elif ipinfo_token and getattr(isp_detector, "token", None) != ipinfo_token:
+        isp_detector.update_token(ipinfo_token)
     
     logger.info(f"📊 Processing {len(ACTIVE_USERS)} active users...")
     
@@ -875,16 +877,18 @@ async def check_users_usage(panel_data: PanelType):
     async with get_db() as db:
         special_limit = await UserCRUD.get_all_special_limits(db)
     
-    # Initialize ISP detector if not already done
+    # Initialize or update ISP detector
+    ipinfo_token = config_data.get("ipinfo_token") or api_config.get("ipinfo_token", "")
+    use_fallback_api = api_config.get("use_fallback_isp_api", False)
     if isp_detector is None:
-        ipinfo_token = api_config.get("ipinfo_token", "")
-        use_fallback_api = api_config.get("use_fallback_isp_api", False)
         logger.info(f"[check_users_usage] Loading ipinfo_token: {'Present' if ipinfo_token else 'NOT FOUND'}")
         if ipinfo_token:
             logger.info(f"[check_users_usage] Token preview: {ipinfo_token[:20]}...")
         if use_fallback_api:
             logger.info("[check_users_usage] Using fallback ISP API (ip-api.com) for all requests")
         isp_detector = ISPDetector(token=ipinfo_token if ipinfo_token else None, use_fallback_only=use_fallback_api)
+    elif ipinfo_token and getattr(isp_detector, "token", None) != ipinfo_token:
+        isp_detector.update_token(ipinfo_token)
     
     logger.info("📊 Building user info from active connections...")
     
