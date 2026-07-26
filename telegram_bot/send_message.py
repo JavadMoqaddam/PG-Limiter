@@ -88,24 +88,31 @@ async def send_logs(msg, return_message_id=False, reply_markup=None, topic_type:
     
     tg_send_logger.debug(f"📤 Sending log ({len(msg)} chars) topic={topic_type.value}")
     
-    # Try sending to forum group first if topics are enabled
-    if topics_manager.enabled and topics_manager.group_id:
+    # Try sending to forum group if a group ID is configured
+    if topics_manager.group_id:
+        if not topics_manager.enabled:
+            await topics_manager.set_enabled(True)
+            
         # Check for duplicate if message_key provided
         if message_key and topics_manager.is_message_sent(topic_type, message_key):
             tg_send_logger.debug(f"⏭️ Skipping duplicate message: {message_key[:50]}...")
             return None
         
-        thread_id = topics_manager.get_topic_id(topic_type)
+        # Get thread ID for topic, or fallback to General topic thread ID
+        thread_id = topics_manager.get_topic_id(topic_type) or topics_manager.get_topic_id(TopicType.GENERAL)
         
         for attempt in range(retries):
             try:
-                sent_message = await application.bot.sendMessage(
-                    chat_id=topics_manager.group_id,
-                    text=msg,
-                    parse_mode="HTML",
-                    reply_markup=reply_markup,
-                    message_thread_id=thread_id
-                )
+                kwargs = {
+                    "chat_id": topics_manager.group_id,
+                    "text": msg,
+                    "parse_mode": "HTML",
+                    "reply_markup": reply_markup,
+                }
+                if thread_id:
+                    kwargs["message_thread_id"] = thread_id
+                    
+                sent_message = await application.bot.sendMessage(**kwargs)
                 
                 # Mark message as sent if key provided
                 if message_key:
@@ -122,9 +129,12 @@ async def send_logs(msg, return_message_id=False, reply_markup=None, topic_type:
                 
             except Exception as e:
                 tg_send_logger.warning(f"⚠️ Attempt {attempt + 1}/{retries} failed for forum group: {e}")
+        
+        # When forum group is configured, NEVER fall back to admin private chats
+        tg_send_logger.warning(f"⚠️ Failed to send message to forum group ({topics_manager.group_id}) topic '{topic_type.value}'. Suppressing admin private chat fallback.")
+        return first_message_info
     
-    # Fallback: send to admins
-    admins = await check_admin()
+    # Fallback to admin private chats ONLY if NO forum group is configured at all
     
     if admins:
         for admin in admins:
@@ -360,24 +370,31 @@ async def send_user_message(msg: str, username: str, device_count: int, has_spec
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Try sending to forum group first if topics are enabled
-    if topics_manager.enabled and topics_manager.group_id:
+    # Try sending to forum group if a group ID is configured
+    if topics_manager.group_id:
+        if not topics_manager.enabled:
+            await topics_manager.set_enabled(True)
+            
         # Check for duplicate
         if topics_manager.is_message_sent(TopicType.NO_LIMIT, message_key):
             tg_send_logger.debug(f"⏭️ Skipping duplicate no-limit message for {username}")
             return
         
-        thread_id = topics_manager.get_topic_id(TopicType.NO_LIMIT)
+        # Get thread ID for topic, or fallback to General topic thread ID
+        thread_id = topics_manager.get_topic_id(TopicType.NO_LIMIT) or topics_manager.get_topic_id(TopicType.GENERAL)
         
         for attempt in range(retries):
             try:
-                await application.bot.sendMessage(
-                    chat_id=topics_manager.group_id,
-                    text=msg,
-                    parse_mode="HTML",
-                    reply_markup=reply_markup,
-                    message_thread_id=thread_id
-                )
+                kwargs = {
+                    "chat_id": topics_manager.group_id,
+                    "text": msg,
+                    "parse_mode": "HTML",
+                    "reply_markup": reply_markup,
+                }
+                if thread_id:
+                    kwargs["message_thread_id"] = thread_id
+                    
+                await application.bot.sendMessage(**kwargs)
                 
                 # Mark message as sent for this user
                 await topics_manager.mark_message_sent(TopicType.NO_LIMIT, message_key)
@@ -386,9 +403,12 @@ async def send_user_message(msg: str, username: str, device_count: int, has_spec
                 return
             except Exception as e:
                 tg_send_logger.warning(f"⚠️ Attempt {attempt + 1}/{retries} failed for forum group: {e}")
-    
-    # Fallback: send to admins
-    admins = await check_admin()
+        
+        # When forum group is configured, NEVER fall back to admin private chats
+        tg_send_logger.warning(f"⚠️ Failed to send user message for {username} to forum group ({topics_manager.group_id}). Suppressing admin private chat fallback.")
+        return
+        
+    # Fallback to admin private chats ONLY if NO forum group is configured at all
     
     if admins:
         for admin in admins:
