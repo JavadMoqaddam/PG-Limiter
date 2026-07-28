@@ -16,6 +16,48 @@ sync_logger = get_logger("user_sync")
 _last_sync_time: Optional[datetime] = None
 _sync_in_progress: bool = False
 
+# In-Memory User Metadata Cache populated during User Sync
+# Format: {username: {"group_ids": [...], "owner_username": "...", "is_excepted": bool, "special_limit": int}}
+USER_METADATA_CACHE: dict[str, dict] = {}
+
+
+async def refresh_user_metadata_cache(db=None):
+    """Refresh the in-memory USER_METADATA_CACHE from SQLite database."""
+    global USER_METADATA_CACHE
+    try:
+        from db.models import User
+        from sqlalchemy import select
+        
+        async def _fetch(session):
+            stmt = select(
+                User.username,
+                User.group_ids,
+                User.owner_username,
+                User.is_excepted,
+                User.special_limit
+            )
+            result = await session.execute(stmt)
+            new_cache = {}
+            for row in result:
+                new_cache[row.username] = {
+                    "group_ids": row.group_ids or [],
+                    "owner_username": row.owner_username,
+                    "is_excepted": bool(row.is_excepted),
+                    "special_limit": row.special_limit
+                }
+            return new_cache
+
+        if db is not None:
+            USER_METADATA_CACHE = await _fetch(db)
+        else:
+            from db.database import get_db
+            async with get_db() as session:
+                USER_METADATA_CACHE = await _fetch(session)
+                
+        sync_logger.info(f"🧠 USER_METADATA_CACHE updated in RAM with {len(USER_METADATA_CACHE)} users")
+    except Exception as e:
+        sync_logger.error(f"Failed to refresh USER_METADATA_CACHE: {e}")
+
 
 async def get_all_users_with_details(panel_data: PanelType, status: str | None = None) -> list[dict]:
     """
@@ -227,94 +269,72 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
             local_usernames = await UserCRUD.get_all_usernames(db)
             sync_logger.info(f"📊 Found {len(local_usernames)} existing users in local DB")
             
-            # Sync users from panel in batches to avoid memory issues
-            batch_size = 50
-            total_users = len(users)
+            # Sync users from panel using native Bulk Upsert
+            users_to_upsert = []
+            for user_data in users:
+                try:
+                    username = user_data.get("username")
+                    if not username:
+                        continue
+                    
+                    panel_id = user_data.get("id")
+                    status = user_data.get("status", "active")
+                    
+                    admin_info = user_data.get("admin", {}) or {}
+                    owner_id = admin_info.get("id") if isinstance(admin_info, dict) else None
+                    owner_username = admin_info.get("username") if isinstance(admin_info, dict) else None
+                    if not owner_username:
+                        owner_username = user_data.get("created_by")
+                    
+                    group_ids = user_data.get("group_ids") or user_data.get("groups") or []
+                    if isinstance(group_ids, str):
+                        group_ids = [int(g.strip()) for g in group_ids.split(",") if g.strip()]
+                    
+                    data_limit = user_data.get("data_limit")
+                    if data_limit:
+                        data_limit = data_limit / (1024 ** 3)
+                    
+                    used_traffic = user_data.get("used_traffic", 0)
+                    if used_traffic:
+                        used_traffic = used_traffic / (1024 ** 3)
+                    
+                    expire_at = None
+                    expire_value = user_data.get("expire")
+                    if expire_value:
+                        if isinstance(expire_value, int):
+                            if expire_value > 0:
+                                expire_at = datetime.fromtimestamp(expire_value)
+                        elif isinstance(expire_value, str):
+                            try:
+                                expire_at = datetime.fromisoformat(expire_value.replace("Z", "+00:00"))
+                            except ValueError:
+                                pass
+                    
+                    note = user_data.get("note")
+                    
+                    users_to_upsert.append({
+                        "username": username,
+                        "panel_id": panel_id,
+                        "status": status,
+                        "owner_id": owner_id,
+                        "owner_username": owner_username,
+                        "group_ids": group_ids,
+                        "data_limit": data_limit,
+                        "used_traffic": used_traffic,
+                        "expire_at": expire_at,
+                        "note": note,
+                    })
+                except Exception as e:
+                    sync_logger.error(f"Error parsing user {user_data.get('username', '?')}: {e}")
+                    errors += 1
             
-            for batch_start in range(0, total_users, batch_size):
-                batch_end = min(batch_start + batch_size, total_users)
-                batch = users[batch_start:batch_end]
-                
-                sync_logger.info(f"📝 Processing batch {batch_start//batch_size + 1}: users {batch_start+1}-{batch_end}/{total_users}")
-                
-                for user_data in batch:
-                    try:
-                        username = user_data.get("username")
-                        if not username:
-                            continue
-                        
-                        # Get numeric ID
-                        panel_id = user_data.get("id")
-                        
-                        # Extract user details
-                        status = user_data.get("status", "active")
-                        
-                        # Get admin/owner info
-                        admin_info = user_data.get("admin", {}) or {}
-                        owner_id = admin_info.get("id") if isinstance(admin_info, dict) else None
-                        owner_username = admin_info.get("username") if isinstance(admin_info, dict) else None
-                        
-                        # Alternative: check for "created_by" field
-                        if not owner_username:
-                            owner_username = user_data.get("created_by")
-                        
-                        # Get group IDs
-                        group_ids = user_data.get("group_ids") or user_data.get("groups") or []
-                        if isinstance(group_ids, str):
-                            group_ids = [int(g.strip()) for g in group_ids.split(",") if g.strip()]
-                        
-                        # Get data limits
-                        data_limit = user_data.get("data_limit")
-                        if data_limit:
-                            data_limit = data_limit / (1024 ** 3)  # Convert to GB
-                        
-                        used_traffic = user_data.get("used_traffic", 0)
-                        if used_traffic:
-                            used_traffic = used_traffic / (1024 ** 3)  # Convert to GB
-                        
-                        # Get expiry
-                        expire_at = None
-                        expire_value = user_data.get("expire")
-                        if expire_value:
-                            if isinstance(expire_value, int):
-                                # Unix timestamp
-                                if expire_value > 0:
-                                    expire_at = datetime.fromtimestamp(expire_value)
-                            elif isinstance(expire_value, str):
-                                # ISO datetime string
-                                try:
-                                    expire_at = datetime.fromisoformat(
-                                        expire_value.replace("Z", "+00:00")
-                                    )
-                                except ValueError:
-                                    pass
-                        
-                        # Get note
-                        note = user_data.get("note")
-                        
-                        # Create or update in database
-                        await UserCRUD.create_or_update(
-                            db,
-                            username=username,
-                            panel_id=panel_id,
-                            status=status,
-                            owner_id=owner_id,
-                            owner_username=owner_username,
-                            group_ids=group_ids,
-                            data_limit=data_limit,
-                            used_traffic=used_traffic,
-                            expire_at=expire_at,
-                            note=note,
-                        )
-                        synced += 1
-                        
-                    except Exception as e:
-                        sync_logger.error(f"Error syncing user {user_data.get('username', '?')}: {e}")
-                        errors += 1
-                
-                # Commit batch to database and flush to save memory
-                await db.flush()
-                sync_logger.info(f"✅ Batch committed: {synced} synced, {errors} errors so far")
+            # Execute Native SQLite Bulk Upsert
+            synced = await UserCRUD.bulk_upsert_users(db, users_to_upsert)
+            await db.commit()
+            sync_logger.info(f"✅ Native Bulk Upsert committed: {synced} synced in single transaction")
+            
+            # Refresh in-memory RAM metadata cache
+            await refresh_user_metadata_cache(db)
             
             # SAFETY CHECKS before deleting users
             # Only delete if sync was mostly successful (less than 10% errors)

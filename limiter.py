@@ -165,7 +165,9 @@ async def main():
         
         main_logger.info("=" * 50)
         main_logger.info("🟢 Limiter is now running and monitoring connections")
-        main_logger.info("=" * 50)
+        # Initial RAM cache population for zero-query monitoring
+        from utils.user_sync import refresh_user_metadata_cache
+        await refresh_user_metadata_cache()
         
         await run_check_users_usage(panel_data)
 

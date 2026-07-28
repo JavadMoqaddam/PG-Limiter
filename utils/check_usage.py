@@ -184,12 +184,26 @@ async def get_group_limits_batch(usernames: list[str], config_data: dict, panel_
 
 async def get_active_users_metadata_batch(usernames: list[str]) -> dict[str, dict]:
     """
-    Fetch group_ids, owner_username, is_excepted, and special_limit for multiple users in ONE SQL query.
-    Returns: {username: {"group_ids": [...], "owner_username": "...", "is_excepted": bool, "special_limit": int}}
+    Fetch group_ids, owner_username, is_excepted, and special_limit for multiple users.
+    FIRST checks RAM cache (USER_METADATA_CACHE). Zero database queries if cached!
     """
     if not usernames:
         return {}
+    
     metadata = {}
+    missing_usernames = []
+    
+    from utils.user_sync import USER_METADATA_CACHE
+    
+    for u in usernames:
+        if u in USER_METADATA_CACHE:
+            metadata[u] = USER_METADATA_CACHE[u]
+        else:
+            missing_usernames.append(u)
+            
+    if not missing_usernames:
+        return metadata
+        
     try:
         from db.database import get_db
         from db.models import User
@@ -197,8 +211,8 @@ async def get_active_users_metadata_batch(usernames: list[str]) -> dict[str, dic
         
         async with get_db() as db:
             chunk_size = 900
-            for i in range(0, len(usernames), chunk_size):
-                chunk = usernames[i:i + chunk_size]
+            for i in range(0, len(missing_usernames), chunk_size):
+                chunk = missing_usernames[i:i + chunk_size]
                 stmt = select(
                     User.username,
                     User.group_ids,
@@ -208,12 +222,14 @@ async def get_active_users_metadata_batch(usernames: list[str]) -> dict[str, dic
                 ).where(User.username.in_(chunk))
                 result = await db.execute(stmt)
                 for row in result:
-                    metadata[row.username] = {
+                    item = {
                         "group_ids": row.group_ids or [],
                         "owner_username": row.owner_username,
                         "is_excepted": bool(row.is_excepted),
                         "special_limit": row.special_limit
                     }
+                    metadata[row.username] = item
+                    USER_METADATA_CACHE[row.username] = item
     except Exception as e:
         logger.error(f"Batch fetch active users metadata failed: {e}")
     return metadata

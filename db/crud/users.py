@@ -538,3 +538,60 @@ class UserCRUD:
         await db.flush()
         db_users_logger.info(f"✅ Synced {count} users to database")
         return count
+
+    @staticmethod
+    async def bulk_upsert_users(db: AsyncSession, users_data: List[dict]) -> int:
+        """
+        Perform native SQLite Bulk Upsert (ON CONFLICT(username) DO UPDATE).
+        Upserts thousands of users in single atomic SQL executions per chunk.
+        """
+        if not users_data:
+            return 0
+            
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        
+        db_users_logger.info(f"⚡ Bulk upserting {len(users_data)} users to SQLite")
+        chunk_size = 500
+        count = 0
+        now = datetime.utcnow()
+        
+        for i in range(0, len(users_data), chunk_size):
+            chunk = users_data[i:i + chunk_size]
+            records = []
+            for d in chunk:
+                records.append({
+                    "username": d["username"],
+                    "panel_id": d.get("panel_id"),
+                    "status": d.get("status", "active"),
+                    "owner_id": d.get("owner_id"),
+                    "owner_username": d.get("owner_username"),
+                    "group_ids": d.get("group_ids") or [],
+                    "data_limit": d.get("data_limit"),
+                    "used_traffic": d.get("used_traffic", 0),
+                    "expire_at": d.get("expire_at"),
+                    "note": d.get("note"),
+                    "last_synced_at": now,
+                })
+            
+            stmt = sqlite_insert(User).values(records)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["username"],
+                set_={
+                    "panel_id": stmt.excluded.panel_id,
+                    "status": stmt.excluded.status,
+                    "owner_id": stmt.excluded.owner_id,
+                    "owner_username": stmt.excluded.owner_username,
+                    "group_ids": stmt.excluded.group_ids,
+                    "data_limit": stmt.excluded.data_limit,
+                    "used_traffic": stmt.excluded.used_traffic,
+                    "expire_at": stmt.excluded.expire_at,
+                    "note": stmt.excluded.note,
+                    "last_synced_at": stmt.excluded.last_synced_at,
+                }
+            )
+            await db.execute(stmt)
+            count += len(chunk)
+            
+        await db.flush()
+        db_users_logger.info(f"✅ Native Bulk Upsert completed for {count} users")
+        return count
