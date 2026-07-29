@@ -489,7 +489,7 @@ class EnhancedWarningSystem:
                 subnets.add(ip)
         return subnets
     
-    async def check_persistent_violations(self, panel_data: PanelType, all_users_actual_ips: Dict[str, Set[str]], config_data: dict) -> tuple[Set[str], Set[str]]:
+    async def check_persistent_violations(self, panel_data: PanelType, all_users_actual_ips: Dict[str, Set[str]], config_data: dict, batched_group_limits: dict = None) -> tuple[Set[str], Set[str]]:
         """
         Check for users who still violate limits after 3-minute warning period.
         Uses device counting: only IPs active for 2+ minutes count as devices.
@@ -505,6 +505,17 @@ class EnhancedWarningSystem:
         special_limit = limits_config.get("special", {})
         limit_number = limits_config.get("general", 2)
         
+        # Read special limits from DB if available
+        try:
+            from db.database import get_db
+            from db.crud import UserCRUD
+            async with get_db() as db:
+                db_special_limits = await UserCRUD.get_all_special_limits(db)
+                if db_special_limits:
+                    special_limit.update(db_special_limits)
+        except Exception:
+            pass
+        
         warning_logger.debug(f"⚠️ Checking {len(self.warnings)} active warnings for persistent violations")
         
         for username, warning in self.warnings.items():
@@ -514,6 +525,22 @@ class EnhancedWarningSystem:
                     warning.active_monitoring_task.cancel()
                 
                 user_limit_number = int(special_limit.get(username, limit_number))
+                
+                # Check pattern limits and group limits if no special limit is set
+                if username not in special_limit:
+                    try:
+                        from utils.check_usage import get_limit_from_patterns, extract_limit_from_username
+                        pattern_limit = await get_limit_from_patterns(username)
+                        if pattern_limit is None:
+                            pattern_limit = extract_limit_from_username(username)
+                        
+                        if pattern_limit is not None:
+                            user_limit_number = pattern_limit
+                        elif batched_group_limits and username in batched_group_limits:
+                            user_limit_number = int(batched_group_limits[username])
+                    except Exception as e:
+                        warning_logger.error(f"Error checking pattern/group limit for {username}: {e}")
+                
                 trust_score = warning.trust_score
                 trust_level = warning.get_trust_level()
                 

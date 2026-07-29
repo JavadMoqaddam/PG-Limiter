@@ -118,7 +118,7 @@ def extract_limit_from_username(username: str) -> int | None:
 # ═══════════════════════════════════════════════════════════════════════════════
 async def get_group_limits_batch(usernames: list[str], config_data: dict, panel_data: PanelType) -> dict[str, int]:
     """
-    Smart Batching: Fetches group limits for MULTIPLE users in ONE query.
+    Smart Batching: Fetches group limits for MULTIPLE users in ONE query / RAM cache.
     Handles multi-group logic by taking the maximum limit.
     """
     group_limits = config_data.get("group_limits", {})
@@ -127,54 +127,83 @@ async def get_group_limits_batch(usernames: list[str], config_data: dict, panel_
 
     result_limits = {}
     users_group_mapping = {}
+    missing_usernames = []
     
-    # 1. Fetch group_ids from local DB in ONE query (Smart Batching)
-    try:
-        from db.database import get_db
-        from db.models import User
-        from sqlalchemy import select
+    from utils.user_sync import USER_METADATA_CACHE
+    
+    # 1. Check RAM cache first
+    for u in usernames:
+        if u in USER_METADATA_CACHE:
+            users_group_mapping[u] = USER_METADATA_CACHE[u].get("group_ids", [])
+        else:
+            missing_usernames.append(u)
+    
+    # 2. Fetch group_ids from local DB for missing usernames
+    if missing_usernames:
+        try:
+            from db.database import get_db
+            from db.models import User
+            from sqlalchemy import select
+            
+            async with get_db() as db:
+                chunk_size = 900
+                for i in range(0, len(missing_usernames), chunk_size):
+                    chunk = missing_usernames[i:i + chunk_size]
+                    stmt = select(User.username, User.group_ids).where(User.username.in_(chunk))
+                    result = await db.execute(stmt)
+                    
+                    for row in result:
+                        gids = row.group_ids or []
+                        users_group_mapping[row.username] = gids
+                        # Cache write-back to RAM for O(1) in future cycles
+                        if row.username not in USER_METADATA_CACHE:
+                            USER_METADATA_CACHE[row.username] = {}
+                        USER_METADATA_CACHE[row.username]["group_ids"] = gids
+        except Exception as e:
+            logger.error(f"Batch fetch group_ids failed: {e}")
         
-        async with get_db() as db:
-            # Select only username and group_ids for the active users to save memory
-            chunk_size = 900
-            for i in range(0, len(usernames), chunk_size):
-                chunk = usernames[i:i + chunk_size]
-                stmt = select(User.username, User.group_ids).where(User.username.in_(chunk))
-                result = await db.execute(stmt)
-                
-                for row in result:
-                    users_group_mapping[row.username] = row.group_ids
-    except Exception as e:
-        logger.error(f"Batch fetch group_ids failed: {e}")
-        
-    # 2. Process limits (and fallback to API only if user is completely missing from local DB)
+    # 3. Process limits (and fallback to API only if user is completely missing from local DB)
     for username in usernames:
         max_limit = -1
         gids = users_group_mapping.get(username)
         
-        # If user not found in local DB, fallback to panel API
+        # If user not found in RAM or local DB, fallback to panel API
         if gids is None:
             try:
                 from utils.panel_api import get_user
                 user_info = await get_user(panel_data, username)
                 if user_info and isinstance(user_info, dict):
                     gids = user_info.get("group_ids", [])
-                    # Handle older panel versions that might use group_id
                     if not gids and "group_id" in user_info and user_info["group_id"] is not None:
                         gids = [user_info["group_id"]]
+                    # Cache write-back to RAM for O(1) in future cycles
+                    if username not in USER_METADATA_CACHE:
+                        USER_METADATA_CACHE[username] = {}
+                    USER_METADATA_CACHE[username]["group_ids"] = gids
             except Exception:
                 gids = []
         
         # Calculate the max limit if user is in multiple groups
         if gids:
             for gid in gids:
-                # Check integer and string keys
-                limit = group_limits.get(gid)
+                try:
+                    gid_int = int(gid)
+                    gid_str = str(gid)
+                except (ValueError, TypeError):
+                    gid_int = gid
+                    gid_str = str(gid)
+                
+                limit = group_limits.get(gid_int)
                 if limit is None:
-                    limit = group_limits.get(str(gid))
+                    limit = group_limits.get(gid_str)
                     
-                if limit is not None and limit > max_limit:
-                    max_limit = limit
+                if limit is not None:
+                    try:
+                        limit_val = int(limit)
+                        if limit_val > max_limit:
+                            max_limit = limit_val
+                    except (ValueError, TypeError):
+                        pass
         
         if max_limit > -1:
             result_limits[username] = max_limit
@@ -942,20 +971,19 @@ async def check_users_usage(panel_data: PanelType):
     # Cleanup inactive users from history
     await ip_history_tracker.cleanup_inactive_users(set(all_users_actual_ips.keys()))
     
-    # Check for users who still violate limits after warning period
-    # Pass actual IPs, not formatted display strings
-    disabled_users, warned_users = await warning_system.check_persistent_violations(
-        panel_data, all_users_actual_ips, config_data
-    )
-    
-    # Combine disabled and warned users to skip them in the loop
-    # This prevents double processing in the same cycle
-    processed_users = disabled_users | warned_users
-    
-    # ---- NEW: Get Group Limits & Metadata in ONE Query (Batching) ----
+    # Batch fetch group limits & metadata for active users
     active_usernames = list(all_users_actual_ips.keys())
     batched_group_limits = await get_group_limits_batch(active_usernames, config_data, panel_data)
     users_metadata_usage = await get_active_users_metadata_batch(active_usernames)
+    
+    # Check for users who still violate limits after warning period
+    # Pass actual IPs and group limits
+    disabled_users, warned_users = await warning_system.check_persistent_violations(
+        panel_data, all_users_actual_ips, config_data, batched_group_limits
+    )
+    
+    # Combine disabled and warned users to skip them in the loop
+    processed_users = disabled_users | warned_users
     
     group_filter_data = config_data.get("group_filter", {})
     group_filter_enabled_u = group_filter_data.get("enabled", False)
