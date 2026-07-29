@@ -9,7 +9,7 @@ import ipaddress
 import re
 from collections import Counter
 
-from telegram_bot.send_message import send_logs, send_user_message, send_active_users_log, send_monitoring_log
+from telegram_bot.send_message import send_logs, send_user_message
 from utils.logs import logger
 from utils.panel_api import disable_user
 from utils.read_config import read_config, get_config_value
@@ -836,39 +836,10 @@ async def check_ip_used() -> dict:
         
         combined_message_parts.append(user_block)
     
-    # Send combined message with all users
-    if combined_message_parts:
-        header = (
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 <b>Active Users Report</b>\n"
-            f"👥 Users: {users_shown} | 📱 Devices: {total_devices} | 🌐 IPs: {total_ips}\n"
-            f"📏 General limit: {general_limit}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-        )
-        
-        # Split into chunks if too long (Telegram limit ~4096 chars)
-        full_message = header + "\n\n".join(combined_message_parts)
-        
-        if len(full_message) > 4000:
-            # Send in chunks
-            await send_active_users_log(header)
-            chunk = ""
-            for block in combined_message_parts:
-                if len(chunk) + len(block) + 2 > 3900:
-                    await send_active_users_log(chunk)
-                    await asyncio.sleep(0.3)
-                    chunk = block
-                else:
-                    chunk = chunk + "\n\n" + block if chunk else block
-            if chunk:
-                await send_active_users_log(chunk)
-        else:
-            await send_active_users_log(full_message)
-    
     # Send SEPARATE action messages for users who need limit setting
     # (users without special limit and not in except list)
     if users_needing_limit:
-        await asyncio.sleep(1)  # Small delay after combined message
+        await asyncio.sleep(0.5)
         
         for user_data in users_needing_limit:
             email = user_data["email"]
@@ -887,15 +858,6 @@ async def check_ip_used() -> dict:
                 await asyncio.sleep(0.5)
             except Exception as e:
                 logger.error(f"Failed to send action message for user {email}: {e}")
-    
-    # Send monitoring summary
-    monitoring_summary = await warning_system.generate_monitoring_summary()
-    if monitoring_summary:
-        try:
-            await asyncio.sleep(1)
-            await send_monitoring_log(monitoring_summary)
-        except Exception as e:
-            logger.error(f"Failed to send monitoring summary: {e}")
     
     return all_users_log
 

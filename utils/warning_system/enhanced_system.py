@@ -17,7 +17,6 @@ from utils.warning_system.user_warning import UserWarning
 from utils.warning_system.helpers import (
     safe_send_logs,
     safe_send_warning_log,
-    safe_send_monitoring_log,
     safe_send_disable_notification,
     safe_disable_user_with_punishment,
 )
@@ -635,36 +634,13 @@ class EnhancedWarningSystem:
                     elif len(current_ips) > user_limit_number and device_count <= user_limit_number:
                         warning_logger.info(f"✅ User {username}: {len(current_ips)} IPs but only {device_count} devices - no action")
                         log_monitoring_event("monitoring_cleared", username, {"ips": len(current_ips), "devices": device_count, "limit": user_limit_number})
-                        await safe_send_monitoring_log(
-                            f"✅ <b>MONITORING ENDED - NO ACTION</b> - {time_str}\n\n"
-                            f"User: <code>{username}</code>\n"
-                            f"Current IPs: <code>{len(current_ips)}</code>\n"
-                            f"Confirmed Devices: <code>{device_count}</code> (active 2+ min)\n"
-                            f"User limit: <code>{user_limit_number}</code>\n"
-                            f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
-                            f"📊 IP Activity:\n<code>{activity_summary}</code>\n\n"
-                            f"IPs were temporary - not enough persistent devices to violate."
-                        )
                     
                     else:
                         warning_logger.info(f"✅ User {username} is now within limits ({device_count} devices, limit: {user_limit_number})")
                         log_monitoring_event("monitoring_ended", username, {"devices": device_count, "limit": user_limit_number})
-                        await safe_send_monitoring_log(
-                            f"✅ <b>MONITORING ENDED</b> - {time_str}\n\n"
-                            f"User: <code>{username}</code>\n"
-                            f"Confirmed Devices: <code>{device_count}</code>\n"
-                            f"User limit: <code>{user_limit_number}</code>\n\n"
-                            f"User is now compliant with device limits."
-                        )
                 else:
                     warning_logger.info(f"ℹ️ User {username} not found in current logs - monitoring ended")
                     log_monitoring_event("monitoring_ended", username, {"reason": "user_inactive"})
-                    await safe_send_monitoring_log(
-                        f"ℹ️ <b>MONITORING ENDED</b> - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                        f"User: <code>{username}</code>\n"
-                        f"Reason: <code>User not found in current logs</code>\n\n"
-                        f"User is no longer active."
-                    )
                 
                 users_to_remove.append(username)
         
@@ -692,8 +668,7 @@ class EnhancedWarningSystem:
                 )
         
         if active_warnings:
-            message = "🔍 <b>Currently Monitoring Users:</b>\n\n" + "\n".join(active_warnings)
-            await safe_send_monitoring_log(message)
+            warning_logger.debug(f"Currently monitoring {len(active_warnings)} users")
     
     def get_monitoring_users(self) -> Set[str]:
         """Get set of users currently being monitored"""

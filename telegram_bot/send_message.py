@@ -169,11 +169,6 @@ async def send_disable_enable_log(msg, return_message_id=False, reply_markup=Non
     return await send_logs(msg, return_message_id, reply_markup, TopicType.DISABLE_ENABLE)
 
 
-async def send_active_users_log(msg, return_message_id=False, reply_markup=None):
-    """Send an active users message to the active_users topic."""
-    return await send_logs(msg, return_message_id, reply_markup, TopicType.ACTIVE_USERS)
-
-
 async def send_backup_log(msg, return_message_id=False, reply_markup=None):
     """Send a backup message to the backups topic."""
     return await send_logs(msg, return_message_id, reply_markup, TopicType.BACKUPS)
@@ -182,11 +177,6 @@ async def send_backup_log(msg, return_message_id=False, reply_markup=None):
 async def send_no_limit_log(msg, return_message_id=False, reply_markup=None):
     """Send a no-limit message to the no_limit topic."""
     return await send_logs(msg, return_message_id, reply_markup, TopicType.NO_LIMIT)
-
-
-async def send_monitoring_log(msg, return_message_id=False, reply_markup=None):
-    """Send a monitoring message to the monitoring topic."""
-    return await send_logs(msg, return_message_id, reply_markup, TopicType.MONITORING)
 
 
 async def delete_message(message_info):

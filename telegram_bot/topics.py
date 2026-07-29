@@ -38,10 +38,8 @@ class TopicType(Enum):
     GENERAL = "general"
     WARNINGS = "warnings"
     DISABLE_ENABLE = "disable_enable"
-    ACTIVE_USERS = "active_users"
     BACKUPS = "backups"
     NO_LIMIT = "no_limit"
-    MONITORING = "monitoring"
 
 
 # Topic display configuration
@@ -61,11 +59,6 @@ TOPIC_CONFIG = {
         "icon_color": 0xCB86DB,  # Purple
         "description": "User disable and enable notifications"
     },
-    TopicType.ACTIVE_USERS: {
-        "name": "👥 Active Users",
-        "icon_color": 0x8EEE98,  # Green
-        "description": "Active users log and reports"
-    },
     TopicType.BACKUPS: {
         "name": "💾 Backups",
         "icon_color": 0xFF93B2,  # Pink
@@ -75,11 +68,6 @@ TOPIC_CONFIG = {
         "name": "📱 No Limit Found",
         "icon_color": 0xFB6F5F,  # Orange-red
         "description": "Users without special limits"
-    },
-    TopicType.MONITORING: {
-        "name": "📊 Monitoring",
-        "icon_color": 0x6FB9F0,  # Blue
-        "description": "Monitoring status and analytics"
     },
 }
 
