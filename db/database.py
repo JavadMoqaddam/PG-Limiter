@@ -96,6 +96,22 @@ def _ensure_db_columns():
         if added:
             db_logger.info(f"📌 Added missing columns to users table: {', '.join(added)}")
         
+        # Ensure indexes exist on live SQLite database file
+        indexes_to_create = [
+            ("ix_users_owner_id", "CREATE INDEX IF NOT EXISTS ix_users_owner_id ON users (owner_id)"),
+            ("ix_users_owner_username", "CREATE INDEX IF NOT EXISTS ix_users_owner_username ON users (owner_username)"),
+            ("ix_users_status", "CREATE INDEX IF NOT EXISTS ix_users_status ON users (status)"),
+            ("ix_users_is_excepted", "CREATE INDEX IF NOT EXISTS ix_users_is_excepted ON users (is_excepted)"),
+            ("ix_users_special_limit", "CREATE INDEX IF NOT EXISTS ix_users_special_limit ON users (special_limit)"),
+            ("ix_users_is_disabled_by_limiter", "CREATE INDEX IF NOT EXISTS ix_users_is_disabled_by_limiter ON users (is_disabled_by_limiter)"),
+            ("ix_users_status_disabled", "CREATE INDEX IF NOT EXISTS ix_users_status_disabled ON users (status, is_disabled_by_limiter)"),
+        ]
+        for idx_name, stmt in indexes_to_create:
+            try:
+                cursor.execute(stmt)
+            except Exception:
+                pass
+        
         conn.commit()
         conn.close()
         

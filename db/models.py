@@ -88,9 +88,12 @@ class User(Base):
     
     __table_args__ = (
         Index("ix_users_owner_id", "owner_id"),
+        Index("ix_users_owner_username", "owner_username"),
         Index("ix_users_status", "status"),
         Index("ix_users_is_excepted", "is_excepted"),
+        Index("ix_users_special_limit", "special_limit"),
         Index("ix_users_is_disabled_by_limiter", "is_disabled_by_limiter"),
+        Index("ix_users_status_disabled", "status", "is_disabled_by_limiter"),
     )
     
     def __repr__(self):
