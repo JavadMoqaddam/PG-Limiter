@@ -394,3 +394,59 @@ async def parse_logs(log: str, node_id: int = None, node_name: str = None) -> di
             ACTIVE_USERS[email] = user
 
     return ACTIVE_USERS
+
+
+async def clear_node_active_connections(node_id: int) -> int:
+    """
+    Atomically clear active connections belonging to a specific node_id from ACTIVE_USERS.
+    This prevents ghost connections when an SSE connection drops or reconnects.
+    
+    Args:
+        node_id (int): The ID of the node to clear connections for.
+        
+    Returns:
+        int: Number of connections removed.
+    """
+    if node_id is None:
+        return 0
+        
+    removed_count = 0
+    users_to_cleanup = []
+    
+    for username, user in list(ACTIVE_USERS.items()):
+        if not hasattr(user, "device_info") or not user.device_info or not user.device_info.connections:
+            continue
+            
+        # Build new connection list atomically
+        new_connections = [
+            conn for conn in user.device_info.connections 
+            if conn.node_id != node_id
+        ]
+        
+        removed_from_user = len(user.device_info.connections) - len(new_connections)
+        if removed_from_user > 0:
+            removed_count += removed_from_user
+            
+            if new_connections:
+                # Recompute sets atomically
+                new_ips = {conn.ip for conn in new_connections}
+                new_nodes = {conn.node_id for conn in new_connections if conn.node_id is not None}
+                new_protocols = {conn.inbound_protocol for conn in new_connections if conn.inbound_protocol is not None}
+                
+                # Atomic assignment
+                user.device_info.connections = new_connections
+                user.device_info.unique_ips = new_ips
+                user.device_info.unique_nodes = new_nodes
+                user.device_info.inbound_protocols = new_protocols
+                user.device_info.is_multi_device = (
+                    len(new_ips) > 2 or len(new_protocols) > 1 or len(new_nodes) > 1
+                )
+                user.ip = list(new_ips)
+            else:
+                users_to_cleanup.append(username)
+                
+    for username in users_to_cleanup:
+        if username in ACTIVE_USERS:
+            del ACTIVE_USERS[username]
+            
+    return removed_count

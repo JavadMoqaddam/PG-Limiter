@@ -164,6 +164,12 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
                     # Update status to connected
                     await _update_node_status(node.node_id, node.node_name, "✅ Connected")
                     
+                    # Clear stale/ghost connections for this specific node BEFORE reading fresh stream
+                    from utils.parse_logs import clear_node_active_connections
+                    cleared_count = await clear_node_active_connections(node.node_id)
+                    if cleared_count > 0:
+                        logger.info(f"🧹 Cleared {cleared_count} stale connections for node {node.node_id} ({node.node_name}) before reading SSE stream")
+                    
                     async for line in response.aiter_lines():
                         if line.startswith("data: "):
                             log_data = line[6:]  # Remove "data: " prefix
@@ -223,6 +229,10 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
                 # Update status to show disconnected
                 if node_id in _node_connection_status:
                     await _update_node_status(node_id, _node_connection_status[node_id]["name"], "⚫ Disconnected")
+                
+                # Clear active connections for this deactivated node
+                from utils.parse_logs import clear_node_active_connections
+                await clear_node_active_connections(node_id)
                 
                 del deactivate_nodes[task_name]
                 task.cancel()
