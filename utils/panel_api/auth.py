@@ -114,6 +114,8 @@ async def get_token(panel_data: PanelType, force_refresh: bool = False) -> Panel
     for attempt in range(max_attempts):
         auth_logger.debug(f"🔑 Token fetch attempt {attempt + 1}/{max_attempts}")
         for scheme in ["https", "http"]:
+            if scheme == "http" and ":443" in str(panel_data.panel_domain):
+                continue
             url = f"{scheme}://{panel_data.panel_domain}/api/admin/token"
             start_time = time.perf_counter()
             try:

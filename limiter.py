@@ -73,12 +73,12 @@ async def main():
     else:
         main_logger.info("ℹ Redis cache module not available, using in-memory cache")
     
-    # Start Telegram bot
+    # Start Telegram bot in background task
     main_logger.debug("Starting Telegram bot task...")
     asyncio.create_task(run_telegram_bot())
     await asyncio.sleep(2)
     main_logger.info("✓ Telegram bot started")
-    
+
     # Load configuration
     main_logger.debug("Loading configuration...")
     while True:
@@ -130,12 +130,23 @@ async def main():
     await get_nodes(panel_data)
     
     async with asyncio.TaskGroup() as tg:
-        await asyncio.sleep(5)
+        await asyncio.sleep(2)
+        
+        # Start Redis Pub/Sub listener for L1/L2 cache invalidations
+        if REDIS_AVAILABLE:
+            from utils.redis_cache import start_pubsub_listener
+            tg.create_task(start_pubsub_listener(), name="redis_pubsub")
+            main_logger.info("✓ Redis Pub/Sub listener registered in TaskGroup")
+
+        # Start unknown user background worker
+        from utils.user_sync import run_unknown_user_worker
+        tg.create_task(run_unknown_user_worker(panel_data), name="unknown_user_worker")
+        main_logger.info("✓ Unknown user worker registered in TaskGroup")
+
         nodes_list = await get_nodes(panel_data)
         
         if nodes_list and not isinstance(nodes_list, ValueError):
             await init_node_status_message(nodes_list)
-            
             connected_nodes = [n for n in nodes_list if n.status == "connected"]
             main_logger.info(f"🖥️ Found {len(nodes_list)} nodes ({len(connected_nodes)} connected)")
             
@@ -143,37 +154,27 @@ async def main():
                 if node.status == "connected":
                     main_logger.debug(f"Connecting to node: {node.node_name} (id={node.node_id})")
                     await create_node_task(panel_data, tg, node)
-                    await asyncio.sleep(1)
             
             main_logger.info(f"✓ Connected to {len(connected_nodes)} nodes")
         else:
             main_logger.warning("No nodes available or error fetching nodes")
         
-        # Start background tasks
+        # Start background management tasks
         main_logger.info("🔄 Starting background tasks...")
         tg.create_task(check_and_add_new_nodes(panel_data, tg), name="add_new_nodes")
-        main_logger.debug("  └─ Started: check_and_add_new_nodes")
         tg.create_task(handle_cancel(panel_data, TASKS), name="cancel_disable_nodes")
-        main_logger.debug("  └─ Started: handle_cancel")
         tg.create_task(handle_cancel_all(TASKS, panel_data, tg), name="cancel_all")
-        main_logger.debug("  └─ Started: handle_cancel_all")
         
-        # Enable disabled user task is now part of check_usage.py punishment system
-        # Start the enable_dis_user loop to auto-enable users after punishment time passes
         from utils.panel_api import enable_dis_user
         tg.create_task(enable_dis_user(panel_data), name="enable_disabled_users")
-        main_logger.debug("  └─ Started: enable_disabled_users")
         
-        # Start user sync loop for filter caching
         from utils.user_sync import run_user_sync_loop
         tg.create_task(run_user_sync_loop(panel_data), name="user_sync")
-        main_logger.debug("  └─ Started: user_sync")
         
-        main_logger.info("✓ All background tasks started")
-        
+        main_logger.info("✓ All background tasks registered in TaskGroup")
         main_logger.info("=" * 50)
         main_logger.info("🟢 Limiter is now running and monitoring connections")
-        # Initial RAM cache population for zero-query monitoring
+        
         from utils.user_sync import refresh_user_metadata_cache
         await refresh_user_metadata_cache()
         

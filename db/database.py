@@ -38,8 +38,8 @@ def _get_db_path() -> str:
 
 def _ensure_db_columns():
     """
-    Ensure all required columns exist in the database.
-    This runs SYNCHRONOUSLY at module load time, before any async operations.
+    Ensure all required tables and columns exist in the database.
+    Runs inside a thread executor during init_db().
     """
     db_path = _get_db_path()
     
@@ -48,26 +48,28 @@ def _ensure_db_columns():
     if db_dir and not os.path.exists(db_dir):
         os.makedirs(db_dir, exist_ok=True)
     
-    if not os.path.exists(db_path):
-        return  # Fresh DB, will be created by migrations
-    
     try:
+        # 1. Create tables if they do not exist
+        from sqlalchemy import create_engine
+        from db.models import Base
+        sync_engine = create_engine(f"sqlite:///{db_path}")
+        Base.metadata.create_all(sync_engine)
+        sync_engine.dispose()
+
+        # 2. Add any missing columns to existing SQLite tables
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
-        # Check if users table exists
         cursor.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='users'"
         )
         if not cursor.fetchone():
             conn.close()
-            return  # No users table yet
+            return
         
-        # Get existing columns
         cursor.execute("PRAGMA table_info(users)")
         existing_columns = {row[1] for row in cursor.fetchall()}
         
-        # Define columns to add
         columns_to_add = [
             ("is_excepted", "BOOLEAN DEFAULT 0"),
             ("exception_reason", "TEXT"),
@@ -92,12 +94,11 @@ def _ensure_db_columns():
                     cursor.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
                     added.append(col_name)
                 except sqlite3.OperationalError:
-                    pass  # Column might already exist
+                    pass
         
         if added:
             db_logger.info(f"📌 Added missing columns to users table: {', '.join(added)}")
         
-        # Ensure indexes exist on live SQLite database file
         indexes_to_create = [
             ("ix_users_owner_id", "CREATE INDEX IF NOT EXISTS ix_users_owner_id ON users (owner_id)"),
             ("ix_users_owner_username", "CREATE INDEX IF NOT EXISTS ix_users_owner_username ON users (owner_username)"),
@@ -118,9 +119,6 @@ def _ensure_db_columns():
         
     except Exception as e:
         db_logger.warning(f"Column check failed: {e}")
-
-
-# Run column check inside init_db via thread executor instead of module load time
 
 
 # For SQLite, use standard async engine without StaticPool to allow concurrent connections with WAL mode
@@ -170,7 +168,7 @@ _DB_INITIALIZED = False
 
 async def init_db():
     """
-    Initialize the database - run migrations automatically.
+    Initialize the database - run schema checks and table creation.
     Should be called once at application startup.
     """
     global _DB_INITIALIZED
@@ -185,12 +183,11 @@ async def init_db():
         os.makedirs(db_dir, exist_ok=True)
         db_logger.info(f"📁 Created database directory: {db_dir}")
     
-    db_logger.debug("🔄 Running database migrations...")
+    db_logger.debug("🔄 Running database schema checks...")
     
-    # Run column checks and migrations in background thread to avoid blocking asyncio event loop
+    # Run column checks and table creation in background thread
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _ensure_db_columns)
-    await loop.run_in_executor(None, _run_migrations_sync)
     
     _DB_INITIALIZED = True
     db_logger.info(f"✅ Database initialized: {DATABASE_URL}")

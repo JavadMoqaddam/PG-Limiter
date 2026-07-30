@@ -5,6 +5,7 @@ Messages can be sent to:
 2. Admin private chats (fallback)
 """
 
+import asyncio
 import json
 import os
 from utils.logs import get_logger
@@ -64,21 +65,45 @@ def remove_disable_message_tracking(username: str):
         tg_send_logger.debug(f"🗑️ Removed disable message tracking for {username}")
 
 
+import time
+
+_LAST_SENT_TIME_PER_CHAT: dict[str, float] = {}
+
+
+async def _wait_for_rate_limit(chat_key: str, min_delay: float = 0.5):
+    """Enforce minimum delay between API calls for the same chat/topic to avoid 429 Flood Control."""
+    global _LAST_SENT_TIME_PER_CHAT
+    try:
+        now = time.time()
+        last = _LAST_SENT_TIME_PER_CHAT.get(chat_key, 0)
+        elapsed = now - last
+        if elapsed < min_delay:
+            await asyncio.sleep(min_delay - elapsed)
+        _LAST_SENT_TIME_PER_CHAT[chat_key] = time.time()
+    except Exception:
+        pass
+
+
+import html as html_lib
+
+
+def _sanitize_html_message(msg: str) -> str:
+    """If message contains raw HTML document tags, wrap in code tag to prevent Telegram parse errors."""
+    if not isinstance(msg, str):
+        msg = str(msg)
+    if "<html>" in msg.lower() or "<head>" in msg.lower() or "<body>" in msg.lower():
+        # Escape raw HTML and format cleanly as code block
+        clean = html_lib.escape(msg)
+        return f"<code>{clean[:1000]}</code>"
+    return msg
+
+
 async def send_logs(msg, return_message_id=False, reply_markup=None, topic_type: TopicType = TopicType.GENERAL, message_key: str = None):
     """
-    Send logs to forum group topic or all admins.
-    
-    Args:
-        msg: The message to send
-        return_message_id: If True, returns the message_id of the first message
-        reply_markup: Optional InlineKeyboardMarkup for buttons
-        topic_type: Topic type to send to (default: GENERAL)
-        message_key: Optional key for deduplication (if provided, message won't be sent if already sent with same key)
-        
-    Returns:
-        If return_message_id is True, returns (message_id, chat_id) tuple or None
-        Otherwise returns None
+    Send logs to forum group topic or all admins with rate throttling and HTML sanitization.
     """
+    msg = _sanitize_html_message(msg)
+    
     # Import application here to get the updated instance
     from telegram_bot.main import application
     
@@ -90,6 +115,9 @@ async def send_logs(msg, return_message_id=False, reply_markup=None, topic_type:
     
     # Try sending to forum group if a group ID is configured
     if topics_manager.group_id:
+        chat_key = f"group:{topics_manager.group_id}:topic:{topic_type.value}"
+        await _wait_for_rate_limit(chat_key, min_delay=0.5)
+
         if not topics_manager.enabled:
             await topics_manager.set_enabled(True)
             

@@ -330,23 +330,30 @@ async def check_and_add_new_nodes(panel_data: PanelType, tg: asyncio.TaskGroup) 
     global _node_connection_status
     
     while True:
-        all_nodes = await get_nodes(panel_data)
-        if all_nodes and not isinstance(all_nodes, ValueError):
-            for node in all_nodes:
-                if (
-                    node not in task_node_mapping.values()
-                    and node.status == "connected"
-                ):
-                    # Add to status tracking
-                    _node_connection_status[node.node_id] = {
-                        "name": node.node_name,
-                        "status": "⏳ Connecting..."
-                    }
-                    
-                    logger.info(f"Add a new node. id: {node.node_id} name: {node.node_name}")
-                    await _update_node_status(node.node_id, node.node_name, "⏳ Connecting...")
-                    await create_node_task(panel_data, tg, node)
-        # Check for new nodes every 2 minutes instead of 25 seconds to reduce API calls
+        try:
+            all_nodes = await get_nodes(panel_data)
+            if all_nodes and not isinstance(all_nodes, ValueError):
+                for node in all_nodes:
+                    if (
+                        node not in task_node_mapping.values()
+                        and node.status == "connected"
+                    ):
+                        _node_connection_status[node.node_id] = {
+                            "name": node.node_name,
+                            "status": "⏳ Connecting..."
+                        }
+                        
+                        logger.info(f"Add a new node. id: {node.node_id} name: {node.node_name}")
+                        try:
+                            await _update_node_status(node.node_id, node.node_name, "⏳ Connecting...")
+                        except Exception as update_err:
+                            logger.warning(f"Failed updating node status: {update_err}")
+                        await create_node_task(panel_data, tg, node)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in check_and_add_new_nodes: {e}")
+            
         await asyncio.sleep(120)
 
 
