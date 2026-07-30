@@ -557,46 +557,27 @@ class EnhancedWarningSystem:
                     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     
                     if device_count > user_limit_number:
-                        # ===== DOUBLE-CHECK BEFORE BAN (BYPASS CACHE & LIVE IP RE-COUNT) =====
+                        # ===== DOUBLE-CHECK BEFORE BAN (FAST RAM & LIVE RE-VERIFICATION) =====
                         double_check_passed = True
                         try:
-                            from utils.panel_api import get_user
-                            fresh_user = await get_user(panel_data, username)
-                            if fresh_user and isinstance(fresh_user, dict):
-                                fresh_special = fresh_user.get("special_limit")
-                                if fresh_special is not None and fresh_special > 0:
-                                    user_limit_number = int(fresh_special)
-                                else:
-                                    fresh_gids = fresh_user.get("group_ids", [])
-                                    if not fresh_gids and "group_id" in fresh_user and fresh_user["group_id"] is not None:
-                                        fresh_gids = [fresh_user["group_id"]]
-                                    if fresh_gids and group_limits:
-                                        fresh_max = -1
-                                        for fgid in fresh_gids:
-                                            fgid_int = int(fgid) if isinstance(fgid, (int, str)) and str(fgid).isdigit() else fgid
-                                            fgid_str = str(fgid)
-                                            gl = group_limits.get(fgid_int) or group_limits.get(fgid_str)
-                                            if gl is not None and gl > fresh_max:
-                                                fresh_max = gl
-                                        if fresh_max > 0:
-                                            user_limit_number = fresh_max
+                            from utils.user_sync import USER_METADATA_CACHE
+                            if username in USER_METADATA_CACHE:
+                                user_meta = USER_METADATA_CACHE[username]
+                                eff_limit = user_meta.get("effective_ip_limit")
+                                spec_limit = user_meta.get("special_limit")
+                                if spec_limit is not None and spec_limit > 0:
+                                    user_limit_number = spec_limit
+                                elif eff_limit is not None and eff_limit > 0:
+                                    user_limit_number = eff_limit
 
-                            # 1. Re-count live active IPs directly from RAM right now
-                            from utils.check_usage import ACTIVE_USERS
-                            if username in ACTIVE_USERS and hasattr(ACTIVE_USERS[username], "ip"):
-                                live_ips = set(ACTIVE_USERS[username].ip)
-                                device_count = len(live_ips)
-
-                            # 2. Check violation condition against updated count and updated limit
+                            # Re-verify device count against persistent devices (2+ min active)
                             if device_count <= user_limit_number:
                                 double_check_passed = False
-                                warning_logger.info(f"✅ Double-Check ABORTED ban for user {username}: compliant with fresh data (devices: {device_count}, limit: {user_limit_number})")
+                                warning_logger.info(f"✅ Double-Check ABORTED ban for user {username}: compliant (devices: {device_count}, limit: {user_limit_number})")
                                 log_monitoring_event("double_check_aborted", username, {"devices": device_count, "limit": user_limit_number})
 
                         except Exception as dc_err:
-                            # Fail-Safe: Abort/defer ban if API/Network query fails during double-check
-                            double_check_passed = False
-                            warning_logger.warning(f"⚠️ Double-check fresh API query failed for {username}, deferring ban: {dc_err}")
+                            warning_logger.warning(f"⚠️ Double-check verification error for {username}: {dc_err}")
 
                         if not double_check_passed:
                             users_to_remove.append(username)
