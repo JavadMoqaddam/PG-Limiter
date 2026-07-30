@@ -247,7 +247,9 @@ async def get_active_users_metadata_batch(usernames: list[str]) -> dict[str, dic
                     User.group_ids,
                     User.owner_username,
                     User.is_excepted,
-                    User.special_limit
+                    User.special_limit,
+                    User.is_monitored,
+                    User.effective_ip_limit
                 ).where(User.username.in_(chunk))
                 result = await db.execute(stmt)
                 for row in result:
@@ -255,7 +257,9 @@ async def get_active_users_metadata_batch(usernames: list[str]) -> dict[str, dic
                         "group_ids": row.group_ids or [],
                         "owner_username": row.owner_username,
                         "is_excepted": bool(row.is_excepted),
-                        "special_limit": row.special_limit
+                        "special_limit": row.special_limit,
+                        "is_monitored": bool(row.is_monitored) if row.is_monitored is not None else True,
+                        "effective_ip_limit": row.effective_ip_limit,
                     }
                     metadata[row.username] = item
                     USER_METADATA_CACHE[row.username] = item

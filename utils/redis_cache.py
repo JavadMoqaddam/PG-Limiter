@@ -533,21 +533,60 @@ async def remove_disabled_user(username: str) -> bool:
     return True
 
 
-async def get_cache_stats() -> Dict[str, Any]:
-    """Get comprehensive cache statistics."""
-    cache = await get_cache()
-    stats = await cache.get_stats()
-    
-    # Add category counts
-    try:
-        client = cache.client
-        stats["categories"] = {
-            "tokens": len(await client.keys(f"{CACHE_PREFIX}token:*")),
-            "nodes": len(await client.keys(f"{CACHE_PREFIX}nodes:*")),
-            "isp": len(await client.keys(f"{CACHE_PREFIX}isp:*")),
-            "panel_users": len(await client.keys(f"{CACHE_PREFIX}panel_users:*")),
-        }
-    except Exception:
-        stats["categories"] = {}
-    
     return stats
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REDIS PUB/SUB CACHE INVALIDATION (L1 RAM + L2 Redis Architecture)
+# ═══════════════════════════════════════════════════════════════════════════════
+PUBSUB_CHANNEL = f"{CACHE_PREFIX}cache_inval"
+
+
+async def publish_cache_invalidation(reason: str = "config_updated") -> bool:
+    """Publish a cache invalidation signal via Redis Pub/Sub."""
+    try:
+        cache = await get_cache()
+        if cache.is_connected and REDIS_AVAILABLE:
+            payload = json.dumps({"type": "invalidate", "reason": reason})
+            await cache.client.publish(PUBSUB_CHANNEL, payload)
+            redis_logger.info(f"📢 Published cache invalidation via Redis Pub/Sub (reason={reason})")
+            return True
+    except Exception as e:
+        redis_logger.warning(f"Failed to publish Redis Pub/Sub invalidation: {e}")
+    return False
+
+
+async def start_pubsub_listener():
+    """Background listener for Redis Pub/Sub cache invalidation signals."""
+    if not REDIS_AVAILABLE:
+        redis_logger.info("ℹ️ Redis not available, skipping Pub/Sub listener")
+        return
+        
+    while True:
+        try:
+            cache = await get_cache()
+            if not cache.is_connected:
+                await asyncio.sleep(5)
+                continue
+                
+            pubsub = cache.client.pubsub()
+            await pubsub.subscribe(PUBSUB_CHANNEL)
+            redis_logger.info(f"🎧 Redis Pub/Sub listener subscribed to channel: {PUBSUB_CHANNEL}")
+            
+            async for message in pubsub.listen():
+                if message and message.get("type") == "message":
+                    try:
+                        data = json.loads(message.get("data", "{}"))
+                        redis_logger.info(f"⚡ Received Pub/Sub cache invalidation signal: {data}")
+                        
+                        from utils.user_sync import recompute_all_user_limits
+                        await recompute_all_user_limits()
+                    except Exception as parse_err:
+                        redis_logger.error(f"Error processing Pub/Sub message: {parse_err}")
+                        
+        except asyncio.CancelledError:
+            redis_logger.info("Redis Pub/Sub listener cancelled")
+            break
+        except Exception as e:
+            redis_logger.error(f"Error in Redis Pub/Sub listener: {e}")
+            await asyncio.sleep(5)
