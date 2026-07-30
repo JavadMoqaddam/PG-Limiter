@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Dict, List, Optional
 
 
-@dataclass
+@dataclass(slots=True)
 class PanelType:
     """
     A class used to represent the credentials for a panel.
@@ -25,7 +25,7 @@ class PanelType:
     panel_token: str | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class NodeType:
     """
     A class used to represent the data for a node.
@@ -58,7 +58,7 @@ class UserStatus(Enum):
     DISABLE = "DISABLE"
 
 
-@dataclass
+@dataclass(slots=True)
 class ConnectionInfo:
     """
     Represents connection information for a specific IP address.
@@ -79,7 +79,7 @@ class ConnectionInfo:
     connection_count: int = 1
 
 
-@dataclass
+@dataclass(slots=True)
 class DeviceInfo:
     """
     Represents device information based on IP and connection patterns.
@@ -98,7 +98,7 @@ class DeviceInfo:
     inbound_protocols: set = field(default_factory=set)
 
 
-@dataclass
+@dataclass(slots=True)
 class UserType:
     """
     Represents a user type with panel API fields.
@@ -135,7 +135,7 @@ class UserType:
     admin_username: str | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class EnhancedUserInfo:
     """
     Enhanced user information with ISP details and warning status.

@@ -15,7 +15,6 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.pool import StaticPool
 
 from db.models import Base
 from utils.logs import get_logger
@@ -119,18 +118,19 @@ def _ensure_db_columns():
         db_logger.warning(f"Column check failed: {e}")
 
 
-# Run column check immediately at module load time
-_ensure_db_columns()
+# Run column check inside init_db via thread executor instead of module load time
 
 
-# For SQLite, use StaticPool for better async support
+# For SQLite, use standard async engine without StaticPool to allow concurrent connections with WAL mode
 if DATABASE_URL.startswith("sqlite"):
     db_logger.debug(f"📦 Using SQLite database: {DATABASE_URL}")
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
-        connect_args={"check_same_thread": False, "timeout": 30.0},
-        poolclass=StaticPool,
+        connect_args={"check_same_thread": False, "timeout": 60.0},
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20,
     )
     
     from sqlalchemy import event
@@ -140,7 +140,8 @@ if DATABASE_URL.startswith("sqlite"):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA journal_mode=WAL;")
         cursor.execute("PRAGMA synchronous=NORMAL;")
-        cursor.execute("PRAGMA busy_timeout=30000;")
+        cursor.execute("PRAGMA busy_timeout=60000;")
+        cursor.execute("PRAGMA cache_size=-64000;")
         cursor.close()
 else:
     db_logger.debug(f"📦 Using external database: {DATABASE_URL}")
@@ -184,8 +185,9 @@ async def init_db():
     
     db_logger.debug("🔄 Running database migrations...")
     
-    # Run migrations in background thread to avoid blocking asyncio event loop
+    # Run column checks and migrations in background thread to avoid blocking asyncio event loop
     loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _ensure_db_columns)
     await loop.run_in_executor(None, _run_migrations_sync)
     
     _DB_INITIALIZED = True
