@@ -557,12 +557,16 @@ class EnhancedWarningSystem:
                     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     
                     if device_count > user_limit_number:
-                        # ===== DOUBLE-CHECK BEFORE BAN (FAST RAM & LIVE RE-VERIFICATION) =====
-                        double_check_passed = True
+                        # ===== DOUBLE-CHECK BEFORE BAN (O(1) FAST RAM CHECK) =====
                         try:
                             from utils.user_sync import USER_METADATA_CACHE
                             if username in USER_METADATA_CACHE:
                                 user_meta = USER_METADATA_CACHE[username]
+                                if user_meta.get("is_excepted"):
+                                    warning_logger.info(f"✅ Double-Check ABORTED ban for user {username}: user is excepted/whitelisted")
+                                    users_to_remove.append(username)
+                                    continue
+
                                 eff_limit = user_meta.get("effective_ip_limit")
                                 spec_limit = user_meta.get("special_limit")
                                 if spec_limit is not None and spec_limit > 0:
@@ -570,18 +574,13 @@ class EnhancedWarningSystem:
                                 elif eff_limit is not None and eff_limit > 0:
                                     user_limit_number = eff_limit
 
-                            # Re-verify device count against persistent devices (2+ min active)
-                            if device_count <= user_limit_number:
-                                double_check_passed = False
-                                warning_logger.info(f"✅ Double-Check ABORTED ban for user {username}: compliant (devices: {device_count}, limit: {user_limit_number})")
-                                log_monitoring_event("double_check_aborted", username, {"devices": device_count, "limit": user_limit_number})
-
+                                if device_count <= user_limit_number:
+                                    warning_logger.info(f"✅ Double-Check ABORTED ban for user {username}: limit updated to {user_limit_number}")
+                                    log_monitoring_event("double_check_aborted", username, {"devices": device_count, "limit": user_limit_number})
+                                    users_to_remove.append(username)
+                                    continue
                         except Exception as dc_err:
                             warning_logger.warning(f"⚠️ Double-check verification error for {username}: {dc_err}")
-
-                        if not double_check_passed:
-                            users_to_remove.append(username)
-                            continue
 
                         warning_logger.warning(f"🚫 User {username} exceeds limit after double-check: {device_count} > {user_limit_number}")
                         try:
