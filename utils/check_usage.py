@@ -967,13 +967,10 @@ async def check_users_usage(panel_data: PanelType):
             user_meta = users_metadata_usage.get(user_name, {})
             
             # Check group filter (In-Memory)
-            if group_filter_enabled_u and group_filter_ids_u:
-                user_gids = [str(x) for x in user_meta.get("group_ids", [])]
-                user_in_group = any(g in group_filter_ids_u for g in user_gids)
-                should_limit = user_in_group if group_filter_mode_u == "include" else not user_in_group
-                if not should_limit:
-                    group_filtered_users.add(user_name)
-                    continue
+            # Check pre-computed group_filter status (O(1) RAM lookup)
+            if not user_meta.get("is_monitored", True):
+                group_filtered_users.add(user_name)
+                continue
             
             # Check admin filter (In-Memory)
             if admin_filter_enabled_u and admin_filter_names_u:
@@ -985,25 +982,12 @@ async def check_users_usage(panel_data: PanelType):
                         admin_filtered_users.add(user_name)
                         continue
             
-            user_limit_number = int(special_limit.get(user_name, limit_number))
-            
-            # If user doesn't have a special limit, check for pattern-based limits
-            if user_name not in special_limit:
-                # Check database limit patterns first (prefix/postfix)
-                pattern_limit = await get_limit_from_patterns(user_name)
-                if pattern_limit is None:
-                    # Fallback to regex-based pattern extraction
-                    pattern_limit = extract_limit_from_username(user_name)
-                
-                if pattern_limit is not None:
-                    user_limit_number = pattern_limit
-                    # Also save to special_limit cache
-                    special_limit[user_name] = pattern_limit
-                else:
-                    # Check Group Limit (From Batched Cache)
-                    group_limit = batched_group_limits.get(user_name)
-                    if group_limit is not None:
-                        user_limit_number = group_limit
+            # Resolve effective IP limit in O(1) from pre-computed metadata
+            eff_limit = user_meta.get("effective_ip_limit")
+            if eff_limit is not None:
+                user_limit_number = eff_limit
+            else:
+                user_limit_number = int(special_limit.get(user_name, limit_number))
             
             if len(unique_ips) > user_limit_number:
                 # Get user data and ISP info for this user

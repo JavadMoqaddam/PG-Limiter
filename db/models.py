@@ -60,6 +60,10 @@ class User(Base):
     # Extra data from panel
     note = Column(Text, nullable=True)
     
+    # ===== Pre-computed Group Filter & Limit fields =====
+    is_monitored = Column(Boolean, default=True)  # False = user excluded by group_filter
+    effective_ip_limit = Column(Integer, nullable=True)  # Pre-computed effective IP limit
+
     # ===== Exception/Whitelist fields (from except_users) =====
     is_excepted = Column(Boolean, default=False)  # True = user is whitelisted
     exception_reason = Column(Text, nullable=True)

@@ -4,6 +4,7 @@ This module contains functions to get logs from the nodes using SSE (Server-Sent
 
 import asyncio
 import sys
+import time
 from asyncio import Task
 from datetime import datetime
 
@@ -55,11 +56,20 @@ async def _build_node_status_message() -> str:
     return "\n".join(lines)
 
 
+_last_status_edit_time = 0.0
+
+
 async def _update_node_status(node_id: int, node_name: str, status: str) -> None:
-    """Update the status of a node and refresh the message."""
-    global _node_connection_status, _node_status_message_id
+    """Update the status of a node and refresh the message with rate throttling."""
+    global _node_connection_status, _node_status_message_id, _last_status_edit_time
     
     _node_connection_status[node_id] = {"name": node_name, "status": status}
+    
+    # Throttle edits: only edit Telegram message at most once every 3 seconds to avoid Flood Control 429
+    now = time.time()
+    if _node_status_message_id and (now - _last_status_edit_time < 3.0):
+        return
+    _last_status_edit_time = now
     
     message = await _build_node_status_message()
     

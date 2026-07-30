@@ -81,6 +81,8 @@ def _ensure_db_columns():
             ("original_groups", "JSON"),
             ("disable_reason", "TEXT"),
             ("punishment_step", "INTEGER DEFAULT 0"),
+            ("is_monitored", "BOOLEAN DEFAULT 1"),
+            ("effective_ip_limit", "INTEGER"),
         ]
         
         added = []

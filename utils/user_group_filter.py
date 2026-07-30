@@ -178,6 +178,7 @@ def get_group_name(groups: list[dict], group_id: int) -> str:
 async def should_limit_user(panel_data, username: str, config_data: dict) -> tuple[bool, str]:
     """
     Check if a user should be subject to limiting based on group filter settings.
+    Uses pre-computed O(1) RAM cache from user_sync.
     
     Args:
         panel_data: Panel connection data
@@ -186,42 +187,39 @@ async def should_limit_user(panel_data, username: str, config_data: dict) -> tup
         
     Returns:
         Tuple of (should_limit: bool, reason: str)
-        - (True, "") if user should be limited
-        - (False, reason) if user should be skipped
     """
     group_filter = config_data.get("group_filter", {})
-    
-    # Check if filtering is enabled
     if not group_filter.get("enabled", False):
-        return (True, "")  # No filtering, limit all users
-    
-    filter_mode = group_filter.get("mode", "include")
-    filter_group_ids = group_filter.get("group_ids", [])
-    
-    # If no groups specified, treat as disabled
-    if not filter_group_ids:
-        return (True, "")  # No groups specified, limit all users
-    
-    # Get user's groups
+        return (True, "")
+
+    from utils.user_sync import USER_METADATA_CACHE, queue_unknown_user_fetch
+
+    # Fast O(1) RAM lookup
+    if username in USER_METADATA_CACHE:
+        is_monitored = USER_METADATA_CACHE[username].get("is_monitored", True)
+        if is_monitored:
+            return (True, "")
+        else:
+            return (False, "User excluded by pre-computed group filter")
+
+    # Unknown user: Queue in background worker without blocking
+    await queue_unknown_user_fetch(username)
+
+    # Fallback to standard check if not yet in cache
     user_group_ids = await get_user_groups(panel_data, username)
-    
-    # Check if user belongs to any of the filter groups
+    filter_group_ids = group_filter.get("group_ids", [])
+    if not filter_group_ids:
+        return (True, "")
+
+    filter_mode = group_filter.get("mode", "include")
     str_filter_ids = [str(x) for x in filter_group_ids]
     str_user_group_ids = [str(x) for x in user_group_ids]
     user_in_filter_groups = any(gid in str_filter_ids for gid in str_user_group_ids)
-    
+
     if filter_mode == "include":
-        # Include mode: only limit users in specified groups
-        if user_in_filter_groups:
-            return (True, "")
-        else:
-            return (False, f"User not in monitored groups")
+        return (True, "") if user_in_filter_groups else (False, "User not in monitored groups")
     else:
-        # Exclude mode: skip users in specified groups (whitelist)
-        if user_in_filter_groups:
-            return (False, f"User in whitelisted group")
-        else:
-            return (True, "")
+        return (False, "User in whitelisted group") if user_in_filter_groups else (True, "")
 
 
 async def batch_filter_users(panel_data, usernames: list[str], config_data: dict) -> tuple[set[str], set[str]]:

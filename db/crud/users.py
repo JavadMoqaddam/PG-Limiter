@@ -570,6 +570,8 @@ class UserCRUD:
                     "used_traffic": d.get("used_traffic", 0),
                     "expire_at": d.get("expire_at"),
                     "note": d.get("note"),
+                    "is_monitored": d.get("is_monitored", True),
+                    "effective_ip_limit": d.get("effective_ip_limit"),
                     "last_synced_at": now,
                 })
             
@@ -586,6 +588,8 @@ class UserCRUD:
                     "used_traffic": stmt.excluded.used_traffic,
                     "expire_at": stmt.excluded.expire_at,
                     "note": stmt.excluded.note,
+                    "is_monitored": stmt.excluded.is_monitored,
+                    "effective_ip_limit": stmt.excluded.effective_ip_limit,
                     "last_synced_at": stmt.excluded.last_synced_at,
                 }
             )

@@ -17,8 +17,112 @@ _last_sync_time: Optional[datetime] = None
 _sync_in_progress: bool = False
 
 # In-Memory User Metadata Cache populated during User Sync
-# Format: {username: {"group_ids": [...], "owner_username": "...", "is_excepted": bool, "special_limit": int}}
+# Format: {username: {"group_ids": [...], "owner_username": "...", "is_excepted": bool, "special_limit": int, "is_monitored": bool, "effective_ip_limit": int}}
 USER_METADATA_CACHE: dict[str, dict] = {}
+
+# Background Queue & Throttled Worker for Unknown Users
+_UNKNOWN_USERS_QUEUE: asyncio.Queue = asyncio.Queue()
+_UNKNOWN_USERS_FETCHING: set[str] = set()
+
+
+def calculate_user_effective_limit_and_monitoring(
+    username: str,
+    group_ids: list[int],
+    is_excepted: bool = False,
+    special_limit: int | None = None,
+    config: dict = None,
+) -> tuple[bool, int | None]:
+    """
+    Pre-compute is_monitored and effective_ip_limit for a user in O(1) time.
+    
+    Returns:
+        (is_monitored: bool, effective_ip_limit: int | None)
+    """
+    if config is None:
+        config = {}
+        
+    # 1. Exception / Whitelist check
+    if is_excepted:
+        return (False, None)
+    
+    # 2. Group Filter check
+    group_filter = config.get("group_filter", {})
+    is_monitored = True
+    
+    if group_filter.get("enabled", False):
+        filter_mode = group_filter.get("mode", "include")
+        filter_group_ids = [str(x) for x in group_filter.get("group_ids", [])]
+        user_group_ids_str = [str(x) for x in (group_ids or [])]
+        user_in_filter = any(g in filter_group_ids for g in user_group_ids_str)
+        
+        if filter_mode == "include":
+            is_monitored = user_in_filter
+        else:
+            is_monitored = not user_in_filter
+
+    if not is_monitored:
+        return (False, None)
+
+    # 3. Effective Limit Calculation
+    # Priority A: Special limit set specifically for this user
+    if special_limit is not None and special_limit > 0:
+        return (True, special_limit)
+
+    # Priority B: Group Limits from config
+    group_limits = config.get("group_limits", {})
+    if group_limits and group_ids:
+        matching_limits = []
+        for gid in group_ids:
+            gid_str = str(gid)
+            if gid_str in group_limits:
+                try:
+                    matching_limits.append(int(group_limits[gid_str]))
+                except (ValueError, TypeError):
+                    pass
+        if matching_limits:
+            return (True, max(matching_limits))
+
+    # Priority C: Username Suffix Regex Pattern (e.g. .2.User or 2User)
+    try:
+        from utils.check_usage import extract_limit_from_username
+        pattern_limit = extract_limit_from_username(username)
+        if pattern_limit is not None:
+            return (True, pattern_limit)
+    except Exception:
+        pass
+
+    # Priority D: Default to General Limit (None indicates use default general limit)
+    return (True, None)
+
+
+async def recompute_all_user_limits(config: dict = None):
+    """
+    Instantly recompute is_monitored and effective_ip_limit for all users in RAM cache
+    without making ANY network API calls to Pasargad panel.
+    """
+    global USER_METADATA_CACHE
+    if config is None:
+        try:
+            from utils.read_config import read_config
+            config = await read_config()
+        except Exception as e:
+            sync_logger.error(f"Error reading config during limit recompute: {e}")
+            config = {}
+    
+    recomputed_count = 0
+    for username, data in USER_METADATA_CACHE.items():
+        is_monitored, effective_limit = calculate_user_effective_limit_and_monitoring(
+            username=username,
+            group_ids=data.get("group_ids", []),
+            is_excepted=data.get("is_excepted", False),
+            special_limit=data.get("special_limit"),
+            config=config,
+        )
+        data["is_monitored"] = is_monitored
+        data["effective_ip_limit"] = effective_limit
+        recomputed_count += 1
+    
+    sync_logger.info(f"⚡ Recomputed effective limits in RAM for {recomputed_count} users (0ms network calls)")
 
 
 async def refresh_user_metadata_cache(db=None):
@@ -34,7 +138,9 @@ async def refresh_user_metadata_cache(db=None):
                 User.group_ids,
                 User.owner_username,
                 User.is_excepted,
-                User.special_limit
+                User.special_limit,
+                User.is_monitored,
+                User.effective_ip_limit
             )
             result = await session.execute(stmt)
             new_cache = {}
@@ -43,7 +149,9 @@ async def refresh_user_metadata_cache(db=None):
                     "group_ids": row.group_ids or [],
                     "owner_username": row.owner_username,
                     "is_excepted": bool(row.is_excepted),
-                    "special_limit": row.special_limit
+                    "special_limit": row.special_limit,
+                    "is_monitored": bool(row.is_monitored) if row.is_monitored is not None else True,
+                    "effective_ip_limit": row.effective_ip_limit
                 }
             return new_cache
 
@@ -57,6 +165,38 @@ async def refresh_user_metadata_cache(db=None):
         sync_logger.info(f"🧠 USER_METADATA_CACHE updated in RAM with {len(USER_METADATA_CACHE)} users")
     except Exception as e:
         sync_logger.error(f"Failed to refresh USER_METADATA_CACHE: {e}")
+
+
+async def queue_unknown_user_fetch(username: str):
+    """Queue an unknown user for background fetch without blocking or spamming the API."""
+    if username and username not in USER_METADATA_CACHE and username not in _UNKNOWN_USERS_FETCHING:
+        _UNKNOWN_USERS_FETCHING.add(username)
+        await _UNKNOWN_USERS_QUEUE.put(username)
+
+
+async def run_unknown_user_worker(panel_data: PanelType):
+    """Worker task that processes unknown users with a semaphore to prevent API throttling."""
+    semaphore = asyncio.Semaphore(5)  # Max 5 concurrent API fetches
+    
+    async def _fetch(u: str):
+        async with semaphore:
+            try:
+                await fetch_and_sync_single_user(u, panel_data)
+            except Exception as ex:
+                sync_logger.error(f"Error fetching unknown user {u}: {ex}")
+            finally:
+                _UNKNOWN_USERS_FETCHING.discard(u)
+    
+    while True:
+        try:
+            username = await _UNKNOWN_USERS_QUEUE.get()
+            asyncio.create_task(_fetch(username))
+            _UNKNOWN_USERS_QUEUE.task_done()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            sync_logger.error(f"Error in unknown user worker loop: {e}")
+            await asyncio.sleep(1)
 
 
 async def get_all_users_with_details(panel_data: PanelType, status: str | None = None) -> list[dict]:
@@ -263,6 +403,9 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
         
         sync_logger.info("📂 Opening database connection for sync...")
         
+        from utils.read_config import read_config
+        config = await read_config()
+        
         async with get_db() as db:
             sync_logger.info("✅ Database connection opened")
             # Get existing usernames in local DB
@@ -312,6 +455,15 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
                     
                     note = user_data.get("note")
                     
+                    # Pre-compute is_monitored and effective_ip_limit
+                    is_monitored, effective_limit = calculate_user_effective_limit_and_monitoring(
+                        username=username,
+                        group_ids=group_ids,
+                        is_excepted=False,
+                        special_limit=None,
+                        config=config,
+                    )
+                    
                     users_to_upsert.append({
                         "username": username,
                         "panel_id": panel_id,
@@ -323,6 +475,8 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
                         "used_traffic": used_traffic,
                         "expire_at": expire_at,
                         "note": note,
+                        "is_monitored": is_monitored,
+                        "effective_ip_limit": effective_limit,
                     })
                 except Exception as e:
                     sync_logger.error(f"Error parsing user {user_data.get('username', '?')}: {e}")

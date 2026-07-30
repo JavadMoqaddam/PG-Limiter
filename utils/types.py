@@ -133,6 +133,9 @@ class UserType:
     group_ids: list[int] | None = None
     online_at: str | None = None
     admin_username: str | None = None
+    # Pre-computed filter & limit fields
+    is_monitored: bool = True
+    effective_ip_limit: int | None = None
 
 
 @dataclass(slots=True)

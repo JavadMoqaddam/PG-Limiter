@@ -52,6 +52,14 @@ async def main():
     main_logger.info(f"🚀 Starting Limiter v{VERSION}")
     main_logger.info("=" * 50)
     
+    # Ensure database tables and columns are initialized
+    from db.database import init_db
+    try:
+        await init_db()
+        main_logger.info("✓ Database initialized")
+    except Exception as db_err:
+        main_logger.error(f"Database initialization error: {db_err}")
+    
     # Initialize Redis cache
     if REDIS_AVAILABLE:
         try:
