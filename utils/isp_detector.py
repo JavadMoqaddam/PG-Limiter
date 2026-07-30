@@ -375,14 +375,15 @@ class ISPDetector:
         logger.info(f"🔍 ISP lookup: Aggregated {total_uncached_ips} IPs into {len(uncached_subnets)} /24 subnets")
         semaphore = asyncio.Semaphore(3)
 
+        session = await self._get_session()
+
         async def lookup_subnet(subnet_key: str, sample_ip: str) -> Tuple[str, Dict[str, str]]:
             async with semaphore:
                 try:
                     url = f"http://ip-api.com/json/{sample_ip}?fields=status,country,countryCode,regionName,city,isp,org,asname"
-                    async with httpx.AsyncClient() as client:
-                        response = await client.get(url, timeout=4)
-                        if response.status_code == 200:
-                            data = response.json()
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as response:
+                        if response.status == 200:
+                            data = await response.json()
                             if data.get("status") == "success":
                                 isp_name = data.get("asname") or data.get("isp") or data.get("org") or "Unknown ISP"
                                 info = {

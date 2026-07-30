@@ -3,6 +3,7 @@ Database Connection and Session Management
 Uses async SQLAlchemy with aiosqlite for SQLite.
 """
 
+import asyncio
 import os
 import sqlite3
 import warnings
@@ -145,11 +146,18 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 
+_DB_INITIALIZED = False
+
+
 async def init_db():
     """
     Initialize the database - run migrations automatically.
     Should be called once at application startup.
     """
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+
     # Ensure data directory exists
     db_path = _get_db_path()
     
@@ -160,9 +168,11 @@ async def init_db():
     
     db_logger.debug("🔄 Running database migrations...")
     
-    # Run migrations (synchronous)
-    _run_migrations_sync()
+    # Run migrations in background thread to avoid blocking asyncio event loop
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _run_migrations_sync)
     
+    _DB_INITIALIZED = True
     db_logger.info(f"✅ Database initialized: {DATABASE_URL}")
 
 
