@@ -102,17 +102,11 @@ class ISPDetector:
                     cached = await get_cached_isp(ip)
                     if cached:
                         logger.debug(f"ISP Redis cache hit for {ip}")
-                        # Also store in memory cache
-                        self.cache[ip] = cached
                         return cached
             except asyncio.TimeoutError:
                 logger.warning(f"Redis cache timeout for {ip}")
             except Exception as e:
                 logger.warning(f"Redis cache lookup failed for {ip}: {e}")
-        
-        # Check memory cache
-        if ip in self.cache:
-            return self.cache[ip]
         
         # Check database cache (by subnet) if enabled
         if self._db_cache:
@@ -120,8 +114,6 @@ class ISPDetector:
                 async with asyncio.timeout(3):  # 3 second DB cache timeout
                     cached = await self._db_cache.get_cached_isp(ip)
                     if cached:
-                        # Copy to memory cache and Redis
-                        self.cache[ip] = cached
                         await self._cache_isp_result(ip, cached)
                         logger.debug(f"ISP cache hit for {ip} (subnet cache)")
                         return cached
@@ -138,15 +130,13 @@ class ISPDetector:
         
         # If we're rate limited, return default info immediately
         if self.rate_limited:
-            default_info = {
+            return {
                 "ip": ip,
                 "isp": "Unknown ISP",
                 "country": "Unknown",
                 "city": "Unknown",
                 "region": "Unknown"
             }
-            self.cache[ip] = default_info
-            return default_info
             
         # Rate limiting
         current_time = asyncio.get_event_loop().time()

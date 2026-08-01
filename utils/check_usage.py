@@ -926,16 +926,25 @@ async def check_users_usage(panel_data: PanelType):
     isp_info_batch = await isp_detector.get_multiple_isp_info(list(all_ips_for_isp_lookup))
     logger.info(f"✅ ISP lookup complete")
     
-    # Record IPs to history tracker for long-term tracking
+    # Record IPs to history tracker for long-term tracking (Redis ZSETs)
     logger.debug("📝 Recording IPs to history tracker...")
     for username, unique_ips in all_users_actual_ips.items():
         await ip_history_tracker.record_user_ips(username, unique_ips)
     
-    # Save history periodically
-    await ip_history_tracker.save_history()
-    
-    # Cleanup inactive users from history
-    await ip_history_tracker.cleanup_inactive_users(set(all_users_actual_ips.keys()))
+    # Sync active users ZSET to Redis pg_limiter:active_users
+    try:
+        from utils.redis_cache import get_cache
+        cache = await get_cache()
+        if cache.is_connected and all_users_actual_ips:
+            now_ts = time.time()
+            cutoff_15m = now_ts - 900
+            async with cache.client.pipeline(transaction=True) as pipe:
+                active_mapping = {user: now_ts for user in all_users_actual_ips.keys()}
+                pipe.zadd("pg_limiter:active_users", active_mapping)
+                pipe.zremrangebyscore("pg_limiter:active_users", "-inf", cutoff_15m)
+                await pipe.execute()
+    except Exception as sync_err:
+        logger.warning(f"Active users Redis ZSET sync note: {sync_err}")
     
     # Batch fetch group limits & metadata for active users
     active_usernames = list(all_users_actual_ips.keys())

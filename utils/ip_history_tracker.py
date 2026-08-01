@@ -1,181 +1,100 @@
 """
-IP History Tracker - Tracks unique IPs per user over time periods
+IP History Tracker - Tracks unique IPs per user over time periods using Redis ZSETs.
+Eliminates memory leaks and JSON disk I/O spikes.
 """
 
-import json
-import os
 import time
 from typing import Dict, Set, List, Tuple
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-
+from datetime import datetime
 from utils.logs import logger
 
 
-@dataclass
-class IPHistoryEntry:
-    """Single IP history entry"""
-    timestamp: float
-    ip: str
-
-
-@dataclass
-class UserIPHistory:
-    """IP history for a user"""
-    username: str
-    entries: List[IPHistoryEntry] = field(default_factory=list)
-    
-    def add_ip(self, ip: str, timestamp: float = None):
-        """Add an IP to history"""
-        if timestamp is None:
-            timestamp = time.time()
-        self.entries.append(IPHistoryEntry(timestamp=timestamp, ip=ip))
-    
-    def get_unique_ips_since(self, hours: int) -> Set[str]:
-        """Get unique IPs seen in the last X hours"""
-        cutoff_time = time.time() - (hours * 3600)
-        return {entry.ip for entry in self.entries if entry.timestamp >= cutoff_time}
-    
-    def cleanup_old_entries(self, max_hours: int = 48):
-        """Remove entries older than max_hours"""
-        cutoff_time = time.time() - (max_hours * 3600)
-        self.entries = [entry for entry in self.entries if entry.timestamp >= cutoff_time]
-
-
 class IPHistoryTracker:
-    """Tracks IP history for all users"""
+    """Tracks IP history for all users using Redis ZSETs (0 JSON disk I/O, 0 RAM leaks)."""
     
-    def __init__(self, filename=".ip_history.json"):
-        self.filename = filename
-        self.user_histories: Dict[str, UserIPHistory] = {}
-        self.load_history()
-    
-    def load_history(self):
-        """Load IP history from file"""
-        try:
-            if os.path.exists(self.filename):
-                with open(self.filename, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    for username, history_data in data.items():
-                        user_history = UserIPHistory(username=username)
-                        for entry_data in history_data.get("entries", []):
-                            user_history.entries.append(
-                                IPHistoryEntry(
-                                    timestamp=entry_data["timestamp"],
-                                    ip=entry_data["ip"]
-                                )
-                            )
-                        self.user_histories[username] = user_history
-                logger.info(f"Loaded IP history for {len(self.user_histories)} users")
-        except Exception as e:
-            logger.error(f"Error loading IP history: {e}")
-            self.user_histories = {}
-    
-    async def save_history(self):
-        """Save IP history to file"""
-        try:
-            data = {}
-            for username, user_history in self.user_histories.items():
-                data[username] = {
-                    "username": username,
-                    "entries": [
-                        {
-                            "timestamp": entry.timestamp,
-                            "ip": entry.ip
-                        }
-                        for entry in user_history.entries
-                    ]
-                }
-            
-            with open(self.filename, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving IP history: {e}")
-    
+    def __init__(self):
+        pass
+
     async def record_user_ips(self, username: str, ips: Set[str]):
-        """Record IPs for a user at current time"""
+        """Record IPs for a user using Redis ZSET with atomic Pipeline trimming."""
+        if not ips or not username:
+            return
         current_time = time.time()
+        cutoff_48h = current_time - (48 * 3600)
+        key = f"pg_limiter:user:{username}:ip_history"
         
-        if username not in self.user_histories:
-            self.user_histories[username] = UserIPHistory(username=username)
-        
-        user_history = self.user_histories[username]
-        
-        # Add each IP
-        for ip in ips:
-            user_history.add_ip(ip, current_time)
-        
-        # Cleanup old entries (keep 48 hours)
-        user_history.cleanup_old_entries(max_hours=48)
-    
+        try:
+            from utils.redis_cache import get_cache
+            cache = await get_cache()
+            if cache.is_connected:
+                async with cache.client.pipeline(transaction=True) as pipe:
+                    mapping = {ip: current_time for ip in ips}
+                    pipe.zadd(key, mapping)
+                    pipe.zremrangebyscore(key, "-inf", cutoff_48h)
+                    await pipe.execute()
+        except Exception as e:
+            logger.warning(f"Failed to record IP history in Redis for {username}: {e}")
+
+    async def get_unique_ips_since(self, username: str, hours: int) -> Set[str]:
+        """Get unique IPs seen in the last X hours from Redis ZSET."""
+        cutoff_time = time.time() - (hours * 3600)
+        key = f"pg_limiter:user:{username}:ip_history"
+        try:
+            from utils.redis_cache import get_cache
+            cache = await get_cache()
+            if cache.is_connected:
+                ips = await cache.client.zrangebyscore(key, min=cutoff_time, max="+inf")
+                return set(ips or [])
+        except Exception as e:
+            logger.warning(f"Error fetching IP history for {username}: {e}")
+        return set()
+
     async def get_users_exceeding_limits(self, hours: int, config_data: dict) -> List[Tuple[str, int, int, Set[str]]]:
-        """
-        Get users who exceeded their limits in the last X hours
-        
-        Returns:
-            List of (username, unique_ip_count, limit, unique_ips)
-        """
+        """Get users who exceeded their limits in the last X hours."""
         results = []
-        
-        # Use new config format
         limits_config = config_data.get("limits", {})
-        except_users = limits_config.get("except_users", [])
+        except_users = set(limits_config.get("except_users", []))
         special_limit = limits_config.get("special", {})
         general_limit = limits_config.get("general", 2)
         
-        for username, user_history in self.user_histories.items():
-            if username in except_users:
-                continue
+        try:
+            from utils.redis_cache import get_cache
+            cache = await get_cache()
+            if cache.is_connected:
+                # Scan for all ip_history keys in Redis
+                keys = await cache.client.keys("pg_limiter:user:*:ip_history")
+                cutoff_time = time.time() - (hours * 3600)
+                
+                for key in keys:
+                    # Extract username from key: pg_limiter:user:{username}:ip_history
+                    parts = key.split(":")
+                    if len(parts) >= 4:
+                        username = parts[2]
+                        if username in except_users:
+                            continue
+                            
+                        unique_ips = await cache.client.zrangebyscore(key, min=cutoff_time, max="+inf")
+                        if not unique_ips:
+                            continue
+                            
+                        ip_count = len(unique_ips)
+                        user_limit = int(special_limit.get(username, general_limit))
+                        
+                        if ip_count > user_limit:
+                            results.append((username, ip_count, user_limit, set(unique_ips)))
+        except Exception as e:
+            logger.error(f"Error checking users exceeding limits: {e}")
             
-            # Get unique IPs in time period
-            unique_ips = user_history.get_unique_ips_since(hours)
-            ip_count = len(unique_ips)
-            
-            # Get user's limit
-            user_limit = int(special_limit.get(username, general_limit))
-            
-            # Only include if exceeded limit
-            if ip_count > user_limit:
-                results.append((username, ip_count, user_limit, unique_ips))
-        
-        # Sort by IP count descending
         results.sort(key=lambda x: x[1], reverse=True)
-        
         return results
-    
-    async def cleanup_inactive_users(self, active_users: Set[str]):
-        """Remove users who are no longer active"""
-        # Keep users who have entries in last 48 hours
-        cutoff_time = time.time() - (48 * 3600)
-        
-        users_to_remove = []
-        for username, user_history in self.user_histories.items():
-            # Check if user has any recent entries
-            has_recent = any(entry.timestamp >= cutoff_time for entry in user_history.entries)
-            if not has_recent and username not in active_users:
-                users_to_remove.append(username)
-        
-        for username in users_to_remove:
-            del self.user_histories[username]
-        
-        if users_to_remove:
-            logger.info(f"Cleaned up {len(users_to_remove)} inactive users from IP history")
-    
+
     async def generate_report(self, hours: int, config_data: dict, isp_detector=None) -> str:
-        """
-        Generate a formatted report of users exceeding limits
-        
-        Args:
-            hours: Time period (12 or 48)
-            config_data: Configuration with limits
-            isp_detector: Optional ISP detector for enhanced info
-        """
+        """Generate a formatted report of users exceeding limits."""
         users_data = await self.get_users_exceeding_limits(hours, config_data)
         
         if not users_data:
             return f"📊 <b>{hours}H IP History Report</b>\n\n✅ No users exceeded their limits in the last {hours} hours."
         
-        # Get ISP info if detector available
         isp_info_batch = {}
         if isp_detector:
             all_ips = set()
@@ -184,7 +103,6 @@ class IPHistoryTracker:
             if all_ips:
                 isp_info_batch = await isp_detector.get_multiple_isp_info(list(all_ips))
         
-        # Build report
         report_lines = [
             f"📊 <b>{hours}H IP History Report</b>",
             f"⏰ Period: Last {hours} hours",
@@ -199,7 +117,6 @@ class IPHistoryTracker:
             report_lines.append(f"   📍 Unique IPs: <b>{ip_count}</b> (Limit: {limit})")
             report_lines.append(f"   ⚠️ Exceeded by: <b>{ip_count - limit}</b> IPs")
             
-            # Show IPs with ISP info if available
             if isp_info_batch:
                 ip_list = []
                 for ip in sorted(unique_ips):
@@ -210,7 +127,6 @@ class IPHistoryTracker:
                     else:
                         ip_list.append(ip)
                 
-                # Show first 5 IPs, then summarize if more
                 if len(ip_list) <= 5:
                     for ip_str in ip_list:
                         report_lines.append(f"      • {ip_str}")
@@ -219,7 +135,6 @@ class IPHistoryTracker:
                         report_lines.append(f"      • {ip_str}")
                     report_lines.append(f"      • ... and {len(ip_list) - 5} more")
             else:
-                # Simple IP list without ISP info
                 ip_list = sorted(unique_ips)
                 if len(ip_list) <= 5:
                     for ip in ip_list:
@@ -231,7 +146,6 @@ class IPHistoryTracker:
             
             report_lines.append("")
         
-        # Summary
         total_ips = sum(ip_count for _, ip_count, _, _ in users_data)
         report_lines.append("─────────────────────")
         report_lines.append(f"📈 <b>Summary:</b>")

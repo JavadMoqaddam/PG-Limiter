@@ -107,23 +107,8 @@ async def main():
     )
     main_logger.info(f"✓ Panel configured: {config_file['panel']['domain']}")
     
-    # Re-enable previously disabled users
-    main_logger.debug("Checking for previously disabled users...")
-    dis_users = await dis_obj.read_and_clear_users()
-    if dis_users:
-        main_logger.info(f"📋 Re-enabling {len(dis_users)} previously disabled users...")
-        result = await enable_selected_users(panel_data, dis_users)
-        enabled = result.get("enabled", [])
-        failed = result.get("failed", [])
-        not_found = result.get("not_found", [])
-        if enabled:
-            main_logger.info(f"✓ Re-enabled {len(enabled)} previously disabled users")
-        if not_found:
-            main_logger.info(f"🗑️ {len(not_found)} users were deleted from panel")
-        if failed:
-            main_logger.warning(f"⚠️ Failed to re-enable {len(failed)} users: {failed}")
-    else:
-        main_logger.debug("No previously disabled users to re-enable")
+    # Preserve disabled users across restarts (enable_dis_user background loop handles expired bans)
+    main_logger.info("✓ Disabled users state preserved across restarts")
     
     # Get available nodes
     main_logger.debug("Fetching available nodes...")

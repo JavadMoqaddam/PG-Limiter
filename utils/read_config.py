@@ -37,7 +37,7 @@ _cache_loaded = False
 
 async def invalidate_config_cache():
     """Invalidate configuration cache (Redis and in-memory)."""
-    global _config_cache, _cache_loaded
+    global _config_cache, _cache_loaded, _config_fast_cache, _config_fast_time
     
     if REDIS_CACHE_AVAILABLE:
         try:
@@ -48,6 +48,8 @@ async def invalidate_config_cache():
     
     _config_cache = {}
     _cache_loaded = False
+    _config_fast_cache = None
+    _config_fast_time = 0.0
     config_logger.info("🔧 Configuration cache invalidated")
 
 
@@ -155,24 +157,30 @@ def get_config_sync() -> Dict[str, Any]:
     return load_env_config()
 
 
+import time
+
+_config_fast_cache = None
+_config_fast_time = 0.0
+
+
 async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     """
     Read and return merged configuration from ENV and DB.
-    Uses Redis cache when available for fast access.
-    
-    Args:
-        check_required_elements: If True, validate required settings
-        
-    Returns:
-        Complete configuration dictionary
+    Uses Redis cache with short 2s in-memory window to prevent Redis network floods.
     """
-    global _config_cache, _cache_loaded
+    global _config_cache, _cache_loaded, _config_fast_cache, _config_fast_time
+    
+    now = time.time()
+    if not check_required_elements and _config_fast_cache is not None and (now - _config_fast_time < 2.0):
+        return _config_fast_cache
     
     # Try Redis cache first
     if REDIS_CACHE_AVAILABLE and not check_required_elements:
         try:
             cached = await get_cached_config()
             if cached:
+                _config_fast_cache = cached
+                _config_fast_time = now
                 config_logger.debug("🔧 Using Redis cached config")
                 return cached
         except Exception as e:
@@ -180,6 +188,8 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     
     # Check in-memory cache
     if _cache_loaded and _config_cache and not check_required_elements:
+        _config_fast_cache = _config_cache
+        _config_fast_time = now
         config_logger.debug("🔧 Using in-memory cached config")
         return _config_cache
     
@@ -369,6 +379,9 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
             config_logger.debug("🔧 Config stored in Redis cache")
         except Exception as e:
             config_logger.warning(f"Failed to cache config in Redis: {e}")
+    
+    _config_fast_cache = config
+    _config_fast_time = time.time()
     
     return config
 
