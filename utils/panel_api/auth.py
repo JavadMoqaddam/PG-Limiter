@@ -63,10 +63,14 @@ async def safe_send_logs_panel(message: str):
         auth_logger.error(f"Failed to send telegram message: {e}")
 
 
+_auth_token_lock = asyncio.Lock()
+
+
 async def get_token(panel_data: PanelType, force_refresh: bool = False) -> PanelType | ValueError:
     """
     Get access token from the panel API with caching (Redis or in-memory).
     Tokens are cached for 30 minutes to minimize unnecessary API calls.
+    Uses asyncio.Lock to prevent thundering herd API requests under concurrency.
     
     Args:
         panel_data (PanelType): A PanelType object containing
@@ -82,7 +86,7 @@ async def get_token(panel_data: PanelType, force_refresh: bool = False) -> Panel
     """
     current_time = time.time()
     
-    # Try Redis cache first
+    # Fast path: Check Redis cache first without lock if not force_refresh
     if not force_refresh and REDIS_CACHE_AVAILABLE:
         try:
             cached_token = await get_cached_token(panel_data.panel_domain)
@@ -93,7 +97,7 @@ async def get_token(panel_data: PanelType, force_refresh: bool = False) -> Panel
         except Exception as e:
             auth_logger.warning(f"Redis cache error: {e}, falling back to in-memory")
     
-    # Fallback: Check in-memory cache
+    # Fast path: Check in-memory cache without lock if not force_refresh
     if (not force_refresh and 
         _token_cache["token"] is not None and 
         _token_cache["panel_domain"] == panel_data.panel_domain and
@@ -102,8 +106,31 @@ async def get_token(panel_data: PanelType, force_refresh: bool = False) -> Panel
         remaining = int(_token_cache["expires_at"] - current_time)
         auth_logger.debug(f"🔑 Using in-memory cached token (expires in {remaining}s)")
         return panel_data
-    
-    auth_logger.info(f"🔑 Fetching new token for {panel_data.panel_domain} (force_refresh={force_refresh})")
+
+    # Acquire lock for fetching/refreshing token to prevent thundering herd
+    async with _auth_token_lock:
+        current_time = time.time()
+        
+        # Double-check cache inside lock (in case another task fetched the token while we waited for lock)
+        if not force_refresh and REDIS_CACHE_AVAILABLE:
+            try:
+                cached_token = await get_cached_token(panel_data.panel_domain)
+                if cached_token:
+                    panel_data.panel_token = cached_token
+                    auth_logger.debug(f"🔑 Using Redis cached token (resolved after lock)")
+                    return panel_data
+            except Exception:
+                pass
+
+        if (not force_refresh and 
+            _token_cache["token"] is not None and 
+            _token_cache["panel_domain"] == panel_data.panel_domain and
+            current_time < _token_cache["expires_at"]):
+            panel_data.panel_token = _token_cache["token"]
+            auth_logger.debug(f"🔑 Using in-memory cached token (resolved after lock)")
+            return panel_data
+        
+        auth_logger.info(f"🔑 Fetching new token for {panel_data.panel_domain} (force_refresh={force_refresh})")
     
     # Need to fetch a new token
     payload = {
