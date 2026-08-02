@@ -69,13 +69,14 @@ class DisabledUsers:
                 DISABLED_USERS_TIMESTAMPS = {}
                 DISABLED_USERS_ENABLE_AT = {}
         except Exception as error:  # pylint: disable=broad-except
-            logger.error(error)
-            print("Check the error or delete the file :", error)
-            print("Delete the .disable_users.json file? (y/n)")
-            if input().lower() == "y":
-                print("Deleting ...")
-                logger.info("remove .disable_users.json file")
-                os.remove(self.filename)
+            logger.error(f"Failed to load disabled users file: {error}")
+            # Rename corrupted file for debugging instead of blocking on input()
+            try:
+                backup_path = self.filename + ".corrupted"
+                os.rename(self.filename, backup_path)
+                logger.warning(f"Renamed corrupted file to {backup_path}")
+            except OSError:
+                pass
             self.disabled_users = {}
             self.enable_at = {}
             DISABLED_USERS = set()
