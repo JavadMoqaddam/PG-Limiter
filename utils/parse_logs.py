@@ -300,6 +300,28 @@ async def parse_logs(log: str, node_id: int = None, node_name: str = None) -> di
     from db.crud.users import UserCRUD
     
     lines = log.splitlines()
+    
+    # Pre-resolve unknown numeric IDs in a single DB query to avoid per-line sessions
+    unknown_ids = set()
+    for line in lines:
+        if "accepted" not in line or "BLOCK]" in line:
+            continue
+        email_match = EMAIL_REGEX.search(line)
+        if email_match:
+            email = email_match.group(1)
+            if email.isdigit() and email not in LOCAL_ID_CACHE:
+                unknown_ids.add(email)
+    
+    if unknown_ids:
+        try:
+            async with get_db() as db:
+                for numeric_id in unknown_ids:
+                    real_username = await UserCRUD.get_username_by_panel_id(db, int(numeric_id))
+                    if real_username:
+                        LOCAL_ID_CACHE[numeric_id] = real_username
+        except Exception as e:
+            parse_logger.error(f"Error batch-resolving numeric IDs: {e}")
+    
     for line in lines:
         if "accepted" not in line:
             continue
@@ -364,18 +386,13 @@ async def parse_logs(log: str, node_id: int = None, node_name: str = None) -> di
             if not email or not email.strip() or email in INVALID_EMAILS:
                 continue
                 
-            # Translate numeric ID to username
+            # Translate numeric ID to username (pre-resolved in batch above)
             if email.isdigit():
                 if email in LOCAL_ID_CACHE:
                     email = LOCAL_ID_CACHE[email]
                 else:
-                    async with get_db() as db:
-                        real_username = await UserCRUD.get_username_by_panel_id(db, int(email))
-                    if real_username:
-                        LOCAL_ID_CACHE[email] = real_username
-                        email = real_username
-                    else:
-                        continue
+                    # ID was not found in batch pre-resolution, skip it
+                    continue
         else:
             continue
 

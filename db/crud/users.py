@@ -135,11 +135,13 @@ class UserCRUD:
     
     @staticmethod
     async def get_by_group(db: AsyncSession, group_id: int) -> List[User]:
-        """Get users in a specific group."""
+        """Get users in a specific group using SQL-level filtering."""
         db_users_logger.debug(f"🔍 Getting users by group ID: {group_id}")
-        result = await db.execute(select(User))
-        users = result.scalars().all()
-        filtered = [u for u in users if group_id in (u.group_ids or [])]
+        # Filter at DB level using JSON contains pattern for SQLite
+        result = await db.execute(
+            select(User).where(User.group_ids.contains(group_id))
+        )
+        filtered = list(result.scalars().all())
         db_users_logger.debug(f"✅ Found {len(filtered)} users in group {group_id}")
         return filtered
     

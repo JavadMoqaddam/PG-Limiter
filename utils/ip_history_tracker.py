@@ -61,8 +61,10 @@ class IPHistoryTracker:
             from utils.redis_cache import get_cache
             cache = await get_cache()
             if cache.is_connected:
-                # Scan for all ip_history keys in Redis
-                keys = await cache.client.keys("pg_limiter:user:*:ip_history")
+                # Scan for all ip_history keys in Redis using SCAN (non-blocking)
+                keys = []
+                async for key in cache.client.scan_iter(match="pg_limiter:user:*:ip_history", count=100):
+                    keys.append(key)
                 cutoff_time = time.time() - (hours * 3600)
                 
                 for key in keys:
