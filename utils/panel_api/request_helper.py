@@ -299,7 +299,6 @@ async def panel_request(
                     # Rate limited (429)
                     if response.status_code == 429:
                         _record_failure(scheme)
-                        _record_failure(scheme)
                         last_error = f"Rate limited (429) on {url}"
                         request_logger.warning(last_error)
                         await asyncio.sleep(retry_delay * 2 + random.uniform(0.1, 0.5))
