@@ -146,7 +146,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
         token = get_panel_token.panel_token
         
         # Determine the scheme based on the domain
-        scheme = "https" if panel_data.panel_domain.startswith("https://") else "https"
+        scheme = "https" if panel_data.panel_domain.startswith("https://") else "http"
         base_url = panel_data.panel_domain.replace("https://", "").replace("http://", "")
         
         try:
