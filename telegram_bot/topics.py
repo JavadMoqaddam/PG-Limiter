@@ -14,6 +14,7 @@ Topics:
 - No Limit Found: Users without special limits
 """
 
+import asyncio
 import json
 import os
 import time
@@ -31,6 +32,8 @@ MESSAGE_CACHE_FILE = "data/topic_message_cache.json"
 
 # Cache expiry in seconds (24 hours)
 MESSAGE_CACHE_EXPIRY = 86400
+
+from utils.atomic_io import atomic_write_json
 
 
 class TopicType(Enum):
@@ -80,6 +83,7 @@ class TopicsManager:
         self._group_id: Optional[int] = None  # Forum group ID
         self._enabled: bool = False
         self._message_cache: dict[str, dict] = {}  # {topic_type: {message_key: timestamp}}
+        self._write_lock = asyncio.Lock()
         self._load()
         self._load_message_cache()
     
@@ -125,12 +129,15 @@ class TopicsManager:
             if not topic_cache:
                 del self._message_cache[topic_type]
     
+    def _sync_save_message_cache(self):
+        """Synchronous file write for message cache."""
+        atomic_write_json(MESSAGE_CACHE_FILE, self._message_cache)
+
     async def _save_message_cache(self):
-        """Save message cache to file."""
+        """Save message cache using asyncio.Lock and atomic write for safety."""
         try:
-            os.makedirs(os.path.dirname(MESSAGE_CACHE_FILE), exist_ok=True)
-            with open(MESSAGE_CACHE_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self._message_cache, f, indent=2)
+            async with self._write_lock:
+                await asyncio.to_thread(self._sync_save_message_cache)
         except Exception as e:
             topics_logger.error(f"❌ Failed to save message cache: {e}")
     
@@ -161,16 +168,19 @@ class TopicsManager:
             self._message_cache = {}
         await self._save_message_cache()
     
+    def _sync_save(self):
+        """Synchronous file write for topics configuration."""
+        atomic_write_json(TOPICS_FILE, {
+            "enabled": self._enabled,
+            "group_id": self._group_id,
+            "topics": self._topics
+        })
+
     async def _save(self):
-        """Save topics configuration to file."""
+        """Save topics configuration using asyncio.Lock and atomic write for safety."""
         try:
-            os.makedirs(os.path.dirname(TOPICS_FILE), exist_ok=True)
-            with open(TOPICS_FILE, 'w', encoding='utf-8') as f:
-                json.dump({
-                    "enabled": self._enabled,
-                    "group_id": self._group_id,
-                    "topics": self._topics
-                }, f, indent=2)
+            async with self._write_lock:
+                await asyncio.to_thread(self._sync_save)
             topics_logger.debug("💾 Topics config saved")
         except Exception as e:
             topics_logger.error(f"❌ Failed to save topics: {e}")

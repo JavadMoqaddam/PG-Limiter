@@ -3,6 +3,7 @@ Backup and restore handlers for the Telegram bot.
 Includes functions for creating and restoring backups.
 """
 
+import asyncio
 import json
 import os
 import shutil
@@ -16,6 +17,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
+from utils.atomic_io import atomic_write_json
 
 from telegram_bot.constants import RESTORE_CONFIG
 from telegram_bot.handlers.admin import check_admin_privilege
@@ -36,74 +38,66 @@ def create_migrate_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-async def send_backup(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    """Send a comprehensive backup zip file to the user."""
-    check = await check_admin_privilege(update)
-    if check is not None:
-        return check
+def _sync_create_backup_zip() -> tuple[str, str, str]:
+    """Create backup zip file synchronously. Returns (zip_path, zip_name, temp_dir)."""
+    temp_dir = tempfile.mkdtemp()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_name = f"pg-limiter-backup-{timestamp}.zip"
+    zip_path = os.path.join(temp_dir, zip_name)
     
-    try:
-        await update.message.reply_text("📦 Creating backup... Please wait.")
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # Check Docker mounted config directory (read-only mount)
+        docker_config_dir = "/etc/opt/pg-limiter"
+        config_found = False
+        if os.path.exists(docker_config_dir):
+            for filename in os.listdir(docker_config_dir):
+                filepath = os.path.join(docker_config_dir, filename)
+                if os.path.isfile(filepath):
+                    zipf.write(filepath, f"config/{filename}")
+                    config_found = True
+                    backup_logger.info(f"Added config file: {filename}")
         
-        # Create temp directory for backup
-        temp_dir = tempfile.mkdtemp()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_name = f"pg-limiter-backup-{timestamp}.zip"
-        zip_path = os.path.join(temp_dir, zip_name)
+        # Also check local .env if not found in config dir
+        if os.path.exists(".env"):
+            zipf.write(".env", "config/.env")
+            config_found = True
+            backup_logger.info("Added local .env file")
         
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # Check Docker mounted config directory (read-only mount)
-            docker_config_dir = "/etc/opt/pg-limiter"
-            config_found = False
-            if os.path.exists(docker_config_dir):
-                for filename in os.listdir(docker_config_dir):
-                    filepath = os.path.join(docker_config_dir, filename)
-                    if os.path.isfile(filepath):
-                        zipf.write(filepath, f"config/{filename}")
-                        config_found = True
-                        backup_logger.info(f"Added config file: {filename}")
-            
-            # Also check local .env if not found in config dir
-            if os.path.exists(".env"):
-                zipf.write(".env", "config/.env")
-                config_found = True
-                backup_logger.info("Added local .env file")
-            
-            if not config_found:
-                backup_logger.warning("No config files found to backup")
-            
-            # Add data files from /var/lib/pg-limiter/ (or local data/)
-            data_dirs = [
-                "/var/lib/pg-limiter/data",
-                "data",
-            ]
-            for data_dir in data_dirs:
-                if os.path.exists(data_dir) and os.path.isdir(data_dir):
-                    for root, dirs, files in os.walk(data_dir):
-                        for file in files:
-                            filepath = os.path.join(root, file)
-                            arcname = os.path.join("data", os.path.relpath(filepath, data_dir))
-                            zipf.write(filepath, arcname)
-                    break
-            
-            # Add legacy JSON files if they exist
-            legacy_files = [
-                ".disable_users.json",
-                ".violation_history.json",
-                ".user_groups_backup.json",
-            ]
-            for legacy_file in legacy_files:
-                if os.path.exists(legacy_file):
-                    zipf.write(legacy_file, f"legacy/{legacy_file}")
-            
-            # Add backup info
-            hostname = "unknown"
-            try:
-                hostname = os.uname().nodename
-            except AttributeError:
-                pass
-            
-            backup_info = f"""PG-Limiter Backup
+        if not config_found:
+            backup_logger.warning("No config files found to backup")
+        
+        # Add data files from /var/lib/pg-limiter/ (or local data/)
+        data_dirs = [
+            "/var/lib/pg-limiter/data",
+            "data",
+        ]
+        for data_dir in data_dirs:
+            if os.path.exists(data_dir) and os.path.isdir(data_dir):
+                for root, dirs, files in os.walk(data_dir):
+                    for file in files:
+                        filepath = os.path.join(root, file)
+                        arcname = os.path.join("data", os.path.relpath(filepath, data_dir))
+                        zipf.write(filepath, arcname)
+                break
+        
+        # Add legacy JSON files if they exist
+        legacy_files = [
+            ".disable_users.json",
+            ".violation_history.json",
+            ".user_groups_backup.json",
+        ]
+        for legacy_file in legacy_files:
+            if os.path.exists(legacy_file):
+                zipf.write(legacy_file, f"legacy/{legacy_file}")
+        
+        # Add backup info
+        hostname = "unknown"
+        try:
+            hostname = os.uname().nodename
+        except AttributeError:
+            pass
+        
+        backup_info = f"""PG-Limiter Backup
 Created: {datetime.now().isoformat()}
 Hostname: {hostname}
 
@@ -116,7 +110,20 @@ To restore:
 1. Send this zip file to the bot with /restore command
 2. Or use: pg-limiter restore <this-file.zip>
 """
-            zipf.writestr("backup_info.txt", backup_info)
+        zipf.writestr("backup_info.txt", backup_info)
+    return zip_path, zip_name, temp_dir
+
+
+async def send_backup(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Send a comprehensive backup zip file to the user."""
+    check = await check_admin_privilege(update)
+    if check is not None:
+        return check
+    
+    try:
+        await update.message.reply_text("📦 Creating backup... Please wait.")
+        
+        zip_path, zip_name, temp_dir = await asyncio.to_thread(_sync_create_backup_zip)
         
         # Send the zip file
         with open(zip_path, 'rb') as f:
@@ -157,6 +164,64 @@ async def restore_config(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     return RESTORE_CONFIG
 
 
+def _sync_restore_config_zip(file_content: bytearray) -> tuple[bool, str]:
+    """Restore zip backup synchronously. Returns (env_restored, env_restore_note)."""
+    temp_dir = tempfile.mkdtemp()
+    zip_path = os.path.join(temp_dir, "backup.zip")
+    
+    with open(zip_path, 'wb') as f:
+        f.write(file_content)
+    
+    with zipfile.ZipFile(zip_path, 'r') as zipf:
+        zipf.extractall(temp_dir)
+    
+    # Restore .env file if present
+    env_restored = False
+    env_restore_note = ""
+    for env_name in ["config/.env", ".env"]:
+        src_path = os.path.join(temp_dir, env_name)
+        if os.path.exists(src_path):
+            # Determine destination - check if config dir exists AND is writable
+            config_dir = "/etc/opt/pg-limiter"
+            if os.path.exists(config_dir) and os.access(config_dir, os.W_OK):
+                env_dst = os.path.join(config_dir, ".env")
+            else:
+                env_dst = ".env"
+                if os.path.exists(config_dir):
+                    # Config dir exists but is read-only (Docker mount)
+                    env_restore_note = " (saved locally - config dir is read-only)"
+            
+            shutil.copy(src_path, env_dst)
+            env_restored = True
+            backup_logger.info(f"Restored .env to: {env_dst}")
+            break
+    
+    # Restore data files
+    data_src = os.path.join(temp_dir, "data")
+    if os.path.exists(data_src):
+        data_dst = "/var/lib/pg-limiter/data" if os.path.exists("/var/lib/pg-limiter") else "data"
+        
+        # Copy database files
+        for item in os.listdir(data_src):
+            src = os.path.join(data_src, item)
+            dst = os.path.join(data_dst, item)
+            if os.path.isfile(src):
+                os.makedirs(data_dst, exist_ok=True)
+                shutil.copy2(src, dst)
+    
+    # Restore legacy files (for migration)
+    legacy_src = os.path.join(temp_dir, "legacy")
+    if os.path.exists(legacy_src):
+        for item in os.listdir(legacy_src):
+            src = os.path.join(legacy_src, item)
+            if os.path.isfile(src):
+                shutil.copy2(src, item)
+    
+    # Cleanup
+    shutil.rmtree(temp_dir)
+    
+    return env_restored, env_restore_note
+
 async def restore_config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the uploaded backup file and restore it."""
     try:
@@ -176,59 +241,7 @@ async def restore_config_handler(update: Update, context: ContextTypes.DEFAULT_T
         
         if file_name.endswith('.zip'):
             # Handle zip backup (new format)
-            temp_dir = tempfile.mkdtemp()
-            zip_path = os.path.join(temp_dir, "backup.zip")
-            
-            with open(zip_path, 'wb') as f:
-                f.write(file_content)
-            
-            with zipfile.ZipFile(zip_path, 'r') as zipf:
-                zipf.extractall(temp_dir)
-            
-            # Restore .env file if present
-            env_restored = False
-            env_restore_note = ""
-            for env_name in ["config/.env", ".env"]:
-                src_path = os.path.join(temp_dir, env_name)
-                if os.path.exists(src_path):
-                    # Determine destination - check if config dir exists AND is writable
-                    config_dir = "/etc/opt/pg-limiter"
-                    if os.path.exists(config_dir) and os.access(config_dir, os.W_OK):
-                        env_dst = os.path.join(config_dir, ".env")
-                    else:
-                        env_dst = ".env"
-                        if os.path.exists(config_dir):
-                            # Config dir exists but is read-only (Docker mount)
-                            env_restore_note = " (saved locally - config dir is read-only)"
-                    
-                    shutil.copy(src_path, env_dst)
-                    env_restored = True
-                    backup_logger.info(f"Restored .env to: {env_dst}")
-                    break
-            
-            # Restore data files
-            data_src = os.path.join(temp_dir, "data")
-            if os.path.exists(data_src):
-                data_dst = "/var/lib/pg-limiter/data" if os.path.exists("/var/lib/pg-limiter") else "data"
-                
-                # Copy database files
-                for item in os.listdir(data_src):
-                    src = os.path.join(data_src, item)
-                    dst = os.path.join(data_dst, item)
-                    if os.path.isfile(src):
-                        os.makedirs(data_dst, exist_ok=True)
-                        shutil.copy2(src, dst)
-            
-            # Restore legacy files (for migration)
-            legacy_src = os.path.join(temp_dir, "legacy")
-            if os.path.exists(legacy_src):
-                for item in os.listdir(legacy_src):
-                    src = os.path.join(legacy_src, item)
-                    if os.path.isfile(src):
-                        shutil.copy2(src, item)
-            
-            # Cleanup
-            shutil.rmtree(temp_dir)
+            env_restored, env_restore_note = await asyncio.to_thread(_sync_restore_config_zip, file_content)
             
             env_status = '✓' + env_restore_note if env_restored else '✗'
             await update.message.reply_html(
@@ -604,6 +617,50 @@ async def migrate_backup_cancel(update: Update, _context: ContextTypes.DEFAULT_T
     return ConversationHandler.END
 
 
+def _sync_create_auto_backup_zip(interval_hours: int) -> tuple[str, str, str]:
+    """Create auto backup zip file synchronously. Returns (zip_path, zip_name, temp_dir)."""
+    temp_dir = tempfile.mkdtemp()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_name = f"pg-limiter-auto-backup-{timestamp}.zip"
+    zip_path = os.path.join(temp_dir, zip_name)
+    
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # Check Docker mounted config directory
+        docker_config_dir = "/etc/opt/pg-limiter"
+        if os.path.exists(docker_config_dir):
+            for filename in os.listdir(docker_config_dir):
+                filepath = os.path.join(docker_config_dir, filename)
+                if os.path.isfile(filepath):
+                    zipf.write(filepath, f"config/{filename}")
+        
+        if os.path.exists(".env"):
+            zipf.write(".env", "config/.env")
+        
+        # Add data files
+        data_dirs = ["/var/lib/pg-limiter/data", "data"]
+        for data_dir in data_dirs:
+            if os.path.exists(data_dir) and os.path.isdir(data_dir):
+                for root, _, files in os.walk(data_dir):
+                    for file in files:
+                        filepath = os.path.join(root, file)
+                        arcname = os.path.join("data", os.path.relpath(filepath, data_dir))
+                        zipf.write(filepath, arcname)
+                break
+        
+        # Add legacy files
+        for legacy_file in [".disable_users.json", ".violation_history.json", ".user_groups_backup.json"]:
+            if os.path.exists(legacy_file):
+                zipf.write(legacy_file, f"legacy/{legacy_file}")
+        
+        # Add backup info
+        backup_info = f"""PG-Limiter Automatic Backup
+Created: {datetime.now().isoformat()}
+Type: Automatic (scheduled every {interval_hours} hour(s))
+"""
+        zipf.writestr("backup_info.txt", backup_info)
+    
+    return zip_path, zip_name, temp_dir
+
 async def send_automatic_backup():
     """
     Send an automatic backup to the forum group (if topics enabled) or all admins.
@@ -617,49 +674,11 @@ async def send_automatic_backup():
     
     try:
         # Get auto-backup config for interval info
-        config = get_auto_backup_config()
+        config = await asyncio.to_thread(get_auto_backup_config)
         interval_hours = config.get("interval_hours", 1)
         
         # Create temp directory for backup
-        temp_dir = tempfile.mkdtemp()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_name = f"pg-limiter-auto-backup-{timestamp}.zip"
-        zip_path = os.path.join(temp_dir, zip_name)
-        
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # Check Docker mounted config directory
-            docker_config_dir = "/etc/opt/pg-limiter"
-            if os.path.exists(docker_config_dir):
-                for filename in os.listdir(docker_config_dir):
-                    filepath = os.path.join(docker_config_dir, filename)
-                    if os.path.isfile(filepath):
-                        zipf.write(filepath, f"config/{filename}")
-            
-            if os.path.exists(".env"):
-                zipf.write(".env", "config/.env")
-            
-            # Add data files
-            data_dirs = ["/var/lib/pg-limiter/data", "data"]
-            for data_dir in data_dirs:
-                if os.path.exists(data_dir) and os.path.isdir(data_dir):
-                    for root, _, files in os.walk(data_dir):
-                        for file in files:
-                            filepath = os.path.join(root, file)
-                            arcname = os.path.join("data", os.path.relpath(filepath, data_dir))
-                            zipf.write(filepath, arcname)
-                    break
-            
-            # Add legacy files
-            for legacy_file in [".disable_users.json", ".violation_history.json", ".user_groups_backup.json"]:
-                if os.path.exists(legacy_file):
-                    zipf.write(legacy_file, f"legacy/{legacy_file}")
-            
-            # Add backup info
-            backup_info = f"""PG-Limiter Automatic Backup
-Created: {datetime.now().isoformat()}
-Type: Automatic (scheduled every {interval_hours} hour(s))
-"""
-            zipf.writestr("backup_info.txt", backup_info)
+        zip_path, zip_name, temp_dir = await asyncio.to_thread(_sync_create_auto_backup_zip, interval_hours)
         
         # Get topics manager
         topics_manager = get_topics_manager()
@@ -721,6 +740,8 @@ Type: Automatic (scheduled every {interval_hours} hour(s))
 
 AUTO_BACKUP_CONFIG_FILE = "data/auto_backup_config.json"
 
+_auto_backup_lock = asyncio.Lock()
+
 # Default config: enabled with 1 hour interval
 DEFAULT_AUTO_BACKUP_CONFIG = {
     "enabled": True,
@@ -742,8 +763,7 @@ def get_auto_backup_config() -> dict:
 def save_auto_backup_config(config: dict):
     """Save the auto-backup configuration."""
     os.makedirs(os.path.dirname(AUTO_BACKUP_CONFIG_FILE), exist_ok=True)
-    with open(AUTO_BACKUP_CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=2)
+    atomic_write_json(AUTO_BACKUP_CONFIG_FILE, config)
 
 
 def create_auto_backup_keyboard(config: dict) -> InlineKeyboardMarkup:
@@ -795,7 +815,8 @@ async def auto_backup_menu(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     if check is not None:
         return check
     
-    config = get_auto_backup_config()
+    async with _auto_backup_lock:
+        config = await asyncio.to_thread(get_auto_backup_config)
     enabled = config.get("enabled", True)
     interval = config.get("interval_hours", 1)
     
@@ -832,9 +853,10 @@ async def auto_backup_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if check is not None:
         return check
     
-    config = get_auto_backup_config()
-    config["enabled"] = not config.get("enabled", True)
-    save_auto_backup_config(config)
+    async with _auto_backup_lock:
+        config = await asyncio.to_thread(get_auto_backup_config)
+        config["enabled"] = not config.get("enabled", True)
+        await asyncio.to_thread(save_auto_backup_config, config)
     
     # Reschedule the job
     await reschedule_auto_backup(context.application)
@@ -848,9 +870,10 @@ async def auto_backup_set_interval(update: Update, context: ContextTypes.DEFAULT
     if check is not None:
         return check
     
-    config = get_auto_backup_config()
-    config["interval_hours"] = hours
-    save_auto_backup_config(config)
+    async with _auto_backup_lock:
+        config = await asyncio.to_thread(get_auto_backup_config)
+        config["interval_hours"] = hours
+        await asyncio.to_thread(save_auto_backup_config, config)
     
     # Reschedule the job
     await reschedule_auto_backup(context.application)
@@ -898,7 +921,8 @@ async def reschedule_auto_backup(application):
     for job in current_jobs:
         job.schedule_removal()
     
-    config = get_auto_backup_config()
+    async with _auto_backup_lock:
+        config = await asyncio.to_thread(get_auto_backup_config)
     if not config.get("enabled", True):
         backup_logger.info("Auto-backup disabled, job removed")
         return

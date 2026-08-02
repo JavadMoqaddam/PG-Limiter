@@ -11,11 +11,13 @@ import time
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, List, Optional
 
+import secrets
+
 from fastapi import FastAPI, HTTPException, Depends, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
-import secrets
+from utils.atomic_io import atomic_write_json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +27,10 @@ logger = logging.getLogger(__name__)
 CONFIG_FILE = "config.json"
 BACKUP_FILE = "backup.json"
 DISABLED_USERS_FILE = ".disable_users.json"
+
+_config_lock = asyncio.Lock()
+_backup_lock = asyncio.Lock()
+_disabled_lock = asyncio.Lock()
 
 # Security
 security = HTTPBasic()
@@ -75,8 +81,7 @@ def load_config() -> dict:
 
 def save_config(config: dict):
     """Save config to file"""
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+    atomic_write_json(CONFIG_FILE, config)
 
 def load_backup() -> dict:
     """Load backup file"""
@@ -87,8 +92,7 @@ def load_backup() -> dict:
 
 def save_backup(backup: dict):
     """Save backup file"""
-    with open(BACKUP_FILE, "w", encoding="utf-8") as f:
-        json.dump(backup, f, indent=2)
+    atomic_write_json(BACKUP_FILE, backup)
 
 def load_disabled_users() -> dict:
     """Load disabled users"""
@@ -110,8 +114,7 @@ def load_disabled_users() -> dict:
 
 def save_disabled_users(users: dict):
     """Save disabled users"""
-    with open(DISABLED_USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump({"disabled_users": users}, f, indent=2)
+    atomic_write_json(DISABLED_USERS_FILE, {"disabled_users": users})
 
 
 def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
@@ -180,8 +183,10 @@ async def root():
 @app.get("/status", response_model=StatusResponse, tags=["Status"])
 async def get_status(username: str = Depends(verify_credentials)):
     """Get current limiter status"""
-    config = load_config()
-    disabled = load_disabled_users()
+    async with _config_lock:
+        config = await asyncio.to_thread(load_config)
+    async with _disabled_lock:
+        disabled = await asyncio.to_thread(load_disabled_users)
     
     limits = config.get("limits", {})
     timing = config.get("timing", {})
@@ -204,8 +209,10 @@ async def get_status(username: str = Depends(verify_credentials)):
 @app.get("/users/limits", tags=["User Limits"])
 async def list_user_limits(username: str = Depends(verify_credentials)):
     """List all users with special limits"""
-    config = load_config()
-    backup = load_backup()
+    async with _config_lock:
+        config = await asyncio.to_thread(load_config)
+    async with _backup_lock:
+        backup = await asyncio.to_thread(load_backup)
     
     special_limits = {}
     if "limits" in config and "special" in config["limits"]:
@@ -225,8 +232,10 @@ async def list_user_limits(username: str = Depends(verify_credentials)):
 @app.get("/users/limits/{user}", tags=["User Limits"])
 async def get_user_limit(user: str, username: str = Depends(verify_credentials)):
     """Get a specific user's limit"""
-    config = load_config()
-    backup = load_backup()
+    async with _config_lock:
+        config = await asyncio.to_thread(load_config)
+    async with _backup_lock:
+        backup = await asyncio.to_thread(load_backup)
     
     limit = None
     if "limits" in config and "special" in config["limits"]:
@@ -250,21 +259,23 @@ async def get_user_limit(user: str, username: str = Depends(verify_credentials))
 @app.post("/users/limits", tags=["User Limits"])
 async def add_user_limit(user_limit: UserLimit, username: str = Depends(verify_credentials)):
     """Add or update a user's special limit"""
-    config = load_config()
-    backup = load_backup()
-    
-    if "limits" not in config:
-        config["limits"] = {}
-    if "special" not in config["limits"]:
-        config["limits"]["special"] = {}
-    if "special" not in backup:
-        backup["special"] = {}
-    
-    config["limits"]["special"][user_limit.username] = user_limit.limit
-    backup["special"][user_limit.username] = user_limit.limit
-    
-    save_config(config)
-    save_backup(backup)
+    async with _config_lock:
+        async with _backup_lock:
+            config = await asyncio.to_thread(load_config)
+            backup = await asyncio.to_thread(load_backup)
+            
+            if "limits" not in config:
+                config["limits"] = {}
+            if "special" not in config["limits"]:
+                config["limits"]["special"] = {}
+            if "special" not in backup:
+                backup["special"] = {}
+            
+            config["limits"]["special"][user_limit.username] = user_limit.limit
+            backup["special"][user_limit.username] = user_limit.limit
+            
+            await asyncio.to_thread(save_config, config)
+            await asyncio.to_thread(save_backup, backup)
     
     return {"success": True, "message": f"Limit for {user_limit.username} set to {user_limit.limit}"}
 
@@ -272,21 +283,23 @@ async def add_user_limit(user_limit: UserLimit, username: str = Depends(verify_c
 @app.put("/users/limits/{user}", tags=["User Limits"])
 async def update_user_limit(user: str, update: UpdateLimit, username: str = Depends(verify_credentials)):
     """Update a user's special limit"""
-    config = load_config()
-    backup = load_backup()
-    
-    if "limits" not in config:
-        config["limits"] = {}
-    if "special" not in config["limits"]:
-        config["limits"]["special"] = {}
-    if "special" not in backup:
-        backup["special"] = {}
-    
-    config["limits"]["special"][user] = update.limit
-    backup["special"][user] = update.limit
-    
-    save_config(config)
-    save_backup(backup)
+    async with _config_lock:
+        async with _backup_lock:
+            config = await asyncio.to_thread(load_config)
+            backup = await asyncio.to_thread(load_backup)
+            
+            if "limits" not in config:
+                config["limits"] = {}
+            if "special" not in config["limits"]:
+                config["limits"]["special"] = {}
+            if "special" not in backup:
+                backup["special"] = {}
+            
+            config["limits"]["special"][user] = update.limit
+            backup["special"][user] = update.limit
+            
+            await asyncio.to_thread(save_config, config)
+            await asyncio.to_thread(save_backup, backup)
     
     return {"success": True, "message": f"Limit for {user} updated to {update.limit}"}
 
@@ -294,21 +307,23 @@ async def update_user_limit(user: str, update: UpdateLimit, username: str = Depe
 @app.delete("/users/limits/{user}", tags=["User Limits"])
 async def delete_user_limit(user: str, username: str = Depends(verify_credentials)):
     """Delete a user's special limit"""
-    config = load_config()
-    backup = load_backup()
-    
     removed = False
     
-    if "limits" in config and "special" in config["limits"]:
-        if user in config["limits"]["special"]:
-            del config["limits"]["special"][user]
-            save_config(config)
-            removed = True
-    
-    if "special" in backup and user in backup["special"]:
-        del backup["special"][user]
-        save_backup(backup)
-        removed = True
+    async with _config_lock:
+        async with _backup_lock:
+            config = await asyncio.to_thread(load_config)
+            backup = await asyncio.to_thread(load_backup)
+            
+            if "limits" in config and "special" in config["limits"]:
+                if user in config["limits"]["special"]:
+                    del config["limits"]["special"][user]
+                    await asyncio.to_thread(save_config, config)
+                    removed = True
+            
+            if "special" in backup and user in backup["special"]:
+                del backup["special"][user]
+                await asyncio.to_thread(save_backup, backup)
+                removed = True
     
     if not removed:
         raise HTTPException(status_code=404, detail=f"User {user} not found in special limits")
@@ -323,8 +338,10 @@ async def delete_user_limit(user: str, username: str = Depends(verify_credential
 @app.get("/users/except", tags=["Except Users"])
 async def list_except_users(username: str = Depends(verify_credentials)):
     """List all except (whitelisted) users"""
-    config = load_config()
-    backup = load_backup()
+    async with _config_lock:
+        config = await asyncio.to_thread(load_config)
+    async with _backup_lock:
+        backup = await asyncio.to_thread(load_backup)
     
     except_users = set()
     if "users" in config and "except" in config["users"]:
@@ -341,24 +358,26 @@ async def list_except_users(username: str = Depends(verify_credentials)):
 @app.post("/users/except", tags=["Except Users"])
 async def add_except_user(user: ExceptUser, username: str = Depends(verify_credentials)):
     """Add a user to the except list"""
-    config = load_config()
-    backup = load_backup()
-    
-    if "users" not in config:
-        config["users"] = {}
-    if "except" not in config["users"]:
-        config["users"]["except"] = []
-    if "except_users" not in backup:
-        backup["except_users"] = []
-    
-    if user.username in config["users"]["except"] or user.username in backup["except_users"]:
-        raise HTTPException(status_code=400, detail=f"User {user.username} is already in except list")
-    
-    config["users"]["except"].append(user.username)
-    backup["except_users"].append(user.username)
-    
-    save_config(config)
-    save_backup(backup)
+    async with _config_lock:
+        async with _backup_lock:
+            config = await asyncio.to_thread(load_config)
+            backup = await asyncio.to_thread(load_backup)
+            
+            if "users" not in config:
+                config["users"] = {}
+            if "except" not in config["users"]:
+                config["users"]["except"] = []
+            if "except_users" not in backup:
+                backup["except_users"] = []
+            
+            if user.username in config["users"]["except"] or user.username in backup["except_users"]:
+                raise HTTPException(status_code=400, detail=f"User {user.username} is already in except list")
+            
+            config["users"]["except"].append(user.username)
+            backup["except_users"].append(user.username)
+            
+            await asyncio.to_thread(save_config, config)
+            await asyncio.to_thread(save_backup, backup)
     
     return {"success": True, "message": f"User {user.username} added to except list"}
 
@@ -366,21 +385,23 @@ async def add_except_user(user: ExceptUser, username: str = Depends(verify_crede
 @app.delete("/users/except/{user}", tags=["Except Users"])
 async def delete_except_user(user: str, username: str = Depends(verify_credentials)):
     """Remove a user from the except list"""
-    config = load_config()
-    backup = load_backup()
-    
     removed = False
     
-    if "users" in config and "except" in config["users"]:
-        if user in config["users"]["except"]:
-            config["users"]["except"].remove(user)
-            save_config(config)
-            removed = True
-    
-    if "except_users" in backup and user in backup["except_users"]:
-        backup["except_users"].remove(user)
-        save_backup(backup)
-        removed = True
+    async with _config_lock:
+        async with _backup_lock:
+            config = await asyncio.to_thread(load_config)
+            backup = await asyncio.to_thread(load_backup)
+            
+            if "users" in config and "except" in config["users"]:
+                if user in config["users"]["except"]:
+                    config["users"]["except"].remove(user)
+                    await asyncio.to_thread(save_config, config)
+                    removed = True
+            
+            if "except_users" in backup and user in backup["except_users"]:
+                backup["except_users"].remove(user)
+                await asyncio.to_thread(save_backup, backup)
+                removed = True
     
     if not removed:
         raise HTTPException(status_code=404, detail=f"User {user} not found in except list")
@@ -395,7 +416,8 @@ async def delete_except_user(user: str, username: str = Depends(verify_credentia
 @app.get("/users/disabled", tags=["Disabled Users"])
 async def list_disabled_users_route(username: str = Depends(verify_credentials)):
     """List all currently disabled users"""
-    disabled = load_disabled_users()
+    async with _disabled_lock:
+        disabled = await asyncio.to_thread(load_disabled_users)
     current_time = time.time()
     
     data = []
@@ -417,13 +439,14 @@ async def list_disabled_users_route(username: str = Depends(verify_credentials))
 @app.delete("/users/disabled/{user}", tags=["Disabled Users"])
 async def enable_disabled_user(user: str, username: str = Depends(verify_credentials)):
     """Enable a disabled user (remove from disabled list)"""
-    disabled = load_disabled_users()
-    
-    if user not in disabled:
-        raise HTTPException(status_code=404, detail=f"User {user} is not in disabled list")
-    
-    del disabled[user]
-    save_disabled_users(disabled)
+    async with _disabled_lock:
+        disabled = await asyncio.to_thread(load_disabled_users)
+        
+        if user not in disabled:
+            raise HTTPException(status_code=404, detail=f"User {user} is not in disabled list")
+        
+        del disabled[user]
+        await asyncio.to_thread(save_disabled_users, disabled)
     
     return {"success": True, "message": f"User {user} removed from disabled list"}
 
@@ -431,10 +454,11 @@ async def enable_disabled_user(user: str, username: str = Depends(verify_credent
 @app.delete("/users/disabled", tags=["Disabled Users"])
 async def enable_all_disabled_users(username: str = Depends(verify_credentials)):
     """Enable all disabled users (clear the disabled list)"""
-    disabled = load_disabled_users()
-    count = len(disabled)
-    
-    save_disabled_users({})
+    async with _disabled_lock:
+        disabled = await asyncio.to_thread(load_disabled_users)
+        count = len(disabled)
+        
+        await asyncio.to_thread(save_disabled_users, {})
     
     return {"success": True, "message": f"Cleared {count} users from disabled list"}
 
@@ -446,7 +470,8 @@ async def enable_all_disabled_users(username: str = Depends(verify_credentials))
 @app.get("/config", tags=["Configuration"])
 async def get_config(username: str = Depends(verify_credentials)):
     """Get current configuration (sensitive data masked)"""
-    config = load_config()
+    async with _config_lock:
+        config = await asyncio.to_thread(load_config)
     
     # Mask sensitive data
     if "panel" in config:
@@ -465,13 +490,14 @@ async def get_config(username: str = Depends(verify_credentials)):
 @app.put("/config/limits/general", tags=["Configuration"])
 async def set_general_limit(limit: int = Query(..., ge=1), username: str = Depends(verify_credentials)):
     """Set the general IP limit"""
-    config = load_config()
-    
-    if "limits" not in config:
-        config["limits"] = {}
-    
-    config["limits"]["general"] = limit
-    save_config(config)
+    async with _config_lock:
+        config = await asyncio.to_thread(load_config)
+        
+        if "limits" not in config:
+            config["limits"] = {}
+        
+        config["limits"]["general"] = limit
+        await asyncio.to_thread(save_config, config)
     
     return {"success": True, "message": f"General limit set to {limit}"}
 
@@ -479,13 +505,14 @@ async def set_general_limit(limit: int = Query(..., ge=1), username: str = Depen
 @app.put("/config/timing/check_interval", tags=["Configuration"])
 async def set_check_interval(interval: int = Query(..., ge=30), username: str = Depends(verify_credentials)):
     """Set the check interval in seconds"""
-    config = load_config()
-    
-    if "timing" not in config:
-        config["timing"] = {}
-    
-    config["timing"]["check_interval"] = interval
-    save_config(config)
+    async with _config_lock:
+        config = await asyncio.to_thread(load_config)
+        
+        if "timing" not in config:
+            config["timing"] = {}
+        
+        config["timing"]["check_interval"] = interval
+        await asyncio.to_thread(save_config, config)
     
     return {"success": True, "message": f"Check interval set to {interval} seconds"}
 
@@ -493,13 +520,14 @@ async def set_check_interval(interval: int = Query(..., ge=30), username: str = 
 @app.put("/config/timing/reenable_time", tags=["Configuration"])
 async def set_reenable_time(seconds: int = Query(..., ge=60), username: str = Depends(verify_credentials)):
     """Set the time to automatically re-enable disabled users"""
-    config = load_config()
-    
-    if "timing" not in config:
-        config["timing"] = {}
-    
-    config["timing"]["time_to_active_users"] = seconds
-    save_config(config)
+    async with _config_lock:
+        config = await asyncio.to_thread(load_config)
+        
+        if "timing" not in config:
+            config["timing"] = {}
+        
+        config["timing"]["time_to_active_users"] = seconds
+        await asyncio.to_thread(save_config, config)
     
     return {"success": True, "message": f"Re-enable time set to {seconds} seconds"}
 

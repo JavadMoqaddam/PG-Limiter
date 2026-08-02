@@ -20,6 +20,7 @@ from utils.warning_system.helpers import (
     safe_send_disable_notification,
     safe_disable_user_with_punishment,
 )
+from utils.atomic_io import atomic_write_json
 
 # Module logger
 warning_logger = get_logger("warning_system")
@@ -43,6 +44,7 @@ class EnhancedWarningSystem:
         self.warnings: Dict[str, UserWarning] = {}
         self.warning_history: Dict[str, list] = {}
         self.monitoring_period = 180  # 3 minutes in seconds
+        self._write_lock = asyncio.Lock()
         self.load_warnings()
         self.load_warning_history()
         warning_logger.debug(f"⚠️ EnhancedWarningSystem initialized (monitoring_period={self.monitoring_period}s)")
@@ -59,11 +61,15 @@ class EnhancedWarningSystem:
             warning_logger.error(f"Error loading warning history: {e}")
             self.warning_history = {}
     
+    def _sync_save_warning_history(self):
+        """Synchronous file write for warning history."""
+        atomic_write_json(self.history_filename, self.warning_history)
+
     async def save_warning_history(self):
-        """Save warning history to file"""
+        """Save warning history to file using asyncio.to_thread to avoid blocking."""
         try:
-            with open(self.history_filename, "w", encoding="utf-8") as file:
-                json.dump(self.warning_history, file, indent=2)
+            async with self._write_lock:
+                await asyncio.to_thread(self._sync_save_warning_history)
             warning_logger.debug(f"⚠️ Saved warning history ({len(self.warning_history)} users)")
         except Exception as e:
             warning_logger.error(f"Error saving warning history: {e}")
@@ -197,50 +203,55 @@ class EnhancedWarningSystem:
         except Exception as e:
             warning_logger.error(f"Error loading warnings: {e}")
     
-    async def save_warnings(self):
-        """Save warnings to file"""
-        try:
-            data = {}
-            for username, warning in self.warnings.items():
-                monitoring_history_serializable = []
-                for snapshot in warning.monitoring_history:
-                    monitoring_history_serializable.append({
-                        'timestamp': snapshot['timestamp'],
-                        'ips': list(snapshot['ips']),
-                        'ip_count': snapshot['ip_count']
-                    })
-                
-                ip_to_inbounds_serializable = {}
-                if warning.ip_to_inbounds:
-                    for ip, inbounds in warning.ip_to_inbounds.items():
-                        ip_to_inbounds_serializable[ip] = list(inbounds)
-                
-                data[username] = {
-                    "username": warning.username,
-                    "ip_count": warning.ip_count,
-                    "ips": list(warning.ips),
-                    "warning_time": warning.warning_time,
-                    "monitoring_end_time": warning.monitoring_end_time,
-                    "warned": warning.warned,
-                    "monitoring_history": monitoring_history_serializable,
-                    "ip_first_seen": warning.ip_first_seen,
-                    "ip_last_seen": warning.ip_last_seen,
-                    "ip_seen_count": warning.ip_seen_count,
-                    "trust_score": warning.trust_score,
-                    "inbound_protocols": list(warning.inbound_protocols),
-                    "isp_names": list(warning.isp_names),
-                    "ip_subnets": list(warning.ip_subnets),
-                    "previous_warnings_12h": warning.previous_warnings_12h,
-                    "previous_warnings_24h": warning.previous_warnings_24h,
-                    "ip_to_inbounds": ip_to_inbounds_serializable,
-                    "same_ip_multiple_inbounds": warning.same_ip_multiple_inbounds,
-                    "isp_change_pattern": warning.isp_change_pattern,
-                    "connection_details": warning.connection_details
-                }
+    def _sync_save_warnings(self):
+        """Synchronous serialization and file write for active warnings."""
+        data = {}
+        for username, warning in self.warnings.items():
+            monitoring_history_serializable = []
+            for snapshot in warning.monitoring_history:
+                monitoring_history_serializable.append({
+                    'timestamp': snapshot['timestamp'],
+                    'ips': list(snapshot['ips']),
+                    'ip_count': snapshot['ip_count']
+                })
             
-            with open(self.filename, "w", encoding="utf-8") as file:
-                json.dump(data, file, indent=2)
-            warning_logger.debug(f"⚠️ Saved {len(data)} warnings to file")
+            ip_to_inbounds_serializable = {}
+            if warning.ip_to_inbounds:
+                for ip, inbounds in warning.ip_to_inbounds.items():
+                    ip_to_inbounds_serializable[ip] = list(inbounds)
+            
+            data[username] = {
+                "username": warning.username,
+                "ip_count": warning.ip_count,
+                "ips": list(warning.ips),
+                "warning_time": warning.warning_time,
+                "monitoring_end_time": warning.monitoring_end_time,
+                "warned": warning.warned,
+                "monitoring_history": monitoring_history_serializable,
+                "ip_first_seen": warning.ip_first_seen,
+                "ip_last_seen": warning.ip_last_seen,
+                "ip_seen_count": warning.ip_seen_count,
+                "trust_score": warning.trust_score,
+                "inbound_protocols": list(warning.inbound_protocols),
+                "isp_names": list(warning.isp_names),
+                "ip_subnets": list(warning.ip_subnets),
+                "previous_warnings_12h": warning.previous_warnings_12h,
+                "previous_warnings_24h": warning.previous_warnings_24h,
+                "ip_to_inbounds": ip_to_inbounds_serializable,
+                "same_ip_multiple_inbounds": warning.same_ip_multiple_inbounds,
+                "isp_change_pattern": warning.isp_change_pattern,
+                "connection_details": warning.connection_details
+            }
+        
+        atomic_write_json(self.filename, data)
+        return len(data)
+
+    async def save_warnings(self):
+        """Save warnings to file using asyncio.to_thread to avoid blocking."""
+        try:
+            async with self._write_lock:
+                count = await asyncio.to_thread(self._sync_save_warnings)
+            warning_logger.debug(f"⚠️ Saved {count} warnings to file")
                 
         except Exception as e:
             warning_logger.error(f"Error saving warnings: {e}")

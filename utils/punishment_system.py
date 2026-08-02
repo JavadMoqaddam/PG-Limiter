@@ -21,6 +21,7 @@ Example configuration:
 }
 """
 
+import asyncio
 import json
 import os
 import time
@@ -28,6 +29,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from utils.logs import get_logger
+from utils.atomic_io import atomic_write_json
 
 punishment_logger = get_logger("punishment")
 
@@ -107,6 +109,7 @@ class PunishmentSystem:
         self.steps: list[PunishmentStep] = self.DEFAULT_STEPS.copy()
         self.window_hours: int = self.DEFAULT_WINDOW_HOURS
         self.enabled: bool = True
+        self._write_lock = asyncio.Lock()
         self.load_violations()
     
     def load_violations(self):
@@ -136,25 +139,26 @@ class PunishmentSystem:
             punishment_logger.error(f"❌ Error loading violation history: {e}")
             self.violations = {}
     
+    def _sync_save_violations(self):
+        """Synchronous file write for violation history data."""
+        data = {"violations": {}}
+        for username, records in self.violations.items():
+            data["violations"][username] = []
+            for record in records:
+                data["violations"][username].append({
+                    "username": record.username,
+                    "timestamp": record.timestamp,
+                    "step_applied": record.step_applied,
+                    "disable_duration": record.disable_duration,
+                    "enabled_at": record.enabled_at
+                })
+        atomic_write_json(self.filename, data)
+
     async def save_violations(self):
-        """Save violation history to file"""
+        """Save violation history to file using asyncio.Lock and atomic write for safety."""
         try:
-            data = {"violations": {}}
-            
-            for username, records in self.violations.items():
-                data["violations"][username] = []
-                for record in records:
-                    data["violations"][username].append({
-                        "username": record.username,
-                        "timestamp": record.timestamp,
-                        "step_applied": record.step_applied,
-                        "disable_duration": record.disable_duration,
-                        "enabled_at": record.enabled_at
-                    })
-            
-            with open(self.filename, "w", encoding="utf-8") as file:
-                json.dump(data, file, indent=2)
-                
+            async with self._write_lock:
+                await asyncio.to_thread(self._sync_save_violations)
             punishment_logger.debug(f"💾 Saved violation history for {len(self.violations)} users")
         except Exception as e:
             punishment_logger.error(f"❌ Error saving violation history: {e}")

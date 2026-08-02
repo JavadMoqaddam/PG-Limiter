@@ -3,6 +3,7 @@ Telegram bot runner module.
 This module provides the function to run the Telegram bot in the background.
 """
 
+import asyncio
 import os
 import json
 from telegram.ext import ApplicationBuilder
@@ -77,7 +78,7 @@ async def run_telegram_bot():
             
             job_queue = application.job_queue
             if job_queue:
-                config = get_auto_backup_config()
+                config = await asyncio.to_thread(get_auto_backup_config)
                 if config.get("enabled", True):
                     interval_hours = config.get("interval_hours", 1)
                     interval_seconds = interval_hours * 3600

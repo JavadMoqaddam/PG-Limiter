@@ -3,12 +3,14 @@ This module contains utility functions for managing admin IDs,
 handling special limits for users, and interacting with the database.
 """
 
+import asyncio
 import json
 import os
 import sys
 
 from utils.types import PanelType
 from utils.read_config import invalidate_config_cache
+from utils.atomic_io import atomic_write_json
 
 try:
     import httpx
@@ -22,6 +24,9 @@ try:
     DB_AVAILABLE = True
 except ImportError:
     DB_AVAILABLE = False
+
+
+_config_write_lock = asyncio.Lock()
 
 
 async def get_token(panel_data: PanelType) -> PanelType | ValueError:
@@ -51,26 +56,38 @@ async def get_token(panel_data: PanelType) -> PanelType | ValueError:
     raise ValueError(message)
 
 
+def _sync_read_json_file() -> dict:
+    """Synchronous file read for config.json."""
+    with open("config.json", "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 async def read_json_file() -> dict:
     """
     Reads and returns the content of the config.json file.
+    Uses asyncio.to_thread to avoid blocking the event loop.
 
     Returns:
         The content of the config.json file.
     """
-    with open("config.json", "r", encoding="utf-8") as f:
-        return json.load(f)
+    return await asyncio.to_thread(_sync_read_json_file)
+
+
+def _sync_write_json_file(data: dict):
+    """Synchronous file write for config.json."""
+    atomic_write_json("config.json", data, ensure_ascii=False)
 
 
 async def write_json_file(data: dict):
     """
     Writes the given data to the config.json file.
+    Uses asyncio.Lock to prevent race conditions and atomic write for crash safety.
 
     Args:
         data: The data to write to the file.
     """
-    with open("config.json", "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    async with _config_write_lock:
+        await asyncio.to_thread(_sync_write_json_file, data)
 
 
 async def add_admin_to_config(new_admin_id: int) -> int | None:

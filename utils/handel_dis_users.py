@@ -3,11 +3,13 @@ This module contains the DisabledUsers class
 which provides methods for managing disabled users
 """
 
+import asyncio
 import json
 import os
 import time
 
 from utils.logs import logger
+from utils.atomic_io import atomic_write_json
 
 DISABLED_USERS = set()
 # Track when each user was disabled: {username: timestamp}
@@ -26,6 +28,7 @@ class DisabledUsers:
         self.filename = "/var/lib/pg-limiter/disable_users.json"
         self.disabled_users = {}  # {username: disabled_timestamp}
         self.enable_at = {}  # {username: enable_at_timestamp} - custom enable time
+        self._write_lock = asyncio.Lock()
         self.load_disabled_users()
 
     def load_disabled_users(self):
@@ -79,15 +82,20 @@ class DisabledUsers:
             DISABLED_USERS_TIMESTAMPS = {}
             DISABLED_USERS_ENABLE_AT = {}
 
+    def _sync_save_disabled_users(self):
+        """Synchronous file write for disabled users data."""
+        atomic_write_json(self.filename, {
+            "disabled_users": self.disabled_users,
+            "enable_at": self.enable_at
+        })
+
     async def save_disabled_users(self):
         """
         Saves the disabled users with timestamps to the JSON file.
+        Uses asyncio.Lock to prevent race conditions and atomic write for crash safety.
         """
-        with open(self.filename, "w", encoding="utf-8") as file:
-            json.dump({
-                "disabled_users": self.disabled_users,
-                "enable_at": self.enable_at
-            }, file, indent=2)
+        async with self._write_lock:
+            await asyncio.to_thread(self._sync_save_disabled_users)
         logger.info(f"Saved {len(self.disabled_users)} disabled users to {self.filename}")
 
     async def add_user(self, username: str, duration_seconds: int = 0, permanent: bool = False):
@@ -164,7 +172,7 @@ class DisabledUsers:
             List of usernames ready to be enabled
         """
         # Reload from file to get latest data
-        self.load_disabled_users()
+        await asyncio.to_thread(self.load_disabled_users)
         
         current_time = time.time()
         users_to_enable = []

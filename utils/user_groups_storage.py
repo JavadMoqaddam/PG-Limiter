@@ -3,11 +3,13 @@ This module handles storing and retrieving user's original groups
 before they were moved to the disabled group.
 """
 
+import asyncio
 import json
 import os
 import time
 
 from utils.logs import logger
+from utils.atomic_io import atomic_write_json
 
 # In-memory cache
 USER_ORIGINAL_GROUPS = {}
@@ -23,6 +25,7 @@ class UserGroupsStorage:
     def __init__(self, filename=".user_groups_backup.json"):
         self.filename = filename
         self.user_groups = {}  # {username: {"groups": [group_ids], "saved_at": timestamp}}
+        self._write_lock = asyncio.Lock()
         self.load_data()
 
     def load_data(self):
@@ -43,11 +46,15 @@ class UserGroupsStorage:
             self.user_groups = {}
             USER_ORIGINAL_GROUPS = {}
 
+    def _sync_save_data(self):
+        """Synchronous file write for user groups data."""
+        atomic_write_json(self.filename, {"user_groups": self.user_groups})
+
     async def save_data(self):
-        """Save user groups data to the JSON file."""
+        """Save user groups data using asyncio.Lock and atomic write for safety."""
         try:
-            with open(self.filename, "w", encoding="utf-8") as file:
-                json.dump({"user_groups": self.user_groups}, file, indent=2)
+            async with self._write_lock:
+                await asyncio.to_thread(self._sync_save_data)
             logger.info(f"Saved {len(self.user_groups)} user groups to {self.filename}")
         except Exception as error:
             logger.error(f"Error saving user groups: {error}")
@@ -81,7 +88,7 @@ class UserGroupsStorage:
             List of group IDs or None if not found
         """
         # Reload from file to get latest data
-        self.load_data()
+        await asyncio.to_thread(self.load_data)
         
         if username in self.user_groups:
             return self.user_groups[username].get("groups", None)
@@ -111,7 +118,7 @@ class UserGroupsStorage:
         Returns:
             True if user has saved groups
         """
-        self.load_data()
+        await asyncio.to_thread(self.load_data)
         return username in self.user_groups
 
     async def get_all_users_with_saved_groups(self) -> list[str]:
@@ -121,7 +128,7 @@ class UserGroupsStorage:
         Returns:
             List of usernames
         """
-        self.load_data()
+        await asyncio.to_thread(self.load_data)
         return list(self.user_groups.keys())
 
     async def clear_all(self):
