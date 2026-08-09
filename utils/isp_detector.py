@@ -6,7 +6,6 @@ Uses Redis cache when available for fast lookups, with fallback to in-memory and
 
 import asyncio
 import aiohttp
-import httpx
 from typing import Dict, Optional, Tuple
 from utils.logs import logger
 
