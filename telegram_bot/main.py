@@ -296,15 +296,6 @@ async def help_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(text=HELP_TEXT)
 
 
-async def send_logs(msg):
-    """Send log messages to all admins."""
-    admins = await check_admin()
-    for admin in admins:
-        try:
-            await application.bot.send_message(chat_id=admin, text=msg)
-        except Exception:
-            pass
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CALLBACK QUERY HANDLER
@@ -1275,11 +1266,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     if data.startswith("user_info:"):
         username = data.split(":", 1)[1]
         await query.answer(f"User: {username}", show_alert=False)
-        return
-    
-    # Handle noop callback (page indicator buttons that should do nothing)
-    if data == "noop":
-        await query.answer()
         return
     
     # Fallback for unhandled callbacks
