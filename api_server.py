@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # Config files
 CONFIG_FILE = "config.json"
 BACKUP_FILE = "backup.json"
-DISABLED_USERS_FILE = ".disable_users.json"
+DISABLED_USERS_FILE = "/var/lib/pg-limiter/disable_users.json"
 
 _config_lock = asyncio.Lock()
 _backup_lock = asyncio.Lock()

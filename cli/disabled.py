@@ -20,7 +20,7 @@ from cli.utils import (
 
 app = typer.Typer(no_args_is_help=True, help="Manage disabled users")
 
-DISABLED_USERS_FILE = ".disable_users.json"
+DISABLED_USERS_FILE = "/var/lib/pg-limiter/disable_users.json"
 
 
 def load_disabled_users() -> dict:
