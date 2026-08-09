@@ -10,9 +10,8 @@ from ssl import SSLError
 
 try:
     import httpx
-except ImportError:
-    print("Module 'httpx' is not installed use: 'pip install httpx' to install it")
-    sys.exit()
+except ImportError as exc:
+    raise ImportError("Module 'httpx' is not installed. Use: 'pip install httpx'") from exc
 
 from utils.logs import logger, log_api_request, get_logger
 from utils.types import PanelType

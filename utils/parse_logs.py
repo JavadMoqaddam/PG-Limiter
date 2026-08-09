@@ -16,9 +16,8 @@ from utils.types import ConnectionInfo, DeviceInfo, UserType
 
 try:
     import httpx
-except ImportError:
-    print("Module 'httpx' is not installed use: 'pip install httpx' to install it")
-    sys.exit()
+except ImportError as exc:
+    raise ImportError("Module 'httpx' is not installed. Use: 'pip install httpx'") from exc
 
 INVALID_EMAILS = {
     "API]",

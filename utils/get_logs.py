@@ -12,11 +12,8 @@ from utils.parse_logs import INVALID_IPS
 
 try:
     import httpx
-except ImportError:
-    print(
-        "Module 'httpx' is not installed use: 'pip install httpx' to install it"
-    )
-    sys.exit()
+except ImportError as exc:
+    raise ImportError("Module 'httpx' is not installed. Use: 'pip install httpx'") from exc
 from telegram_bot.send_message import send_logs, edit_message
 from utils.logs import logger  # pylint: disable=ungrouped-imports
 from utils.panel_api import get_nodes, get_token
