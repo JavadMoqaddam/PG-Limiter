@@ -533,8 +533,6 @@ async def remove_disabled_user(username: str) -> bool:
     return True
 
 
-    return stats
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # REDIS PUB/SUB CACHE INVALIDATION (L1 RAM + L2 Redis Architecture)
