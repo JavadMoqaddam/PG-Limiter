@@ -3,7 +3,6 @@ This module contains functions to get logs from the nodes using SSE (Server-Sent
 """
 
 import asyncio
-import sys
 import time
 from asyncio import Task
 from datetime import datetime

@@ -4,7 +4,6 @@ Authentication and token management for panel API.
 
 import asyncio
 import random
-import sys
 import time
 from ssl import SSLError
 

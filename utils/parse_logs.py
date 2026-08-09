@@ -5,7 +5,6 @@ This module contains functions to parse and validate logs.
 import ipaddress
 import random
 import re
-import sys
 import time
 
 from cachetools import TTLCache
