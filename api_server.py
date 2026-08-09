@@ -109,7 +109,7 @@ def load_disabled_users() -> dict:
                     return {user: time.time() for user in old_users}
                 return old_users
             return {}
-    except:
+    except Exception:
         return {}
 
 def save_disabled_users(users: dict):
@@ -610,7 +610,7 @@ if __name__ == "__main__":
         api_config = config.get("api", {})
         host = api_config.get("host", "0.0.0.0")
         port = api_config.get("port", 8307)
-    except:
+    except Exception:
         host = "0.0.0.0"
         port = 8307
     
