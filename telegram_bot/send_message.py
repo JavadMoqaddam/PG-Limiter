@@ -166,7 +166,7 @@ async def send_logs(msg, return_message_id=False, reply_markup=None, topic_type:
         return first_message_info
     
     # Fallback to admin private chats ONLY if NO forum group is configured at all
-    
+    admins = await check_admin()
     if admins:
         for admin in admins:
             for attempt in range(retries):
@@ -430,7 +430,7 @@ async def send_user_message(msg: str, username: str, device_count: int, has_spec
         return
         
     # Fallback to admin private chats ONLY if NO forum group is configured at all
-    
+    admins = await check_admin()
     if admins:
         for admin in admins:
             for attempt in range(retries):
