@@ -13,4 +13,4 @@ sqlalchemy[asyncio]==2.0.51
 aiosqlite==0.22.1
 alembic==1.19.0
 # Caching
-redis==8.10.0
+redis==8.1.0
