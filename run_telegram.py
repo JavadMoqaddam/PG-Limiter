@@ -4,6 +4,7 @@ This module provides the function to run the Telegram bot in the background.
 """
 
 import asyncio
+from datetime import timedelta
 import os
 import json
 from telegram.ext import ApplicationBuilder
@@ -81,12 +82,13 @@ async def run_telegram_bot():
                 config = await asyncio.to_thread(get_auto_backup_config)
                 if config.get("enabled", True):
                     interval_hours = config.get("interval_hours", 1)
-                    interval_seconds = interval_hours * 3600
-                    
+                    async def _auto_backup_job(context):
+                        await send_automatic_backup()
+
                     job_queue.run_repeating(
-                        lambda context: send_automatic_backup(),
-                        interval=interval_seconds,
-                        first=interval_seconds,
+                        _auto_backup_job,
+                        interval=timedelta(hours=interval_hours),
+                        first=timedelta(hours=interval_hours),
                         name="automatic_backup"
                     )
                     telegram_runner_logger.info(f"✓ Automatic backup scheduled (every {interval_hours} hour(s))")

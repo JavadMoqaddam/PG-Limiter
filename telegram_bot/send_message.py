@@ -143,7 +143,7 @@ async def send_logs(msg, return_message_id=False, reply_markup=None, topic_type:
                 if thread_id:
                     kwargs["message_thread_id"] = thread_id
                     
-                sent_message = await application.bot.sendMessage(**kwargs)
+                sent_message = await application.bot.send_message(**kwargs)
                 
                 # Mark message as sent if key provided
                 if message_key:
@@ -171,7 +171,7 @@ async def send_logs(msg, return_message_id=False, reply_markup=None, topic_type:
         for admin in admins:
             for attempt in range(retries):
                 try:
-                    sent_message = await application.bot.sendMessage(
+                    sent_message = await application.bot.send_message(
                         chat_id=admin, text=msg, parse_mode="HTML",
                         reply_markup=reply_markup
                     )
@@ -415,7 +415,7 @@ async def send_user_message(msg: str, username: str, device_count: int, has_spec
                 if thread_id:
                     kwargs["message_thread_id"] = thread_id
                     
-                await application.bot.sendMessage(**kwargs)
+                await application.bot.send_message(**kwargs)
                 
                 # Mark message as sent for this user
                 await topics_manager.mark_message_sent(TopicType.NO_LIMIT, message_key)
@@ -435,7 +435,7 @@ async def send_user_message(msg: str, username: str, device_count: int, has_spec
         for admin in admins:
             for attempt in range(retries):
                 try:
-                    await application.bot.sendMessage(
+                    await application.bot.send_message(
                         chat_id=admin, 
                         text=msg, 
                         parse_mode="HTML",

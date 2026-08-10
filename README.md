@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/Python-3.12+-blue?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/License-AGPL--3.0-green" alt="License">
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/Version-0.9.8-orange" alt="Version">
@@ -80,7 +80,7 @@
 
 ## 📋 Requirements
 
-- **Python 3.10+**
+- **Python 3.12+**
 - **PasarGuard Panel** (latest version)
 - **Telegram Bot Token** (from [@BotFather](https://t.me/BotFather))
 - **Redis** (optional, but recommended for production)

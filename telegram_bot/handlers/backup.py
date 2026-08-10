@@ -9,7 +9,7 @@ import os
 import shutil
 import tempfile
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -928,12 +928,14 @@ async def reschedule_auto_backup(application):
         return
     
     interval_hours = config.get("interval_hours", 1)
-    interval_seconds = interval_hours * 3600
-    
+
+    async def _auto_backup_job(context):
+        await send_automatic_backup()
+
     job_queue.run_repeating(
-        lambda context: send_automatic_backup(),
-        interval=interval_seconds,
-        first=interval_seconds,
+        _auto_backup_job,
+        interval=timedelta(hours=interval_hours),
+        first=timedelta(hours=interval_hours),
         name="automatic_backup"
     )
     backup_logger.info(f"✓ Auto-backup scheduled (every {interval_hours} hour(s))")
