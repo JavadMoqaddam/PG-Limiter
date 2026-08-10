@@ -3,32 +3,65 @@ Telegram Bot Constants
 Contains callback data constants and conversation states.
 """
 
-# Conversation states
-(
-    GET_DOMAIN,
-    GET_PORT,
-    GET_USERNAME,
-    GET_PASSWORD,
-    GET_CONFIRMATION,
-    GET_CHAT_ID,
-    GET_SPECIAL_LIMIT,
-    GET_LIMIT_NUMBER,
-    GET_CHAT_ID_TO_REMOVE,
-    SET_COUNTRY_CODE,
-    SET_EXCEPT_USERS,
-    REMOVE_EXCEPT_USER,
-    GET_GENERAL_LIMIT_NUMBER,
-    GET_CHECK_INTERVAL,
-    GET_TIME_TO_ACTIVE_USERS,
-    SET_IPINFO_TOKEN,
-    SET_ENHANCED_DETAILS,
-    RESTORE_CONFIG,
-    WAITING_USERNAME_FOR_LIMIT,
-    SET_CDN_INBOUND,
-    SET_NODE_SETTINGS,
-    WAITING_GROUP_ID,
-    SET_GROUP_LIMIT,
-) = range(23)
+from enum import IntEnum
+
+
+class ConversationState(IntEnum):
+    """Conversation states for ConversationHandler.
+
+    Using IntEnum instead of range() unpacking ensures that
+    adding or removing a state does not silently shift all
+    subsequent values and break existing conversations.
+    """
+    GET_DOMAIN = 0
+    GET_PORT = 1
+    GET_USERNAME = 2
+    GET_PASSWORD = 3
+    GET_CONFIRMATION = 4
+    GET_CHAT_ID = 5
+    GET_SPECIAL_LIMIT = 6
+    GET_LIMIT_NUMBER = 7
+    GET_CHAT_ID_TO_REMOVE = 8
+    SET_COUNTRY_CODE = 9
+    SET_EXCEPT_USERS = 10
+    REMOVE_EXCEPT_USER = 11
+    GET_GENERAL_LIMIT_NUMBER = 12
+    GET_CHECK_INTERVAL = 13
+    GET_TIME_TO_ACTIVE_USERS = 14
+    SET_IPINFO_TOKEN = 15
+    SET_ENHANCED_DETAILS = 16
+    RESTORE_CONFIG = 17
+    WAITING_USERNAME_FOR_LIMIT = 18
+    SET_CDN_INBOUND = 19
+    SET_NODE_SETTINGS = 20
+    WAITING_GROUP_ID = 21
+    SET_GROUP_LIMIT = 22
+
+
+# Re-export as module-level names for backward compatibility
+GET_DOMAIN = ConversationState.GET_DOMAIN
+GET_PORT = ConversationState.GET_PORT
+GET_USERNAME = ConversationState.GET_USERNAME
+GET_PASSWORD = ConversationState.GET_PASSWORD
+GET_CONFIRMATION = ConversationState.GET_CONFIRMATION
+GET_CHAT_ID = ConversationState.GET_CHAT_ID
+GET_SPECIAL_LIMIT = ConversationState.GET_SPECIAL_LIMIT
+GET_LIMIT_NUMBER = ConversationState.GET_LIMIT_NUMBER
+GET_CHAT_ID_TO_REMOVE = ConversationState.GET_CHAT_ID_TO_REMOVE
+SET_COUNTRY_CODE = ConversationState.SET_COUNTRY_CODE
+SET_EXCEPT_USERS = ConversationState.SET_EXCEPT_USERS
+REMOVE_EXCEPT_USER = ConversationState.REMOVE_EXCEPT_USER
+GET_GENERAL_LIMIT_NUMBER = ConversationState.GET_GENERAL_LIMIT_NUMBER
+GET_CHECK_INTERVAL = ConversationState.GET_CHECK_INTERVAL
+GET_TIME_TO_ACTIVE_USERS = ConversationState.GET_TIME_TO_ACTIVE_USERS
+SET_IPINFO_TOKEN = ConversationState.SET_IPINFO_TOKEN
+SET_ENHANCED_DETAILS = ConversationState.SET_ENHANCED_DETAILS
+RESTORE_CONFIG = ConversationState.RESTORE_CONFIG
+WAITING_USERNAME_FOR_LIMIT = ConversationState.WAITING_USERNAME_FOR_LIMIT
+SET_CDN_INBOUND = ConversationState.SET_CDN_INBOUND
+SET_NODE_SETTINGS = ConversationState.SET_NODE_SETTINGS
+WAITING_GROUP_ID = ConversationState.WAITING_GROUP_ID
+SET_GROUP_LIMIT = ConversationState.SET_GROUP_LIMIT
 
 
 class CallbackData:
