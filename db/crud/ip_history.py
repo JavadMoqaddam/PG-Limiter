@@ -2,7 +2,7 @@
 IP History CRUD operations.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 
 from sqlalchemy import select, delete, and_
@@ -35,7 +35,7 @@ class IPHistoryCRUD:
         history = result.scalar_one_or_none()
         
         if history:
-            history.last_seen = datetime.utcnow()
+            history.last_seen = datetime.now(timezone.utc)
             history.connection_count += 1
             if node_name:
                 history.node_name = node_name
@@ -59,7 +59,7 @@ class IPHistoryCRUD:
     async def get_user_ips(db: AsyncSession, username: str, hours: int = 24) -> List[IPHistory]:
         """Get IPs for a user within the specified hours."""
         db_ip_logger.debug(f"🔍 Getting IPs for {username} (last {hours}h)")
-        cutoff = datetime.utcnow() - timedelta(hours=hours)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         result = await db.execute(
             select(IPHistory)
             .where(
@@ -78,7 +78,7 @@ class IPHistoryCRUD:
     async def cleanup_old(db: AsyncSession, days: int = 7) -> int:
         """Remove IP history older than specified days."""
         db_ip_logger.debug(f"🧹 Cleaning up IP history older than {days} days")
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         result = await db.execute(delete(IPHistory).where(IPHistory.last_seen < cutoff))
         if result.rowcount > 0:
             db_ip_logger.info(f"✅ Cleaned up {result.rowcount} old IP records")

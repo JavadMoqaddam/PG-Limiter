@@ -4,7 +4,7 @@ Periodically syncs users from the panel to local database for efficient filterin
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from utils.logs import get_logger
@@ -383,7 +383,7 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
     
     try:
         sync_logger.info("🔄 Starting user sync from panel to database...")
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         
         # Fetch ALL users from panel (all statuses) to avoid losing disabled users
         users = await get_all_users_with_details(panel_data, status=None)
@@ -555,8 +555,8 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
             
             await db.commit()
         
-        elapsed = (datetime.utcnow() - start_time).total_seconds()
-        _last_sync_time = datetime.utcnow()
+        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+        _last_sync_time = datetime.now(timezone.utc)
         
         sync_logger.info(
             f"✅ User sync completed: {synced} synced, {deleted} deleted, "
@@ -790,7 +790,7 @@ async def is_sync_needed(sync_interval_minutes: int) -> bool:
     if _last_sync_time is None:
         return True
     
-    elapsed = (datetime.utcnow() - _last_sync_time).total_seconds()
+    elapsed = (datetime.now(timezone.utc) - _last_sync_time).total_seconds()
     return elapsed >= sync_interval_minutes * 60
 
 

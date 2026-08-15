@@ -2,7 +2,7 @@
 Subnet ISP Cache CRUD operations.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from sqlalchemy import select, delete, func
@@ -78,7 +78,7 @@ class SubnetISPCRUD:
             existing.region = region
             existing.asn = asn
             existing.as_name = as_name
-            existing.cached_at = datetime.utcnow()
+            existing.cached_at = datetime.now(timezone.utc)
             existing.hit_count += 1
             return existing
         
@@ -116,7 +116,7 @@ class SubnetISPCRUD:
     async def cleanup_old(db: AsyncSession, days: int = 30) -> int:
         """Remove cache entries older than specified days."""
         db_isp_logger.debug(f"🧹 Cleaning up ISP cache older than {days} days")
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         result = await db.execute(delete(SubnetISP).where(SubnetISP.cached_at < cutoff))
         if result.rowcount > 0:
             db_isp_logger.info(f"✅ Cleaned up {result.rowcount} old ISP cache entries")

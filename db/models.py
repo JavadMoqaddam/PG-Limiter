@@ -3,7 +3,7 @@ Database Models for PG-Limiter
 SQLAlchemy models for all database tables.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from sqlalchemy import (
     Column,
@@ -18,6 +18,11 @@ from sqlalchemy import (
     JSON,
 )
 from sqlalchemy.orm import relationship, DeclarativeBase
+
+
+def utc_now() -> datetime:
+    """Return timezone-aware current UTC datetime (Python 3.12+ compliant)."""
+    return datetime.now(timezone.utc)
 
 
 class Base(DeclarativeBase):
@@ -52,10 +57,10 @@ class User(Base):
     data_limit = Column(Float, nullable=True)  # GB
     used_traffic = Column(Float, default=0)  # GB
     
-    # Timestamps
-    created_at = Column(DateTime, default=datetime.utcnow)
+    # Timestamps (ISO datetime objects)
+    created_at = Column(DateTime, default=utc_now)
     expire_at = Column(DateTime, nullable=True)
-    last_synced_at = Column(DateTime, default=datetime.utcnow)
+    last_synced_at = Column(DateTime, default=utc_now)
     
     # Extra data from panel
     note = Column(Text, nullable=True)
@@ -115,8 +120,8 @@ class UserLimit(Base):
     username = Column(String(255), unique=True, nullable=False, index=True)
     limit = Column(Integer, nullable=False, default=2)
     
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
     
     def __repr__(self):
         return f"<UserLimit(username='{self.username}', limit={self.limit})>"
@@ -133,7 +138,7 @@ class ExceptUser(Base):
     username = Column(String(255), unique=True, nullable=False, index=True)
     reason = Column(Text, nullable=True)
     
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     created_by = Column(String(255), nullable=True)
     
     def __repr__(self):
@@ -182,7 +187,7 @@ class SubnetISP(Base):
     as_name = Column(String(255), nullable=True)
     
     # Cache metadata
-    cached_at = Column(DateTime, default=datetime.utcnow)
+    cached_at = Column(DateTime, default=utc_now)
     hit_count = Column(Integer, default=1)  # How many times this cache was used
     
     __table_args__ = (
@@ -243,7 +248,7 @@ class Config(Base):
     key = Column(String(255), unique=True, nullable=False, index=True)
     value = Column(JSON, nullable=True)  # Can store any JSON-serializable value
     
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
     
     def __repr__(self):
         return f"<Config(key='{self.key}')>"
@@ -265,8 +270,8 @@ class IPHistory(Base):
     inbound_protocol = Column(String(100), nullable=True)
     
     # Timestamps
-    first_seen = Column(DateTime, default=datetime.utcnow)
-    last_seen = Column(DateTime, default=datetime.utcnow)
+    first_seen = Column(DateTime, default=utc_now)
+    last_seen = Column(DateTime, default=utc_now)
     
     # Connection count
     connection_count = Column(Integer, default=1)
@@ -303,7 +308,7 @@ class AdminPattern(Base):
     description = Column(Text, nullable=True)
     
     # Timestamps
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     
     __table_args__ = (
         Index("ix_admin_patterns_admin", "admin_username"),
@@ -338,7 +343,7 @@ class LimitPattern(Base):
     description = Column(Text, nullable=True)
     
     # Timestamps
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     
     __table_args__ = (
         Index("ix_limit_patterns_type", "pattern_type"),

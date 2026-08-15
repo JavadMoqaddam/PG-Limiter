@@ -2,7 +2,7 @@
 Config CRUD operations (key-value store).
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,7 +26,7 @@ class ConfigCRUD:
         if config:
             db_config_logger.debug(f"✏️ Updating config: {key}")
             config.value = value
-            config.updated_at = datetime.utcnow()
+            config.updated_at = datetime.now(timezone.utc)
         else:
             db_config_logger.debug(f"➕ Creating config: {key}")
             config = Config(key=key, value=value)

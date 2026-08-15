@@ -4,7 +4,7 @@ Handles all user-related operations including exceptions, limits, and disable st
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 
 from sqlalchemy import select, delete
@@ -55,7 +55,7 @@ class UserCRUD:
             user.used_traffic = used_traffic
             user.expire_at = expire_at
             user.note = note
-            user.last_synced_at = datetime.utcnow()
+            user.last_synced_at = datetime.now(timezone.utc)
         else:
             db_users_logger.debug(f"➕ Creating new user: {username}")
             user = User(
@@ -226,7 +226,7 @@ class UserCRUD:
         user.is_excepted = excepted
         user.exception_reason = reason if excepted else None
         user.excepted_by = excepted_by if excepted else None
-        user.excepted_at = datetime.utcnow() if excepted else None
+        user.excepted_at = datetime.now(timezone.utc) if excepted else None
         
         await db.flush()
         action = "added to" if excepted else "removed from"
@@ -302,7 +302,7 @@ class UserCRUD:
                 return None
         
         user.special_limit = limit
-        user.special_limit_updated_at = datetime.utcnow() if limit is not None else None
+        user.special_limit_updated_at = datetime.now(timezone.utc) if limit is not None else None
         
         await db.flush()
         if limit is not None:
@@ -555,7 +555,7 @@ class UserCRUD:
         db_users_logger.info(f"⚡ Bulk upserting {len(users_data)} users to SQLite")
         chunk_size = 500
         count = 0
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         
         for i in range(0, len(users_data), chunk_size):
             chunk = users_data[i:i + chunk_size]
