@@ -155,7 +155,7 @@ Docker volumes:
 
 ```bash
 # Option 1: Use system package (Ubuntu/Debian)
-sudo apt install python3-httpx python3-aiohttp
+sudo apt install python3-httpx
 
 # Option 2: Use --break-system-packages
 pip3 install -r requirements.txt --break-system-packages

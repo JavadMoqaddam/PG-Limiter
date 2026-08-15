@@ -5,8 +5,8 @@ Uses Redis cache when available for fast lookups, with fallback to in-memory and
 """
 
 import asyncio
-import aiohttp
 from typing import Dict, Optional, Tuple
+import httpx
 from utils.logs import logger
 
 # Try to import Redis cache
@@ -51,7 +51,7 @@ class ISPDetector:
         self.rate_limit_delay = 1  # 1 second delay between requests
         self.last_request_time = 0
         self.rate_limited = False  # Track if we're rate limited
-        self._session = None  # Shared aiohttp session
+        self._client: Optional[httpx.AsyncClient] = None  # Shared httpx AsyncClient
         self._db_cache = get_db_subnet_cache() if self.use_db_cache else None
         
         if self.use_db_cache:
@@ -69,19 +69,22 @@ class ISPDetector:
             self.rate_limited = False
             logger.info(f"🔑 ISPDetector token updated: {token[:20]}...")
     
-    async def _get_session(self):
-        """Get or create the shared aiohttp session"""
-        if self._session is None or self._session.closed:
-            # Create session with connection limits
-            connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
-            self._session = aiohttp.ClientSession(connector=connector)
-        return self._session
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Get or create the shared httpx AsyncClient"""
+        if self._client is None or self._client.is_closed:
+            # Create client with connection limits
+            limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+            self._client = httpx.AsyncClient(limits=limits, timeout=8.0)
+        return self._client
+    
+    # Backwards compatibility alias
+    _get_session = _get_client
     
     async def close(self):
-        """Close the aiohttp session"""
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+        """Close the httpx AsyncClient"""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
     
     async def get_isp_info(self, ip: str) -> Dict[str, str]:
         """
@@ -94,7 +97,11 @@ class ISPDetector:
         Returns:
             Dict[str, str]: Dictionary containing ISP information
         """
-        # Check Redis cache first (fastest)
+        # Check in-memory cache first (instant)
+        if ip in self.cache:
+            return self.cache[ip]
+
+        # Check Redis cache (fast)
         if REDIS_CACHE_AVAILABLE:
             try:
                 async with asyncio.timeout(2):  # 2 second Redis timeout
@@ -152,42 +159,40 @@ class ISPDetector:
             else:
                 logger.debug(f"ISP lookup for {ip} without token")
             
-            session = await self._get_session()
-            # Wrap entire API call in timeout
-            async with asyncio.timeout(10):
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        # Prefer as_domain, fallback to as_name, then org
-                        isp_name = data.get("as_domain") or data.get("as_name") or data.get("org", "Unknown ISP")
-                        logger.debug(f"ISP detected for {ip}: {isp_name}")
-                        isp_info = {
-                            "ip": ip,
-                            "isp": isp_name,
-                            "country": data.get("country", "Unknown"),
-                            "city": data.get("city", "Unknown"),
-                            "region": data.get("region", "Unknown")
-                        }
-                        self.cache[ip] = isp_info
-                        self.last_request_time = asyncio.get_event_loop().time()
-                        # Save to all caches (Redis + database) - don't await, fire and forget
-                        asyncio.create_task(self._cache_isp_result(ip, isp_info))
-                        return isp_info
-                    elif response.status == 429:
-                        # Rate limited - set flag and return default
-                        self.rate_limited = True
-                        logger.warning(f"ISP detection rate limited for {ip}")
-                    elif response.status == 403:
-                        # Forbidden - try fallback API
-                        logger.warning(f"ipinfo.io returned 403 for {ip}, trying fallback API...")
-                        result = await self._get_isp_fallback(ip)
-                        asyncio.create_task(self._cache_isp_result(ip, result))
-                        return result
-                    else:
-                        response_text = await response.text()
-                        logger.warning(f"Failed to get ISP info for {ip}: HTTP {response.status} - {response_text[:100]}")
-                        
-        except asyncio.TimeoutError:
+            client = await self._get_client()
+            response = await client.get(url, headers=headers, timeout=8.0)
+            if response.status_code == 200:
+                data = response.json()
+                # Prefer as_domain, fallback to as_name, then org
+                isp_name = data.get("as_domain") or data.get("as_name") or data.get("org", "Unknown ISP")
+                logger.debug(f"ISP detected for {ip}: {isp_name}")
+                isp_info = {
+                    "ip": ip,
+                    "isp": isp_name,
+                    "country": data.get("country", "Unknown"),
+                    "city": data.get("city", "Unknown"),
+                    "region": data.get("region", "Unknown")
+                }
+                self.cache[ip] = isp_info
+                self.last_request_time = asyncio.get_event_loop().time()
+                # Save to all caches (Redis + database) - don't await, fire and forget
+                asyncio.create_task(self._cache_isp_result(ip, isp_info))
+                return isp_info
+            elif response.status_code == 429:
+                # Rate limited - set flag and return default
+                self.rate_limited = True
+                logger.warning(f"ISP detection rate limited for {ip}")
+            elif response.status_code == 403:
+                # Forbidden - try fallback API
+                logger.warning(f"ipinfo.io returned 403 for {ip}, trying fallback API...")
+                result = await self._get_isp_fallback(ip)
+                asyncio.create_task(self._cache_isp_result(ip, result))
+                return result
+            else:
+                response_text = response.text
+                logger.warning(f"Failed to get ISP info for {ip}: HTTP {response.status_code} - {response_text[:100]}")
+                
+        except (httpx.TimeoutException, asyncio.TimeoutError):
             logger.warning(f"⏱️ Timeout getting ISP info for {ip}, trying fallback...")
             # Try fallback on timeout - don't wait for cache
             result = await self._get_isp_fallback(ip)
@@ -261,32 +266,30 @@ class ISPDetector:
         try:
             url = f"http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,region,regionName,city,isp,org,as,asname"
             
-            session = await self._get_session()
-            # Wrap in timeout to prevent hanging
-            async with asyncio.timeout(8):  # 8 second timeout for API call
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if data.get("status") == "success":
-                            # Prefer asname, fallback to isp, then org
-                            isp_name = data.get("asname") or data.get("isp") or data.get("org", "Unknown ISP")
-                            isp_info = {
-                                "ip": ip,
-                                "isp": isp_name,
-                                "country": data.get("countryCode", "Unknown"),
-                                "city": data.get("city", "Unknown"),
-                                "region": data.get("regionName", "Unknown")
-                            }
-                            logger.debug(f"✓ Fallback API success for {ip}: {isp_info['isp']}")
-                            self.cache[ip] = isp_info
-                            return isp_info
-                        else:
-                            logger.warning(f"Fallback API returned failure for {ip}: {data.get('message', 'unknown')}")
-                    elif response.status == 429:
-                        logger.warning(f"Fallback API rate limited for {ip}")
-                    else:
-                        logger.warning(f"Fallback API HTTP {response.status} for {ip}")
-        except asyncio.TimeoutError:
+            client = await self._get_client()
+            response = await client.get(url, timeout=8.0)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("status") == "success":
+                    # Prefer asname, fallback to isp, then org
+                    isp_name = data.get("asname") or data.get("isp") or data.get("org", "Unknown ISP")
+                    isp_info = {
+                        "ip": ip,
+                        "isp": isp_name,
+                        "country": data.get("countryCode", "Unknown"),
+                        "city": data.get("city", "Unknown"),
+                        "region": data.get("regionName", "Unknown")
+                    }
+                    logger.debug(f"✓ Fallback API success for {ip}: {isp_info['isp']}")
+                    self.cache[ip] = isp_info
+                    return isp_info
+                else:
+                    logger.warning(f"Fallback API returned failure for {ip}: {data.get('message', 'unknown')}")
+            elif response.status_code == 429:
+                logger.warning(f"Fallback API rate limited for {ip}")
+            else:
+                logger.warning(f"Fallback API HTTP {response.status_code} for {ip}")
+        except (httpx.TimeoutException, asyncio.TimeoutError):
             logger.warning(f"Fallback API timeout for {ip}")
         except Exception as e:
             logger.warning(f"Fallback API error for {ip}: {type(e).__name__}: {str(e)[:100]}")
@@ -364,27 +367,27 @@ class ISPDetector:
         logger.info(f"🔍 ISP lookup: Aggregated {total_uncached_ips} IPs into {len(uncached_subnets)} /24 subnets")
         semaphore = asyncio.Semaphore(3)
 
-        session = await self._get_session()
+        client = await self._get_client()
 
         async def lookup_subnet(subnet_key: str, sample_ip: str) -> Tuple[str, Dict[str, str]]:
             async with semaphore:
                 try:
                     url = f"http://ip-api.com/json/{sample_ip}?fields=status,country,countryCode,regionName,city,isp,org,asname"
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            if data.get("status") == "success":
-                                isp_name = data.get("asname") or data.get("isp") or data.get("org") or "Unknown ISP"
-                                info = {
-                                    "ip": sample_ip,
-                                    "isp": isp_name,
-                                    "country": data.get("countryCode", "Unknown"),
-                                    "city": data.get("city", "Unknown"),
-                                    "region": data.get("regionName", "Unknown")
-                                }
-                                self.cache[subnet_key] = info
-                                asyncio.create_task(self._save_to_db_cache(sample_ip, info))
-                                return subnet_key, info
+                    response = await client.get(url, timeout=4.0)
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data.get("status") == "success":
+                            isp_name = data.get("asname") or data.get("isp") or data.get("org") or "Unknown ISP"
+                            info = {
+                                "ip": sample_ip,
+                                "isp": isp_name,
+                                "country": data.get("countryCode", "Unknown"),
+                                "city": data.get("city", "Unknown"),
+                                "region": data.get("regionName", "Unknown")
+                            }
+                            self.cache[subnet_key] = info
+                            asyncio.create_task(self._save_to_db_cache(sample_ip, info))
+                            return subnet_key, info
                 except Exception:
                     pass
                 

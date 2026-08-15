@@ -8,7 +8,7 @@ On newer Linux distributions (Ubuntu 23.04+, Fedora 38+), you might encounter "e
 
 ```bash
 sudo apt update
-sudo apt install python3-httpx python3-aiohttp python3-requests
+sudo apt install python3-httpx
 ```
 
 ### Option 2: Break System Packages Flag
