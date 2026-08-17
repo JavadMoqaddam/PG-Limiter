@@ -12,9 +12,9 @@ trust_logger = get_logger("trust_score")
 
 
 @dataclass
-class UserWarning:
+class UserLimitWarning:
     """
-    Represents a warning for a user who exceeded limits
+    Represents a limit violation warning for a user with behavior analysis & trust score.
     """
     username: str
     ip_count: int
@@ -343,3 +343,7 @@ class UserWarning:
             patterns.append(f"⚠️ {self.previous_warnings_24h} disables in 24h")
         
         return " | ".join(patterns) if patterns else "No specific pattern detected"
+
+
+# Backward compatibility alias
+UserWarning = UserLimitWarning

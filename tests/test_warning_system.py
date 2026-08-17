@@ -12,13 +12,14 @@ from unittest.mock import patch, AsyncMock, MagicMock
 
 
 class TestUserWarning:
-    """Tests for UserWarning class"""
+    """Tests for UserLimitWarning class"""
     
     def test_warning_creation(self):
         """Test creating a user warning"""
-        from utils.warning_system.user_warning import UserWarning
+        from utils.warning_system.user_warning import UserLimitWarning, UserWarning
         
-        warning = UserWarning(
+        # Test main class
+        warning = UserLimitWarning(
             username="test_user",
             ip_count=5,
             ips={"1.1.1.1", "2.2.2.2", "3.3.3.3"},
@@ -29,13 +30,15 @@ class TestUserWarning:
         assert warning.username == "test_user"
         assert warning.ip_count == 5
         assert len(warning.ips) == 3
+        # Test backward-compatible alias
+        assert UserWarning is UserLimitWarning
     
     def test_monitoring_active(self):
         """Test monitoring period is active"""
-        from utils.warning_system.user_warning import UserWarning
+        from utils.warning_system.user_warning import UserLimitWarning
         
         current_time = time.time()
-        warning = UserWarning(
+        warning = UserLimitWarning(
             username="test_user",
             ip_count=5,
             ips={"1.1.1.1"},
@@ -47,10 +50,10 @@ class TestUserWarning:
     
     def test_monitoring_expired(self):
         """Test monitoring period expired"""
-        from utils.warning_system.user_warning import UserWarning
+        from utils.warning_system.user_warning import UserLimitWarning
         
         current_time = time.time()
-        warning = UserWarning(
+        warning = UserLimitWarning(
             username="test_user",
             ip_count=5,
             ips={"1.1.1.1"},
@@ -62,10 +65,10 @@ class TestUserWarning:
     
     def test_time_remaining(self):
         """Test time remaining calculation"""
-        from utils.warning_system.user_warning import UserWarning
+        from utils.warning_system.user_warning import UserLimitWarning
         
         current_time = time.time()
-        warning = UserWarning(
+        warning = UserLimitWarning(
             username="test_user",
             ip_count=5,
             ips={"1.1.1.1"},

@@ -13,7 +13,7 @@ from datetime import datetime
 
 from utils.logs import logger, log_monitoring_event, get_logger
 from utils.types import PanelType, UserType
-from utils.warning_system.user_warning import UserWarning
+from utils.warning_system.user_warning import UserLimitWarning
 from utils.warning_system.helpers import (
     safe_send_logs,
     safe_send_warning_log,
@@ -45,7 +45,7 @@ class EnhancedWarningSystem:
     ):
         self.filename = filename
         self.history_filename = history_filename
-        self.warnings: Dict[str, UserWarning] = {}
+        self.warnings: Dict[str, UserLimitWarning] = {}
         self.warning_history: Dict[str, list] = {}
         self.monitoring_period = 180  # 3 minutes in seconds
         self._write_lock = asyncio.Lock()
@@ -180,7 +180,7 @@ class EnhancedWarningSystem:
                         ip_last_seen = warning_data.get("ip_last_seen", {})
                         ip_seen_count = warning_data.get("ip_seen_count", {})
                         
-                        warning = UserWarning(
+                        warning = UserLimitWarning(
                             username=warning_data["username"],
                             ip_count=warning_data["ip_count"],
                             ips=set(warning_data["ips"]),
@@ -324,7 +324,7 @@ class EnhancedWarningSystem:
         
         same_ip_multiple_inbounds = any(len(inbounds) > 1 for inbounds in ip_to_inbounds.values())
         
-        warning = UserWarning(
+        warning = UserLimitWarning(
             username=username,
             ip_count=ip_count,
             ips=ips,

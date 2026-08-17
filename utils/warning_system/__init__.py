@@ -17,8 +17,8 @@ from utils.warning_system.helpers import (
     safe_disable_user_with_punishment,
 )
 
-# Import UserWarning dataclass
-from utils.warning_system.user_warning import UserWarning
+# Import UserLimitWarning dataclass (with UserWarning alias)
+from utils.warning_system.user_warning import UserLimitWarning, UserWarning
 
 # Import EnhancedWarningSystem and global instance
 from utils.warning_system.enhanced_system import (
@@ -33,7 +33,8 @@ __all__ = [
     "safe_send_disable_notification",
     "safe_disable_user",
     "safe_disable_user_with_punishment",
-    # UserWarning
+    # UserWarning / UserLimitWarning
+    "UserLimitWarning",
     "UserWarning",
     # EnhancedWarningSystem
     "EnhancedWarningSystem",
