@@ -221,118 +221,65 @@ async def get_all_panel_users(
         filter_desc.append(f"search={search}")
     filter_str = f" ({', '.join(filter_desc)})" if filter_desc else ""
     users_logger.debug(f"📋 Fetching panel users with pagination{filter_str}...")
-    max_attempts = 5
+    
+    from utils.panel_api.request_helper import panel_get
+    
     all_usernames = set()
     limit = 100
+    offset = 0
     
-    for attempt in range(max_attempts):
-        all_usernames.clear()
-        offset = 0
+    while True:
+        params = {"offset": offset, "limit": limit}
+        if status:
+            params["status"] = status
+        if admin:
+            params["admin"] = admin
+        if group:
+            params["group"] = group
+        if search:
+            params["search"] = search
+
+        response = await panel_get(
+            panel_data,
+            "/api/users",
+            params=params,
+            timeout=30.0,
+            max_retries=3,
+        )
         
-        force_refresh = attempt > 0
-        get_panel_token = await get_token(panel_data, force_refresh=force_refresh)
-        if isinstance(get_panel_token, ValueError):
-            raise get_panel_token
-        token = get_panel_token.panel_token
-        headers = {
-            "Authorization": f"Bearer {token}",
-        }
-        
-        pagination_success = True
-        while pagination_success:
-            page_success = False
-            for scheme in ["https", "http"]:
-                # Build query parameters
-                params = [f"offset={offset}", f"limit={limit}"]
-                if status:
-                    params.append(f"status={status}")
-                if admin:
-                    for a in admin:
-                        params.append(f"admin={a}")
-                if group:
-                    for g in group:
-                        params.append(f"group={g}")
-                if search:
-                    params.append(f"search={search}")
-                query_string = "&".join(params)
-                url = f"{scheme}://{panel_data.panel_domain}/api/users?{query_string}"
-                start_time = time.perf_counter()
-                try:
-                    async with httpx.AsyncClient(verify=False) as client:
-                        response = await client.get(url, headers=headers, timeout=30)
-                        elapsed = (time.perf_counter() - start_time) * 1000
-                        response.raise_for_status()
-                    
-                    log_api_request("GET", url, response.status_code, elapsed)
-                    
-                    try:
-                        data = response.json()
-                    except Exception as json_error:
-                        users_logger.error(f"Failed to parse JSON from {url}: {json_error}")
-                        continue
-                    
-                    users = []
-                    if isinstance(data, dict) and "users" in data:
-                        users = data["users"]
-                        total = data.get("total", len(users))
-                    elif isinstance(data, list):
-                        users = data
-                        total = len(users)
-                    else:
-                        users_logger.error(f"Unexpected users response format: {type(data)}")
-                        continue
-                    
-                    for user in users:
-                        if isinstance(user, dict) and "username" in user:
-                            all_usernames.add(user["username"])
-                    
-                    users_logger.debug(f"📋 Page fetched: offset={offset}, got {len(users)} users, total: {len(all_usernames)}")
-                    
-                    if len(users) < limit or offset + len(users) >= total:
-                        users_logger.info(f"📋 Fetched {len(all_usernames)} users from panel (total: {total})")
-                        return all_usernames
-                    
-                    offset += limit
-                    page_success = True
-                    break
-                    
-                except SSLError:
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    log_api_request("GET", url, None, elapsed, "SSL Error")
-                    continue
-                except httpx.HTTPStatusError:
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    if response.status_code == 401:
-                        await invalidate_token_cache()
-                        users_logger.warning("Got 401 error, invalidating token cache and retrying")
-                    log_api_request("GET", url, response.status_code, elapsed, f"HTTP {response.status_code}")
-                    message = f"[{response.status_code}] {response.text}"
-                    users_logger.error(message)
-                    continue
-                except httpx.TimeoutException:
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    log_api_request("GET", url, None, elapsed, "Timeout")
-                    users_logger.warning(f"Timeout fetching page at offset {offset}")
-                    continue
-                except Exception as error:
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    log_api_request("GET", url, None, elapsed, str(error))
-                    message = f"An unexpected error occurred: {error}"
-                    users_logger.error(message)
-                    continue
+        if response is None:
+            message = f"Failed to get users page at offset {offset}"
+            users_logger.error(message)
+            raise ValueError(message)
             
-            if not page_success:
-                pagination_success = False
-                users_logger.warning(f"Failed to fetch page at offset {offset}, will retry attempt")
-                break
+        try:
+            data = response.json()
+        except Exception as json_error:
+            users_logger.error(f"Failed to parse JSON from panel /api/users: {json_error}")
+            raise ValueError(f"Invalid JSON response: {json_error}")
+            
+        users = []
+        if isinstance(data, dict) and "users" in data:
+            users = data["users"]
+            total = data.get("total", len(users))
+        elif isinstance(data, list):
+            users = data
+            total = len(users)
+        else:
+            users_logger.error(f"Unexpected users response format: {type(data)}")
+            break
+            
+        for user in users:
+            if isinstance(user, dict) and "username" in user:
+                all_usernames.add(user["username"])
+                
+        users_logger.debug(f"📋 Page fetched: offset={offset}, got {len(users)} users, total: {len(all_usernames)}")
         
-        wait_time = min(30, random.randint(2, 5) * (attempt + 1))
-        users_logger.debug(f"Waiting {wait_time}s before retry...")
-        await asyncio.sleep(wait_time)
-    
-    message = f"Failed to get all users after {max_attempts} attempts."
-    users_logger.error(message)
-    raise ValueError(message)
+        if len(users) < limit or offset + len(users) >= total:
+            users_logger.info(f"📋 Fetched {len(all_usernames)} users from panel (total: {total})")
+            return all_usernames
+            
+        offset += limit
 
 
 async def check_user_exists(panel_data: PanelType, username: str) -> bool:
@@ -350,35 +297,20 @@ async def check_user_exists(panel_data: PanelType, username: str) -> bool:
     users_logger.debug(f"👤 Checking if user exists: {username}")
     from utils.panel_api.request_helper import panel_get
     
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        force_refresh = attempt > 0
-        
-        response = await panel_get(
-            panel_data,
-            f"/api/user/{username}",
-            force_refresh=force_refresh,
-            timeout=10.0,
-            max_retries=2
-        )
-        
-        if response is not None:
-            if response.status_code == 200:
-                users_logger.debug(f"👤 User {username} exists")
-                return True
-            elif response.status_code == 404:
-                users_logger.debug(f"👤 User {username} not found")
-                return False
-            elif response.status_code == 401:
-                await invalidate_token_cache()
-                users_logger.warning("Got 401 error, invalidating token cache and retrying")
-                continue
-        
-        users_logger.warning(f"Attempt {attempt + 1}/{max_attempts} failed")
-        
-        if attempt < max_attempts - 1:
-            wait_time = min(10, random.randint(1, 3) * (attempt + 1))
-            await asyncio.sleep(wait_time)
+    response = await panel_get(
+        panel_data,
+        f"/api/user/{username}",
+        timeout=10.0,
+        max_retries=2,
+    )
+    
+    if response is not None:
+        if response.status_code == 200:
+            users_logger.debug(f"👤 User {username} exists")
+            return True
+        elif response.status_code == 404:
+            users_logger.debug(f"👤 User {username} not found")
+            return False
     
     users_logger.warning(f"Could not verify if user {username} exists, assuming exists")
     return True
@@ -488,41 +420,26 @@ async def update_user_groups(panel_data: PanelType, username: str, group_ids: li
     from utils.panel_api.request_helper import panel_put
     
     users_logger.info(f"👥 Updating groups for user {username} to {group_ids}")
-    max_attempts = 3
+    payload = {"group_ids": group_ids}
     
-    for attempt in range(max_attempts):
-        force_refresh = attempt > 0
-        payload = {"group_ids": group_ids}
-        
-        response = await panel_put(
-            panel_data,
-            f"/api/user/{username}",
-            json_data=payload,
-            force_refresh=force_refresh,
-            timeout=15.0,
-            max_retries=2
-        )
-        
-        if response is not None:
-            if response.status_code in (200, 201):
-                log_user_action("UPDATE_GROUPS", username, f"groups={group_ids}", success=True)
-                users_logger.info(f"👥 Updated groups for user {username} to {group_ids}")
-                return True
-            elif response.status_code == 401:
-                await invalidate_token_cache()
-                users_logger.warning("Got 401 error, retrying...")
-                continue
-            elif response.status_code == 404:
-                users_logger.warning(f"User {username} not found")
-                return False
-        
-        users_logger.warning(f"Attempt {attempt + 1}/{max_attempts} failed")
-        
-        if attempt < max_attempts - 1:
-            wait_time = min(10, random.randint(1, 3) * (attempt + 1))
-            await asyncio.sleep(wait_time)
+    response = await panel_put(
+        panel_data,
+        f"/api/user/{username}",
+        json_data=payload,
+        timeout=15.0,
+        max_retries=3,
+    )
     
-    message = f"Failed to update groups for user {username} after {max_attempts} attempts."
+    if response is not None:
+        if response.status_code in (200, 201):
+            log_user_action("UPDATE_GROUPS", username, f"groups={group_ids}", success=True)
+            users_logger.info(f"👥 Updated groups for user {username} to {group_ids}")
+            return True
+        elif response.status_code == 404:
+            users_logger.warning(f"User {username} not found")
+            return False
+    
+    message = f"Failed to update groups for user {username}"
     log_user_action("UPDATE_GROUPS", username, message, success=False)
     users_logger.error(message)
     return False
@@ -538,63 +455,38 @@ async def enable_all_user(panel_data: PanelType) -> None | ValueError:
 
     Returns:
         None
-
-    Raises:
-        ValueError: If the function fails to enable the users on both the HTTP
-        and HTTPS endpoints.
     """
+    from utils.panel_api.request_helper import panel_put
+    
     users_logger.info("✅ Enabling all users...")
-    get_panel_token = await get_token(panel_data)
-    if isinstance(get_panel_token, ValueError):
-        raise get_panel_token
-    token = get_panel_token.panel_token
-    headers = {
-        "Authorization": f"Bearer {token}",
-    }
     users = await all_user(panel_data)
     if isinstance(users, ValueError):
         raise users
     
     enabled_count = 0
     failed_count = 0
-    for username in users:
-        for scheme in ["https", "http"]:
-            url = f"{scheme}://{panel_data.panel_domain}/api/user/{username.name}"
-            status = {"status": "active"}
-            start_time = time.perf_counter()
-            try:
-                async with httpx.AsyncClient(verify=False) as client:
-                    response = await client.put(
-                        url, json=status, headers=headers, timeout=5
-                    )
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    response.raise_for_status()
-                log_api_request("PUT", url, response.status_code, elapsed)
-                log_user_action("ENABLE", username.name, success=True)
-                message = f"Enabled user: {username.name}"
-                await safe_send_logs_panel(message)
-                users_logger.debug(message)
-                enabled_count += 1
-                break
-            except SSLError:
-                continue
-            except httpx.HTTPStatusError:
-                elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request("PUT", url, response.status_code, elapsed, f"HTTP {response.status_code}")
-                message = f"[{response.status_code}] {response.text}"
-                await safe_send_logs_panel(message)
-                log_user_action("ENABLE", username.name, message, success=False)
-                users_logger.error(message)
-                failed_count += 1
-                continue
-            except Exception as error:  # pylint: disable=broad-except
-                elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request("PUT", url, None, elapsed, str(error))
-                message = f"An unexpected error occurred: {error}"
-                await safe_send_logs_panel(message)
-                log_user_action("ENABLE", username.name, message, success=False)
-                users_logger.error(message)
-                failed_count += 1
+    status = {"status": "active"}
+    
+    for user_obj in users:
+        username = user_obj.name
+        response = await panel_put(
+            panel_data,
+            f"/api/user/{username}",
+            json_data=status,
+            timeout=10.0,
+            max_retries=2,
+        )
+        if response is not None and response.status_code in (200, 201):
+            log_user_action("ENABLE", username, success=True)
+            users_logger.debug(f"Enabled user: {username}")
+            enabled_count += 1
+        else:
+            message = f"Failed to enable user: {username}"
+            await safe_send_logs_panel(message)
+            log_user_action("ENABLE", username, message, success=False)
+            users_logger.error(message)
+            failed_count += 1
+            
     users_logger.info(f"✅ Enabled all users: {enabled_count} success, {failed_count} failed")
 
 
@@ -614,42 +506,27 @@ async def enable_user_by_status(panel_data: PanelType, username: str) -> tuple[b
     from utils.panel_api.request_helper import panel_put
     
     users_logger.debug(f"✅ Enabling user by status: {username}")
-    max_attempts = 3
+    status = {"status": "active"}
     
-    for attempt in range(max_attempts):
-        force_refresh = attempt > 0
-        status = {"status": "active"}
-        
-        response = await panel_put(
-            panel_data,
-            f"/api/user/{username}",
-            json_data=status,
-            force_refresh=force_refresh,
-            timeout=10.0,
-            max_retries=2
-        )
-        
-        if response is not None:
-            if response.status_code in (200, 201):
-                log_user_action("ENABLE", username, "status=active", success=True)
-                users_logger.info(f"✅ Enabled user by status: {username}")
-                return (True, False)  # success, not deleted
-            elif response.status_code == 401:
-                await invalidate_token_cache()
-                users_logger.warning("Got 401 error, retrying...")
-                continue
-            elif response.status_code == 404:
-                users_logger.warning(f"User {username} not found (deleted from panel)")
-                log_user_action("ENABLE", username, "User not found (deleted)", success=False)
-                return (False, True)  # failed, user was deleted
-        
-        users_logger.warning(f"Attempt {attempt + 1}/{max_attempts} failed")
-        
-        if attempt < max_attempts - 1:
-            wait_time = min(10, random.randint(1, 3) * (attempt + 1))
-            await asyncio.sleep(wait_time)
+    response = await panel_put(
+        panel_data,
+        f"/api/user/{username}",
+        json_data=status,
+        timeout=10.0,
+        max_retries=3,
+    )
     
-    log_user_action("ENABLE", username, "Failed after max attempts", success=False)
+    if response is not None:
+        if response.status_code in (200, 201):
+            log_user_action("ENABLE", username, "status=active", success=True)
+            users_logger.info(f"✅ Enabled user by status: {username}")
+            return (True, False)  # success, not deleted
+        elif response.status_code == 404:
+            users_logger.warning(f"User {username} not found (deleted from panel)")
+            log_user_action("ENABLE", username, "User not found (deleted)", success=False)
+            return (False, True)  # failed, user was deleted
+    
+    log_user_action("ENABLE", username, "Failed to enable user", success=False)
     return (False, False)  # failed, but user might still exist
 
 
@@ -827,59 +704,25 @@ async def _update_user_groups_and_status(panel_data: PanelType, username: str, g
             - success: True if successful
             - not_found: True if user doesn't exist (404)
     """
-    max_attempts = 5
-    for attempt in range(max_attempts):
-        force_refresh = attempt > 0
-        get_panel_token = await get_token(panel_data, force_refresh=force_refresh)
-        if isinstance(get_panel_token, ValueError):
-            raise get_panel_token
-        token = get_panel_token.panel_token
-        headers = {"Authorization": f"Bearer {token}"}
-        payload = {"group_ids": group_ids, "status": status}
-        
-        for scheme in ["https", "http"]:
-            url = f"{scheme}://{panel_data.panel_domain}/api/user/{username}"
-            start_time = time.perf_counter()
-            try:
-                async with httpx.AsyncClient(verify=False) as client:
-                    response = await client.put(url, json=payload, headers=headers, timeout=10)
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    
-                    # Check for 404 before raise_for_status
-                    if response.status_code == 404:
-                        log_api_request("PUT", url, 404, elapsed, "User not found")
-                        users_logger.warning(f"User {username} not found (deleted from panel)")
-                        return (False, True)  # failed, user was deleted
-                    
-                    response.raise_for_status()
-                log_api_request("PUT", url, response.status_code, elapsed)
-                users_logger.debug(f"Updated user {username}: groups={group_ids}, status={status} [{elapsed:.0f}ms]")
-                return (True, False)  # success, not deleted
-            except SSLError:
-                elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request("PUT", url, None, elapsed, "SSL Error")
-                continue
-            except httpx.HTTPStatusError:
-                elapsed = (time.perf_counter() - start_time) * 1000
-                if response.status_code == 401:
-                    await invalidate_token_cache()
-                elif response.status_code == 404:
-                    log_api_request("PUT", url, 404, elapsed, "User not found")
-                    users_logger.warning(f"User {username} not found (deleted from panel)")
-                    return (False, True)  # failed, user was deleted
-                log_api_request("PUT", url, response.status_code, elapsed, f"HTTP {response.status_code}")
-                continue
-            except httpx.TimeoutException:
-                elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request("PUT", url, None, elapsed, "Timeout")
-                continue
-            except Exception as error:
-                elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request("PUT", url, None, elapsed, str(error))
-                users_logger.error(f"Error updating user: {error}")
-                continue
-        wait_time = min(30, random.randint(2, 5) * (attempt + 1))
-        await asyncio.sleep(wait_time)
+    from utils.panel_api.request_helper import panel_put
+    
+    payload = {"group_ids": group_ids, "status": status}
+    response = await panel_put(
+        panel_data,
+        f"/api/user/{username}",
+        json_data=payload,
+        timeout=10.0,
+        max_retries=3,
+    )
+    
+    if response is not None:
+        if response.status_code in (200, 201):
+            users_logger.debug(f"Updated user {username}: groups={group_ids}, status={status}")
+            return (True, False)  # success, not deleted
+        elif response.status_code == 404:
+            users_logger.warning(f"User {username} not found (deleted from panel)")
+            return (False, True)  # failed, user was deleted
+            
     return (False, False)  # failed, but user might still exist
 
 
@@ -1093,41 +936,26 @@ async def disable_user_by_status(panel_data: PanelType, username: str) -> bool:
     from utils.panel_api.request_helper import panel_put
     
     users_logger.debug(f"🚫 Disabling user by status: {username}")
-    max_attempts = 3
+    status = {"status": "disabled"}
     
-    for attempt in range(max_attempts):
-        force_refresh = attempt > 0
-        status = {"status": "disabled"}
-        
-        response = await panel_put(
-            panel_data,
-            f"/api/user/{username}",
-            json_data=status,
-            force_refresh=force_refresh,
-            timeout=10.0,
-            max_retries=2
-        )
-        
-        if response is not None:
-            if response.status_code in (200, 201):
-                log_user_action("DISABLE", username, "status=disabled", success=True)
-                users_logger.info(f"🚫 Disabled user by status: {username}")
-                return True
-            elif response.status_code == 401:
-                await invalidate_token_cache()
-                users_logger.warning("Got 401 error, retrying...")
-                continue
-            elif response.status_code == 404:
-                users_logger.warning(f"User {username} not found")
-                return False
-        
-        users_logger.warning(f"Attempt {attempt + 1}/{max_attempts} failed")
-        
-        if attempt < max_attempts - 1:
-            wait_time = min(10, random.randint(1, 3) * (attempt + 1))
-            await asyncio.sleep(wait_time)
+    response = await panel_put(
+        panel_data,
+        f"/api/user/{username}",
+        json_data=status,
+        timeout=10.0,
+        max_retries=3,
+    )
     
-    log_user_action("DISABLE", username, "Failed after max attempts", success=False)
+    if response is not None:
+        if response.status_code in (200, 201):
+            log_user_action("DISABLE", username, "status=disabled", success=True)
+            users_logger.info(f"🚫 Disabled user by status: {username}")
+            return True
+        elif response.status_code == 404:
+            users_logger.warning(f"User {username} not found")
+            return False
+            
+    log_user_action("DISABLE", username, "Failed to disable user", success=False)
     return False
 
 
@@ -1179,52 +1007,23 @@ async def disable_user_by_group(panel_data: PanelType, username: str, disabled_g
         except Exception as db_error:
             users_logger.warning(f"Could not save groups to database (JSON backup exists): {db_error}")
         
-        # Combined API call: set both group_ids and status in one request
-        max_attempts = 5
-        for attempt in range(max_attempts):
-            force_refresh = attempt > 0
-            get_panel_token = await get_token(panel_data, force_refresh=force_refresh)
-            if isinstance(get_panel_token, ValueError):
-                raise get_panel_token
-            token = get_panel_token.panel_token
-            headers = {"Authorization": f"Bearer {token}"}
-            # Combine group_ids and status in a single payload
-            payload = {"group_ids": [disabled_group_id], "status": "disabled"}
-            
-            for scheme in ["https", "http"]:
-                url = f"{scheme}://{panel_data.panel_domain}/api/user/{username}"
-                start_time = time.perf_counter()
-                try:
-                    async with httpx.AsyncClient(verify=False) as client:
-                        response = await client.put(url, json=payload, headers=headers, timeout=10)
-                        elapsed = (time.perf_counter() - start_time) * 1000
-                        response.raise_for_status()
-                    log_api_request("PUT", url, response.status_code, elapsed)
-                    log_user_action("DISABLE", username, f"moved to group {disabled_group_id}, status disabled", success=True)
-                    users_logger.info(f"🚫 Disabled user by group: {username} (moved to group {disabled_group_id}, status disabled) [{elapsed:.0f}ms]")
-                    return True
-                except SSLError:
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    log_api_request("PUT", url, None, elapsed, "SSL Error")
-                    continue
-                except httpx.HTTPStatusError:
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    if response.status_code == 401:
-                        await invalidate_token_cache()
-                    log_api_request("PUT", url, response.status_code, elapsed, f"HTTP {response.status_code}")
-                    continue
-                except httpx.TimeoutException:
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    log_api_request("PUT", url, None, elapsed, "Timeout")
-                    continue
-                except Exception as error:
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    log_api_request("PUT", url, None, elapsed, str(error))
-                    users_logger.error(f"Error disabling user: {error}")
-                    continue
-            wait_time = min(30, random.randint(2, 5) * (attempt + 1))
-            await asyncio.sleep(wait_time)
+        # Combined API call: set both group_ids and status in one request via panel_put
+        from utils.panel_api.request_helper import panel_put
+        payload = {"group_ids": [disabled_group_id], "status": "disabled"}
         
+        response = await panel_put(
+            panel_data,
+            f"/api/user/{username}",
+            json_data=payload,
+            timeout=10.0,
+            max_retries=3,
+        )
+        
+        if response is not None and response.status_code in (200, 201):
+            log_user_action("DISABLE", username, f"moved to group {disabled_group_id}, status disabled", success=True)
+            users_logger.info(f"🚫 Disabled user by group: {username} (moved to group {disabled_group_id}, status disabled)")
+            return True
+            
         log_user_action("DISABLE", username, "Failed to move to disabled group", success=False)
         return False
     except Exception as error:
