@@ -358,6 +358,10 @@ def get_punishment_system() -> PunishmentSystem:
     return _punishment_system
 
 
+# Global instance alias to be imported by other modules (uniform with warning_system)
+punishment_system = get_punishment_system()
+
+
 async def get_punishment_for_user(username: str, config_data: dict) -> tuple[PunishmentStep, int, int]:
     """
     Get the punishment to apply for a user.

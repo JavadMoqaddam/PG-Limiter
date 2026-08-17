@@ -767,8 +767,17 @@ class EnhancedWarningSystem:
         
         summary_lines.append(f"\n📈 Total: {len(active_warnings)} users monitored")
         
-        return "\n".join(summary_lines)
+# Global singleton instance and accessor function
+_warning_system: Optional[EnhancedWarningSystem] = None
 
 
-# Global instance to be imported by other modules
-warning_system = EnhancedWarningSystem()
+def get_warning_system() -> EnhancedWarningSystem:
+    """Get or create the global EnhancedWarningSystem singleton instance."""
+    global _warning_system
+    if _warning_system is None:
+        _warning_system = EnhancedWarningSystem()
+    return _warning_system
+
+
+# Global instance alias to be imported by other modules (for backward compatibility)
+warning_system = get_warning_system()

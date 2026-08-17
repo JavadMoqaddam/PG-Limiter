@@ -20,9 +20,10 @@ from utils.warning_system.helpers import (
 # Import UserLimitWarning dataclass (with UserWarning alias)
 from utils.warning_system.user_warning import UserLimitWarning, UserWarning
 
-# Import EnhancedWarningSystem and global instance
+# Import EnhancedWarningSystem and global instances/accessors
 from utils.warning_system.enhanced_system import (
     EnhancedWarningSystem,
+    get_warning_system,
     warning_system,
 )
 
@@ -38,5 +39,6 @@ __all__ = [
     "UserWarning",
     # EnhancedWarningSystem
     "EnhancedWarningSystem",
+    "get_warning_system",
     "warning_system",
 ]
