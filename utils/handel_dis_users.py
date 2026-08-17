@@ -201,6 +201,32 @@ class DisabledUsers:
             )
             self._sync_views_from_entries()
             await asyncio.to_thread(self._sync_save_disabled_users)
+        
+        # Synchronize with SQLite database if available
+        try:
+            from db.database import get_db, DB_AVAILABLE
+            from db.crud import UserCRUD
+            if DB_AVAILABLE:
+                async with get_db() as session:
+                    await UserCRUD.set_disabled(
+                        session,
+                        username=username,
+                        disabled=True,
+                        disabled_at=current_time,
+                        enable_at=enable_at_val,
+                        fetch_from_panel=False,
+                    )
+                    await session.commit()
+        except Exception as e:
+            logger.debug(f"Database sync on disable skipped for {username}: {e}")
+
+        # Synchronize with Redis cache if available
+        try:
+            from utils.redis_cache import add_disabled_user
+            await add_disabled_user(username, current_time)
+        except Exception:
+            pass
+
         logger.info(f"Saved {len(self._entries)} disabled users to {self.filename}")
 
     async def remove_user(self, username: str):
@@ -212,6 +238,30 @@ class DisabledUsers:
                 del self._entries[username]
             self._sync_views_from_entries()
             await asyncio.to_thread(self._sync_save_disabled_users)
+        
+        # Synchronize with SQLite database if available
+        try:
+            from db.database import get_db, DB_AVAILABLE
+            from db.crud import UserCRUD
+            if DB_AVAILABLE:
+                async with get_db() as session:
+                    await UserCRUD.set_disabled(
+                        session,
+                        username=username,
+                        disabled=False,
+                        fetch_from_panel=False,
+                    )
+                    await session.commit()
+        except Exception as e:
+            logger.debug(f"Database sync on enable skipped for {username}: {e}")
+
+        # Synchronize with Redis cache if available
+        try:
+            from utils.redis_cache import remove_disabled_user
+            await remove_disabled_user(username)
+        except Exception:
+            pass
+
         logger.info(f"Saved {len(self._entries)} disabled users to {self.filename}")
 
     async def get_users_to_enable(self, default_time_to_active: int) -> list[str]:
@@ -285,6 +335,10 @@ class DisabledUsers:
         if remaining <= 0:
             return RemainingTimeResult(status=DisableStatus.READY_TO_ENABLE, seconds=0)
         return RemainingTimeResult(status=DisableStatus.TIMED, seconds=remaining)
+
+    def is_disabled(self, username: str) -> bool:
+        """Check if a user is currently registered as disabled."""
+        return username in self._entries
 
     async def read_and_clear_users(self) -> set[str]:
         """

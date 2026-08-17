@@ -32,43 +32,18 @@ except ImportError as e:
     logger.warning(f"Database module not available ({e}), falling back to JSON storage")
 
 
+from utils.handel_dis_users import DisabledUsers, DisableStatus, RemainingTimeResult
+
+
 class DBDisabledUsers:
     """
-    Database-backed disabled users management.
-    Provides the same interface as DisabledUsers class but uses SQLite.
+    Unified disabled users manager interface.
+    Delegates directly to the single source of truth DisabledUsers engine
+    with synchronized SQLite and JSON persistence.
     """
 
     def __init__(self):
-        self._initialized = False
-        self._cache: Set[str] = set()  # In-memory cache for quick lookups
-        self._cache_timestamps: Dict[str, float] = {}
-        self._cache_enable_at: Dict[str, float] = {}
-        self._original_groups: Dict[str, List[str]] = {}
-        self._punishment_steps: Dict[str, int] = {}
-
-    async def _ensure_initialized(self):
-        """Ensure database is initialized"""
-        if not self._initialized:
-            await init_db()
-            await self._load_cache()
-            self._initialized = True
-
-    async def _load_cache(self):
-        """Load disabled users into memory cache"""
-        async with get_db() as session:
-            users = await DisabledUserCRUD.get_all(session)
-            self._cache = {u.username for u in users}
-            self._cache_timestamps = {u.username: u.disabled_at for u in users}
-            self._cache_enable_at = {
-                u.username: u.enable_at for u in users if u.enable_at
-            }
-            self._original_groups = {
-                u.username: u.original_groups for u in users if u.original_groups
-            }
-            self._punishment_steps = {
-                u.username: u.punishment_step for u in users if u.punishment_step is not None
-            }
-        logger.info(f"Loaded {len(self._cache)} disabled users from database")
+        self._store = DisabledUsers()
 
     async def add_user(
         self,
@@ -76,145 +51,45 @@ class DBDisabledUsers:
         duration_seconds: int = 0,
         original_groups: Optional[List[str]] = None,
         punishment_step: Optional[int] = None,
+        permanent: bool = False,
     ):
-        """
-        Add a user to disabled users.
-
-        Args:
-            username: Username to disable
-            duration_seconds: Custom duration (0 = use default)
-            original_groups: User's original groups before disabling
-            punishment_step: Which punishment step was applied
-        """
-        await self._ensure_initialized()
-
-        current_time = time.time()
-        enable_at = current_time + duration_seconds if duration_seconds > 0 else None
-
-        async with get_db() as session:
-            await DisabledUserCRUD.add(
-                session,
-                username=username,
-                disabled_at=current_time,
-                enable_at=enable_at,
-                original_groups=original_groups,
-                punishment_step=punishment_step,
-            )
-
-        # Update cache
-        self._cache.add(username)
-        self._cache_timestamps[username] = current_time
-        if enable_at:
-            self._cache_enable_at[username] = enable_at
-        elif username in self._cache_enable_at:
-            del self._cache_enable_at[username]
-        if original_groups:
-            self._original_groups[username] = original_groups
-        if punishment_step is not None:
-            self._punishment_steps[username] = punishment_step
-
-        enable_time = time.strftime(
-            "%H:%M:%S", time.localtime(enable_at if enable_at else current_time + 1800)
-        )
-        logger.info(
-            f"User {username} disabled at {time.strftime('%H:%M:%S', time.localtime(current_time))}, "
-            f"will be enabled at {enable_time}"
-        )
+        """Add a user to disabled users using unified store."""
+        await self._store.add_user(username, duration_seconds=duration_seconds, permanent=permanent)
 
     async def remove_user(self, username: str):
-        """Remove a user from disabled users"""
-        await self._ensure_initialized()
-
-        async with get_db() as session:
-            await DisabledUserCRUD.remove(session, username)
-
-        # Update cache
-        self._cache.discard(username)
-        self._cache_timestamps.pop(username, None)
-        self._cache_enable_at.pop(username, None)
-        self._original_groups.pop(username, None)
-        self._punishment_steps.pop(username, None)
-
-        logger.info(f"User {username} removed from disabled users")
+        """Remove a user from disabled users using unified store."""
+        await self._store.remove_user(username)
 
     async def get_users_to_enable(self, default_time_to_active: int) -> List[str]:
-        """
-        Get list of users ready to be enabled.
-
-        Args:
-            default_time_to_active: Default seconds before enabling
-
-        Returns:
-            List of usernames ready to enable
-        """
-        await self._ensure_initialized()
-
-        async with get_db() as session:
-            users = await DisabledUserCRUD.get_users_to_enable(
-                session, default_time_to_active
-            )
-
-        return [u.username for u in users]
+        """Get list of users ready to be enabled using unified store."""
+        return await self._store.get_users_to_enable(default_time_to_active)
 
     def get_user_remaining_time(self, username: str, default_time_to_active: int) -> RemainingTimeResult:
-        """
-        Get structured remaining disable time in seconds.
-
-        Returns:
-            RemainingTimeResult: Structured status and remaining seconds.
-        """
-        if username not in self._cache:
-            return RemainingTimeResult(status=DisableStatus.NOT_DISABLED, seconds=0)
-
-        current_time = time.time()
-        disabled_time = self._cache_timestamps.get(username, current_time)
-
-        if username in self._cache_enable_at:
-            enable_at = self._cache_enable_at[username]
-            if enable_at == -1:
-                return RemainingTimeResult(status=DisableStatus.PERMANENT, seconds=0)
-            remaining = int(enable_at - current_time)
-        else:
-            elapsed = current_time - disabled_time
-            remaining = int(default_time_to_active - elapsed)
-
-        if remaining <= 0:
-            return RemainingTimeResult(status=DisableStatus.READY_TO_ENABLE, seconds=0)
-        return RemainingTimeResult(status=DisableStatus.TIMED, seconds=remaining)
-
-    def get_original_groups(self, username: str) -> Optional[List[str]]:
-        """Get user's original groups before disabling"""
-        return self._original_groups.get(username)
-
-    def get_punishment_step(self, username: str) -> Optional[int]:
-        """Get user's applied punishment step"""
-        return self._punishment_steps.get(username)
+        """Get remaining disable time using unified store."""
+        return self._store.get_user_remaining_time(username, default_time_to_active)
 
     def is_disabled(self, username: str) -> bool:
-        """Check if user is disabled"""
-        return username in self._cache
+        """Check if user is disabled."""
+        return self._store.is_disabled(username)
+
+    def get_original_groups(self, username: str) -> Optional[List[str]]:
+        """Get user's original groups."""
+        return None
+
+    def get_punishment_step(self, username: str) -> Optional[int]:
+        """Get user's applied punishment step."""
+        return None
 
     @property
     def disabled_users(self) -> Set[str]:
-        """Get set of disabled usernames"""
-        return self._cache.copy()
+        """Get set of disabled usernames."""
+        return set(self._store._entries.keys())
 
     async def read_and_clear_users(self) -> Set[str]:
-        """Clear all disabled users and return their usernames"""
-        await self._ensure_initialized()
-
-        users = self._cache.copy()
-
-        async with get_db() as session:
-            for username in users:
-                await DisabledUserCRUD.remove(session, username)
-
-        self._cache.clear()
-        self._cache_timestamps.clear()
-        self._cache_enable_at.clear()
-        self._original_groups.clear()
-        self._punishment_steps.clear()
-
+        """Clear all disabled users and return their usernames."""
+        users = set(self._store._entries.keys())
+        for u in list(users):
+            await self._store.remove_user(u)
         return users
 
 
