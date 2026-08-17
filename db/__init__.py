@@ -10,6 +10,7 @@ from db.database import (
     close_db,
     AsyncSessionLocal,
     engine,
+    DB_AVAILABLE,
 )
 
 from db.models import (
@@ -43,6 +44,7 @@ __all__ = [
     "close_db",
     "AsyncSessionLocal",
     "engine",
+    "DB_AVAILABLE",
     # Models
     "Base",
     "User",

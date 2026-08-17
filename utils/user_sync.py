@@ -378,6 +378,7 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
                 
                 # Refresh in-memory RAM metadata cache
                 await refresh_user_metadata_cache(db)
+                await recompute_all_user_limits(config)
                 
                 # SAFETY CHECKS before deleting users
                 # Only delete if sync was mostly successful (less than 10% errors)

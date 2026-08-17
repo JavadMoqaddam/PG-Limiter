@@ -18,11 +18,13 @@ from utils.logs import get_logger
 
 db_logger = get_logger("database")
 
-# Database URL - defaults to SQLite in data directory
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "sqlite+aiosqlite:///./data/pg_limiter.db"
 )
+
+# Flag indicating database availability
+DB_AVAILABLE: bool = True
 
 
 def _get_db_path() -> str:

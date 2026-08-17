@@ -161,8 +161,9 @@ async def main():
         main_logger.info("=" * 50)
         main_logger.info("🟢 Limiter is now running and monitoring connections")
         
-        from utils.user_sync import refresh_user_metadata_cache
+        from utils.user_sync import refresh_user_metadata_cache, recompute_all_user_limits
         await refresh_user_metadata_cache()
+        await recompute_all_user_limits()
         
         await run_check_users_usage(panel_data)
 
