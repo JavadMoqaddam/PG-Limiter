@@ -146,6 +146,96 @@ def extract_limit_from_username(username: str) -> int | None:
     return None
 
 
+async def resolve_effective_limit(
+    username: str,
+    config: dict | None = None,
+    metadata: dict | None = None,
+    special_limit: dict[str, int] | None = None,
+    group_limits: dict[str, int] | None = None,
+    auto_persist_pattern: bool = False,
+) -> int:
+    """
+    Single source of truth for resolving a user's effective IP limit.
+    
+    Priority order:
+    1. Special Limit (Direct user override in DB / special_limit dict)
+    2. Pre-computed Metadata Limit (effective_ip_limit from RAM metadata)
+    3. Database Limit Patterns (Prefix/Postfix patterns from DB)
+    4. Username Regex Patterns (.X.User or XUser)
+    5. Group Limit (Batched group limit from Pasargad group)
+    6. General Fallback Limit (Default config limit, e.g. 2)
+    
+    Args:
+        username: Username to resolve limit for
+        config: Full or partial configuration dictionary
+        metadata: Cached metadata dictionary for the user (optional)
+        special_limit: Mapping of username -> special limit override (optional)
+        group_limits: Mapping of username -> group limit (optional)
+        auto_persist_pattern: If True, save auto-detected pattern limits into DB
+        
+    Returns:
+        int: The resolved effective IP limit (>= 1)
+    """
+    # 1. Check direct special limit override
+    if special_limit and username in special_limit:
+        try:
+            return int(special_limit[username])
+        except (ValueError, TypeError):
+            pass
+
+    # 2. Check pre-computed metadata limit (if provided)
+    if metadata and isinstance(metadata, dict):
+        eff_limit = metadata.get("effective_ip_limit")
+        if eff_limit is not None:
+            try:
+                return int(eff_limit)
+            except (ValueError, TypeError):
+                pass
+
+    # 3. Check database limit patterns (prefix/postfix)
+    pattern_limit = await get_limit_from_patterns(username)
+    
+    # 4. Fallback to username regex pattern (.2.User or 2User)
+    if pattern_limit is None:
+        pattern_limit = extract_limit_from_username(username)
+        
+    if pattern_limit is not None:
+        if auto_persist_pattern:
+            try:
+                from db.database import get_db
+                from db.crud import UserCRUD
+                async with get_db() as db:
+                    await UserCRUD.set_special_limit(db, username, pattern_limit)
+                    await db.commit()
+                if special_limit is not None:
+                    special_limit[username] = pattern_limit
+                logger.info(f"✅ Auto-set limit for {username} to {pattern_limit} based on username pattern")
+            except Exception as e:
+                logger.error(f"Failed to auto-set limit for {username}: {e}")
+        return int(pattern_limit)
+
+    # 5. Check Group Limit
+    if group_limits and username in group_limits:
+        try:
+            return int(group_limits[username])
+        except (ValueError, TypeError):
+            pass
+
+    # 6. General Fallback Limit
+    general_limit = 2
+    if config and isinstance(config, dict):
+        limits_sec = config.get("limits", {})
+        if isinstance(limits_sec, dict):
+            general_limit = limits_sec.get("general", 2)
+        elif "general_limit" in config:
+            general_limit = config.get("general_limit", 2)
+            
+    try:
+        return int(general_limit)
+    except (ValueError, TypeError):
+        return 2
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # NEW: Smart Batching for Group Limits (Performance Optimized)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -766,43 +856,19 @@ async def check_ip_used() -> dict:
         ip_count = len(user_info.formatted_ips)
         device_count = all_user_device_counts.get(email, 0)
         
-        # Get user's limit (special or general)
-        user_limit = special_limit.get(email, general_limit)
-        has_special_limit = email in special_limit
         is_except = email in except_users
-        has_group_limit = False
-        
-        # Auto-set limit from username pattern if user doesn't have a special limit
-        # First check database limit patterns (prefix/postfix), then fallback to regex patterns
-        if not has_special_limit and not is_except:
-            # Check database limit patterns first (prefix/postfix like texiu_ -> limit 2)
-            username_limit = await get_limit_from_patterns(email)
-            
-            # Fallback to regex-based pattern extraction (e.g., .2.User, 2User)
-            if username_limit is None:
-                username_limit = extract_limit_from_username(email)
-            
-            if username_limit is not None:
-                # Auto-set the limit from pattern
-                from db.database import get_db
-                from db.crud import UserCRUD
-                try:
-                    async with get_db() as db:
-                        await UserCRUD.set_special_limit(db, email, username_limit)
-                        await db.commit()
-                    special_limit[email] = username_limit
-                    user_limit = username_limit
-                    has_special_limit = True
-                    logger.info(f"✅ Auto-set limit for {email} to {username_limit} based on username pattern")
-                except Exception as e:
-                    logger.error(f"Failed to auto-set limit for {email}: {e}")
-            else:
-                # Check Group Limit (From Batched Cache)
-                group_limit = batched_group_limits.get(email)
-                if group_limit is not None:
-                    user_limit = group_limit
-                    has_group_limit = True
-        
+        has_special_limit_before = email in special_limit
+        user_limit = await resolve_effective_limit(
+            username=email,
+            config=config_data,
+            metadata=None,
+            special_limit=special_limit,
+            group_limits=batched_group_limits,
+            auto_persist_pattern=(not is_except),
+        )
+        has_special_limit = (email in special_limit)
+        has_group_limit = (not has_special_limit_before) and bool(batched_group_limits and email in batched_group_limits)
+
         # Skip users who are not exceeding their limit
         # A user violates when device_count > user_limit
         if device_count <= user_limit:
@@ -1031,12 +1097,15 @@ async def check_users_usage(panel_data: PanelType):
                         admin_filtered_users.add(user_name)
                         continue
             
-            # Resolve effective IP limit in O(1) from pre-computed metadata
-            eff_limit = user_meta.get("effective_ip_limit")
-            if eff_limit is not None:
-                user_limit_number = eff_limit
-            else:
-                user_limit_number = int(special_limit.get(user_name, limit_number))
+            # Resolve effective IP limit using single source of truth
+            user_limit_number = await resolve_effective_limit(
+                username=user_name,
+                config=config_data,
+                metadata=user_meta,
+                special_limit=special_limit,
+                group_limits=batched_group_limits,
+                auto_persist_pattern=False,
+            )
             
             if len(unique_ips) > user_limit_number:
                 # Get user data and ISP info for this user

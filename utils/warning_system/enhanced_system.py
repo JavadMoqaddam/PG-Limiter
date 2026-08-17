@@ -534,22 +534,15 @@ class EnhancedWarningSystem:
                 if warning.active_monitoring_task and not warning.active_monitoring_task.done():
                     warning.active_monitoring_task.cancel()
                 
-                user_limit_number = int(special_limit.get(username, limit_number))
-                
-                # Check pattern limits and group limits if no special limit is set
-                if username not in special_limit:
-                    try:
-                        from utils.check_usage import get_limit_from_patterns, extract_limit_from_username
-                        pattern_limit = await get_limit_from_patterns(username)
-                        if pattern_limit is None:
-                            pattern_limit = extract_limit_from_username(username)
-                        
-                        if pattern_limit is not None:
-                            user_limit_number = pattern_limit
-                        elif batched_group_limits and username in batched_group_limits:
-                            user_limit_number = int(batched_group_limits[username])
-                    except Exception as e:
-                        warning_logger.error(f"Error checking pattern/group limit for {username}: {e}")
+                from utils.check_usage import resolve_effective_limit
+                user_limit_number = await resolve_effective_limit(
+                    username=username,
+                    config=config_data,
+                    metadata=None,
+                    special_limit=special_limit,
+                    group_limits=batched_group_limits,
+                    auto_persist_pattern=False,
+                )
                 
                 trust_score = warning.trust_score
                 trust_level = warning.get_trust_level()
