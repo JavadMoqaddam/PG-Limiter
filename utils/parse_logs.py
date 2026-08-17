@@ -9,7 +9,7 @@ import time
 
 from cachetools import TTLCache
 
-from utils.check_usage import ACTIVE_USERS, ACTIVE_USERS_LOCK
+from utils.shared_state import ACTIVE_USERS, ACTIVE_USERS_LOCK
 from utils.read_config import read_config
 from utils.types import ConnectionInfo, DeviceInfo, UserType
 
