@@ -8,9 +8,36 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from enum import Enum
 
 from utils.logs import logger
 from utils.atomic_io import atomic_write_json
+
+
+class DisableStatus(str, Enum):
+    NOT_DISABLED = "not_disabled"
+    PERMANENT = "permanent"
+    TIMED = "timed"
+    READY_TO_ENABLE = "ready"
+
+
+@dataclass(slots=True)
+class RemainingTimeResult:
+    """Structured result for user disabled remaining time."""
+    status: DisableStatus
+    seconds: int = 0
+
+    @property
+    def is_disabled(self) -> bool:
+        return self.status != DisableStatus.NOT_DISABLED
+
+    @property
+    def is_permanent(self) -> bool:
+        return self.status == DisableStatus.PERMANENT
+
+    @property
+    def is_ready(self) -> bool:
+        return self.status == DisableStatus.READY_TO_ENABLE
 
 
 @dataclass(slots=True)
@@ -221,30 +248,35 @@ class DisabledUsers:
             
             return users_to_enable
 
-    def get_user_remaining_time(self, username: str, default_time_to_active: int) -> int:
+    def get_user_remaining_time(self, username: str, default_time_to_active: int) -> RemainingTimeResult:
         """
-        Get remaining disable time for a user in seconds.
+        Get structured remaining disable time for a user.
         
         Args:
             username: The username to check
             default_time_to_active: Default time in seconds
             
         Returns:
-            Remaining seconds, 0 if ready to enable, -1 if not disabled, -2 if permanent
+            RemainingTimeResult: Structured status and remaining seconds
         """
         entry = self._entries.get(username)
         if not entry:
-            return -1
+            return RemainingTimeResult(status=DisableStatus.NOT_DISABLED, seconds=0)
         
         current_time = time.time()
         if entry.enable_at is not None:
             if entry.enable_at == -1:
-                return -2  # Special code for permanent
-            return max(0, int(entry.enable_at - current_time))
+                return RemainingTimeResult(status=DisableStatus.PERMANENT, seconds=0)
+            remaining = int(entry.enable_at - current_time)
+            if remaining <= 0:
+                return RemainingTimeResult(status=DisableStatus.READY_TO_ENABLE, seconds=0)
+            return RemainingTimeResult(status=DisableStatus.TIMED, seconds=remaining)
         
         elapsed = current_time - entry.disabled_at
-        remaining = default_time_to_active - elapsed
-        return max(0, int(remaining))
+        remaining = int(default_time_to_active - elapsed)
+        if remaining <= 0:
+            return RemainingTimeResult(status=DisableStatus.READY_TO_ENABLE, seconds=0)
+        return RemainingTimeResult(status=DisableStatus.TIMED, seconds=remaining)
 
     async def read_and_clear_users(self) -> set[str]:
         """

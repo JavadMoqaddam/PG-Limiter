@@ -13,6 +13,7 @@ import time
 from typing import Dict, List, Optional, Set
 
 from utils.logs import logger
+from utils.handel_dis_users import DisableStatus, RemainingTimeResult
 
 # Try to import database module, fall back to JSON if not available
 try:
@@ -155,27 +156,31 @@ class DBDisabledUsers:
 
         return [u.username for u in users]
 
-    def get_user_remaining_time(self, username: str, default_time_to_active: int) -> int:
+    def get_user_remaining_time(self, username: str, default_time_to_active: int) -> RemainingTimeResult:
         """
-        Get remaining disable time in seconds.
+        Get structured remaining disable time in seconds.
 
         Returns:
-            Remaining seconds, 0 if ready, -1 if not disabled
+            RemainingTimeResult: Structured status and remaining seconds.
         """
         if username not in self._cache:
-            return -1
+            return RemainingTimeResult(status=DisableStatus.NOT_DISABLED, seconds=0)
 
         current_time = time.time()
         disabled_time = self._cache_timestamps.get(username, current_time)
 
         if username in self._cache_enable_at:
             enable_at = self._cache_enable_at[username]
-            remaining = enable_at - current_time
+            if enable_at == -1:
+                return RemainingTimeResult(status=DisableStatus.PERMANENT, seconds=0)
+            remaining = int(enable_at - current_time)
         else:
             elapsed = current_time - disabled_time
-            remaining = default_time_to_active - elapsed
+            remaining = int(default_time_to_active - elapsed)
 
-        return max(0, int(remaining))
+        if remaining <= 0:
+            return RemainingTimeResult(status=DisableStatus.READY_TO_ENABLE, seconds=0)
+        return RemainingTimeResult(status=DisableStatus.TIMED, seconds=remaining)
 
     def get_original_groups(self, username: str) -> Optional[List[str]]:
         """Get user's original groups before disabling"""
