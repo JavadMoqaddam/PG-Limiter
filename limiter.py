@@ -191,6 +191,14 @@ async def cleanup_resources():
     except Exception as e:
         main_logger.debug(f"Error closing DB: {e}")
 
+    # 4. Close Panel API shared HTTP client
+    try:
+        from utils.panel_api.request_helper import close_panel_client
+        await close_panel_client()
+        main_logger.debug("✓ Panel HTTP client closed")
+    except Exception as e:
+        main_logger.debug(f"Error closing Panel client: {e}")
+
 
 if __name__ == "__main__":
     restart_count = 0

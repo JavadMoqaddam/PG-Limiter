@@ -144,10 +144,11 @@ async def get_token(panel_data: PanelType, force_refresh: bool = False) -> Panel
             url = f"{scheme}://{panel_data.panel_domain}/api/admin/token"
             start_time = time.perf_counter()
             try:
-                async with httpx.AsyncClient(verify=False) as client:
-                    response = await client.post(url, data=payload, timeout=5)
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    response.raise_for_status()
+                from utils.panel_api.request_helper import get_panel_client
+                client = await get_panel_client()
+                response = await client.post(url, data=payload, timeout=10.0)
+                elapsed = (time.perf_counter() - start_time) * 1000
+                response.raise_for_status()
                 
                 log_api_request("POST", url, response.status_code, elapsed)
                 

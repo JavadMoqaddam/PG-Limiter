@@ -82,6 +82,42 @@ class PanelCircuitBreaker:
 # Shared circuit breaker instance
 circuit_breaker = PanelCircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
 
+# Shared persistent httpx.AsyncClient with connection pooling
+_panel_client: Optional[httpx.AsyncClient] = None
+
+
+async def get_panel_client() -> httpx.AsyncClient:
+    """
+    Get or create shared persistent httpx.AsyncClient for Panel API requests
+    with connection pooling, keepalive, and proper connection limits.
+    """
+    global _panel_client
+    if _panel_client is None or _panel_client.is_closed:
+        limits = httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=30.0)
+        _panel_client = httpx.AsyncClient(
+            verify=False,
+            timeout=30.0,
+            limits=limits,
+        )
+    return _panel_client
+
+
+async def close_panel_client():
+    """Close the shared Panel API httpx.AsyncClient if open."""
+    global _panel_client
+    if _panel_client is not None:
+        try:
+            if not getattr(_panel_client, "is_closed", False):
+                res = _panel_client.aclose()
+                if asyncio.iscoroutine(res):
+                    await res
+            request_logger.debug("🔒 Closed shared Panel API HTTP client")
+        except Exception as e:
+            request_logger.warning(f"Error closing panel client: {e}")
+        finally:
+            _panel_client = None
+
+
 # Track panel endpoint health
 _panel_health = {
     "https_failures": 0,
@@ -150,15 +186,15 @@ async def check_panel_availability(panel_data: PanelType, timeout: float = 5.0) 
     Returns:
         bool: True if panel is reachable, False otherwise
     """
+    client = await get_panel_client()
     for scheme in _get_scheme_order():
         url = f"{scheme}://{panel_data.panel_domain}/api/"
         try:
-            async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
-                response = await client.get(url)
-                # Any response (even 401/404) means panel is up
-                if response.status_code < 500:
-                    _record_connection_success()
-                    return True
+            response = await client.get(url, timeout=timeout)
+            # Any response (even 401/404) means panel is up
+            if response.status_code < 500:
+                _record_connection_success()
+                return True
         except (httpx.ConnectError, httpx.TimeoutException, SSLError):
             continue
         except Exception:
@@ -255,20 +291,20 @@ async def panel_request(
             start_time = time.perf_counter()
             
             try:
-                async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
-                    if method == "GET":
-                        response = await client.get(url, headers=headers)
-                    elif method == "POST":
-                        if form_data:
-                            response = await client.post(url, headers=headers, data=form_data)
-                        else:
-                            response = await client.post(url, headers=headers, json=json_data)
-                    elif method == "PUT":
-                        response = await client.put(url, headers=headers, json=json_data)
-                    elif method == "DELETE":
-                        response = await client.delete(url, headers=headers)
+                client = await get_panel_client()
+                if method == "GET":
+                    response = await client.get(url, headers=headers, timeout=timeout)
+                elif method == "POST":
+                    if form_data:
+                        response = await client.post(url, headers=headers, data=form_data, timeout=timeout)
                     else:
-                        response = await client.request(method, url, headers=headers, json=json_data)
+                        response = await client.post(url, headers=headers, json=json_data, timeout=timeout)
+                elif method == "PUT":
+                    response = await client.put(url, headers=headers, json=json_data, timeout=timeout)
+                elif method == "DELETE":
+                    response = await client.delete(url, headers=headers, timeout=timeout)
+                else:
+                    response = await client.request(method, url, headers=headers, json=json_data, timeout=timeout)
                     
                     elapsed = (time.perf_counter() - start_time) * 1000
                     log_api_request(method, url, response.status_code, elapsed)

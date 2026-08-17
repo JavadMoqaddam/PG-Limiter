@@ -79,73 +79,74 @@ async def all_user(panel_data: PanelType) -> list[UserType] | ValueError:
             url = f"{scheme}://{panel_data.panel_domain}/api/users"
             
             try:
-                async with httpx.AsyncClient(verify=False) as client:
-                    # First request to get total count
-                    start_time = time.perf_counter()
-                    first_page_users, total_users = await _fetch_users_page(
-                        client, url, headers, offset=0, limit=limit
+                from utils.panel_api.request_helper import get_panel_client
+                client = await get_panel_client()
+                # First request to get total count
+                start_time = time.perf_counter()
+                first_page_users, total_users = await _fetch_users_page(
+                    client, url, headers, offset=0, limit=limit
+                )
+                
+                if total_users is None:
+                    users_logger.error("Could not get total user count from API")
+                    continue
+                
+                users_logger.info(f"📊 Panel reports {total_users} total users")
+                
+                # If all users fit in first page, we're done
+                if len(first_page_users) >= total_users or len(first_page_users) < limit:
+                    all_user_data = first_page_users
+                else:
+                    # Calculate remaining pages needed
+                    remaining = total_users - len(first_page_users)
+                    offsets = list(range(limit, total_users, limit))
+                    
+                    users_logger.info(f"📥 Fetching {len(offsets)} more pages in parallel (max {max_concurrent} concurrent)...")
+                    
+                    # Fetch remaining pages in parallel with semaphore
+                    semaphore = asyncio.Semaphore(max_concurrent)
+                    
+                    def make_fetcher(sem, cli, u, hdrs):
+                        async def fetch_with_semaphore(offset: int):
+                            async with sem:
+                                users, _ = await _fetch_users_page(cli, u, hdrs, offset, limit)
+                                return users
+                        return fetch_with_semaphore
+                    
+                    fetcher = make_fetcher(semaphore, client, url, headers)
+                    tasks = [fetcher(offset) for offset in offsets]
+                    pages = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Combine all pages
+                    all_user_data = first_page_users
+                    for i, page in enumerate(pages):
+                        if isinstance(page, Exception):
+                            users_logger.error(f"Error fetching page {i+1}: {page}")
+                            continue
+                        all_user_data.extend(page)
+                
+                elapsed = (time.perf_counter() - start_time) * 1000
+                    
+                # Convert to UserType objects
+                users = []
+                for user_data in all_user_data:
+                    admin_info = user_data.get("admin")
+                    admin_username = admin_info.get("username") if isinstance(admin_info, dict) else None
+                    user = UserType(
+                        name=user_data["username"],
+                        panel_status=user_data.get("status"),
+                        data_limit=user_data.get("data_limit"),
+                        used_traffic=user_data.get("used_traffic"),
+                        lifetime_used_traffic=user_data.get("lifetime_used_traffic"),
+                        expire=user_data.get("expire"),
+                        group_ids=user_data.get("group_ids"),
+                        online_at=user_data.get("online_at"),
+                        admin_username=admin_username,
                     )
-                    
-                    if total_users is None:
-                        users_logger.error("Could not get total user count from API")
-                        continue
-                    
-                    users_logger.info(f"📊 Panel reports {total_users} total users")
-                    
-                    # If all users fit in first page, we're done
-                    if len(first_page_users) >= total_users or len(first_page_users) < limit:
-                        all_user_data = first_page_users
-                    else:
-                        # Calculate remaining pages needed
-                        remaining = total_users - len(first_page_users)
-                        offsets = list(range(limit, total_users, limit))
-                        
-                        users_logger.info(f"📥 Fetching {len(offsets)} more pages in parallel (max {max_concurrent} concurrent)...")
-                        
-                        # Fetch remaining pages in parallel with semaphore
-                        semaphore = asyncio.Semaphore(max_concurrent)
-                        
-                        def make_fetcher(sem, cli, u, hdrs):
-                            async def fetch_with_semaphore(offset: int):
-                                async with sem:
-                                    users, _ = await _fetch_users_page(cli, u, hdrs, offset, limit)
-                                    return users
-                            return fetch_with_semaphore
-                        
-                        fetcher = make_fetcher(semaphore, client, url, headers)
-                        tasks = [fetcher(offset) for offset in offsets]
-                        pages = await asyncio.gather(*tasks, return_exceptions=True)
-                        
-                        # Combine all pages
-                        all_user_data = first_page_users
-                        for i, page in enumerate(pages):
-                            if isinstance(page, Exception):
-                                users_logger.error(f"Error fetching page {i+1}: {page}")
-                                continue
-                            all_user_data.extend(page)
-                    
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    
-                    # Convert to UserType objects
-                    users = []
-                    for user_data in all_user_data:
-                        admin_info = user_data.get("admin")
-                        admin_username = admin_info.get("username") if isinstance(admin_info, dict) else None
-                        user = UserType(
-                            name=user_data["username"],
-                            panel_status=user_data.get("status"),
-                            data_limit=user_data.get("data_limit"),
-                            used_traffic=user_data.get("used_traffic"),
-                            lifetime_used_traffic=user_data.get("lifetime_used_traffic"),
-                            expire=user_data.get("expire"),
-                            group_ids=user_data.get("group_ids"),
-                            online_at=user_data.get("online_at"),
-                            admin_username=admin_username,
-                        )
-                        users.append(user)
-                    
-                    users_logger.info(f"📋 Fetched all {len(users)} users in {elapsed:.0f}ms")
-                    return users
+                    users.append(user)
+                
+                users_logger.info(f"📋 Fetched all {len(users)} users in {elapsed:.0f}ms")
+                return users
                     
             except SSLError:
                 elapsed = (time.perf_counter() - start_time) * 1000
