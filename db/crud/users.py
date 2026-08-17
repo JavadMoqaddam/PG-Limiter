@@ -16,6 +16,21 @@ from utils.logs import get_logger
 db_users_logger = get_logger("db.users")
 
 
+async def _invalidate_user_caches(username: str, reason: str = "user_mutation"):
+    """Synchronously invalidate L0 RAM cache and publish L2 Redis Pub/Sub invalidation."""
+    try:
+        from utils.user_sync import invalidate_user_metadata_cache
+        invalidate_user_metadata_cache(username)
+    except Exception:
+        pass
+        
+    try:
+        from utils.redis_cache import publish_cache_invalidation
+        await publish_cache_invalidation(reason=reason, target_user=username)
+    except Exception:
+        pass
+
+
 class UserCRUD:
     """
     Consolidated CRUD operations for Users table.
@@ -73,6 +88,7 @@ class UserCRUD:
             db.add(user)
         
         await db.flush()
+        await _invalidate_user_caches(username, reason="create_or_update")
         return user
     
     @staticmethod
@@ -165,6 +181,7 @@ class UserCRUD:
         result = await db.execute(delete(User).where(User.username == username))
         deleted = result.rowcount > 0
         if deleted:
+            await _invalidate_user_caches(username, reason="delete")
             db_users_logger.info(f"✅ Deleted user: {username}")
         else:
             db_users_logger.warning(f"⚠️ User not found for deletion: {username}")
@@ -234,6 +251,7 @@ class UserCRUD:
         
         await db.flush()
         action = "added to" if excepted else "removed from"
+        await _invalidate_user_caches(username, reason=f"set_exception:{excepted}")
         db_users_logger.info(f"✅ User {username} {action} exception list")
         return user
     
@@ -309,6 +327,7 @@ class UserCRUD:
         user.special_limit_updated_at = datetime.now(timezone.utc) if limit is not None else None
         
         await db.flush()
+        await _invalidate_user_caches(username, reason="set_special_limit")
         if limit is not None:
             db_users_logger.info(f"✅ Special limit set for {username}: {limit}")
         else:
@@ -418,6 +437,7 @@ class UserCRUD:
             db_users_logger.info(f"✅ User {username} enabled")
         
         await db.flush()
+        await _invalidate_user_caches(username, reason=f"set_disabled:{disabled}")
         return user
     
     @staticmethod

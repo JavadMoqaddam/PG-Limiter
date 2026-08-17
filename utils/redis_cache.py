@@ -540,14 +540,14 @@ async def remove_disabled_user(username: str) -> bool:
 PUBSUB_CHANNEL = f"{CACHE_PREFIX}cache_inval"
 
 
-async def publish_cache_invalidation(reason: str = "config_updated") -> bool:
+async def publish_cache_invalidation(reason: str = "config_updated", target_user: Optional[str] = None) -> bool:
     """Publish a cache invalidation signal via Redis Pub/Sub."""
     try:
         cache = await get_cache()
         if cache.is_connected and REDIS_AVAILABLE:
-            payload = json.dumps({"type": "invalidate", "reason": reason})
+            payload = json.dumps({"type": "invalidate", "reason": reason, "user": target_user})
             await cache.client.publish(PUBSUB_CHANNEL, payload)
-            redis_logger.info(f"📢 Published cache invalidation via Redis Pub/Sub (reason={reason})")
+            redis_logger.debug(f"📢 Published cache invalidation (reason={reason}, user={target_user})")
             return True
     except Exception as e:
         redis_logger.warning(f"Failed to publish Redis Pub/Sub invalidation: {e}")
@@ -575,10 +575,13 @@ async def start_pubsub_listener():
                 if message and message.get("type") == "message":
                     try:
                         data = json.loads(message.get("data", "{}"))
-                        redis_logger.info(f"⚡ Received Pub/Sub cache invalidation signal: {data}")
-                        
-                        from utils.user_sync import recompute_all_user_limits
-                        await recompute_all_user_limits()
+                        redis_logger.debug(f"⚡ Received Pub/Sub cache invalidation signal: {data}")
+                        target_user = data.get("user")
+                        from utils.user_sync import invalidate_user_metadata_cache, recompute_all_user_limits
+                        if target_user:
+                            invalidate_user_metadata_cache(target_user)
+                        else:
+                            await recompute_all_user_limits()
                     except Exception as parse_err:
                         redis_logger.error(f"Error processing Pub/Sub message: {parse_err}")
                         

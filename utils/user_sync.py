@@ -132,6 +132,21 @@ async def recompute_all_user_limits(config: dict = None):
         sync_logger.debug(f"PubSub publish note: {err}")
 
 
+def invalidate_user_metadata_cache(username: Optional[str] = None):
+    """
+    Invalidate in-memory USER_METADATA_CACHE (L0).
+    If username is None, clears the entire cache.
+    """
+    global USER_METADATA_CACHE
+    if username is None:
+        USER_METADATA_CACHE.clear()
+        sync_logger.debug("🧹 Cleared entire in-memory USER_METADATA_CACHE")
+    else:
+        if username in USER_METADATA_CACHE:
+            USER_METADATA_CACHE.pop(username, None)
+            sync_logger.debug(f"🧹 Invalidated {username} from in-memory USER_METADATA_CACHE")
+
+
 async def refresh_user_metadata_cache(db=None):
     """Refresh the in-memory USER_METADATA_CACHE from SQLite database."""
     global USER_METADATA_CACHE
