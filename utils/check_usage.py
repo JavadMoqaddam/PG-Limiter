@@ -31,6 +31,34 @@ _active_users_lock = ACTIVE_USERS_LOCK
 # clear one copy but leave the other untouched)
 isp_detector = None  # Will be initialized when needed
 
+
+def _ensure_isp_detector(config_data: dict) -> ISPDetector:
+    """
+    Ensure the global ISPDetector singleton is initialized and updated with the latest config.
+    
+    Args:
+        config_data: Configuration dictionary containing ipinfo_token or api config.
+        
+    Returns:
+        ISPDetector: The global ISPDetector instance.
+    """
+    global isp_detector
+    api_config = config_data.get("api", {}) if isinstance(config_data.get("api"), dict) else {}
+    ipinfo_token = config_data.get("ipinfo_token") or api_config.get("ipinfo_token", "")
+    use_fallback_api = api_config.get("use_fallback_isp_api", False)
+    
+    if isp_detector is None:
+        logger.info(f"Loading IPINFO_TOKEN from config: {'Present' if ipinfo_token else 'NOT FOUND'}")
+        if ipinfo_token:
+            logger.info(f"Token preview: {ipinfo_token[:20]}...")
+        if use_fallback_api:
+            logger.info("Using fallback ISP API (ip-api.com) for all requests")
+        isp_detector = ISPDetector(token=ipinfo_token if ipinfo_token else None, use_fallback_only=use_fallback_api)
+    elif ipinfo_token and getattr(isp_detector, "token", None) != ipinfo_token:
+        isp_detector.update_token(ipinfo_token)
+        
+    return isp_detector
+
 # Pattern to match usernames ending with .X.User where X is a number (e.g., amir.2.User)
 USERNAME_LIMIT_PATTERN = re.compile(r'\.(\d+)\.User$')
 # Pattern to match usernames ending with XUser where X is a number (e.g., Bastami22User, MVHHe2User)
@@ -623,15 +651,7 @@ async def check_ip_used() -> dict:
     )
     
     # Initialize or update ISP detector with token from config
-    ipinfo_token = config_data.get("ipinfo_token") or config_data.get("api", {}).get("ipinfo_token", "")
-    use_fallback_api = config_data.get("api", {}).get("use_fallback_isp_api", False)
-    if isp_detector is None:
-        logger.info(f"Loading IPINFO_TOKEN from config: {'Present' if ipinfo_token else 'NOT FOUND'}")
-        if use_fallback_api:
-            logger.info("Using fallback ISP API (ip-api.com) for all requests")
-        isp_detector = ISPDetector(token=ipinfo_token if ipinfo_token else None, use_fallback_only=use_fallback_api)
-    elif ipinfo_token and getattr(isp_detector, "token", None) != ipinfo_token:
-        isp_detector.update_token(ipinfo_token)
+    isp_detector = _ensure_isp_detector(config_data)
     
     active_users_snapshot = await get_active_users_snapshot()
     logger.info(f"📊 Processing {len(active_users_snapshot)} active users...")
@@ -960,17 +980,7 @@ async def check_users_usage(panel_data: PanelType):
         special_limit = await UserCRUD.get_all_special_limits(db)
     
     # Initialize or update ISP detector
-    ipinfo_token = config_data.get("ipinfo_token") or api_config.get("ipinfo_token", "")
-    use_fallback_api = api_config.get("use_fallback_isp_api", False)
-    if isp_detector is None:
-        logger.info(f"[check_users_usage] Loading ipinfo_token: {'Present' if ipinfo_token else 'NOT FOUND'}")
-        if ipinfo_token:
-            logger.info(f"[check_users_usage] Token preview: {ipinfo_token[:20]}...")
-        if use_fallback_api:
-            logger.info("[check_users_usage] Using fallback ISP API (ip-api.com) for all requests")
-        isp_detector = ISPDetector(token=ipinfo_token if ipinfo_token else None, use_fallback_only=use_fallback_api)
-    elif ipinfo_token and getattr(isp_detector, "token", None) != ipinfo_token:
-        isp_detector.update_token(ipinfo_token)
+    isp_detector = _ensure_isp_detector(config_data)
     
     logger.info("📊 Building user info from active connections...")
     
