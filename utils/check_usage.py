@@ -5,6 +5,7 @@ Enhanced with warning system and ISP detection.
 """
 
 import asyncio
+from dataclasses import dataclass, field
 import ipaddress
 import re
 import time
@@ -450,7 +451,37 @@ def group_ips_by_subnet(ip_list: list[str]) -> tuple[list[str], dict[str, list[s
     return formatted_results, ip_mapping
 
 
-def _build_ip_details(user_info: EnhancedUserInfo, original_user: UserType, show_enhanced_details: bool, cdn_inbounds: list[str] = None, cdn_nodes: list[int] = None, disabled_nodes: list[int] = None, subnet_ip_grouping: bool = False, high_trust_ip_grouping: bool = False, user_trust_score: float = 0.0, high_trust_threshold: int = 20, isp_info: dict = None) -> tuple[list[str], int]:
+@dataclass(slots=True)
+class DeviceCountingConfig:
+    """Configuration container for device counting and IP grouping rules."""
+    cdn_inbounds: list[str] = field(default_factory=list)
+    cdn_nodes: list[int] = field(default_factory=list)
+    disabled_nodes: list[int] = field(default_factory=list)
+    subnet_ip_grouping: bool = False
+    high_trust_ip_grouping: bool = False
+    high_trust_threshold: int = 20
+
+    @classmethod
+    def from_config(cls, config_data: dict) -> "DeviceCountingConfig":
+        """Build DeviceCountingConfig from application config dictionary."""
+        return cls(
+            cdn_inbounds=config_data.get("cdn_inbounds", []) or [],
+            cdn_nodes=config_data.get("cdn_nodes", []) or [],
+            disabled_nodes=config_data.get("disabled_nodes", []) or [],
+            subnet_ip_grouping=config_data.get("subnet_ip_grouping", False),
+            high_trust_ip_grouping=config_data.get("high_trust_ip_grouping", False),
+            high_trust_threshold=config_data.get("high_trust_threshold", 20),
+        )
+
+
+def _build_ip_details(
+    user_info: EnhancedUserInfo,
+    original_user: UserType,
+    show_enhanced_details: bool,
+    device_config: DeviceCountingConfig | None = None,
+    user_trust_score: float = 0.0,
+    isp_info: dict | None = None,
+) -> tuple[list[str], int]:
     """
     Build IP details with connection info for a user.
     
@@ -458,35 +489,26 @@ def _build_ip_details(user_info: EnhancedUserInfo, original_user: UserType, show
         user_info: Enhanced user information
         original_user: Original user data with device info
         show_enhanced_details: Whether to show detailed connection info
-        cdn_inbounds: List of inbound protocols that should be treated as CDN.
-                     In CDN mode, all IPs from the same inbound count as 1 device.
-        cdn_nodes: List of node IDs that are behind CDN.
-                   All IPs from CDN nodes count as 1 device per node.
-        disabled_nodes: List of node IDs to exclude from monitoring.
-                       Connections from these nodes are completely ignored.
-        subnet_ip_grouping: When True, IPs in same subnet with same node AND
-                           inbound protocol are counted as a single device.
-                           Uses /24 for same ISP, /16 when ISPs match.
-        high_trust_ip_grouping: When True and user has high trust score, IPs using
-                               same node AND inbound are counted as one device
-                               (for detecting WiFi/Mobile switching on same phone).
-        user_trust_score: The user's current trust score (from warning system).
-        high_trust_threshold: Minimum trust score required for high_trust_ip_grouping.
-        isp_info: Dict mapping IP addresses to their ISP info (for subnet grouping).
+        device_config: DeviceCountingConfig containing CDN and grouping parameters
+        user_trust_score: The user's current trust score (from warning system)
+        isp_info: Dict mapping IP addresses to their ISP info (for subnet grouping)
         
     Returns:
         Tuple of (list of formatted IP detail strings, device count)
         Device count = unique (IP, inbound) combinations, with CDN inbounds/nodes counting as 1
     """
-    if cdn_inbounds is None:
-        cdn_inbounds = []
-    if cdn_nodes is None:
-        cdn_nodes = []
-    if disabled_nodes is None:
-        disabled_nodes = []
+    if device_config is None:
+        device_config = DeviceCountingConfig()
     if isp_info is None:
         isp_info = {}
-    
+        
+    cdn_inbounds = device_config.cdn_inbounds
+    cdn_nodes = device_config.cdn_nodes
+    disabled_nodes = device_config.disabled_nodes
+    subnet_ip_grouping = device_config.subnet_ip_grouping
+    high_trust_ip_grouping = device_config.high_trust_ip_grouping
+    high_trust_threshold = device_config.high_trust_threshold
+
     # Check if high trust mode should be applied for this user
     apply_high_trust_grouping = (
         high_trust_ip_grouping and 
@@ -629,12 +651,7 @@ async def check_ip_used() -> dict:
     general_limit = config_data.get("limits", {}).get("general", 2)
     except_users = config_data.get("except_users", [])  # except_users is at root level
     show_enhanced_details = config_data.get("display", {}).get("show_enhanced_details", True)
-    cdn_inbounds = config_data.get("cdn_inbounds", [])  # List of inbounds in CDN mode
-    cdn_nodes = config_data.get("cdn_nodes", [])  # List of node IDs in CDN mode
-    disabled_nodes = config_data.get("disabled_nodes", [])  # List of node IDs to exclude
-    subnet_ip_grouping = config_data.get("subnet_ip_grouping", False)  # Relaxed IP counting mode
-    high_trust_ip_grouping = config_data.get("high_trust_ip_grouping", False)  # High trust mode
-    high_trust_threshold = config_data.get("high_trust_threshold", 20)  # Minimum trust score
+    device_config = DeviceCountingConfig.from_config(config_data)
     
     # Read special limits from database instead of config
     from db.database import get_db
@@ -815,8 +832,9 @@ async def check_ip_used() -> dict:
         
         _, device_count = _build_ip_details(
             user_info, original_user, show_enhanced_details, 
-            cdn_inbounds, cdn_nodes, disabled_nodes, subnet_ip_grouping,
-            high_trust_ip_grouping, user_trust_score, high_trust_threshold, user_isp_info
+            device_config=device_config,
+            user_trust_score=user_trust_score,
+            isp_info=user_isp_info,
         )
         all_user_device_counts[email] = device_count
         total_devices += device_count
@@ -878,8 +896,9 @@ async def check_ip_used() -> dict:
         # Build IP details
         ip_details, _ = _build_ip_details(
             user_info, original_user, show_enhanced_details, 
-            cdn_inbounds, cdn_nodes, disabled_nodes, subnet_ip_grouping,
-            high_trust_ip_grouping, user_trust_score, high_trust_threshold, user_isp_info
+            device_config=device_config,
+            user_trust_score=user_trust_score,
+            isp_info=user_isp_info,
         )
         
         # Build status indicators
