@@ -110,6 +110,7 @@ class PunishmentSystem:
         self.window_hours: int = self.DEFAULT_WINDOW_HOURS
         self.enabled: bool = True
         self._write_lock = asyncio.Lock()
+        self._last_cleanup: float = 0.0
         self.load_violations()
     
     def load_violations(self):
@@ -191,6 +192,7 @@ class PunishmentSystem:
     def cleanup_old_violations(self):
         """Remove violations older than the time window"""
         current_time = time.time()
+        self._last_cleanup = current_time
         window_seconds = self.window_hours * 60 * 60
         cutoff_time = current_time - window_seconds
         
@@ -203,6 +205,15 @@ class PunishmentSystem:
             # Remove user if no recent violations
             if not self.violations[username]:
                 del self.violations[username]
+
+    def _ensure_cleanup(self, force: bool = False):
+        """
+        Ensure old violations are cleaned up periodically (at most once every 5 minutes).
+        Avoids O(N) iteration over all users on every single user check.
+        """
+        current_time = time.time()
+        if force or (current_time - self._last_cleanup > 300):
+            self.cleanup_old_violations()
     
     def get_violation_count(self, username: str) -> int:
         """
@@ -214,7 +225,7 @@ class PunishmentSystem:
         Returns:
             Number of violations in the time window
         """
-        self.cleanup_old_violations()
+        self._ensure_cleanup()
         return len(self.violations.get(username, []))
     
     def get_next_step_index(self, username: str) -> int:
