@@ -305,52 +305,52 @@ async def panel_request(
                     response = await client.delete(url, headers=headers, timeout=timeout)
                 else:
                     response = await client.request(method, url, headers=headers, json=json_data, timeout=timeout)
-                    
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    log_api_request(method, url, response.status_code, elapsed)
-                    
-                    # Any response means panel server is reachable
-                    _record_connection_success()
-                    
-                    # 4xx Client Errors (400, 401, 403, 404): Panel is UP and functioning!
-                    # Reset/don't trip Circuit Breaker on 4xx business responses
-                    if response.status_code < 500:
-                        circuit_breaker.record_result(is_server_failure=False)
-                    
-                    # Success
-                    if response.status_code in (200, 201, 204):
-                        _record_success(scheme)
-                        return response, None
-                    
-                    # Auth error - caller should refresh token
-                    if response.status_code == 401:
-                        _record_failure(scheme)
-                        return response, "Unauthorized - token may be expired"
-                    
-                    # Not found
-                    if response.status_code == 404:
-                        _record_success(scheme)  # Server responded, just not found
-                        return response, None
-                    
-                    # Rate limited (429)
-                    if response.status_code == 429:
-                        _record_failure(scheme)
-                        last_error = f"Rate limited (429) on {url}"
-                        request_logger.warning(last_error)
-                        await asyncio.sleep(retry_delay * 2 + random.uniform(0.1, 0.5))
-                        continue
-                    
-                    # 5xx Server error - count as server failure for Circuit Breaker
-                    if response.status_code >= 500:
-                        circuit_breaker.record_result(is_server_failure=True)
-                        _record_failure(scheme)
-                        last_error = f"Server error ({response.status_code}) on {url}"
-                        request_logger.warning(last_error)
-                        continue
-                    
-                    # Other errors
+                
+                elapsed = (time.perf_counter() - start_time) * 1000
+                log_api_request(method, url, response.status_code, elapsed)
+                
+                # Any response means panel server is reachable
+                _record_connection_success()
+                
+                # 4xx Client Errors (400, 401, 403, 404): Panel is UP and functioning!
+                # Reset/don't trip Circuit Breaker on 4xx business responses
+                if response.status_code < 500:
+                    circuit_breaker.record_result(is_server_failure=False)
+                
+                # Success
+                if response.status_code in (200, 201, 204):
+                    _record_success(scheme)
+                    return response, None
+                
+                # Auth error - caller should refresh token
+                if response.status_code == 401:
                     _record_failure(scheme)
-                    last_error = f"HTTP {response.status_code}: {response.text[:100]}"
+                    return response, "Unauthorized - token may be expired"
+                
+                # Not found
+                if response.status_code == 404:
+                    _record_success(scheme)  # Server responded, just not found
+                    return response, None
+                
+                # Rate limited (429)
+                if response.status_code == 429:
+                    _record_failure(scheme)
+                    last_error = f"Rate limited (429) on {url}"
+                    request_logger.warning(last_error)
+                    await asyncio.sleep(retry_delay * 2 + random.uniform(0.1, 0.5))
+                    continue
+                
+                # 5xx Server error - count as server failure for Circuit Breaker
+                if response.status_code >= 500:
+                    circuit_breaker.record_result(is_server_failure=True)
+                    _record_failure(scheme)
+                    last_error = f"Server error ({response.status_code}) on {url}"
+                    request_logger.warning(last_error)
+                    continue
+                
+                # Other errors
+                _record_failure(scheme)
+                last_error = f"HTTP {response.status_code}: {response.text[:100]}"
                     
             except (SSLError, httpx.TimeoutException, httpx.ConnectError, httpx.RequestError) as e:
                 elapsed = (time.perf_counter() - start_time) * 1000
