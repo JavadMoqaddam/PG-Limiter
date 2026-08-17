@@ -52,7 +52,7 @@ CACHE_PREFIX = "pg_limiter:"
 
 
 class InMemoryCache:
-    """Fallback in-memory cache when Redis is not available."""
+    """Fallback in-memory cache when Redis is not available, optimized with lock-free reads."""
     
     def __init__(self):
         self._cache: Dict[str, Dict[str, Any]] = {}
@@ -60,26 +60,27 @@ class InMemoryCache:
         redis_logger.info("📦 Using in-memory cache (Redis not available)")
     
     async def get(self, key: str) -> Optional[str]:
-        """Get value from cache."""
-        async with self._lock:
-            import time
-            entry = self._cache.get(key)
-            if entry and (entry["expires_at"] == 0 or entry["expires_at"] > time.time()):
-                return entry["value"]
-            elif entry:
-                del self._cache[key]
-            return None
+        """Get value from cache (lock-free concurrent read)."""
+        import time
+        entry = self._cache.get(key)
+        if entry:
+            exp = entry.get("expires_at", 0)
+            if exp == 0 or exp > time.time():
+                return entry.get("value")
+            # Key expired: schedule background cleanup without blocking read
+            asyncio.create_task(self.delete(key))
+        return None
     
     async def set(self, key: str, value: str, ex: Optional[int] = None) -> bool:
-        """Set value in cache with optional expiration."""
+        """Set value in cache with optional expiration (protected write)."""
+        import time
+        expires_at = 0 if ex is None else time.time() + ex
         async with self._lock:
-            import time
-            expires_at = 0 if ex is None else time.time() + ex
             self._cache[key] = {"value": value, "expires_at": expires_at}
             return True
     
     async def delete(self, key: str) -> int:
-        """Delete key from cache."""
+        """Delete key from cache (protected write)."""
         async with self._lock:
             if key in self._cache:
                 del self._cache[key]
@@ -87,40 +88,39 @@ class InMemoryCache:
             return 0
     
     async def exists(self, key: str) -> int:
-        """Check if key exists."""
+        """Check if key exists (lock-free read)."""
         value = await self.get(key)
         return 1 if value is not None else 0
     
     async def keys(self, pattern: str) -> List[str]:
-        """Get keys matching pattern."""
+        """Get keys matching pattern (protected write/clean)."""
+        import fnmatch
+        import time
         async with self._lock:
-            import fnmatch
-            import time
             # Clean expired entries first
             current_time = time.time()
             expired = [k for k, v in self._cache.items() 
-                      if v["expires_at"] != 0 and v["expires_at"] <= current_time]
+                      if v.get("expires_at", 0) != 0 and v["expires_at"] <= current_time]
             for k in expired:
-                del self._cache[k]
+                self._cache.pop(k, None)
             
-            # Match pattern (convert Redis pattern to fnmatch)
-            pattern = pattern.replace("*", "*")
+            # Match pattern
             return [k for k in self._cache if fnmatch.fnmatch(k, pattern)]
     
     async def ttl(self, key: str) -> int:
-        """Get TTL for key."""
-        async with self._lock:
-            import time
-            entry = self._cache.get(key)
-            if not entry:
-                return -2
-            if entry["expires_at"] == 0:
-                return -1
-            remaining = int(entry["expires_at"] - time.time())
-            return remaining if remaining > 0 else -2
+        """Get TTL for key (lock-free read)."""
+        import time
+        entry = self._cache.get(key)
+        if not entry:
+            return -2
+        exp = entry.get("expires_at", 0)
+        if exp == 0:
+            return -1
+        remaining = int(exp - time.time())
+        return remaining if remaining > 0 else -2
     
     async def flushdb(self) -> bool:
-        """Flush all keys."""
+        """Flush all keys (protected write)."""
         async with self._lock:
             self._cache.clear()
             return True
@@ -130,15 +130,16 @@ class InMemoryCache:
         return True
     
     async def close(self):
-        """Close connection (no-op for in-memory)."""
-        self._cache.clear()
+        """Close connection (protected write)."""
+        async with self._lock:
+            self._cache.clear()
     
     async def incr(self, key: str) -> int:
-        """Increment value."""
+        """Increment value (protected write)."""
+        import time
         async with self._lock:
-            import time
             entry = self._cache.get(key)
-            if entry and (entry["expires_at"] == 0 or entry["expires_at"] > time.time()):
+            if entry and (entry.get("expires_at", 0) == 0 or entry["expires_at"] > time.time()):
                 try:
                     new_val = int(entry["value"]) + 1
                     entry["value"] = str(new_val)
@@ -149,38 +150,36 @@ class InMemoryCache:
             return 1
     
     async def hset(self, name: str, key: str, value: str) -> int:
-        """Set hash field."""
+        """Set hash field (protected write)."""
         async with self._lock:
             if name not in self._cache:
                 self._cache[name] = {"value": {}, "expires_at": 0}
             entry = self._cache[name]
-            if not isinstance(entry["value"], dict):
+            if not isinstance(entry.get("value"), dict):
                 entry["value"] = {}
             is_new = key not in entry["value"]
             entry["value"][key] = value
             return 1 if is_new else 0
     
     async def hget(self, name: str, key: str) -> Optional[str]:
-        """Get hash field."""
-        async with self._lock:
-            entry = self._cache.get(name)
-            if entry and isinstance(entry["value"], dict):
-                return entry["value"].get(key)
-            return None
+        """Get hash field (lock-free read)."""
+        entry = self._cache.get(name)
+        if entry and isinstance(entry.get("value"), dict):
+            return entry["value"].get(key)
+        return None
     
     async def hgetall(self, name: str) -> Dict[str, str]:
-        """Get all hash fields."""
-        async with self._lock:
-            entry = self._cache.get(name)
-            if entry and isinstance(entry["value"], dict):
-                return entry["value"].copy()
-            return {}
+        """Get all hash fields (lock-free snapshot read)."""
+        entry = self._cache.get(name)
+        if entry and isinstance(entry.get("value"), dict):
+            return dict(entry["value"])
+        return {}
     
     async def hdel(self, name: str, *keys: str) -> int:
-        """Delete hash fields."""
+        """Delete hash fields (protected write)."""
         async with self._lock:
             entry = self._cache.get(name)
-            if entry and isinstance(entry["value"], dict):
+            if entry and isinstance(entry.get("value"), dict):
                 count = 0
                 for key in keys:
                     if key in entry["value"]:
