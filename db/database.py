@@ -39,10 +39,10 @@ if DATABASE_URL.startswith("sqlite"):
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
-        connect_args={"check_same_thread": False, "timeout": 60.0},
+        connect_args={"check_same_thread": False, "timeout": 30.0},
         pool_pre_ping=True,
-        pool_size=10,
-        max_overflow=20,
+        pool_size=1,
+        max_overflow=4,
     )
     
     from sqlalchemy import event
@@ -52,7 +52,7 @@ if DATABASE_URL.startswith("sqlite"):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA journal_mode=WAL;")
         cursor.execute("PRAGMA synchronous=NORMAL;")
-        cursor.execute("PRAGMA busy_timeout=60000;")
+        cursor.execute("PRAGMA busy_timeout=30000;")
         cursor.execute("PRAGMA cache_size=-64000;")
         cursor.close()
 else:
