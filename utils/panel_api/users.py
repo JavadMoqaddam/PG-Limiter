@@ -1246,8 +1246,6 @@ async def enable_dis_user(panel_data: PanelType):
                     users_logger.warning(f"⚠️ Failed to enable {len(failed)} users (will retry): {failed}")
         except Exception as e:
             users_logger.error(f"Error in enable_dis_user loop: {e}")
-        except Exception as e:
-            users_logger.error(f"Error in enable_dis_user loop: {e}")
 
 
 async def cleanup_deleted_users(panel_data: PanelType) -> dict:
