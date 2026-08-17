@@ -812,13 +812,15 @@ async def check_ip_used(config_data: dict | None = None) -> dict:
     
     total_ips = len(all_actual_ips)
     
-    # Calculate device counts for all users
+    # Calculate device counts and pre-build IP details for all users in one pass
     all_user_device_counts = {}
+    all_user_ip_details = {}
     total_devices = 0
     
     for email, user_info in enhanced_users_info.items():
         if not user_info.user.ip:
             all_user_device_counts[email] = 0
+            all_user_ip_details[email] = []
             continue
         
         original_user = active_users_snapshot.get(email)
@@ -831,13 +833,14 @@ async def check_ip_used(config_data: dict | None = None) -> dict:
         # Get ISP info for this user's IPs
         user_isp_info = {ip: isp_info_batch.get(ip, {}) for ip in user_info.user.ip if ip in isp_info_batch}
         
-        _, device_count = _build_ip_details(
+        ip_details, device_count = _build_ip_details(
             user_info, original_user, show_enhanced_details, 
             device_config=device_config,
             user_trust_score=user_trust_score,
             isp_info=user_isp_info,
         )
         all_user_device_counts[email] = device_count
+        all_user_ip_details[email] = ip_details
         total_devices += device_count
     
     logger.info("Number of all active ips: %s, devices: %s", str(total_ips), str(total_devices))
@@ -886,21 +889,8 @@ async def check_ip_used(config_data: dict | None = None) -> dict:
         
         users_shown += 1
         
-        # Get user's trust score from warning system (if available)
-        user_trust_score = 0.0
-        if email in warning_system.warnings:
-            user_trust_score = warning_system.warnings[email].trust_score
-        
-        # Get ISP info for this user's IPs
-        user_isp_info = {ip: isp_info_batch.get(ip, {}) for ip in user_info.user.ip if ip in isp_info_batch}
-        
-        # Build IP details
-        ip_details, _ = _build_ip_details(
-            user_info, original_user, show_enhanced_details, 
-            device_config=device_config,
-            user_trust_score=user_trust_score,
-            isp_info=user_isp_info,
-        )
+        # Retrieve pre-computed IP details (avoids duplicate O(N) connection iterations & subnet calculations)
+        ip_details = all_user_ip_details.get(email, [])
         
         # Build status indicators
         status_text = ""
