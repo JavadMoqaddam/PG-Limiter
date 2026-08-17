@@ -515,31 +515,12 @@ class UserCRUD:
     @staticmethod
     async def bulk_sync(db: AsyncSession, users_data: List[dict]) -> int:
         """
-        Bulk sync users from panel data.
-        Creates new users and updates existing ones.
-        Returns count of synced users.
+        DEPRECATED: Bulk sync users from panel data.
+        Use UserCRUD.bulk_upsert_users() instead to avoid N+1 query overhead.
+        This method now delegates to bulk_upsert_users() for optimal performance and backward compatibility.
         """
-        db_users_logger.info(f"🔄 Starting bulk sync for {len(users_data)} users")
-        count = 0
-        for data in users_data:
-            await UserCRUD.create_or_update(
-                db,
-                username=data.get("username"),
-                panel_id=data.get("id"),
-                status=data.get("status", "active"),
-                owner_id=data.get("owner_id") or data.get("admin_id"),
-                owner_username=data.get("owner_username") or data.get("admin_username"),
-                group_ids=data.get("group_ids") or data.get("groups") or [],
-                data_limit=data.get("data_limit"),
-                used_traffic=data.get("used_traffic", 0),
-                expire_at=data.get("expire_at"),
-                note=data.get("note"),
-            )
-            count += 1
-        
-        await db.flush()
-        db_users_logger.info(f"✅ Synced {count} users to database")
-        return count
+        db_users_logger.debug(f"[DEPRECATED] bulk_sync -> bulk_upsert_users({len(users_data)} users)")
+        return await UserCRUD.bulk_upsert_users(db, users_data)
 
     @staticmethod
     async def bulk_upsert_users(db: AsyncSession, users_data: List[dict]) -> int:
