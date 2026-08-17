@@ -22,6 +22,38 @@ from utils.user_group_filter import should_limit_user, get_filter_status_text
 from utils.admin_filter import should_limit_user_by_admin
 
 ACTIVE_USERS: dict[str, UserType] | dict = {}
+ACTIVE_USERS_LOCK = asyncio.Lock()
+_active_users_lock = ACTIVE_USERS_LOCK
+
+
+async def get_active_users_snapshot() -> dict[str, UserType]:
+    """
+    Take an atomic point-in-time snapshot of ACTIVE_USERS with cloned IP lists.
+    Guarantees callers have an isolated, thread-safe view without blocking ongoing log streaming.
+    """
+    async with _active_users_lock:
+        snapshot = {}
+        for email, user in ACTIVE_USERS.items():
+            if not email or not user:
+                continue
+            snapshot[email] = UserType(
+                name=user.name,
+                status=user.status,
+                ip=list(user.ip) if hasattr(user, "ip") and user.ip else [],
+                isp_info=user.isp_info,
+                device_info=user.device_info,
+                panel_status=user.panel_status,
+                data_limit=user.data_limit,
+                used_traffic=user.used_traffic,
+                lifetime_used_traffic=user.lifetime_used_traffic,
+                expire=user.expire,
+                group_ids=user.group_ids,
+                online_at=user.online_at,
+                admin_username=user.admin_username,
+                is_monitored=getattr(user, "is_monitored", True),
+                effective_ip_limit=getattr(user, "effective_ip_limit", None),
+            )
+        return snapshot
 
 # Use global warning system instance imported above
 # (previously a separate instance; having two caused reset button to
@@ -540,7 +572,8 @@ async def check_ip_used() -> dict:
     elif ipinfo_token and getattr(isp_detector, "token", None) != ipinfo_token:
         isp_detector.update_token(ipinfo_token)
     
-    logger.info(f"📊 Processing {len(ACTIVE_USERS)} active users...")
+    active_users_snapshot = await get_active_users_snapshot()
+    logger.info(f"📊 Processing {len(active_users_snapshot)} active users...")
     
     all_users_log = {}
     enhanced_users_info = {}
@@ -551,12 +584,12 @@ async def check_ip_used() -> dict:
     ip_mappings = {}
     all_actual_ips = set()
     
-    for email in list(ACTIVE_USERS.keys()):
+    for email in list(active_users_snapshot.keys()):
         # Skip empty usernames
         if not email or not email.strip():
             continue
         
-        data = ACTIVE_USERS[email]
+        data = active_users_snapshot[email]
         
         # Add ALL IPs for total count
         for ip in data.ip:
@@ -689,7 +722,7 @@ async def check_ip_used() -> dict:
             all_user_device_counts[email] = 0
             continue
         
-        original_user = ACTIVE_USERS.get(email)
+        original_user = active_users_snapshot.get(email)
         
         # Get user's trust score from warning system (if available)
         user_trust_score = 0.0
@@ -910,8 +943,10 @@ async def check_users_usage(panel_data: PanelType):
     all_users_data = {}  # Maps username to UserType with full data
     all_ips_for_isp_lookup = set()  # Collect all IPs for batch ISP lookup
     
-    for email in list(ACTIVE_USERS.keys()):
-        data = ACTIVE_USERS[email]
+    active_users_snapshot = await get_active_users_snapshot()
+    
+    for email in list(active_users_snapshot.keys()):
+        data = active_users_snapshot[email]
         # Get ALL unique IPs for this user (not just filtered ones)
         unique_ips = set(data.ip)
         all_users_actual_ips[email] = unique_ips
@@ -1047,7 +1082,8 @@ async def check_users_usage(panel_data: PanelType):
     # Send monitoring status every few cycles (optional)
     # await warning_system.send_monitoring_status()
     
-    ACTIVE_USERS.clear()
+    async with _active_users_lock:
+        ACTIVE_USERS.clear()
     all_users_log.clear()
 
 

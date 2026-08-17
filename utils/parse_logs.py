@@ -9,7 +9,7 @@ import time
 
 from cachetools import TTLCache
 
-from utils.check_usage import ACTIVE_USERS
+from utils.check_usage import ACTIVE_USERS, ACTIVE_USERS_LOCK
 from utils.read_config import read_config
 from utils.types import ConnectionInfo, DeviceInfo, UserType
 
@@ -394,19 +394,20 @@ async def parse_logs(log: str, node_id: int = None, node_name: str = None) -> di
         else:
             continue
 
-        # Update user information
-        user = ACTIVE_USERS.get(email)
-        if user:
-            # Add IP if not already present
-            if ip not in user.ip:
-                user.ip.append(ip)
-            # Update device info with the specific node info
-            await update_user_device_info_with_node(user, ip, inbound_protocol, current_node_id, current_node_name)
-        else:
-            # Create new user
-            user = UserType(name=email, ip=[ip])
-            await update_user_device_info_with_node(user, ip, inbound_protocol, current_node_id, current_node_name)
-            ACTIVE_USERS[email] = user
+        # Update user information safely under lock
+        async with ACTIVE_USERS_LOCK:
+            user = ACTIVE_USERS.get(email)
+            if user:
+                # Add IP if not already present
+                if ip not in user.ip:
+                    user.ip.append(ip)
+                # Update device info with the specific node info
+                await update_user_device_info_with_node(user, ip, inbound_protocol, current_node_id, current_node_name)
+            else:
+                # Create new user
+                user = UserType(name=email, ip=[ip])
+                await update_user_device_info_with_node(user, ip, inbound_protocol, current_node_id, current_node_name)
+                ACTIVE_USERS[email] = user
 
         try:
             from utils.redis_cache import get_cache
@@ -436,40 +437,41 @@ async def clear_node_active_connections(node_id: int) -> int:
     removed_count = 0
     users_to_cleanup = []
     
-    for username, user in list(ACTIVE_USERS.items()):
-        if not hasattr(user, "device_info") or not user.device_info or not user.device_info.connections:
-            continue
-            
-        # Build new connection list atomically
-        new_connections = [
-            conn for conn in user.device_info.connections 
-            if conn.node_id != node_id
-        ]
-        
-        removed_from_user = len(user.device_info.connections) - len(new_connections)
-        if removed_from_user > 0:
-            removed_count += removed_from_user
-            
-            if new_connections:
-                # Recompute sets atomically
-                new_ips = {conn.ip for conn in new_connections}
-                new_nodes = {conn.node_id for conn in new_connections if conn.node_id is not None}
-                new_protocols = {conn.inbound_protocol for conn in new_connections if conn.inbound_protocol is not None}
+    async with ACTIVE_USERS_LOCK:
+        for username, user in list(ACTIVE_USERS.items()):
+            if not hasattr(user, "device_info") or not user.device_info or not user.device_info.connections:
+                continue
                 
-                # Atomic assignment
-                user.device_info.connections = new_connections
-                user.device_info.unique_ips = new_ips
-                user.device_info.unique_nodes = new_nodes
-                user.device_info.inbound_protocols = new_protocols
-                user.device_info.is_multi_device = (
-                    len(new_ips) > 2 or len(new_protocols) > 1 or len(new_nodes) > 1
-                )
-                user.ip = list(new_ips)
-            else:
-                users_to_cleanup.append(username)
-                
-    for username in users_to_cleanup:
-        if username in ACTIVE_USERS:
-            del ACTIVE_USERS[username]
+            # Build new connection list atomically
+            new_connections = [
+                conn for conn in user.device_info.connections 
+                if conn.node_id != node_id
+            ]
             
+            removed_from_user = len(user.device_info.connections) - len(new_connections)
+            if removed_from_user > 0:
+                removed_count += removed_from_user
+                
+                if new_connections:
+                    # Recompute sets atomically
+                    new_ips = {conn.ip for conn in new_connections}
+                    new_nodes = {conn.node_id for conn in new_connections if conn.node_id is not None}
+                    new_protocols = {conn.inbound_protocol for conn in new_connections if conn.inbound_protocol is not None}
+                    
+                    # Atomic assignment
+                    user.device_info.connections = new_connections
+                    user.device_info.unique_ips = new_ips
+                    user.device_info.unique_nodes = new_nodes
+                    user.device_info.inbound_protocols = new_protocols
+                    user.device_info.is_multi_device = (
+                        len(new_ips) > 2 or len(new_protocols) > 1 or len(new_nodes) > 1
+                    )
+                    user.ip = list(new_ips)
+                else:
+                    users_to_cleanup.append(username)
+                    
+        for username in users_to_cleanup:
+            if username in ACTIVE_USERS:
+                del ACTIVE_USERS[username]
+                
     return removed_count

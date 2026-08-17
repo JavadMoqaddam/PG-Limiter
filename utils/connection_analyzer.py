@@ -17,8 +17,8 @@ async def generate_connection_report(active_users: Dict[str, UserType] = None) -
         str: Formatted report string
     """
     if active_users is None:
-        from utils.check_usage import ACTIVE_USERS
-        active_users = ACTIVE_USERS
+        from utils.check_usage import get_active_users_snapshot
+        active_users = await get_active_users_snapshot()
     
     if not active_users:
         return "No active user connections found."
@@ -59,8 +59,8 @@ async def get_users_by_node(node_id: int, active_users: Dict[str, UserType] = No
         List[Tuple[str, str, str]]: List of (username, ip, inbound_protocol) tuples
     """
     if active_users is None:
-        from utils.check_usage import ACTIVE_USERS
-        active_users = ACTIVE_USERS
+        from utils.check_usage import get_active_users_snapshot
+        active_users = await get_active_users_snapshot()
     
     users_on_node = []
     
@@ -84,8 +84,8 @@ async def get_users_by_inbound_protocol(protocol: str, active_users: Dict[str, U
         List[Tuple[str, str, str]]: List of (username, ip, node_name) tuples
     """
     if active_users is None:
-        from utils.check_usage import ACTIVE_USERS
-        active_users = ACTIVE_USERS
+        from utils.check_usage import get_active_users_snapshot
+        active_users = await get_active_users_snapshot()
     
     users_with_protocol = []
     
@@ -108,8 +108,8 @@ async def get_multi_device_users(active_users: Dict[str, UserType] = None) -> Li
         List[Tuple[str, int, int, List[str]]]: List of (username, ip_count, node_count, protocols) tuples
     """
     if active_users is None:
-        from utils.check_usage import ACTIVE_USERS
-        active_users = ACTIVE_USERS
+        from utils.check_usage import get_active_users_snapshot
+        active_users = await get_active_users_snapshot()
     
     multi_device_users = []
     
@@ -136,8 +136,8 @@ async def get_node_usage_summary(active_users: Dict[str, UserType] = None) -> Di
         Dict[str, Dict[str, int]]: Dictionary with node usage statistics
     """
     if active_users is None:
-        from utils.check_usage import ACTIVE_USERS
-        active_users = ACTIVE_USERS
+        from utils.check_usage import get_active_users_snapshot
+        active_users = await get_active_users_snapshot()
     
     node_stats = {}
     

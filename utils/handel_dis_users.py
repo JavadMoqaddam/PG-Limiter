@@ -1,68 +1,100 @@
 """
-This module contains the DisabledUsers class
-which provides methods for managing disabled users
+This module contains the DisabledUsers class and DisabledUserEntry dataclass
+which provides unified, thread-safe methods for managing disabled users.
 """
 
 import asyncio
 import json
 import os
 import time
+from dataclasses import dataclass
 
 from utils.logs import logger
 from utils.atomic_io import atomic_write_json
 
-DISABLED_USERS = set()
-# Track when each user was disabled: {username: timestamp}
-DISABLED_USERS_TIMESTAMPS = {}
-# Track custom enable times: {username: enable_at_timestamp}
-DISABLED_USERS_ENABLE_AT = {}
+
+@dataclass(slots=True)
+class DisabledUserEntry:
+    """
+    Unified entry representing a disabled user.
+    Eliminates multiple split dictionaries and provides a single source of truth.
+    """
+    username: str
+    disabled_at: float
+    enable_at: float | None = None  # None = default time_to_active, -1 = permanent, >0 = custom timestamp
+
+
+# Shared module-level lock for all DisabledUsers instances and operations
+DISABLED_USERS_LOCK = asyncio.Lock()
+_disabled_users_lock = DISABLED_USERS_LOCK
+
+# Global state collections maintained for backward-compatibility
+DISABLED_USERS: set[str] = set()
+DISABLED_USERS_TIMESTAMPS: dict[str, float] = {}
+DISABLED_USERS_ENABLE_AT: dict[str, float] = {}
 
 
 class DisabledUsers:
     """
-    A class used to represent the Disabled Users.
-    Now tracks the timestamp when each user was disabled and optional custom enable times.
+    Unified manager for disabled users using DisabledUserEntry dataclass.
+    Thread-safe with atomic JSON persistence and cross-instance asyncio.Lock synchronization.
     """
+    _lock = _disabled_users_lock
 
     def __init__(self, filename=".disable_users.json"):
         self.filename = "/var/lib/pg-limiter/disable_users.json"
-        self.disabled_users = {}  # {username: disabled_timestamp}
-        self.enable_at = {}  # {username: enable_at_timestamp} - custom enable time
-        self._write_lock = asyncio.Lock()
+        if filename != ".disable_users.json":
+            self.filename = filename
+        self._entries: dict[str, DisabledUserEntry] = {}
+        self.disabled_users: dict[str, float] = {}  # {username: disabled_timestamp}
+        self.enable_at: dict[str, float] = {}  # {username: enable_at_timestamp}
+        self._write_lock = self._lock
         self.load_disabled_users()
+
+    def _sync_views_from_entries(self):
+        """Synchronize internal views and global structures from the single source of truth (_entries)."""
+        self.disabled_users = {u: e.disabled_at for u, e in self._entries.items()}
+        self.enable_at = {u: e.enable_at for u, e in self._entries.items() if e.enable_at is not None}
+        
+        global DISABLED_USERS, DISABLED_USERS_TIMESTAMPS, DISABLED_USERS_ENABLE_AT
+        DISABLED_USERS = set(self.disabled_users.keys())
+        DISABLED_USERS_TIMESTAMPS = self.disabled_users.copy()
+        DISABLED_USERS_ENABLE_AT = self.enable_at.copy()
 
     def load_disabled_users(self):
         """
-        Loads the disabled users from the JSON file.
-        Now loads timestamps and custom enable times as well.
+        Loads the disabled users from the JSON file into unified DisabledUserEntry registry.
         """
         global DISABLED_USERS, DISABLED_USERS_TIMESTAMPS, DISABLED_USERS_ENABLE_AT
         try:
-            if os.path.exists(self.filename):
+            if os.path.exists(self.filename) and os.path.getsize(self.filename) > 0:
                 with open(self.filename, "r", encoding="utf-8") as file:
                     data = json.load(file)
-                    # Support both old format (list) and new format (dict with timestamps)
-                    if "disable_user" in data:
+                    
+                    raw_disabled = {}
+                    if "disabled_users" in data:
+                        raw_disabled = data.get("disabled_users", {})
+                    elif "disable_user" in data:
                         old_users = data.get("disable_user", [])
                         if isinstance(old_users, list):
-                            # Old format: convert to new format with current timestamp
                             current_time = time.time()
-                            self.disabled_users = {user: current_time for user in old_users}
+                            raw_disabled = {user: current_time for user in old_users}
                         elif isinstance(old_users, dict):
-                            # New format: dict with timestamps
-                            self.disabled_users = old_users
-                    elif "disabled_users" in data:
-                        # New format key
-                        self.disabled_users = data.get("disabled_users", {})
+                            raw_disabled = old_users
                     
-                    # Load custom enable times
-                    self.enable_at = data.get("enable_at", {})
+                    raw_enable_at = data.get("enable_at", {})
                     
-                    # Update globals
-                    DISABLED_USERS = set(self.disabled_users.keys())
-                    DISABLED_USERS_TIMESTAMPS = self.disabled_users.copy()
-                    DISABLED_USERS_ENABLE_AT = self.enable_at.copy()
+                    self._entries.clear()
+                    for username, dis_time in raw_disabled.items():
+                        enable_time = raw_enable_at.get(username)
+                        self._entries[username] = DisabledUserEntry(
+                            username=username,
+                            disabled_at=float(dis_time),
+                            enable_at=float(enable_time) if enable_time is not None else None
+                        )
+                    self._sync_views_from_entries()
             else:
+                self._entries.clear()
                 self.disabled_users = {}
                 self.enable_at = {}
                 DISABLED_USERS = set()
@@ -70,13 +102,13 @@ class DisabledUsers:
                 DISABLED_USERS_ENABLE_AT = {}
         except Exception as error:  # pylint: disable=broad-except
             logger.error(f"Failed to load disabled users file: {error}")
-            # Rename corrupted file for debugging instead of blocking on input()
             try:
                 backup_path = self.filename + ".corrupted"
                 os.rename(self.filename, backup_path)
                 logger.warning(f"Renamed corrupted file to {backup_path}")
             except OSError:
                 pass
+            self._entries.clear()
             self.disabled_users = {}
             self.enable_at = {}
             DISABLED_USERS = set()
@@ -86,18 +118,18 @@ class DisabledUsers:
     def _sync_save_disabled_users(self):
         """Synchronous file write for disabled users data."""
         atomic_write_json(self.filename, {
-            "disabled_users": self.disabled_users,
-            "enable_at": self.enable_at
+            "disabled_users": {u: e.disabled_at for u, e in self._entries.items()},
+            "enable_at": {u: e.enable_at for u, e in self._entries.items() if e.enable_at is not None}
         })
 
     async def save_disabled_users(self):
         """
         Saves the disabled users with timestamps to the JSON file.
-        Uses asyncio.Lock to prevent race conditions and atomic write for crash safety.
+        Uses shared asyncio.Lock to prevent race conditions and atomic write for crash safety.
         """
-        async with self._write_lock:
+        async with self._lock:
             await asyncio.to_thread(self._sync_save_disabled_users)
-        logger.info(f"Saved {len(self.disabled_users)} disabled users to {self.filename}")
+        logger.info(f"Saved {len(self._entries)} disabled users to {self.filename}")
 
     async def add_user(self, username: str, duration_seconds: int = 0, permanent: bool = False):
         """
@@ -111,57 +143,45 @@ class DisabledUsers:
                               Ignored if permanent=True.
             permanent: If True, user will never be auto-enabled (until manual enable).
         """
-        global DISABLED_USERS, DISABLED_USERS_TIMESTAMPS, DISABLED_USERS_ENABLE_AT
-        current_time = time.time()
-        DISABLED_USERS.add(username)
-        DISABLED_USERS_TIMESTAMPS[username] = current_time
-        self.disabled_users[username] = current_time
-        
-        if permanent:
-            # Use -1 as sentinel value for permanent disable (never auto-enable)
-            self.enable_at[username] = -1
-            DISABLED_USERS_ENABLE_AT[username] = -1
-            logger.info(f"User {username} disabled permanently at {time.strftime('%H:%M:%S', time.localtime(current_time))}, "
-                       f"will NOT be auto-enabled (manual only)")
-        elif duration_seconds > 0:
-            # Set custom enable time if duration specified
-            enable_at = current_time + duration_seconds
-            self.enable_at[username] = enable_at
-            DISABLED_USERS_ENABLE_AT[username] = enable_at
-            enable_time = time.strftime('%H:%M:%S', time.localtime(enable_at))
-            logger.info(f"User {username} disabled at {time.strftime('%H:%M:%S', time.localtime(current_time))}, "
-                       f"will be enabled at {enable_time} ({duration_seconds}s)")
-        else:
-            # Remove any existing custom enable time
-            if username in self.enable_at:
-                del self.enable_at[username]
-            if username in DISABLED_USERS_ENABLE_AT:
-                del DISABLED_USERS_ENABLE_AT[username]
-            # Log with default time
-            enable_time = time.strftime('%H:%M:%S', time.localtime(current_time + 1800))  # 30 min default
-            logger.info(f"User {username} disabled at {time.strftime('%H:%M:%S', time.localtime(current_time))}, "
-                       f"will be enabled around {enable_time} (default)")
-        
-        await self.save_disabled_users()
+        async with self._lock:
+            current_time = time.time()
+            enable_at_val: float | None = None
+            
+            if permanent:
+                enable_at_val = -1.0
+                logger.info(f"User {username} disabled permanently at {time.strftime('%H:%M:%S', time.localtime(current_time))}, "
+                           f"will NOT be auto-enabled (manual only)")
+            elif duration_seconds > 0:
+                enable_at_val = current_time + duration_seconds
+                enable_time = time.strftime('%H:%M:%S', time.localtime(enable_at_val))
+                logger.info(f"User {username} disabled at {time.strftime('%H:%M:%S', time.localtime(current_time))}, "
+                           f"will be enabled at {enable_time} ({duration_seconds}s)")
+            else:
+                enable_time = time.strftime('%H:%M:%S', time.localtime(current_time + 1800))
+                logger.info(f"User {username} disabled at {time.strftime('%H:%M:%S', time.localtime(current_time))}, "
+                           f"will be enabled around {enable_time} (default)")
+            
+            self._entries[username] = DisabledUserEntry(
+                username=username,
+                disabled_at=current_time,
+                enable_at=enable_at_val
+            )
+            self._sync_views_from_entries()
+            await asyncio.to_thread(self._sync_save_disabled_users)
+        logger.info(f"Saved {len(self._entries)} disabled users to {self.filename}")
 
     async def remove_user(self, username: str):
         """
-        Removes a user from the disabled users set.
+        Removes a user from the disabled users registry.
         """
-        global DISABLED_USERS, DISABLED_USERS_TIMESTAMPS, DISABLED_USERS_ENABLE_AT
-        if username in self.disabled_users:
-            del self.disabled_users[username]
-        if username in self.enable_at:
-            del self.enable_at[username]
-        if username in DISABLED_USERS:
-            DISABLED_USERS.remove(username)
-        if username in DISABLED_USERS_TIMESTAMPS:
-            del DISABLED_USERS_TIMESTAMPS[username]
-        if username in DISABLED_USERS_ENABLE_AT:
-            del DISABLED_USERS_ENABLE_AT[username]
-        await self.save_disabled_users()
+        async with self._lock:
+            if username in self._entries:
+                del self._entries[username]
+            self._sync_views_from_entries()
+            await asyncio.to_thread(self._sync_save_disabled_users)
+        logger.info(f"Saved {len(self._entries)} disabled users to {self.filename}")
 
-    async def get_users_to_enable(self, default_time_to_active: int) -> list:
+    async def get_users_to_enable(self, default_time_to_active: int) -> list[str]:
         """
         Returns a list of users who should be enabled now.
         Uses custom enable_at time if set, otherwise uses default_time_to_active.
@@ -172,40 +192,36 @@ class DisabledUsers:
         Returns:
             List of usernames ready to be enabled
         """
-        # Reload from file to get latest data
-        await asyncio.to_thread(self.load_disabled_users)
-        
-        current_time = time.time()
-        users_to_enable = []
-        
-        if self.disabled_users:
-            logger.info(f"Checking {len(self.disabled_users)} disabled users (default={default_time_to_active}s)")
-        
-        for username, disabled_time in list(self.disabled_users.items()):
-            # Check if user has custom enable time
-            if username in self.enable_at:
-                enable_at = self.enable_at[username]
-                # -1 means permanent disable - never auto-enable
-                if enable_at == -1:
-                    logger.debug(f"User {username} is permanently disabled (manual enable only)")
-                    continue
-                if current_time >= enable_at:
-                    users_to_enable.append(username)
-                    logger.info(f"User {username} ready to enable (custom timer expired)")
+        async with self._lock:
+            await asyncio.to_thread(self.load_disabled_users)
+            
+            current_time = time.time()
+            users_to_enable = []
+            
+            if self._entries:
+                logger.info(f"Checking {len(self._entries)} disabled users (default={default_time_to_active}s)")
+            
+            for username, entry in list(self._entries.items()):
+                if entry.enable_at is not None:
+                    if entry.enable_at == -1:
+                        logger.debug(f"User {username} is permanently disabled (manual enable only)")
+                        continue
+                    if current_time >= entry.enable_at:
+                        users_to_enable.append(username)
+                        logger.info(f"User {username} ready to enable (custom timer expired)")
+                    else:
+                        remaining = int(entry.enable_at - current_time)
+                        logger.debug(f"User {username} has {remaining}s remaining on custom timer")
                 else:
-                    remaining = int(enable_at - current_time)
-                    logger.debug(f"User {username} has {remaining}s remaining on custom timer")
-            else:
-                # Use default time_to_active
-                elapsed = current_time - disabled_time
-                remaining = default_time_to_active - elapsed
-                if elapsed >= default_time_to_active:
-                    users_to_enable.append(username)
-                    logger.info(f"User {username} ready to enable (disabled {int(elapsed)}s ago)")
-                else:
-                    logger.debug(f"User {username} needs {int(remaining)}s more before enable")
-        
-        return users_to_enable
+                    elapsed = current_time - entry.disabled_at
+                    remaining = default_time_to_active - elapsed
+                    if elapsed >= default_time_to_active:
+                        users_to_enable.append(username)
+                        logger.info(f"User {username} ready to enable (disabled {int(elapsed)}s ago)")
+                    else:
+                        logger.debug(f"User {username} needs {int(remaining)}s more before enable")
+            
+            return users_to_enable
 
     def get_user_remaining_time(self, username: str, default_time_to_active: int) -> int:
         """
@@ -218,35 +234,29 @@ class DisabledUsers:
         Returns:
             Remaining seconds, 0 if ready to enable, -1 if not disabled, -2 if permanent
         """
-        if username not in self.disabled_users:
+        entry = self._entries.get(username)
+        if not entry:
             return -1
         
         current_time = time.time()
-        disabled_time = self.disabled_users[username]
-        
-        if username in self.enable_at:
-            enable_at = self.enable_at[username]
-            # -1 means permanent disable
-            if enable_at == -1:
+        if entry.enable_at is not None:
+            if entry.enable_at == -1:
                 return -2  # Special code for permanent
-            remaining = enable_at - current_time
-        else:
-            elapsed = current_time - disabled_time
-            remaining = default_time_to_active - elapsed
+            return max(0, int(entry.enable_at - current_time))
         
+        elapsed = current_time - entry.disabled_at
+        remaining = default_time_to_active - elapsed
         return max(0, int(remaining))
 
-    async def read_and_clear_users(self):
+    async def read_and_clear_users(self) -> set[str]:
         """
-        Returns a list of all disabled users, clears the set
+        Returns a set of all disabled users, clears the registry
         and saves the empty data to the JSON file.
         """
-        global DISABLED_USERS, DISABLED_USERS_TIMESTAMPS, DISABLED_USERS_ENABLE_AT
-        disabled_users = list(self.disabled_users.keys())
-        self.disabled_users.clear()
-        self.enable_at.clear()
-        DISABLED_USERS.clear()
-        DISABLED_USERS_TIMESTAMPS.clear()
-        DISABLED_USERS_ENABLE_AT.clear()
-        await self.save_disabled_users()
-        return set(disabled_users)
+        async with self._lock:
+            disabled_users = set(self._entries.keys())
+            self._entries.clear()
+            self._sync_views_from_entries()
+            await asyncio.to_thread(self._sync_save_disabled_users)
+        return disabled_users
+
