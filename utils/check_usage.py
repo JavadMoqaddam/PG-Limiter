@@ -22,7 +22,7 @@ from utils.ip_history_tracker import ip_history_tracker
 from utils.user_group_filter import should_limit_user, get_filter_status_text
 from utils.admin_filter import should_limit_user_by_admin
 
-from utils.shared_state import ACTIVE_USERS, ACTIVE_USERS_LOCK, get_active_users_snapshot
+from utils.shared_state import ACTIVE_USERS, ACTIVE_USERS_LOCK, get_active_users_snapshot, pop_active_users_snapshot
 
 # Re-export internal alias for backward compatibility
 _active_users_lock = ACTIVE_USERS_LOCK
@@ -637,7 +637,7 @@ def _build_ip_details(
     return ip_details, device_count
 
 
-async def check_ip_used(config_data: dict | None = None) -> dict:
+async def check_ip_used(config_data: dict | None = None, active_users_snapshot: dict | None = None) -> dict:
     """
     Check active users and display them.
     1. Shows all active users with device count >= general_limit in ONE combined message
@@ -671,7 +671,8 @@ async def check_ip_used(config_data: dict | None = None) -> dict:
     # Initialize or update ISP detector with token from config
     isp_detector = _ensure_isp_detector(config_data)
     
-    active_users_snapshot = await get_active_users_snapshot()
+    if active_users_snapshot is None:
+        active_users_snapshot = await get_active_users_snapshot()
     logger.info(f"📊 Processing {len(active_users_snapshot)} active users...")
     
     all_users_log = {}
@@ -961,7 +962,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     
     if config_data is None:
         config_data = await read_config()
-    all_users_log = await check_ip_used(config_data=config_data)
+    active_users_snapshot = await pop_active_users_snapshot()
+    all_users_log = await check_ip_used(config_data=config_data, active_users_snapshot=active_users_snapshot)
     
     # Use new config format
     limits_config = config_data.get("limits", {})
@@ -986,8 +988,6 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     all_users_actual_ips = {}  # Maps username to set of actual unique IPs
     all_users_data = {}  # Maps username to UserType with full data
     all_ips_for_isp_lookup = set()  # Collect all IPs for batch ISP lookup
-    
-    active_users_snapshot = await get_active_users_snapshot()
     
     for email in list(active_users_snapshot.keys()):
         data = active_users_snapshot[email]
@@ -1129,8 +1129,6 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # Send monitoring status every few cycles (optional)
     # await warning_system.send_monitoring_status()
     
-    async with _active_users_lock:
-        ACTIVE_USERS.clear()
     all_users_log.clear()
 
 
