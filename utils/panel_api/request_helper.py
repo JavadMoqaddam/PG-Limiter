@@ -250,6 +250,7 @@ async def panel_request(
     method: Literal["GET", "POST", "PUT", "DELETE"],
     endpoint: str,
     token: str,
+    params: Optional[dict] = None,
     json_data: Optional[dict] = None,
     form_data: Optional[dict] = None,
     timeout: float = 30.0,
@@ -264,6 +265,7 @@ async def panel_request(
         method: HTTP method
         endpoint: API endpoint (e.g., "/api/users")
         token: Bearer token for authorization
+        params: Query parameters for GET/POST/etc. requests
         json_data: JSON body for POST/PUT requests
         form_data: Form data for POST requests
         timeout: Request timeout in seconds
@@ -293,18 +295,18 @@ async def panel_request(
             try:
                 client = await get_panel_client()
                 if method == "GET":
-                    response = await client.get(url, headers=headers, timeout=timeout)
+                    response = await client.get(url, headers=headers, params=params, timeout=timeout)
                 elif method == "POST":
                     if form_data:
-                        response = await client.post(url, headers=headers, data=form_data, timeout=timeout)
+                        response = await client.post(url, headers=headers, data=form_data, params=params, timeout=timeout)
                     else:
-                        response = await client.post(url, headers=headers, json=json_data, timeout=timeout)
+                        response = await client.post(url, headers=headers, json=json_data, params=params, timeout=timeout)
                 elif method == "PUT":
-                    response = await client.put(url, headers=headers, json=json_data, timeout=timeout)
+                    response = await client.put(url, headers=headers, json=json_data, params=params, timeout=timeout)
                 elif method == "DELETE":
-                    response = await client.delete(url, headers=headers, timeout=timeout)
+                    response = await client.delete(url, headers=headers, params=params, timeout=timeout)
                 else:
-                    response = await client.request(method, url, headers=headers, json=json_data, timeout=timeout)
+                    response = await client.request(method, url, headers=headers, json=json_data, params=params, timeout=timeout)
                 
                 elapsed = (time.perf_counter() - start_time) * 1000
                 log_api_request(method, url, response.status_code, elapsed)
