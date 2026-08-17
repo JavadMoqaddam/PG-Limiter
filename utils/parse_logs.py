@@ -62,6 +62,26 @@ async def remove_id_from_username(username: str) -> str:
     return re.sub(r"^\d+\.", "", username)
 
 
+_geo_client: httpx.AsyncClient | None = None
+
+
+async def get_geo_client() -> httpx.AsyncClient:
+    """Get or create shared persistent httpx.AsyncClient for GeoIP lookups with connection pooling."""
+    global _geo_client
+    if _geo_client is None or _geo_client.is_closed:
+        limits = httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0)
+        _geo_client = httpx.AsyncClient(verify=False, timeout=5.0, limits=limits)
+    return _geo_client
+
+
+async def close_geo_client() -> None:
+    """Close the shared GeoIP httpx.AsyncClient if open."""
+    global _geo_client
+    if _geo_client is not None and not _geo_client.is_closed:
+        await _geo_client.aclose()
+        _geo_client = None
+
+
 async def check_ip(ip_address: str) -> None | str:
     """
     Check the geographical location of an IP address with fallback through multiple APIs.
@@ -92,34 +112,34 @@ async def check_ip(ip_address: str) -> None | str:
     )
     
     last_error = None
+    client = await get_geo_client()
     for endpoint in sorted_endpoints:
         url = endpoint["url"].format(ip=ip_address)
         key = endpoint["key"]
         name = endpoint["name"]
         
         try:
-            async with httpx.AsyncClient(verify=False, timeout=5) as client:
-                resp = await client.get(url, timeout=3)
-                
-                if resp.status_code == 200:
-                    if key is None:
-                        # Direct text response (like ipapi.co/country)
-                        country = resp.text.strip()
-                    else:
-                        info = resp.json()
-                        country = info.get(key)
-                    
-                    if country and len(country) == 2:  # Valid country code
-                        CACHE[ip_address] = country
-                        _endpoint_failures[name] = max(0, _endpoint_failures.get(name, 0) - 1)
-                        _endpoint_last_success[name] = current_time
-                        return country
-                elif resp.status_code == 429:
-                    # Rate limited - increase failure count
-                    _endpoint_failures[name] = _endpoint_failures.get(name, 0) + 3
+            resp = await client.get(url, timeout=3)
+            
+            if resp.status_code == 200:
+                if key is None:
+                    # Direct text response (like ipapi.co/country)
+                    country = resp.text.strip()
                 else:
-                    _endpoint_failures[name] = _endpoint_failures.get(name, 0) + 1
-                    
+                    info = resp.json()
+                    country = info.get(key)
+                
+                if country and len(country) == 2:  # Valid country code
+                    CACHE[ip_address] = country
+                    _endpoint_failures[name] = max(0, _endpoint_failures.get(name, 0) - 1)
+                    _endpoint_last_success[name] = current_time
+                    return country
+            elif resp.status_code == 429:
+                # Rate limited - increase failure count
+                _endpoint_failures[name] = _endpoint_failures.get(name, 0) + 3
+            else:
+                _endpoint_failures[name] = _endpoint_failures.get(name, 0) + 1
+                
         except httpx.TimeoutException:
             _endpoint_failures[name] = _endpoint_failures.get(name, 0) + 2
             last_error = f"Timeout on {name}"
