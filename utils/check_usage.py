@@ -719,7 +719,7 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     
     # Pre-filter users based on group and admin filter settings (In-Memory Batch)
     logger.debug("🔍 Applying user filters (In-Memory Batch)...")
-    active_usernames_list = [u for u in ACTIVE_USERS.keys() if u and u.strip()]
+    active_usernames_list = [u for u in active_users_snapshot.keys() if u and u.strip()]
     users_metadata = await get_active_users_metadata_batch(active_usernames_list)
     
     group_filter = config_data.get("group_filter", {})
@@ -854,7 +854,7 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     )
     
     # ---- NEW: Get Group Limits in ONE Query (Batching) ----
-    active_usernames_for_batch = [email for email in ACTIVE_USERS.keys() if email and email.strip()]
+    active_usernames_for_batch = [email for email in active_users_snapshot.keys() if email and email.strip()]
     batched_group_limits = await get_group_limits_batch(active_usernames_for_batch, config_data, panel_data)
     # -------------------------------------------------------
     # Build combined message for all users with >= general_limit devices
@@ -866,7 +866,7 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
         if not user_info.user.ip:
             continue
         
-        original_user = ACTIVE_USERS.get(email)
+        original_user = active_users_snapshot.get(email)
         ip_count = len(user_info.formatted_ips)
         device_count = all_user_device_counts.get(email, 0)
         
