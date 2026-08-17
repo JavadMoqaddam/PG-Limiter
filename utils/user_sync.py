@@ -123,13 +123,6 @@ async def recompute_all_user_limits(config: dict = None):
         recomputed_count += 1
     
     sync_logger.info(f"⚡ Recomputed effective limits in RAM for {recomputed_count} users (0ms network calls)")
-    
-    # Broadcast Pub/Sub signal for cross-process sync
-    try:
-        from utils.redis_cache import publish_cache_invalidation
-        await publish_cache_invalidation(reason="recompute_limits")
-    except Exception as err:
-        sync_logger.debug(f"PubSub publish note: {err}")
 
 
 def invalidate_user_metadata_cache(username: Optional[str] = None):
