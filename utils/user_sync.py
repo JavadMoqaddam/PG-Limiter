@@ -387,8 +387,6 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
                 
                 if potentially_deleted:
                     # Check if auto-deletion is enabled in config
-                    from utils.read_config import read_config
-                    config = await read_config()
                     auto_delete_enabled = config.get("user_sync", {}).get("auto_delete_users", False)
                     
                     if not auto_delete_enabled:
