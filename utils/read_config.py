@@ -25,7 +25,7 @@ config_logger = get_logger("read_config")
 
 # Try to import database module
 try:
-    from db import get_db, ConfigCRUD, UserLimitCRUD, ExceptUserCRUD
+    from db import get_db, ConfigCRUD, UserCRUD
     DB_AVAILABLE = True
 except ImportError:
     DB_AVAILABLE = False
@@ -138,10 +138,10 @@ async def load_db_config() -> Dict[str, Any]:
             db_config = await ConfigCRUD.get_all(session)
             
             # Load special limits
-            special_limits = await UserLimitCRUD.get_all(session)
+            special_limits = await UserCRUD.get_all_special_limits(session)
             
             # Load except users
-            except_users = await ExceptUserCRUD.get_all(session)
+            except_users = await UserCRUD.get_all_excepted(session)
         
         return {
             "db_config": db_config,

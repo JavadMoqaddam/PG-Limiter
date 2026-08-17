@@ -256,7 +256,7 @@ async def restore_config_handler(update: Update, context: ContextTypes.DEFAULT_T
             try:
                 config_data = json.loads(file_content.decode('utf-8'))
                 
-                from db import get_db, ConfigCRUD, UserLimitCRUD, ExceptUserCRUD
+                from db import get_db, ConfigCRUD, UserCRUD
                 
                 async with get_db() as db:
                     # Import settings to database
@@ -270,12 +270,12 @@ async def restore_config_handler(update: Update, context: ContextTypes.DEFAULT_T
                     # Import special limits
                     special_limits = config_data.get("limits", {}).get("special", {})
                     for username, limit in special_limits.items():
-                        await UserLimitCRUD.set(db, username, limit)
+                        await UserCRUD.set_special_limit(db, username, limit)
                     
                     # Import except users
                     except_users = config_data.get("except_users", [])
                     for username in except_users:
-                        await ExceptUserCRUD.add(db, username, "Restored from backup")
+                        await UserCRUD.set_excepted(db, username, True, reason="Restored from backup")
                 
                 await update.message.reply_html(
                     "✅ <b>Legacy config imported to database!</b>\n\n"
@@ -397,9 +397,7 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
             from db import get_db
             from db.crud import (
                 ConfigCRUD,
-                UserLimitCRUD,
-                ExceptUserCRUD,
-                DisabledUserCRUD,
+                UserCRUD,
                 ViolationHistoryCRUD,
             )
             backup_logger.info("Database imports successful")
@@ -438,7 +436,7 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                         special = limits.get("special", {})
                         for username, limit in special.items():
                             try:
-                                await UserLimitCRUD.set_limit(db, username, int(limit))
+                                await UserCRUD.set_special_limit(db, username, int(limit))
                                 stats["special_limits"] += 1
                             except Exception as e:
                                 stats["errors"].append(f"Special limit {username}: {e}")
@@ -447,7 +445,7 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                         except_list = limits.get("except_users", [])
                         for username in except_list:
                             try:
-                                await ExceptUserCRUD.add(db, username, "Migrated from config.json")
+                                await UserCRUD.set_excepted(db, username, True, reason="Migrated from config.json")
                                 stats["except_users"] += 1
                             except Exception as e:
                                 stats["errors"].append(f"Except user {username}: {e}")
@@ -456,7 +454,7 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                 if "except_users" in data and isinstance(data["except_users"], list):
                     for username in data["except_users"]:
                         try:
-                            await ExceptUserCRUD.add(db, username, "Migrated from config.json")
+                            await UserCRUD.set_excepted(db, username, True, reason="Migrated from config.json")
                             stats["except_users"] += 1
                         except Exception:
                             pass  # May already exist
@@ -519,9 +517,10 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                     current_time = time.time()
                     for username in disabled_users:
                         try:
-                            await DisabledUserCRUD.add(
+                            await UserCRUD.set_disabled(
                                 db,
                                 username=username,
+                                disabled=True,
                                 disabled_at=current_time,
                                 reason="Migrated from JSON backup",
                             )
@@ -533,9 +532,10 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                     for username, disabled_at in disabled_users.items():
                         try:
                             user_enable_at = enable_at.get(username)
-                            await DisabledUserCRUD.add(
+                            await UserCRUD.set_disabled(
                                 db,
                                 username=username,
+                                disabled=True,
                                 disabled_at=disabled_at,
                                 enable_at=user_enable_at,
                                 reason="Migrated from JSON backup",

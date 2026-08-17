@@ -20,7 +20,7 @@ except ImportError:
 
 # Import database utilities
 try:
-    from db import get_db, UserLimitCRUD, ExceptUserCRUD, ConfigCRUD
+    from db import get_db, UserCRUD, ConfigCRUD
     DB_AVAILABLE = True
 except ImportError:
     DB_AVAILABLE = False
@@ -173,11 +173,11 @@ async def handel_special_limit(username: str, limit: int) -> list:
     if DB_AVAILABLE:
         async with get_db() as db:
             # Check if limit was set before
-            existing_limit = await UserLimitCRUD.get_limit(db, username)
+            existing_limit = await UserCRUD.get_special_limit(db, username)
             set_before = 1 if existing_limit is not None else 0
             
             # Set the new limit
-            await UserLimitCRUD.set_limit(db, username, limit)
+            await UserCRUD.set_special_limit(db, username, limit)
             await db.commit()
             return [set_before, limit]
     
@@ -256,7 +256,7 @@ async def get_special_limits_dict() -> dict:
     """
     if DB_AVAILABLE:
         async with get_db() as db:
-            special_limits = await UserLimitCRUD.get_all(db)
+            special_limits = await UserCRUD.get_all_special_limits(db)
             return special_limits or {}
     
     # Fallback to config.json
@@ -276,7 +276,7 @@ async def get_special_limit_list() -> list | None:
     """
     if DB_AVAILABLE:
         async with get_db() as db:
-            special_limits = await UserLimitCRUD.get_all(db)
+            special_limits = await UserCRUD.get_all_special_limits(db)
             if not special_limits:
                 return None
             special_list = "\n".join(
@@ -339,7 +339,7 @@ async def add_except_user(except_user: str) -> str | None:
     """
     if DB_AVAILABLE:
         async with get_db() as db:
-            await ExceptUserCRUD.add(db, except_user)
+            await UserCRUD.set_excepted(db, except_user, True)
             await db.commit()
             return except_user
     
@@ -370,7 +370,7 @@ async def get_except_users_list() -> list:
     """
     if DB_AVAILABLE:
         async with get_db() as db:
-            except_users = await ExceptUserCRUD.get_all(db)
+            except_users = await UserCRUD.get_all_excepted(db)
             return except_users or []
     
     # Fallback to config.json
@@ -387,7 +387,7 @@ async def show_except_users_handler() -> list | None:
     """
     if DB_AVAILABLE:
         async with get_db() as db:
-            except_users = await ExceptUserCRUD.get_all(db)
+            except_users = await UserCRUD.get_all_excepted(db)
             if not except_users:
                 return None
             except_users_str = "\n".join([f"{user}" for user in except_users])
@@ -418,9 +418,9 @@ async def remove_except_user_from_config(user: str) -> str | None:
     """
     if DB_AVAILABLE:
         async with get_db() as db:
-            removed = await ExceptUserCRUD.remove(db, user)
+            result = await UserCRUD.set_excepted(db, user, False)
             await db.commit()
-            return user if removed else None
+            return user if result is not None else None
     
     # Fallback to config.json
     if not os.path.exists("config.json"):

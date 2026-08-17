@@ -78,6 +78,66 @@ AsyncSessionLocal = async_sessionmaker(
 _DB_INITIALIZED = False
 
 
+def _sync_deprecated_legacy_tables_sync(sync_conn):
+    """
+    Ensure data consistency by migrating legacy records from deprecated tables
+    (user_limits, except_users, disabled_users) into the consolidated `users` table
+    if any exist.
+    """
+    from sqlalchemy import text, inspect
+    inspector = inspect(sync_conn)
+    existing_tables = set(inspector.get_table_names())
+    
+    if "users" not in existing_tables:
+        return
+        
+    # 1. Migrate user_limits -> users.special_limit
+    if "user_limits" in existing_tables:
+        try:
+            sync_conn.execute(text("""
+                INSERT INTO users (username, special_limit, is_excepted, is_disabled_by_limiter, status)
+                SELECT username, "limit", 0, 0, 'active' FROM user_limits WHERE username IS NOT NULL
+                ON CONFLICT(username) DO UPDATE SET
+                    special_limit = excluded.special_limit
+                WHERE users.special_limit IS NULL;
+            """))
+        except Exception as e:
+            db_logger.debug(f"Legacy user_limits sync note: {e}")
+
+    # 2. Migrate except_users -> users.is_excepted
+    if "except_users" in existing_tables:
+        try:
+            sync_conn.execute(text("""
+                INSERT INTO users (username, is_excepted, exception_reason, excepted_by, is_disabled_by_limiter, status)
+                SELECT username, 1, reason, created_by, 0, 'active' FROM except_users WHERE username IS NOT NULL
+                ON CONFLICT(username) DO UPDATE SET
+                    is_excepted = 1,
+                    exception_reason = COALESCE(users.exception_reason, excluded.exception_reason),
+                    excepted_by = COALESCE(users.excepted_by, excluded.excepted_by)
+                WHERE users.is_excepted = 0 OR users.is_excepted IS NULL;
+            """))
+        except Exception as e:
+            db_logger.debug(f"Legacy except_users sync note: {e}")
+
+    # 3. Migrate disabled_users -> users.is_disabled_by_limiter
+    if "disabled_users" in existing_tables:
+        try:
+            sync_conn.execute(text("""
+                INSERT INTO users (username, is_disabled_by_limiter, disabled_at, enable_at, original_groups, disable_reason, punishment_step, status)
+                SELECT username, 1, disabled_at, enable_at, original_groups, reason, punishment_step, 'active' FROM disabled_users WHERE username IS NOT NULL
+                ON CONFLICT(username) DO UPDATE SET
+                    is_disabled_by_limiter = 1,
+                    disabled_at = COALESCE(users.disabled_at, excluded.disabled_at),
+                    enable_at = COALESCE(users.enable_at, excluded.enable_at),
+                    original_groups = COALESCE(users.original_groups, excluded.original_groups),
+                    disable_reason = COALESCE(users.disable_reason, excluded.disable_reason),
+                    punishment_step = COALESCE(users.punishment_step, excluded.punishment_step)
+                WHERE users.is_disabled_by_limiter = 0 OR users.is_disabled_by_limiter IS NULL;
+            """))
+        except Exception as e:
+            db_logger.debug(f"Legacy disabled_users sync note: {e}")
+
+
 async def init_db():
     """
     Initialize the database - creates all tables and schema based on SQLAlchemy models.
@@ -99,6 +159,7 @@ async def init_db():
     # Create all tables and indexes via SQLAlchemy declarative metadata
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_sync_deprecated_legacy_tables_sync)
     
     _DB_INITIALIZED = True
     db_logger.info(f"✅ Database initialized: {DATABASE_URL}")

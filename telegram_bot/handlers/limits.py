@@ -330,12 +330,13 @@ async def handle_special_limit_info_callback(query, _context: ContextTypes.DEFAU
 async def handle_remove_special_limit_callback(query, _context: ContextTypes.DEFAULT_TYPE, username: str):
     """Handle callback for removing a special limit."""
     from db.database import get_db, DB_AVAILABLE
-    from db.crud import UserLimitCRUD
+    from db.crud import UserCRUD
     
     if DB_AVAILABLE:
         async with get_db() as db:
-            deleted = await UserLimitCRUD.delete(db, username)
-            if deleted:
+            result = await UserCRUD.set_special_limit(db, username, None)
+            await db.commit()
+            if result is not None:
                 text = f"✅ Special limit for <b>{username}</b> removed!\n\nThis user will now use the general limit."
             else:
                 text = f"❌ No special limit found for <b>{username}</b>."
