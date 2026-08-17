@@ -12,9 +12,9 @@ from utils.types import PanelType
 
 sync_logger = get_logger("user_sync")
 
-# Last sync timestamp
+# Last sync timestamp and sync lock
 _last_sync_time: Optional[datetime] = None
-_sync_in_progress: bool = False
+_sync_lock: asyncio.Lock = asyncio.Lock()
 
 # In-Memory User Metadata Cache populated during User Sync
 # Format: {username: {"group_ids": [...], "owner_username": "...", "is_excepted": bool, "special_limit": int, "is_monitored": bool, "effective_ip_limit": int}}
@@ -253,212 +253,208 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
     Returns:
         Tuple of (synced_count, error_count, deleted_count)
     """
-    global _last_sync_time, _sync_in_progress
+    global _last_sync_time
     
-    if _sync_in_progress:
+    if _sync_lock.locked():
         sync_logger.warning("Sync already in progress, skipping")
         return (0, 0, 0)
     
-    _sync_in_progress = True
-    synced = 0
-    errors = 0
-    deleted = 0
-    deleted_usernames = []
-    
-    try:
-        sync_logger.info("🔄 Starting user sync from panel to database...")
-        start_time = datetime.now(timezone.utc)
+    async with _sync_lock:
+        synced = 0
+        errors = 0
+        deleted = 0
+        deleted_usernames = []
         
-        # Fetch ALL users from panel (all statuses) to avoid losing disabled users
-        users = await get_all_users_with_details(panel_data, status=None)
-        
-        if not users:
-            sync_logger.warning("⚠️ No users fetched from panel - skipping sync entirely")
-            _sync_in_progress = False
-            return (0, 0, 0)
-        
-        sync_logger.info(f"📥 Processing {len(users)} users...")
-        
-        # Build set of usernames from panel
-        panel_usernames = {u.get("username") for u in users if u.get("username")}
-        
-        if not panel_usernames:
-            sync_logger.warning("⚠️ No valid usernames in panel response - skipping sync")
-            _sync_in_progress = False
-            return (0, 0, 0)
-        
-        # Import database modules here to avoid circular imports
-        sync_logger.info("📂 Importing database modules...")
-        from db.database import get_db
-        from db.crud.users import UserCRUD
-        
-        sync_logger.info("📂 Opening database connection for sync...")
-        
-        from utils.read_config import read_config
-        config = await read_config()
-        
-        async with get_db() as db:
-            sync_logger.info("✅ Database connection opened")
-            # Get existing usernames in local DB
-            local_usernames = await UserCRUD.get_all_usernames(db)
-            sync_logger.info(f"📊 Found {len(local_usernames)} existing users in local DB")
+        try:
+            sync_logger.info("🔄 Starting user sync from panel to database...")
+            start_time = datetime.now(timezone.utc)
             
-            # Sync users from panel using native Bulk Upsert
-            users_to_upsert = []
-            for user_data in users:
-                try:
-                    username = user_data.get("username")
-                    if not username:
-                        continue
-                    
-                    panel_id = user_data.get("id")
-                    status = user_data.get("status", "active")
-                    
-                    admin_info = user_data.get("admin", {}) or {}
-                    owner_id = admin_info.get("id") if isinstance(admin_info, dict) else None
-                    owner_username = admin_info.get("username") if isinstance(admin_info, dict) else None
-                    if not owner_username:
-                        owner_username = user_data.get("created_by")
-                    
-                    group_ids = user_data.get("group_ids") or user_data.get("groups") or []
-                    if isinstance(group_ids, str):
-                        group_ids = [int(g.strip()) for g in group_ids.split(",") if g.strip()]
-                    
-                    data_limit = user_data.get("data_limit")
-                    if data_limit:
-                        data_limit = data_limit / (1024 ** 3)
-                    
-                    used_traffic = user_data.get("used_traffic", 0)
-                    if used_traffic:
-                        used_traffic = used_traffic / (1024 ** 3)
-                    
-                    expire_at = None
-                    expire_value = user_data.get("expire")
-                    if expire_value:
-                        if isinstance(expire_value, int):
-                            if expire_value > 0:
-                                expire_at = datetime.fromtimestamp(expire_value)
-                        elif isinstance(expire_value, str):
-                            try:
-                                expire_at = datetime.fromisoformat(expire_value.replace("Z", "+00:00"))
-                            except ValueError:
-                                pass
-                    
-                    note = user_data.get("note")
-                    
-                    # Pre-compute is_monitored and effective_ip_limit
-                    is_monitored, effective_limit = calculate_user_effective_limit_and_monitoring(
-                        username=username,
-                        group_ids=group_ids,
-                        is_excepted=False,
-                        special_limit=None,
-                        config=config,
-                    )
-                    
-                    users_to_upsert.append({
-                        "username": username,
-                        "panel_id": panel_id,
-                        "status": status,
-                        "owner_id": owner_id,
-                        "owner_username": owner_username,
-                        "group_ids": group_ids,
-                        "data_limit": data_limit,
-                        "used_traffic": used_traffic,
-                        "expire_at": expire_at,
-                        "note": note,
-                        "is_monitored": is_monitored,
-                        "effective_ip_limit": effective_limit,
-                    })
-                except Exception as e:
-                    sync_logger.error(f"Error parsing user {user_data.get('username', '?')}: {e}")
-                    errors += 1
+            # Fetch ALL users from panel (all statuses) to avoid losing disabled users
+            users = await get_all_users_with_details(panel_data, status=None)
             
-            # Execute Native SQLite Bulk Upsert
-            synced = await UserCRUD.bulk_upsert_users(db, users_to_upsert)
-            await db.commit()
-            sync_logger.info(f"✅ Native Bulk Upsert committed: {synced} synced in single transaction")
+            if not users:
+                sync_logger.warning("⚠️ No users fetched from panel - skipping sync entirely")
+                return (0, 0, 0)
             
-            # Refresh in-memory RAM metadata cache
-            await refresh_user_metadata_cache(db)
+            sync_logger.info(f"📥 Processing {len(users)} users...")
             
-            # SAFETY CHECKS before deleting users
-            # Only delete if sync was mostly successful (less than 10% errors)
-            # and we received a reasonable number of users from panel
-            potentially_deleted = list(local_usernames - panel_usernames)
-            error_rate = errors / max(len(users), 1)
+            # Build set of usernames from panel
+            panel_usernames = {u.get("username") for u in users if u.get("username")}
             
-            if potentially_deleted:
-                # Check if auto-deletion is enabled in config
-                from utils.read_config import read_config
-                config = await read_config()
-                auto_delete_enabled = config.get("user_sync", {}).get("auto_delete_users", False)
+            if not panel_usernames:
+                sync_logger.warning("⚠️ No valid usernames in panel response - skipping sync")
+                return (0, 0, 0)
+            
+            # Import database modules here to avoid circular imports
+            sync_logger.info("📂 Importing database modules...")
+            from db.database import get_db
+            from db.crud.users import UserCRUD
+            
+            sync_logger.info("📂 Opening database connection for sync...")
+            
+            from utils.read_config import read_config
+            config = await read_config()
+            
+            async with get_db() as db:
+                sync_logger.info("✅ Database connection opened")
+                # Get existing usernames in local DB
+                local_usernames = await UserCRUD.get_all_usernames(db)
+                sync_logger.info(f"📊 Found {len(local_usernames)} existing users in local DB")
                 
-                if not auto_delete_enabled:
-                    sync_logger.info(
-                        f"ℹ️ Auto-deletion disabled. {len(potentially_deleted)} users not in panel but kept in local DB. "
-                        f"Enable 'auto_delete_users' in config or use Telegram bot to review."
-                    )
-                    # Log the users that would have been deleted
-                    if len(potentially_deleted) <= 20:
-                        sync_logger.info(f"Users not in panel: {', '.join(potentially_deleted)}")
+                # Sync users from panel using native Bulk Upsert
+                users_to_upsert = []
+                for user_data in users:
+                    try:
+                        username = user_data.get("username")
+                        if not username:
+                            continue
+                        
+                        panel_id = user_data.get("id")
+                        status = user_data.get("status", "active")
+                        
+                        admin_info = user_data.get("admin", {}) or {}
+                        owner_id = admin_info.get("id") if isinstance(admin_info, dict) else None
+                        owner_username = admin_info.get("username") if isinstance(admin_info, dict) else None
+                        if not owner_username:
+                            owner_username = user_data.get("created_by")
+                        
+                        group_ids = user_data.get("group_ids") or user_data.get("groups") or []
+                        if isinstance(group_ids, str):
+                            group_ids = [int(g.strip()) for g in group_ids.split(",") if g.strip()]
+                        
+                        data_limit = user_data.get("data_limit")
+                        if data_limit:
+                            data_limit = data_limit / (1024 ** 3)
+                        
+                        used_traffic = user_data.get("used_traffic", 0)
+                        if used_traffic:
+                            used_traffic = used_traffic / (1024 ** 3)
+                        
+                        expire_at = None
+                        expire_value = user_data.get("expire")
+                        if expire_value:
+                            if isinstance(expire_value, int):
+                                if expire_value > 0:
+                                    expire_at = datetime.fromtimestamp(expire_value)
+                            elif isinstance(expire_value, str):
+                                try:
+                                    expire_at = datetime.fromisoformat(expire_value.replace("Z", "+00:00"))
+                                except ValueError:
+                                    pass
+                        
+                        note = user_data.get("note")
+                        
+                        # Pre-compute is_monitored and effective_ip_limit
+                        is_monitored, effective_limit = calculate_user_effective_limit_and_monitoring(
+                            username=username,
+                            group_ids=group_ids,
+                            is_excepted=False,
+                            special_limit=None,
+                            config=config,
+                        )
+                        
+                        users_to_upsert.append({
+                            "username": username,
+                            "panel_id": panel_id,
+                            "status": status,
+                            "owner_id": owner_id,
+                            "owner_username": owner_username,
+                            "group_ids": group_ids,
+                            "data_limit": data_limit,
+                            "used_traffic": used_traffic,
+                            "expire_at": expire_at,
+                            "note": note,
+                            "is_monitored": is_monitored,
+                            "effective_ip_limit": effective_limit,
+                        })
+                    except Exception as e:
+                        sync_logger.error(f"Error parsing user {user_data.get('username', '?')}: {e}")
+                        errors += 1
+                
+                # Execute Native SQLite Bulk Upsert
+                synced = await UserCRUD.bulk_upsert_users(db, users_to_upsert)
+                await db.commit()
+                sync_logger.info(f"✅ Native Bulk Upsert committed: {synced} synced in single transaction")
+                
+                # Refresh in-memory RAM metadata cache
+                await refresh_user_metadata_cache(db)
+                
+                # SAFETY CHECKS before deleting users
+                # Only delete if sync was mostly successful (less than 10% errors)
+                # and we received a reasonable number of users from panel
+                potentially_deleted = list(local_usernames - panel_usernames)
+                error_rate = errors / max(len(users), 1)
+                
+                if potentially_deleted:
+                    # Check if auto-deletion is enabled in config
+                    from utils.read_config import read_config
+                    config = await read_config()
+                    auto_delete_enabled = config.get("user_sync", {}).get("auto_delete_users", False)
+                    
+                    if not auto_delete_enabled:
+                        sync_logger.info(
+                            f"ℹ️ Auto-deletion disabled. {len(potentially_deleted)} users not in panel but kept in local DB. "
+                            f"Enable 'auto_delete_users' in config or use Telegram bot to review."
+                        )
+                        # Log the users that would have been deleted
+                        if len(potentially_deleted) <= 20:
+                            sync_logger.info(f"Users not in panel: {', '.join(potentially_deleted)}")
+                        else:
+                            sync_logger.info(f"Users not in panel (first 20): {', '.join(potentially_deleted[:20])}...")
+                    
+                    # Safety check 1: Don't delete if there were too many sync errors
+                    elif error_rate > 0.1:  # More than 10% errors
+                        sync_logger.warning(
+                            f"⚠️ Skipping deletion: too many sync errors ({errors}/{len(users)} = {error_rate:.1%})"
+                        )
+                    # Safety check 2: Don't delete if panel returned significantly fewer users
+                    # This could indicate a pagination or API issue
+                    elif len(local_usernames) > 0 and len(panel_usernames) < len(local_usernames) * 0.5:
+                        sync_logger.warning(
+                            f"⚠️ Skipping deletion: panel returned too few users "
+                            f"({len(panel_usernames)} vs {len(local_usernames)} local). "
+                            f"This may indicate an API issue."
+                        )
+                    # Safety check 3: Don't delete more than 10% of users in one sync (stricter)
+                    elif len(potentially_deleted) > len(local_usernames) * 0.1:
+                        sync_logger.warning(
+                            f"⚠️ Skipping deletion: too many users to delete "
+                            f"({len(potentially_deleted)}/{len(local_usernames)} = "
+                            f"{len(potentially_deleted)/len(local_usernames):.1%}). "
+                            f"Manual review recommended via Telegram bot."
+                        )
+                    # Safety check 4: Don't delete more than 50 users at once
+                    elif len(potentially_deleted) > 50:
+                        sync_logger.warning(
+                            f"⚠️ Skipping deletion: {len(potentially_deleted)} users is too many to delete at once. "
+                            f"Manual review recommended via Telegram bot."
+                        )
                     else:
-                        sync_logger.info(f"Users not in panel (first 20): {', '.join(potentially_deleted[:20])}...")
+                        # All safety checks passed - proceed with deletion
+                        sync_logger.info(f"🗑️ Deleting {len(potentially_deleted)} users removed from panel")
+                        deleted_usernames = potentially_deleted
+                        deleted = await UserCRUD.delete_many(db, deleted_usernames)
                 
-                # Safety check 1: Don't delete if there were too many sync errors
-                elif error_rate > 0.1:  # More than 10% errors
-                    sync_logger.warning(
-                        f"⚠️ Skipping deletion: too many sync errors ({errors}/{len(users)} = {error_rate:.1%})"
-                    )
-                # Safety check 2: Don't delete if panel returned significantly fewer users
-                # This could indicate a pagination or API issue
-                elif len(local_usernames) > 0 and len(panel_usernames) < len(local_usernames) * 0.5:
-                    sync_logger.warning(
-                        f"⚠️ Skipping deletion: panel returned too few users "
-                        f"({len(panel_usernames)} vs {len(local_usernames)} local). "
-                        f"This may indicate an API issue."
-                    )
-                # Safety check 3: Don't delete more than 10% of users in one sync (stricter)
-                elif len(potentially_deleted) > len(local_usernames) * 0.1:
-                    sync_logger.warning(
-                        f"⚠️ Skipping deletion: too many users to delete "
-                        f"({len(potentially_deleted)}/{len(local_usernames)} = "
-                        f"{len(potentially_deleted)/len(local_usernames):.1%}). "
-                        f"Manual review recommended via Telegram bot."
-                    )
-                # Safety check 4: Don't delete more than 50 users at once
-                elif len(potentially_deleted) > 50:
-                    sync_logger.warning(
-                        f"⚠️ Skipping deletion: {len(potentially_deleted)} users is too many to delete at once. "
-                        f"Manual review recommended via Telegram bot."
-                    )
-                else:
-                    # All safety checks passed - proceed with deletion
-                    sync_logger.info(f"🗑️ Deleting {len(potentially_deleted)} users removed from panel")
-                    deleted_usernames = potentially_deleted
-                    deleted = await UserCRUD.delete_many(db, deleted_usernames)
+                await db.commit()
             
-            await db.commit()
+            elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+            _last_sync_time = datetime.now(timezone.utc)
+            
+            sync_logger.info(
+                f"✅ User sync completed: {synced} synced, {deleted} deleted, "
+                f"{errors} errors in {elapsed:.1f}s"
+            )
+            
+            # Send Telegram notification for deleted users
+            if deleted_usernames:
+                await _notify_deleted_users(deleted_usernames)
+            
+        except Exception as e:
+            import traceback
+            sync_logger.error(f"❌ User sync failed: {type(e).__name__}: {e}")
+            sync_logger.error(f"Traceback: {traceback.format_exc()}")
         
-        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-        _last_sync_time = datetime.now(timezone.utc)
-        
-        sync_logger.info(
-            f"✅ User sync completed: {synced} synced, {deleted} deleted, "
-            f"{errors} errors in {elapsed:.1f}s"
-        )
-        
-        # Send Telegram notification for deleted users
-        if deleted_usernames:
-            await _notify_deleted_users(deleted_usernames)
-        
-    except Exception as e:
-        import traceback
-        sync_logger.error(f"❌ User sync failed: {type(e).__name__}: {e}")
-        sync_logger.error(f"Traceback: {traceback.format_exc()}")
-    finally:
-        _sync_in_progress = False
-    
-    return (synced, errors, deleted)
+        return (synced, errors, deleted)
 
 
 async def _notify_deleted_users(usernames: list[str]) -> None:
