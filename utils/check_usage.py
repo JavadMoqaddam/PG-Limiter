@@ -910,26 +910,6 @@ async def check_ip_used() -> dict:
         
         # Build limit indicator
         if is_except:
-            limit_indicator = "🔓"
-        elif has_special_limit:
-            limit_indicator = f"🎯{user_limit}"
-        elif has_group_limit:
-            limit_indicator = f"👥{user_limit}"
-        else:
-            limit_indicator = f"📊{user_limit}"
-            # Add to list of users needing limit setting
-            users_needing_limit.append({
-                "email": email,
-                "device_count": device_count,
-                "ip_count": ip_count
-            })
-        # Build user block with IP details for combined message
-        # Format: 👤 Username
-        #         📱 2 🌐 2 🎯 2
-        #         • IP details...
-        
-        # Build limit indicator
-        if is_except:
             limit_str = "🔓"
         elif has_special_limit:
             limit_str = f"🎯 {user_limit}"
@@ -937,6 +917,12 @@ async def check_ip_used() -> dict:
             limit_str = f"👥 {user_limit}"
         else:
             limit_str = f"📊 {user_limit}"
+            # Add to list of users needing limit setting
+            users_needing_limit.append({
+                "email": email,
+                "device_count": device_count,
+                "ip_count": ip_count
+            })
         
         user_header = f"👤 <b>{email}</b>{status_text}\n   📱 {device_count} 🌐 {ip_count} {limit_str}"
         
