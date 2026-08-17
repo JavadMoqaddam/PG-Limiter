@@ -22,6 +22,7 @@ from utils.get_logs import (
 from utils.handel_dis_users import DisabledUsers
 from utils.logs import get_logger, log_startup_info, log_shutdown_info, log_crash_info
 from utils.panel_api import enable_selected_users, get_nodes
+from utils.parse_logs import close_geo_client
 from utils.read_config import read_config
 from utils.types import PanelType
 
@@ -166,6 +167,31 @@ async def main():
         await run_check_users_usage(panel_data)
 
 
+async def cleanup_resources():
+    """Gracefully close all shared network clients, Redis, and database connections."""
+    # 1. Close GeoIP client
+    try:
+        await close_geo_client()
+        main_logger.debug("✓ GeoIP client closed")
+    except Exception as e:
+        main_logger.debug(f"Error closing Geo client: {e}")
+
+    # 2. Close Redis connection
+    if REDIS_AVAILABLE:
+        try:
+            await close_cache()
+            main_logger.info("✓ Redis cache closed")
+        except Exception as e:
+            main_logger.debug(f"Error closing Redis cache: {e}")
+
+    # 3. Close database connections
+    try:
+        from db.database import close_db
+        await close_db()
+    except Exception as e:
+        main_logger.debug(f"Error closing DB: {e}")
+
+
 if __name__ == "__main__":
     restart_count = 0
     max_restarts = 5
@@ -175,18 +201,19 @@ if __name__ == "__main__":
             asyncio.run(main())
         except KeyboardInterrupt:
             main_logger.info("🛑 Received keyboard interrupt, shutting down...")
-            # Close Redis connection
-            if REDIS_AVAILABLE:
-                try:
-                    asyncio.run(close_cache())
-                    main_logger.info("✓ Redis cache closed")
-                except Exception:
-                    pass
+            try:
+                asyncio.run(cleanup_resources())
+            except Exception:
+                pass
             log_shutdown_info("Limiter", "Keyboard interrupt")
             break
         except SystemExit as e:
             if e.code != 0 and e.code is not None:
                 main_logger.error(f"System exit with code: {e.code}")
+            try:
+                asyncio.run(cleanup_resources())
+            except Exception:
+                pass
             break
         except Exception as er:  # pylint: disable=broad-except
             restart_count += 1
@@ -199,6 +226,10 @@ if __name__ == "__main__":
             if restart_count >= max_restarts:
                 main_logger.error(f"Maximum restart attempts ({max_restarts}) reached")
                 main_logger.error("Please check the logs and fix the issue")
+                try:
+                    asyncio.run(cleanup_resources())
+                except Exception:
+                    pass
                 break
             
             # Exponential backoff for restarts
