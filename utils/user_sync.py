@@ -209,7 +209,7 @@ async def run_unknown_user_worker(panel_data: PanelType):
 async def get_all_users_with_details(panel_data: PanelType, status: str | None = None) -> list[dict]:
     """
     Fetch all users from panel with their full details (groups, owner, etc.).
-    Uses parallel pagination for efficiency with large user bases.
+    Uses centralized parallel pagination with persistent connection pooling for high throughput.
     
     Args:
         panel_data: Panel connection data
@@ -219,142 +219,11 @@ async def get_all_users_with_details(panel_data: PanelType, status: str | None =
     Returns:
         List of user dictionaries with full details
     """
-    import httpx
-    from utils.panel_api.auth import get_token, invalidate_token_cache
-    from utils.logs import log_api_request
-    import time
-    import random
-    import traceback
-    
-    status_str = f" (status={status})" if status else " (all statuses)"
-    sync_logger.info(f"📋 Fetching users with details from panel{status_str}...")
-    max_attempts = 3
-    limit = 1000  # Fetch 1000 users per page
-    max_concurrent = 10  # Max parallel requests
-    
-    async def fetch_page(client: httpx.AsyncClient, url: str, headers: dict, offset: int) -> tuple[list, int | None]:
-        """Fetch a single page of users."""
-        # Build URL with offset/limit and optional status filter
-        page_url = f"{url}?offset={offset}&limit={limit}"
-        if status:
-            page_url = f"{page_url}&status={status}"
-        
-        start_time = time.perf_counter()
-        response = await client.get(page_url, headers=headers)
-        elapsed = (time.perf_counter() - start_time) * 1000
-        response.raise_for_status()
-        log_api_request("GET", page_url, response.status_code, elapsed)
-        
-        data = response.json()
-        users = []
-        total = None
-        if isinstance(data, dict) and "users" in data:
-            users = data["users"]
-            total = data.get("total")
-        elif isinstance(data, list):
-            users = data
-            total = len(data)
-        return users, total
-    
+    from utils.panel_api.users import fetch_all_users_raw
     try:
-        for attempt in range(max_attempts):
-            sync_logger.info(f"🔄 Attempt {attempt + 1}/{max_attempts} to fetch users...")
-            
-            force_refresh = attempt > 0
-            try:
-                get_panel_token = await get_token(panel_data, force_refresh=force_refresh)
-            except Exception as token_error:
-                sync_logger.error(f"❌ Exception getting token: {token_error}")
-                continue
-            
-            if isinstance(get_panel_token, ValueError):
-                sync_logger.error(f"❌ Failed to get panel token: {get_panel_token}")
-                continue
-            
-            if not get_panel_token or not hasattr(get_panel_token, 'panel_token'):
-                sync_logger.error(f"❌ Invalid token response: {type(get_panel_token)}")
-                continue
-            
-            sync_logger.info("✅ Got panel token successfully")
-            token = get_panel_token.panel_token
-            headers = {"Authorization": f"Bearer {token}"}
-            
-            for scheme in ["https", "http"]:
-                url = f"{scheme}://{panel_data.panel_domain}/api/users"
-                start_time = time.perf_counter()
-                
-                try:
-                    async with httpx.AsyncClient(verify=False, timeout=60) as client:
-                        # First request to get total count
-                        first_page_users, total_users = await fetch_page(client, url, headers, offset=0)
-                        
-                        if total_users is None:
-                            sync_logger.error("❌ Could not get total user count from API")
-                            continue
-                        
-                        sync_logger.info(f"📊 Panel reports {total_users} total users{status_str}")
-                        
-                        # If all users fit in first page, we're done
-                        if len(first_page_users) >= total_users or len(first_page_users) < limit:
-                            all_users = first_page_users
-                        else:
-                            # Calculate remaining pages and fetch in parallel
-                            offsets = list(range(limit, total_users, limit))
-                            sync_logger.info(f"📥 Fetching {len(offsets)} more pages in parallel (max {max_concurrent} concurrent)...")
-                            
-                            semaphore = asyncio.Semaphore(max_concurrent)
-                            
-                            def make_fetcher(sem, cli, u, hdrs):
-                                async def fetch_with_semaphore(offset: int):
-                                    async with sem:
-                                        users, _ = await fetch_page(cli, u, hdrs, offset)
-                                        return users
-                                return fetch_with_semaphore
-                            
-                            fetcher = make_fetcher(semaphore, client, url, headers)
-                            tasks = [fetcher(offset) for offset in offsets]
-                            pages = await asyncio.gather(*tasks, return_exceptions=True)
-                            
-                            # Combine all pages
-                            all_users = first_page_users
-                            for i, page in enumerate(pages):
-                                if isinstance(page, Exception):
-                                    sync_logger.error(f"❌ Error fetching page {i+1}: {page}")
-                                    continue
-                                all_users.extend(page)
-                        
-                        elapsed = (time.perf_counter() - start_time) * 1000
-                        sync_logger.info(f"✅ Fetched {len(all_users)} users with details in {elapsed:.0f}ms")
-                        return all_users
-                        
-                except httpx.TimeoutException as e:
-                    elapsed = (time.perf_counter() - start_time) * 1000
-                    sync_logger.error(f"❌ Timeout after {elapsed:.0f}ms: {e}")
-                    continue
-                except httpx.ConnectError as e:
-                    sync_logger.error(f"❌ Connection error ({scheme}): {e}")
-                    continue
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 401:
-                        await invalidate_token_cache()
-                        sync_logger.warning("🔑 Got 401, invalidating token cache")
-                    sync_logger.error(f"❌ HTTP {e.response.status_code}: {e}")
-                    continue
-                except Exception as e:
-                    sync_logger.error(f"❌ Unexpected error: {type(e).__name__}: {e}")
-                    sync_logger.error(f"Traceback: {traceback.format_exc()}")
-                    continue
-            
-            wait_time = min(10, random.randint(1, 3) * (attempt + 1))
-            sync_logger.info(f"⏳ Waiting {wait_time}s before retry...")
-            await asyncio.sleep(wait_time)
-        
-        sync_logger.error("❌ Failed to fetch users from panel after all attempts")
-        return []
-        
+        return await fetch_all_users_raw(panel_data, status=status)
     except Exception as e:
-        sync_logger.error(f"❌ Critical error in get_all_users_with_details: {type(e).__name__}: {e}")
-        sync_logger.error(f"Traceback: {traceback.format_exc()}")
+        sync_logger.error(f"❌ Failed to fetch users with details: {e}")
         return []
 
 

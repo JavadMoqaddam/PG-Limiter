@@ -20,197 +20,32 @@ from utils.panel_api.auth import get_token, invalidate_token_cache, safe_send_lo
 users_logger = get_logger("panel_api.users")
 
 
-async def _fetch_users_page(
-    client: httpx.AsyncClient,
-    url: str,
-    headers: dict,
-    offset: int,
-    limit: int,
-) -> tuple[list[dict], int | None]:
-    """Fetch a single page of users. Returns (users_list, total_count)."""
-    page_url = f"{url}?offset={offset}&limit={limit}"
-    start_time = time.perf_counter()
-    
-    response = await client.get(page_url, headers=headers, timeout=60)
-    elapsed = (time.perf_counter() - start_time) * 1000
-    response.raise_for_status()
-    
-    log_api_request("GET", page_url, response.status_code, elapsed)
-    
-    data = response.json()
-    if not isinstance(data, dict) or "users" not in data:
-        return [], None
-    
-    return data["users"], data.get("total")
-
-
-async def all_user(panel_data: PanelType) -> list[UserType] | ValueError:
-    """
-    Get the list of all users from the panel API with parallel pagination.
-
-    Args:
-        panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
-
-    Returns:
-        list[user]: The list of usernames of all users.
-
-    Raises:
-        ValueError: If the function fails to get the users from both the HTTP
-        and HTTPS endpoints.
-    """
-    users_logger.debug("📋 Fetching all users from panel...")
-    max_attempts = 5
-    limit = 1000  # Fetch 1000 users per page
-    max_concurrent = 10  # Max parallel requests
-    
-    for attempt in range(max_attempts):
-        users_logger.debug(f"📋 Attempt {attempt + 1}/{max_attempts}")
-        force_refresh = attempt > 0
-        get_panel_token = await get_token(panel_data, force_refresh=force_refresh)
-        if isinstance(get_panel_token, ValueError):
-            raise get_panel_token
-        token = get_panel_token.panel_token
-        headers = {
-            "Authorization": f"Bearer {token}",
-        }
-        
-        for scheme in ["https", "http"]:
-            url = f"{scheme}://{panel_data.panel_domain}/api/users"
-            
-            try:
-                from utils.panel_api.request_helper import get_panel_client
-                client = await get_panel_client()
-                # First request to get total count
-                start_time = time.perf_counter()
-                first_page_users, total_users = await _fetch_users_page(
-                    client, url, headers, offset=0, limit=limit
-                )
-                
-                if total_users is None:
-                    users_logger.error("Could not get total user count from API")
-                    continue
-                
-                users_logger.info(f"📊 Panel reports {total_users} total users")
-                
-                # If all users fit in first page, we're done
-                if len(first_page_users) >= total_users or len(first_page_users) < limit:
-                    all_user_data = first_page_users
-                else:
-                    # Calculate remaining pages needed
-                    remaining = total_users - len(first_page_users)
-                    offsets = list(range(limit, total_users, limit))
-                    
-                    users_logger.info(f"📥 Fetching {len(offsets)} more pages in parallel (max {max_concurrent} concurrent)...")
-                    
-                    # Fetch remaining pages in parallel with semaphore
-                    semaphore = asyncio.Semaphore(max_concurrent)
-                    
-                    def make_fetcher(sem, cli, u, hdrs):
-                        async def fetch_with_semaphore(offset: int):
-                            async with sem:
-                                users, _ = await _fetch_users_page(cli, u, hdrs, offset, limit)
-                                return users
-                        return fetch_with_semaphore
-                    
-                    fetcher = make_fetcher(semaphore, client, url, headers)
-                    tasks = [fetcher(offset) for offset in offsets]
-                    pages = await asyncio.gather(*tasks, return_exceptions=True)
-                    
-                    # Combine all pages
-                    all_user_data = first_page_users
-                    for i, page in enumerate(pages):
-                        if isinstance(page, Exception):
-                            users_logger.error(f"Error fetching page {i+1}: {page}")
-                            continue
-                        all_user_data.extend(page)
-                
-                elapsed = (time.perf_counter() - start_time) * 1000
-                    
-                # Convert to UserType objects
-                users = []
-                for user_data in all_user_data:
-                    admin_info = user_data.get("admin")
-                    admin_username = admin_info.get("username") if isinstance(admin_info, dict) else None
-                    user = UserType(
-                        name=user_data["username"],
-                        panel_status=user_data.get("status"),
-                        data_limit=user_data.get("data_limit"),
-                        used_traffic=user_data.get("used_traffic"),
-                        lifetime_used_traffic=user_data.get("lifetime_used_traffic"),
-                        expire=user_data.get("expire"),
-                        group_ids=user_data.get("group_ids"),
-                        online_at=user_data.get("online_at"),
-                        admin_username=admin_username,
-                    )
-                    users.append(user)
-                
-                users_logger.info(f"📋 Fetched all {len(users)} users in {elapsed:.0f}ms")
-                return users
-                    
-            except SSLError:
-                elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request("GET", url, None, elapsed, "SSL Error")
-                continue
-            except httpx.HTTPStatusError as e:
-                elapsed = (time.perf_counter() - start_time) * 1000
-                if e.response.status_code == 401:
-                    await invalidate_token_cache()
-                    users_logger.warning("Got 401 error, invalidating token cache and retrying")
-                log_api_request("GET", url, e.response.status_code, elapsed, f"HTTP {e.response.status_code}")
-                message = f"[{e.response.status_code}] {e.response.text}"
-                await safe_send_logs_panel(message)
-                users_logger.error(message)
-                continue
-            except httpx.TimeoutException:
-                elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request("GET", url, None, elapsed, "Timeout")
-                users_logger.warning(f"Timeout fetching users from {url}")
-                continue
-            except Exception as error:  # pylint: disable=broad-except
-                elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request("GET", url, None, elapsed, str(error))
-                message = f"An unexpected error occurred: {error}"
-                await safe_send_logs_panel(message)
-                users_logger.error(message)
-                continue
-                
-        wait_time = min(30, random.randint(2, 5) * (attempt + 1))
-        users_logger.debug(f"Waiting {wait_time}s before retry...")
-        await asyncio.sleep(wait_time)
-    message = (
-        f"Failed to get users after {max_attempts} attempts. Make sure the panel is running "
-        + "and the username and password are correct."
-    )
-    await safe_send_logs_panel(message)
-    users_logger.error(message)
-    raise ValueError(message)
-
-
-async def get_all_panel_users(
+async def fetch_all_users_raw(
     panel_data: PanelType,
     status: str | None = None,
     admin: list[str] | None = None,
     group: list[int] | None = None,
     search: str | None = None,
-) -> set[str] | ValueError:
+    limit: int = 1000,
+    max_concurrent: int = 10,
+) -> list[dict]:
     """
-    Get all usernames from the panel API with optional filtering.
-
+    Unified high-performance fetch of all users from Panel API using parallel pagination.
+    
     Args:
-        panel_data (PanelType): A PanelType object containing
-            the username, password, and domain for the panel API.
-        status (str | None): Filter by user status (active/disabled/limited/expired/on_hold).
-        admin (list[str] | None): Filter by admin username(s).
-        group (list[int] | None): Filter by group ID(s).
-        search (str | None): Search query for usernames.
-
+        panel_data: Panel connection configuration.
+        status: Optional status filter (e.g. 'active', 'disabled').
+        admin: Optional admin username filter.
+        group: Optional group ID filter.
+        search: Optional search query.
+        limit: Number of users per page (default: 1000).
+        max_concurrent: Max concurrent requests for remaining pages (default: 10).
+        
     Returns:
-        set[str]: A set of all usernames matching the filters.
-
-    Raises:
-        ValueError: If the function fails to get users from the API.
+        list[dict]: List of raw user dictionaries from the panel API.
     """
+    from utils.panel_api.request_helper import panel_get
+    
     filter_desc = []
     if status:
         filter_desc.append(f"status={status}")
@@ -221,65 +56,166 @@ async def get_all_panel_users(
     if search:
         filter_desc.append(f"search={search}")
     filter_str = f" ({', '.join(filter_desc)})" if filter_desc else ""
-    users_logger.debug(f"📋 Fetching panel users with pagination{filter_str}...")
+    users_logger.debug(f"📋 Fetching users from panel{filter_str}...")
     
-    from utils.panel_api.request_helper import panel_get
-    
-    all_usernames = set()
-    limit = 100
-    offset = 0
-    
-    while True:
-        params = {"offset": offset, "limit": limit}
-        if status:
-            params["status"] = status
-        if admin:
-            params["admin"] = admin
-        if group:
-            params["group"] = group
-        if search:
-            params["search"] = search
-
-        response = await panel_get(
-            panel_data,
-            "/api/users",
-            params=params,
-            timeout=30.0,
-            max_retries=3,
-        )
+    params = {"offset": 0, "limit": limit}
+    if status:
+        params["status"] = status
+    if admin:
+        params["admin"] = admin
+    if group:
+        params["group"] = group
+    if search:
+        params["search"] = search
         
-        if response is None:
-            message = f"Failed to get users page at offset {offset}"
-            users_logger.error(message)
-            raise ValueError(message)
-            
-        try:
-            data = response.json()
-        except Exception as json_error:
-            users_logger.error(f"Failed to parse JSON from panel /api/users: {json_error}")
-            raise ValueError(f"Invalid JSON response: {json_error}")
-            
-        users = []
-        if isinstance(data, dict) and "users" in data:
-            users = data["users"]
-            total = data.get("total", len(users))
-        elif isinstance(data, list):
-            users = data
-            total = len(users)
-        else:
-            users_logger.error(f"Unexpected users response format: {type(data)}")
-            break
-            
-        for user in users:
-            if isinstance(user, dict) and "username" in user:
-                all_usernames.add(user["username"])
+    start_time = time.perf_counter()
+    response = await panel_get(
+        panel_data,
+        "/api/users",
+        params=params,
+        timeout=60.0,
+        max_retries=3,
+    )
+    if response is None:
+        message = "Failed to fetch first page of users from Panel API"
+        users_logger.error(message)
+        raise ValueError(message)
+        
+    try:
+        data = response.json()
+    except Exception as e:
+        users_logger.error(f"Failed to parse JSON response from /api/users: {e}")
+        raise ValueError(f"Invalid JSON from /api/users: {e}") from e
+        
+    if isinstance(data, dict) and "users" in data:
+        first_page_users = data["users"]
+        total_users = data.get("total", len(first_page_users))
+    elif isinstance(data, list):
+        first_page_users = data
+        total_users = len(first_page_users)
+    else:
+        users_logger.error(f"Unexpected /api/users response format: {type(data)}")
+        return []
+        
+    users_logger.info(f"📊 Panel reports {total_users} total users{filter_str}")
+    
+    # If all users fit in first page, return immediately
+    if len(first_page_users) >= total_users or len(first_page_users) < limit:
+        elapsed = (time.perf_counter() - start_time) * 1000
+        users_logger.info(f"📋 Fetched {len(first_page_users)} users in {elapsed:.0f}ms")
+        return first_page_users
+        
+    # Calculate remaining offsets for parallel fetching
+    offsets = list(range(limit, total_users, limit))
+    users_logger.info(f"📥 Fetching {len(offsets)} remaining pages in parallel (max {max_concurrent} concurrent)...")
+    
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def fetch_page_task(offset: int) -> list[dict]:
+        async with semaphore:
+            page_params = dict(params)
+            page_params["offset"] = offset
+            page_resp = await panel_get(
+                panel_data,
+                "/api/users",
+                params=page_params,
+                timeout=60.0,
+                max_retries=3,
+            )
+            if page_resp is None:
+                users_logger.warning(f"Failed to fetch page at offset {offset}")
+                return []
+            try:
+                page_data = page_resp.json()
+                if isinstance(page_data, dict) and "users" in page_data:
+                    return page_data["users"]
+                elif isinstance(page_data, list):
+                    return page_data
+                return []
+            except Exception as parse_err:
+                users_logger.warning(f"Error parsing page at offset {offset}: {parse_err}")
+                return []
                 
-        users_logger.debug(f"📋 Page fetched: offset={offset}, got {len(users)} users, total: {len(all_usernames)}")
-        
-        if len(users) < limit or offset + len(users) >= total:
-            users_logger.info(f"📋 Fetched {len(all_usernames)} users from panel (total: {total})")
-            return all_usernames
+    tasks = [fetch_page_task(off) for off in offsets]
+    pages = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    all_users = list(first_page_users)
+    for i, page in enumerate(pages):
+        if isinstance(page, Exception):
+            users_logger.error(f"Exception fetching page {i+1}: {page}")
+            continue
+        if isinstance(page, list):
+            all_users.extend(page)
             
+    elapsed = (time.perf_counter() - start_time) * 1000
+    users_logger.info(f"📋 Fetched all {len(all_users)} users in {elapsed:.0f}ms")
+    return all_users
+
+
+async def all_user(panel_data: PanelType) -> list[UserType] | ValueError:
+    """
+    Get the list of all users from the panel API as UserType objects.
+
+    Args:
+        panel_data (PanelType): Panel connection data.
+
+    Returns:
+        list[UserType]: List of user objects.
+    """
+    try:
+        raw_users = await fetch_all_users_raw(panel_data)
+        users = []
+        for user_data in raw_users:
+            admin_info = user_data.get("admin")
+            admin_username = admin_info.get("username") if isinstance(admin_info, dict) else None
+            user = UserType(
+                name=user_data["username"],
+                panel_status=user_data.get("status"),
+                data_limit=user_data.get("data_limit"),
+                used_traffic=user_data.get("used_traffic"),
+                lifetime_used_traffic=user_data.get("lifetime_used_traffic"),
+                expire=user_data.get("expire"),
+                group_ids=user_data.get("group_ids"),
+                online_at=user_data.get("online_at"),
+                admin_username=admin_username,
+            )
+            users.append(user)
+        return users
+    except Exception as e:
+        message = f"Failed to get users after attempts: {e}"
+        await safe_send_logs_panel(message)
+        users_logger.error(message)
+        raise ValueError(message) from e
+
+
+async def get_all_panel_users(
+    panel_data: PanelType,
+    status: str | None = None,
+    admin: list[str] | None = None,
+    group: list[int] | None = None,
+    search: str | None = None,
+) -> set[str] | ValueError:
+    """
+    Get all usernames from the panel API matching filters as a set of strings.
+
+    Args:
+        panel_data (PanelType): Panel connection data.
+        status (str | None): Filter by user status (active/disabled/limited/expired/on_hold).
+        admin (list[str] | None): Filter by admin username(s).
+        group (list[int] | None): Filter by group ID(s).
+        search (str | None): Search query for usernames.
+
+    Returns:
+        set[str]: Set of matching usernames.
+    """
+    try:
+        raw_users = await fetch_all_users_raw(
+            panel_data, status=status, admin=admin, group=group, search=search
+        )
+        return {u["username"] for u in raw_users if isinstance(u, dict) and "username" in u}
+    except Exception as e:
+        users_logger.error(f"Failed to get panel usernames: {e}")
+        raise ValueError(f"Failed to get users: {e}") from e
         offset += limit
 
 
