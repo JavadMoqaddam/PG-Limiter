@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional, List
 
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import User
@@ -135,11 +135,15 @@ class UserCRUD:
     
     @staticmethod
     async def get_by_group(db: AsyncSession, group_id: int) -> List[User]:
-        """Get users in a specific group using SQL-level filtering."""
+        """
+        Get users in a specific group using exact JSON array matching.
+        Eliminates substring false positives (e.g., group_id=1 matching [11, 21]).
+        """
         db_users_logger.debug(f"🔍 Getting users by group ID: {group_id}")
-        # Filter at DB level using JSON contains pattern for SQLite
         result = await db.execute(
-            select(User).where(User.group_ids.contains(group_id))
+            select(User).where(
+                text("EXISTS (SELECT 1 FROM json_each(users.group_ids) WHERE json_each.value = :group_id)")
+            ).params(group_id=int(group_id))
         )
         filtered = list(result.scalars().all())
         db_users_logger.debug(f"✅ Found {len(filtered)} users in group {group_id}")
