@@ -140,6 +140,14 @@ class DisabledUsers:
             DISABLED_USERS_TIMESTAMPS = {}
             DISABLED_USERS_ENABLE_AT = {}
 
+    async def reload_disabled_users(self):
+        """
+        Thread-safe asynchronous reload of disabled users from the JSON file.
+        Guaranteed to execute under the shared DISABLED_USERS_LOCK.
+        """
+        async with self._lock:
+            await asyncio.to_thread(self.load_disabled_users)
+
     def _sync_save_disabled_users(self):
         """Synchronous file write for disabled users data."""
         atomic_write_json(self.filename, {
