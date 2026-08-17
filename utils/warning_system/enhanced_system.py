@@ -38,9 +38,13 @@ class EnhancedWarningSystem:
     # Minimum duration (seconds) for an IP to count as a device
     MIN_DEVICE_DURATION = 120  # 2 minutes
     
-    def __init__(self, filename=".user_warnings.json", history_filename=".warning_history.json"):
-        self.filename = "/var/lib/pg-limiter/user_warnings.json"
-        self.history_filename = "/var/lib/pg-limiter/warning_history.json"
+    def __init__(
+        self,
+        filename: str = "/var/lib/pg-limiter/user_warnings.json",
+        history_filename: str = "/var/lib/pg-limiter/warning_history.json",
+    ):
+        self.filename = filename
+        self.history_filename = history_filename
         self.warnings: Dict[str, UserWarning] = {}
         self.warning_history: Dict[str, list] = {}
         self.monitoring_period = 180  # 3 minutes in seconds
@@ -52,7 +56,7 @@ class EnhancedWarningSystem:
     def load_warning_history(self):
         """Load warning history from file"""
         try:
-            if os.path.exists(self.history_filename):
+            if os.path.exists(self.history_filename) and os.path.getsize(self.history_filename) > 0:
                 with open(self.history_filename, "r", encoding="utf-8") as file:
                     self.warning_history = json.load(file)
                     self.cleanup_old_warning_history()
@@ -154,7 +158,7 @@ class EnhancedWarningSystem:
     def load_warnings(self):
         """Load warnings from file"""
         try:
-            if os.path.exists(self.filename):
+            if os.path.exists(self.filename) and os.path.getsize(self.filename) > 0:
                 with open(self.filename, "r", encoding="utf-8") as file:
                     data = json.load(file)
                     for username, warning_data in data.items():

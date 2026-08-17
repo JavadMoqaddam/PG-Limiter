@@ -41,10 +41,8 @@ class DisabledUsers:
     """
     _lock = _disabled_users_lock
 
-    def __init__(self, filename=".disable_users.json"):
-        self.filename = "/var/lib/pg-limiter/disable_users.json"
-        if filename != ".disable_users.json":
-            self.filename = filename
+    def __init__(self, filename: str = "/var/lib/pg-limiter/disable_users.json"):
+        self.filename = filename
         self._entries: dict[str, DisabledUserEntry] = {}
         self.disabled_users: dict[str, float] = {}  # {username: disabled_timestamp}
         self.enable_at: dict[str, float] = {}  # {username: enable_at_timestamp}

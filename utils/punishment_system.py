@@ -103,8 +103,8 @@ class PunishmentSystem:
     
     DEFAULT_WINDOW_HOURS = 168  # 7 days
     
-    def __init__(self, filename=".violation_history.json"):
-        self.filename = "/var/lib/pg-limiter/violation_history.json"
+    def __init__(self, filename: str = "/var/lib/pg-limiter/violation_history.json"):
+        self.filename = filename
         self.violations: dict[str, list[ViolationRecord]] = {}  # username -> list of violations
         self.steps: list[PunishmentStep] = self.DEFAULT_STEPS.copy()
         self.window_hours: int = self.DEFAULT_WINDOW_HOURS
@@ -115,7 +115,7 @@ class PunishmentSystem:
     def load_violations(self):
         """Load violation history from file"""
         try:
-            if os.path.exists(self.filename):
+            if os.path.exists(self.filename) and os.path.getsize(self.filename) > 0:
                 punishment_logger.debug(f"📂 Loading violation history from {self.filename}")
                 with open(self.filename, "r", encoding="utf-8") as file:
                     data = json.load(file)
