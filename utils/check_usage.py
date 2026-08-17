@@ -637,7 +637,7 @@ def _build_ip_details(
     return ip_details, device_count
 
 
-async def check_ip_used() -> dict:
+async def check_ip_used(config_data: dict | None = None) -> dict:
     """
     Check active users and display them.
     1. Shows all active users with device count >= general_limit in ONE combined message
@@ -647,7 +647,8 @@ async def check_ip_used() -> dict:
     """
     global isp_detector
     
-    config_data = await read_config()
+    if config_data is None:
+        config_data = await read_config()
     general_limit = config_data.get("limits", {}).get("general", 2)
     except_users = config_data.get("except_users", [])  # except_users is at root level
     show_enhanced_details = config_data.get("display", {}).get("show_enhanced_details", True)
@@ -962,14 +963,15 @@ async def check_ip_used() -> dict:
     return all_users_log
 
 
-async def check_users_usage(panel_data: PanelType):
+async def check_users_usage(panel_data: PanelType, config_data: dict | None = None):
     """
     Enhanced function to check usage with warning system and ISP detection
     """
     global isp_detector
     
-    config_data = await read_config()
-    all_users_log = await check_ip_used()
+    if config_data is None:
+        config_data = await read_config()
+    all_users_log = await check_ip_used(config_data=config_data)
     
     # Use new config format
     limits_config = config_data.get("limits", {})
@@ -1145,7 +1147,7 @@ async def check_users_usage(panel_data: PanelType):
 async def run_check_users_usage(panel_data: PanelType) -> None:
     """run check_ip_used() function and then run check_users_usage()"""
     while True:
-        await check_users_usage(panel_data)
-        data = await read_config()
-        check_interval = data.get("monitoring", {}).get("check_interval", 60)
+        config_data = await read_config()
+        await check_users_usage(panel_data, config_data=config_data)
+        check_interval = config_data.get("monitoring", {}).get("check_interval", 60)
         await asyncio.sleep(int(check_interval))

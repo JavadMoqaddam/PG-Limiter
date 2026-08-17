@@ -187,14 +187,34 @@ async def set_current_node_info(node_id: int, node_name: str) -> None:
     CURRENT_NODE_INFO = {"node_id": node_id, "node_name": node_name}
 
 
+_PARSER_CONFIG_CACHE: dict | None = None
+_PARSER_CONFIG_CACHE_TIME: float = 0.0
+
+
+async def get_cached_parser_config() -> dict:
+    """Get configuration cached in memory with a 30-second TTL to avoid per-log I/O."""
+    global _PARSER_CONFIG_CACHE, _PARSER_CONFIG_CACHE_TIME
+    current_time = time.time()
+    if _PARSER_CONFIG_CACHE is None or (current_time - _PARSER_CONFIG_CACHE_TIME > 30):
+        try:
+            _PARSER_CONFIG_CACHE = await read_config()
+            _PARSER_CONFIG_CACHE_TIME = current_time
+        except Exception:
+            if _PARSER_CONFIG_CACHE is None:
+                _PARSER_CONFIG_CACHE = {}
+    return _PARSER_CONFIG_CACHE
+
+
 async def update_cdn_config() -> None:
     """
     Update the CDN configuration from the config file.
     Should be called periodically to refresh CDN settings.
     """
-    global CDN_CONFIG
+    global CDN_CONFIG, _PARSER_CONFIG_CACHE, _PARSER_CONFIG_CACHE_TIME
     try:
         data = await read_config()
+        _PARSER_CONFIG_CACHE = data
+        _PARSER_CONFIG_CACHE_TIME = time.time()
         CDN_CONFIG["cdn_inbounds"] = data.get("cdn_inbounds", [])
         CDN_CONFIG["cdn_provider"] = data.get("cdn_provider", "cloudflare")
         CDN_CONFIG["use_xff"] = data.get("cdn_use_xff", True)
@@ -270,7 +290,12 @@ async def update_user_device_info(user: UserType, ip: str, inbound_protocol: str
     await update_user_device_info_with_node(user, ip, inbound_protocol, node_id, node_name)
 
 
-async def parse_logs(log: str, node_id: int = None, node_name: str = None) -> dict[str, UserType] | dict:  # pylint: disable=too-many-branches
+async def parse_logs(
+    log: str,
+    node_id: int = None,
+    node_name: str = None,
+    config_data: dict | None = None,
+) -> dict[str, UserType] | dict:  # pylint: disable=too-many-branches
     """
     Asynchronously parse logs to extract and validate IP addresses, emails, and inbound protocols.
 
@@ -278,6 +303,7 @@ async def parse_logs(log: str, node_id: int = None, node_name: str = None) -> di
         log (str): The log to parse.
         node_id (int): The ID of the node that generated this log
         node_name (str): The name of the node that generated this log
+        config_data (dict, optional): Pre-read configuration data. If None, uses fast in-memory cache.
 
     Returns:
         dict[str, UserType]: Dictionary of users with their connection information
@@ -286,7 +312,7 @@ async def parse_logs(log: str, node_id: int = None, node_name: str = None) -> di
     current_node_id = node_id if node_id is not None else CURRENT_NODE_INFO.get("node_id")
     current_node_name = node_name if node_name is not None else CURRENT_NODE_INFO.get("node_name")
     
-    data = await read_config()
+    data = config_data if config_data is not None else await get_cached_parser_config()
     if data.get("INVALID_IPS"):
         INVALID_IPS.update(data.get("INVALID_IPS"))
     
