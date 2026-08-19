@@ -467,12 +467,13 @@ async def enable_user_by_status(panel_data: PanelType, username: str) -> tuple[b
     return (False, False)  # failed, but user might still exist
 
 
-async def _clear_database_disable_flags(username: str) -> None:
+async def _clear_database_disable_flags(username: str, restored_groups: Optional[List[int]] = None) -> None:
     """
     Clear disable flags in database when a user is enabled.
     
     Args:
         username: The username to clear flags for.
+        restored_groups: Optional list of restored group IDs to update in DB.
     """
     try:
         from db.database import get_db_session
@@ -485,6 +486,8 @@ async def _clear_database_disable_flags(username: str) -> None:
                 user_record.original_groups = []
                 user_record.disabled_at = None
                 user_record.enable_at = None
+                if restored_groups is not None:
+                    user_record.group_ids = restored_groups
                 await db.commit()
                 users_logger.debug(f"📦 Cleared disable flags in database for {username}")
     except Exception as db_error:
@@ -570,7 +573,34 @@ async def enable_user_by_group(panel_data: PanelType, username: str) -> tuple[bo
                 return (False, True)
             if success:
                 # Clear database disable flags
-                await _clear_database_disable_flags(username)
+                await _clear_database_disable_flags(username, restored_groups=new_groups)
+                
+                # Update in-memory cache immediately
+                try:
+                    from utils.user_sync import USER_METADATA_CACHE, calculate_user_effective_limit_and_monitoring
+                    existing_meta = USER_METADATA_CACHE.get(username, {})
+                    is_excepted = existing_meta.get("is_excepted", False)
+                    special_limit = existing_meta.get("special_limit")
+                    owner_username = existing_meta.get("owner_username")
+                    
+                    is_mon, eff_lim = calculate_user_effective_limit_and_monitoring(
+                        username=username,
+                        group_ids=new_groups,
+                        is_excepted=is_excepted,
+                        special_limit=special_limit,
+                        config=data,
+                    )
+                    USER_METADATA_CACHE[username] = {
+                        "group_ids": new_groups,
+                        "owner_username": owner_username,
+                        "is_excepted": is_excepted,
+                        "special_limit": special_limit,
+                        "is_monitored": is_mon,
+                        "effective_ip_limit": eff_lim,
+                    }
+                except Exception as cache_err:
+                    users_logger.debug(f"Cache update note on enable for {username}: {cache_err}")
+                
                 log_user_action("ENABLE", username, f"set groups to {new_groups}, status active (fallback)", success=True)
                 users_logger.info(f"✅ Enabled user: {username} (groups: {new_groups}, status active)")
                 return (True, False)
@@ -613,7 +643,33 @@ async def enable_user_by_group(panel_data: PanelType, username: str) -> tuple[bo
             await groups_storage.remove_user(username)
             
             # Clear database disable flags
-            await _clear_database_disable_flags(username)
+            await _clear_database_disable_flags(username, restored_groups=original_groups)
+            
+            # Update in-memory cache immediately
+            try:
+                from utils.user_sync import USER_METADATA_CACHE, calculate_user_effective_limit_and_monitoring
+                existing_meta = USER_METADATA_CACHE.get(username, {})
+                is_excepted = existing_meta.get("is_excepted", False)
+                special_limit = existing_meta.get("special_limit")
+                owner_username = existing_meta.get("owner_username")
+                
+                is_mon, eff_lim = calculate_user_effective_limit_and_monitoring(
+                    username=username,
+                    group_ids=original_groups,
+                    is_excepted=is_excepted,
+                    special_limit=special_limit,
+                    config=data,
+                )
+                USER_METADATA_CACHE[username] = {
+                    "group_ids": original_groups,
+                    "owner_username": owner_username,
+                    "is_excepted": is_excepted,
+                    "special_limit": special_limit,
+                    "is_monitored": is_mon,
+                    "effective_ip_limit": eff_lim,
+                }
+            except Exception as cache_err:
+                users_logger.debug(f"Cache update note on enable for {username}: {cache_err}")
             
             log_user_action("ENABLE", username, f"restored groups {original_groups} (from {groups_source}), status active", success=True)
             users_logger.info(f"✅ Enabled user by group: {username} (restored groups {original_groups}, status active)")
@@ -957,6 +1013,15 @@ async def disable_user_by_group(panel_data: PanelType, username: str, disabled_g
         )
         
         if response is not None and response.status_code in (200, 201):
+            try:
+                from utils.user_sync import USER_METADATA_CACHE
+                if username in USER_METADATA_CACHE:
+                    USER_METADATA_CACHE[username]["group_ids"] = [disabled_group_id]
+                    USER_METADATA_CACHE[username]["is_monitored"] = False
+                    USER_METADATA_CACHE[username]["effective_ip_limit"] = None
+            except Exception as cache_err:
+                users_logger.debug(f"Cache update note on disable for {username}: {cache_err}")
+                
             log_user_action("DISABLE", username, f"moved to group {disabled_group_id}, status disabled", success=True)
             users_logger.info(f"🚫 Disabled user by group: {username} (moved to group {disabled_group_id}, status disabled)")
             return True

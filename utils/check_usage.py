@@ -214,12 +214,32 @@ async def resolve_effective_limit(
                 logger.error(f"Failed to auto-set limit for {username}: {e}")
         return int(pattern_limit)
 
-    # 5. Check Group Limit
+    # 5. Check Group Limit (from pre-batched mapping)
     if group_limits and username in group_limits:
         try:
             return int(group_limits[username])
         except (ValueError, TypeError):
             pass
+
+    # 5b. Direct Group Limit Fallback (Defense-in-depth from config & user group_ids)
+    cfg_group_limits = config.get("group_limits", {}) if (config and isinstance(config, dict)) else {}
+    if cfg_group_limits:
+        user_gids = None
+        if metadata and isinstance(metadata, dict):
+            user_gids = metadata.get("group_ids")
+        if user_gids is None:
+            try:
+                from utils.user_sync import USER_METADATA_CACHE
+                if username in USER_METADATA_CACHE:
+                    user_gids = USER_METADATA_CACHE[username].get("group_ids")
+            except Exception:
+                pass
+        
+        if user_gids:
+            from utils.user_sync import get_max_group_limit
+            max_glim = get_max_group_limit(user_gids, cfg_group_limits)
+            if max_glim is not None:
+                return max_glim
 
     # 6. General Fallback Limit
     general_limit = 2
@@ -256,7 +276,7 @@ async def get_group_limits_batch(usernames: list[str], config_data: dict, panel_
     
     # 1. Check RAM cache first
     for u in usernames:
-        if u in USER_METADATA_CACHE:
+        if u in USER_METADATA_CACHE and USER_METADATA_CACHE[u].get("group_ids") is not None:
             users_group_mapping[u] = USER_METADATA_CACHE[u].get("group_ids", [])
         else:
             missing_usernames.append(u)
@@ -308,28 +328,10 @@ async def get_group_limits_batch(usernames: list[str], config_data: dict, panel_
         
         # Calculate the max limit if user is in multiple groups
         if gids:
-            for gid in gids:
-                try:
-                    gid_int = int(gid)
-                    gid_str = str(gid)
-                except (ValueError, TypeError):
-                    gid_int = gid
-                    gid_str = str(gid)
-                
-                limit = group_limits.get(gid_int)
-                if limit is None:
-                    limit = group_limits.get(gid_str)
-                    
-                if limit is not None:
-                    try:
-                        limit_val = int(limit)
-                        if limit_val > max_limit:
-                            max_limit = limit_val
-                    except (ValueError, TypeError):
-                        pass
-        
-        if max_limit > -1:
-            result_limits[username] = max_limit
+            from utils.user_sync import get_max_group_limit
+            max_glim = get_max_group_limit(gids, group_limits)
+            if max_glim is not None:
+                result_limits[username] = max_glim
             
     return result_limits
 

@@ -621,6 +621,11 @@ async def receive_group_limit(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Save as JSON string
         await save_config_value("group_limits", json.dumps(group_limits))
         await invalidate_config_cache()
+        try:
+            from utils.user_sync import recompute_all_user_limits
+            await recompute_all_user_limits()
+        except Exception:
+            pass
         
         # Send confirmation and clear user_data
         await update.message.reply_html(msg)

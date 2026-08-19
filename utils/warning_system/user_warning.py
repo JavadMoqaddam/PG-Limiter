@@ -41,6 +41,7 @@ class UserLimitWarning:
     same_ip_multiple_inbounds: bool = False  # True if same IP uses different inbounds (likely 1 device)
     isp_change_pattern: str = None  # "sim_swap" or "multi_device" or None
     connection_details: list = None  # List of connection info for analysis
+    user_limit: int = 1  # The user's effective limit
     
     def __post_init__(self):
         if self.monitoring_history is None:
@@ -296,10 +297,11 @@ class UserLimitWarning:
             trust_logger.debug(f"Trust [{self.username}]: -{penalty} ({additional_24h} disables in 24h)")
         
         # Factor 4: IP Count Severity
-        if ip_count > 2:
-            penalty = (ip_count - 2) * 10
+        effective_limit = self.user_limit if (self.user_limit is not None and self.user_limit >= 1) else 1
+        if ip_count > effective_limit:
+            penalty = (ip_count - effective_limit) * 10
             score -= penalty
-            trust_logger.debug(f"Trust [{self.username}]: -{penalty} ({ip_count} IPs, excess penalty)")
+            trust_logger.debug(f"Trust [{self.username}]: -{penalty} ({ip_count} IPs, limit {effective_limit}, excess penalty)")
         
         score = max(-100.0, min(100.0, score))
         trust_logger.info(f"📊 Trust score for {self.username}: {score:.0f}")

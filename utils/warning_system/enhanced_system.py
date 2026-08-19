@@ -199,7 +199,8 @@ class EnhancedWarningSystem:
                             ip_to_inbounds=ip_to_inbounds,
                             same_ip_multiple_inbounds=warning_data.get("same_ip_multiple_inbounds", False),
                             isp_change_pattern=warning_data.get("isp_change_pattern"),
-                            connection_details=warning_data.get("connection_details", [])
+                            connection_details=warning_data.get("connection_details", []),
+                            user_limit=warning_data.get("user_limit", 1)
                         )
                         warning.monitoring_history = monitoring_history
                         self.warnings[username] = warning
@@ -244,7 +245,8 @@ class EnhancedWarningSystem:
                 "ip_to_inbounds": ip_to_inbounds_serializable,
                 "same_ip_multiple_inbounds": warning.same_ip_multiple_inbounds,
                 "isp_change_pattern": warning.isp_change_pattern,
-                "connection_details": warning.connection_details
+                "connection_details": warning.connection_details,
+                "user_limit": getattr(warning, "user_limit", 1)
             }
         
         atomic_write_json(self.filename, data)
@@ -278,6 +280,8 @@ class EnhancedWarningSystem:
             if warning.is_monitoring_active():
                 warning.ip_count = ip_count
                 warning.ips = ips
+                if user_limit:
+                    warning.user_limit = user_limit
                 warning.update_ip_activity(ips, current_time)
                 
                 if user_data and user_data.device_info:
@@ -338,7 +342,8 @@ class EnhancedWarningSystem:
             previous_warnings_24h=previous_warnings_24h,
             ip_to_inbounds=ip_to_inbounds,
             same_ip_multiple_inbounds=same_ip_multiple_inbounds,
-            connection_details=connection_details
+            connection_details=connection_details,
+            user_limit=user_limit if user_limit and user_limit >= 1 else 1
         )
         
         warning.trust_score = warning.calculate_trust_score()
@@ -539,10 +544,12 @@ class EnhancedWarningSystem:
                     warning.active_monitoring_task.cancel()
                 
                 from utils.check_usage import resolve_effective_limit
+                from utils.user_sync import USER_METADATA_CACHE
+                cached_meta = USER_METADATA_CACHE.get(username)
                 user_limit_number = await resolve_effective_limit(
                     username=username,
                     config=config_data,
-                    metadata=None,
+                    metadata=cached_meta,
                     special_limit=special_limit,
                     group_limits=batched_group_limits,
                     auto_persist_pattern=False,
@@ -567,7 +574,6 @@ class EnhancedWarningSystem:
                     if device_count > user_limit_number:
                         # ===== DOUBLE-CHECK BEFORE BAN (O(1) FAST RAM CHECK) =====
                         try:
-                            from utils.user_sync import USER_METADATA_CACHE
                             if username in USER_METADATA_CACHE:
                                 user_meta = USER_METADATA_CACHE[username]
                                 if user_meta.get("is_excepted"):
@@ -581,6 +587,15 @@ class EnhancedWarningSystem:
                                     user_limit_number = spec_limit
                                 elif eff_limit is not None and eff_limit > 0:
                                     user_limit_number = eff_limit
+                                else:
+                                    # Direct safety check for group limits
+                                    gids = user_meta.get("group_ids", [])
+                                    cfg_group_limits = config_data.get("group_limits", {})
+                                    if gids and cfg_group_limits:
+                                        from utils.user_sync import get_max_group_limit
+                                        glim = get_max_group_limit(gids, cfg_group_limits)
+                                        if glim is not None and glim > user_limit_number:
+                                            user_limit_number = glim
 
                                 if device_count <= user_limit_number:
                                     warning_logger.info(f"✅ Double-Check ABORTED ban for user {username}: limit updated to {user_limit_number}")

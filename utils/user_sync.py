@@ -25,6 +25,50 @@ _UNKNOWN_USERS_QUEUE: asyncio.Queue = asyncio.Queue()
 _UNKNOWN_USERS_FETCHING: set[str] = set()
 
 
+def resolve_group_limit(gid: int | str, group_limits: dict) -> int | None:
+    """
+    Safely resolve limit for a single group ID against group_limits dict,
+    handling int, str, and raw key types seamlessly.
+    """
+    if not group_limits or gid is None:
+        return None
+    try:
+        gid_int = int(gid)
+    except (ValueError, TypeError):
+        gid_int = None
+    gid_str = str(gid)
+    
+    limit = None
+    if gid_int is not None and gid_int in group_limits:
+        limit = group_limits[gid_int]
+    elif gid_str in group_limits:
+        limit = group_limits[gid_str]
+    elif gid in group_limits:
+        limit = group_limits[gid]
+        
+    if limit is not None:
+        try:
+            return int(limit)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def get_max_group_limit(group_ids: list[int | str], group_limits: dict) -> int | None:
+    """
+    Calculate the maximum effective limit from a list of group IDs.
+    Returns None if no matching limit found.
+    """
+    if not group_limits or not group_ids:
+        return None
+    matching = []
+    for gid in group_ids:
+        lim = resolve_group_limit(gid, group_limits)
+        if lim is not None:
+            matching.append(lim)
+    return max(matching) if matching else None
+
+
 def calculate_user_effective_limit_and_monitoring(
     username: str,
     group_ids: list[int],
@@ -71,16 +115,9 @@ def calculate_user_effective_limit_and_monitoring(
     # Priority B: Group Limits from config
     group_limits = config.get("group_limits", {})
     if group_limits and group_ids:
-        matching_limits = []
-        for gid in group_ids:
-            gid_str = str(gid)
-            if gid_str in group_limits:
-                try:
-                    matching_limits.append(int(group_limits[gid_str]))
-                except (ValueError, TypeError):
-                    pass
-        if matching_limits:
-            return (True, max(matching_limits))
+        max_glim = get_max_group_limit(group_ids, group_limits)
+        if max_glim is not None:
+            return (True, max_glim)
 
     # Priority C: Username Suffix Regex Pattern (e.g. .2.User or 2User)
     try:
