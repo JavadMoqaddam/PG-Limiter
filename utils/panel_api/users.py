@@ -757,32 +757,26 @@ async def enable_selected_users(
                 success, not_found = await enable_user_by_group(panel_data, username)
                 if not_found:
                     message = f"User {username} was deleted from panel, removing from disabled list"
-                    await safe_send_logs_panel(message)
                     users_logger.warning(message)
                     not_found_users.append(username)
                 elif success:
-                    message = f"Enabled user (group method): {username}"
-                    await safe_send_logs_panel(message)
+                    users_logger.info(f"✅ Enabled user (group method): {username}")
                     enabled_users.append(username)
                 else:
                     message = f"Failed to enable user: {username}"
-                    await safe_send_logs_panel(message)
                     users_logger.error(message)
                     failed_users.append(username)
             else:
                 success, not_found = await enable_user_by_status(panel_data, username)
                 if not_found:
                     message = f"User {username} was deleted from panel, removing from disabled list"
-                    await safe_send_logs_panel(message)
                     users_logger.warning(message)
                     not_found_users.append(username)
                 elif success:
-                    message = f"Enabled user: {username}"
-                    await safe_send_logs_panel(message)
+                    users_logger.info(f"✅ Enabled user: {username}")
                     enabled_users.append(username)
                 else:
                     message = f"Failed to enable user: {username}"
-                    await safe_send_logs_panel(message)
                     users_logger.error(message)
                     failed_users.append(username)
         except Exception as e:
@@ -1071,14 +1065,8 @@ async def disable_user(panel_data: PanelType, username: UserType, duration_secon
     
     if disable_method == "group" and disabled_group_id is not None:
         success = await disable_user_by_group(panel_data, username.name, disabled_group_id)
-        if success:
-            message = f"Disabled user (moved to disabled group): {username.name}"
-            await safe_send_logs_panel(message)
     else:
         success = await disable_user_by_status(panel_data, username.name)
-        if success:
-            message = f"Disabled user: {username.name}"
-            await safe_send_logs_panel(message)
     
     if success:
         dis_obj = DisabledUsers()
@@ -1087,7 +1075,6 @@ async def disable_user(panel_data: PanelType, username: UserType, duration_secon
         return None
     
     message = f"Failed to disable user: {username.name}"
-    await safe_send_logs_panel(message)
     users_logger.error(message)
     raise ValueError(message)
 

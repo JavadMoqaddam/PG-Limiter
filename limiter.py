@@ -74,11 +74,14 @@ async def main():
     else:
         main_logger.info("ℹ Redis cache module not available, using in-memory cache")
     
-    # Start Telegram bot in background task
-    main_logger.debug("Starting Telegram bot task...")
+    # Start Telegram bot and message dispatcher in background tasks
+    main_logger.debug("Starting Telegram bot and dispatcher tasks...")
+    from telegram_bot.dispatcher import get_dispatcher
+    dispatcher = get_dispatcher()
+    asyncio.create_task(dispatcher.start_worker())
     asyncio.create_task(run_telegram_bot())
     await asyncio.sleep(2)
-    main_logger.info("✓ Telegram bot started")
+    main_logger.info("✓ Telegram bot and dispatcher started")
 
     # Load configuration
     main_logger.debug("Loading configuration...")
@@ -116,7 +119,11 @@ async def main():
     await get_nodes(panel_data)
     
     async with asyncio.TaskGroup() as tg:
-        await asyncio.sleep(2)
+        # Start Telegram Dispatcher worker in TaskGroup
+        tg.create_task(dispatcher.start_worker(), name="telegram_dispatcher")
+        main_logger.info("✓ Telegram Dispatcher registered in TaskGroup")
+
+        await asyncio.sleep(0.5)
         
         # Start Redis Pub/Sub listener for L1/L2 cache invalidations
         if REDIS_AVAILABLE:
@@ -144,7 +151,7 @@ async def main():
             main_logger.info(f"✓ Connected to {len(connected_nodes)} nodes")
         else:
             main_logger.warning("No nodes available or error fetching nodes")
-        
+
         # Start background management tasks
         main_logger.info("🔄 Starting background tasks...")
         tg.create_task(check_and_add_new_nodes(panel_data, tg), name="add_new_nodes")
@@ -199,6 +206,15 @@ async def cleanup_resources():
         main_logger.debug("✓ Panel HTTP client closed")
     except Exception as e:
         main_logger.debug(f"Error closing Panel client: {e}")
+
+    # 5. Stop Telegram Dispatcher cleanly
+    try:
+        from telegram_bot.dispatcher import get_dispatcher
+        dispatcher = get_dispatcher()
+        await dispatcher.stop(wait_seconds=3.0)
+        main_logger.debug("✓ Telegram Dispatcher stopped")
+    except Exception as e:
+        main_logger.debug(f"Error stopping Dispatcher: {e}")
 
 
 if __name__ == "__main__":

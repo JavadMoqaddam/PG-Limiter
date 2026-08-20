@@ -53,21 +53,59 @@ async def _build_node_status_message() -> str:
 
 
 _last_status_edit_time = 0.0
+_last_status_text = ""
+_pending_status_update_task: Optional[asyncio.Task] = None
+
+
+async def _get_status_throttle_interval() -> float:
+    """Get node status edit throttle interval (synced with check_interval, default 60s)."""
+    try:
+        from utils.read_config import read_config
+        config = await read_config()
+        return float(config.get("monitoring", {}).get("check_interval", 60))
+    except Exception:
+        return 60.0
+
+
+async def _delayed_status_update(delay: float) -> None:
+    """Flush the latest node connection status to Telegram after the throttle window ends."""
+    global _last_status_edit_time, _last_status_text, _node_status_message_id
+    try:
+        await asyncio.sleep(delay)
+        message = await _build_node_status_message()
+        if message != _last_status_text and _node_status_message_id:
+            _last_status_edit_time = time.time()
+            _last_status_text = message
+            await edit_message(_node_status_message_id, message)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.debug(f"Delayed node status update note: {e}")
 
 
 async def _update_node_status(node_id: int, node_name: str, status: str) -> None:
-    """Update the status of a node and refresh the message with rate throttling."""
-    global _node_connection_status, _node_status_message_id, _last_status_edit_time
+    """Update the status of a node in memory and refresh the message with rate throttling and trailing flush."""
+    global _node_connection_status, _node_status_message_id, _last_status_edit_time, _last_status_text, _pending_status_update_task
     
     _node_connection_status[node_id] = {"name": node_name, "status": status}
     
-    # Throttle edits: only edit Telegram message at most once every 3 seconds to avoid Flood Control 429
+    # Throttle edits: sync with check_interval (default 60s)
     now = time.time()
-    if _node_status_message_id and (now - _last_status_edit_time < 3.0):
+    throttle_interval = await _get_status_throttle_interval()
+    elapsed = now - _last_status_edit_time
+    
+    if _node_status_message_id and elapsed < throttle_interval:
+        # Schedule trailing update so latest states are flushed at the end of the throttle window
+        if _pending_status_update_task is None or _pending_status_update_task.done():
+            _pending_status_update_task = asyncio.create_task(_delayed_status_update(throttle_interval - elapsed))
         return
-    _last_status_edit_time = now
     
     message = await _build_node_status_message()
+    if message == _last_status_text:
+        return
+    
+    _last_status_edit_time = now
+    _last_status_text = message
     
     if _node_status_message_id:
         # Try to edit the existing message

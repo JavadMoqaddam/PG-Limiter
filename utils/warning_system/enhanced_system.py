@@ -264,7 +264,7 @@ class EnhancedWarningSystem:
     
     async def add_warning(self, username: str, ip_count: int, ips: Set[str], user_limit: int = None, 
                          user_data: 'UserType' = None, isp_info: dict = None,
-                         panel_data: 'PanelType' = None) -> str:
+                         panel_data: 'PanelType' = None, send_telegram_notification: bool = True) -> str:
         """
         Add a warning for a user with trust score calculation.
         May instantly disable user if trust score is very low.
@@ -465,18 +465,19 @@ class EnhancedWarningSystem:
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         limit_text = f"User limit: <code>{user_limit}</code>\n" if user_limit else ""
         
-        await safe_send_warning_log(
-            f"⚠️ <b>WARNING</b> - {time_str}\n\n"
-            f"User: <code>{username}</code>\n"
-            f"Active IPs: <code>{ip_count}</code>\n"
-            f"{limit_text}"
-            f"Trust Level: {trust_level} (<code>{warning.trust_score:.0f}</code>)\n"
-            f"Behavior: <code>{behavior_summary}</code>\n"
-            f"Trust Factors:\n{trust_info}\n\n"
-            f"📡 Monitoring for: <code>3 minutes</code>\n"
-            f"IPs active for 2+ min will be counted as devices.\n"
-            f"If devices exceed limit after 3 min, user will be disabled."
-        )
+        if send_telegram_notification:
+            await safe_send_warning_log(
+                f"⚠️ <b>WARNING</b> - {time_str}\n\n"
+                f"User: <code>{username}</code>\n"
+                f"Active IPs: <code>{ip_count}</code>\n"
+                f"{limit_text}"
+                f"Trust Level: {trust_level} (<code>{warning.trust_score:.0f}</code>)\n"
+                f"Behavior: <code>{behavior_summary}</code>\n"
+                f"Trust Factors:\n{trust_info}\n\n"
+                f"📡 Monitoring for: <code>3 minutes</code>\n"
+                f"IPs active for 2+ min will be counted as devices.\n"
+                f"If devices exceed limit after 3 min, user will be disabled."
+            )
         
         logger.warning(f"Warning issued for user {username} with {ip_count} active IPs (limit: {user_limit}, trust: {warning.trust_score:.0f})")
         return "new"

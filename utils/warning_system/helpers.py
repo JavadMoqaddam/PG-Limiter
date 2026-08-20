@@ -9,59 +9,50 @@ from utils.types import PanelType, UserType
 helpers_logger = get_logger("warning_helpers")
 
 
-import asyncio
-
-async def _bg_send_wrapper(coro):
-    """Wrapper to run a sending coroutine in background with exception logging."""
-    try:
-        await coro
-    except Exception as e:
-        helpers_logger.error(f"❌ Background Telegram send failed: {e}")
-
-
 async def safe_send_logs(message: str, is_warning: bool = False):
     """
-    Safely send logs in background, handling import errors gracefully.
+    Safely send logs via Telegram Dispatcher.
     """
     try:
         if is_warning:
             from telegram_bot.send_message import send_warning_log
-            helpers_logger.debug(f"📤 Scheduling background warning log message ({len(message)} chars)")
-            asyncio.create_task(_bg_send_wrapper(send_warning_log(message)))
+            helpers_logger.debug(f"📤 Enqueueing warning log message ({len(message)} chars)")
+            await send_warning_log(message)
         else:
             from telegram_bot.send_message import send_logs
-            helpers_logger.debug(f"📤 Scheduling background Telegram log message ({len(message)} chars)")
-            asyncio.create_task(_bg_send_wrapper(send_logs(message)))
-        helpers_logger.debug("✅ Telegram log scheduled successfully")
+            helpers_logger.debug(f"📤 Enqueueing Telegram log message ({len(message)} chars)")
+            await send_logs(message)
+        helpers_logger.debug("✅ Telegram log enqueued successfully")
     except ImportError as e:
         helpers_logger.warning(f"⚠️ Telegram not configured: {e}")
     except Exception as e:
-        helpers_logger.error(f"❌ Failed to schedule telegram message: {e}")
+        helpers_logger.error(f"❌ Failed to enqueue telegram message: {e}")
 
 
-
-async def safe_send_warning_log(message: str):
-    """Safely send warning log to warnings topic in background."""
-    await safe_send_logs(message, is_warning=True)
+async def safe_send_warning_log(message: str, ttl: float = None):
+    """Safely send warning log to warnings topic."""
+    try:
+        from telegram_bot.send_message import send_warning_log
+        await send_warning_log(message, ttl=ttl)
+    except Exception as e:
+        helpers_logger.error(f"❌ Failed to enqueue warning log: {e}")
 
 
 async def safe_send_disable_notification(message: str, username: str):
-    """Safely send disable notification in background."""
+    """Safely send disable notification with Priority.CRITICAL."""
     try:
         from telegram_bot.send_message import send_disable_notification
-        helpers_logger.debug(f"📤 Scheduling background disable notification for {username}")
-        asyncio.create_task(_bg_send_wrapper(send_disable_notification(message, username)))
-        helpers_logger.debug(f"✅ Disable notification scheduled for {username}")
+        helpers_logger.debug(f"📤 Enqueueing disable notification for {username}")
+        await send_disable_notification(message, username)
+        helpers_logger.debug(f"✅ Disable notification enqueued for {username}")
     except ImportError as e:
         helpers_logger.warning(f"⚠️ Telegram not configured: {e}")
-        await safe_send_logs(message)
     except Exception as e:
-        helpers_logger.error(f"❌ Failed to schedule disable notification for {username}: {e}")
-        await safe_send_logs(message)
+        helpers_logger.error(f"❌ Failed to enqueue disable notification for {username}: {e}")
 
 
 async def safe_disable_user(panel_data: PanelType, user: UserType):
-    """Safely disable user, handling import errors gracefully"""
+    """Safely disable user, handling import errors gracefully."""
     try:
         from utils.panel_api import disable_user
         helpers_logger.debug(f"🚫 Disabling user {user.name}")

@@ -956,6 +956,70 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     return all_users_log
 
 
+async def dispatch_chunked_warnings(new_warnings: list[dict], check_interval: float, total_monitored: int) -> None:
+    """
+    Dispatch new warnings aggregated into chunks of 10 to avoid rate limits and message drops.
+    Includes item-level error handling and HTML escaping.
+    
+    Args:
+        new_warnings: List of warning dicts collected in this scan cycle
+        check_interval: Dynamic scan interval from config/ENV used as TTL
+        total_monitored: Total count of users currently in 3-min monitoring
+    """
+    if not new_warnings:
+        return
+        
+    from telegram_bot.send_message import send_warning_log
+    from datetime import datetime
+    import html
+    
+    chunk_size = 10
+    total_violators = len(new_warnings)
+    total_chunks = (total_violators + chunk_size - 1) // chunk_size
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    for idx in range(0, total_violators, chunk_size):
+        chunk = new_warnings[idx : idx + chunk_size]
+        batch_num = (idx // chunk_size) + 1
+        
+        header = (
+            f"⚠️ <b>WARNINGS REPORT</b> ({batch_num}/{total_chunks}) - <code>{now_str}</code>\n"
+            f"📡 Monitoring for: <code>3 minutes</code>\n"
+            f"📊 Violators in cycle: <code>{total_violators}</code> | In batch: <code>{len(chunk)}</code>"
+        )
+        
+        user_blocks = []
+        for item in chunk:
+            try:
+                username = html.escape(str(item.get("username", "Unknown")))
+                ip_count = item.get("ip_count", 0)
+                limit = item.get("limit", 1)
+                trust_level = item.get("trust_level", "🟡 MEDIUM")
+                trust_score = item.get("trust_score", 0.0)
+                behavior = html.escape(str(item.get("behavior", "")))
+                
+                user_line = (
+                    f"👤 <code>{username}</code>\n"
+                    f"   🌐 Active IPs: <code>{ip_count}</code> (Limit: <code>{limit}</code>)\n"
+                    f"   Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)"
+                )
+                if behavior and behavior != "No specific pattern detected":
+                    user_line += f"\n   Behavior: <code>{behavior}</code>"
+                user_blocks.append(user_line)
+            except Exception as item_err:
+                logger.error(f"Error rendering warning item for batch: {item_err}")
+                continue
+                
+        footer = (
+            f"📈 Total users currently monitored: <code>{total_monitored}</code>\n"
+            f"IPs active for 2+ min will be counted as devices."
+        )
+        
+        batch_msg = f"{header}\n\n" + "\n\n".join(user_blocks) + f"\n\n{footer}"
+        # Enqueue with dynamic TTL = check_interval
+        await send_warning_log(batch_msg, ttl=check_interval)
+
+
 async def check_users_usage(panel_data: PanelType, config_data: dict | None = None):
     """
     Enhanced function to check usage with warning system and ISP detection
@@ -1056,6 +1120,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # Track users skipped due to group filter or admin filter
     group_filtered_users = set()
     admin_filtered_users = set()
+    cycle_new_warnings = []
     
     for user_name, unique_ips in all_users_actual_ips.items():
         if user_name not in except_users and user_name not in processed_users:
@@ -1097,20 +1162,34 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     # User is being monitored, update their IP count and activity tracking
                     result = await warning_system.add_warning(
                         user_name, len(unique_ips), unique_ips, user_limit_number,
-                        user_data=user_data, isp_info=user_isp_info, panel_data=panel_data
+                        user_data=user_data, isp_info=user_isp_info, panel_data=panel_data,
+                        send_telegram_notification=False
                     )
                     logger.info(f"Updated monitoring for user {user_name} with {len(unique_ips)} IPs")
                 else:
                     # New violation - may start monitoring or instant disable
                     result = await warning_system.add_warning(
                         user_name, len(unique_ips), unique_ips, user_limit_number,
-                        user_data=user_data, isp_info=user_isp_info, panel_data=panel_data
+                        user_data=user_data, isp_info=user_isp_info, panel_data=panel_data,
+                        send_telegram_notification=False
                     )
                     
                     if result == "instant_disabled":
                         disabled_users.add(user_name)
                         logger.warning(f"User {user_name} instantly disabled due to low trust score")
                     elif result == "new":
+                        w_obj = warning_system.warnings.get(user_name)
+                        trust_score = w_obj.trust_score if w_obj else 0.0
+                        trust_level = w_obj.get_trust_level() if w_obj else "🟡 MEDIUM"
+                        behavior = w_obj.get_behavior_summary() if w_obj else ""
+                        cycle_new_warnings.append({
+                            "username": user_name,
+                            "ip_count": len(unique_ips),
+                            "limit": user_limit_number,
+                            "trust_score": trust_score,
+                            "trust_level": trust_level,
+                            "behavior": behavior
+                        })
                         message = (
                             f"User {user_name} has {len(unique_ips)} active ips (limit: {user_limit_number}). "
                             f"Warning issued - monitoring for 3 minutes."
@@ -1125,11 +1204,14 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     if admin_filtered_users:
         logger.debug(f"Admin filter: {len(admin_filtered_users)} users skipped")
     
+    # Dispatch chunked warning reports in batches of 10
+    check_interval = float(config_data.get("monitoring", {}).get("check_interval", 60)) if config_data else 60.0
+    total_monitored = len(warning_system.get_monitoring_users())
+    if cycle_new_warnings:
+        await dispatch_chunked_warnings(cycle_new_warnings, check_interval, total_monitored)
+
     # Clean up expired warnings
     await warning_system.cleanup_expired_warnings()
-    
-    # Send monitoring status every few cycles (optional)
-    # await warning_system.send_monitoring_status()
     
     all_users_log.clear()
 
