@@ -71,7 +71,7 @@ jobs:
           ### 🚀 Quick Install (Docker - Recommended)
           
           ```bash
-          sudo bash <(curl -sSL https://raw.githubusercontent.com/MatinDehghanian/PG-Limiter/main/pg-limiter.sh) install
+          sudo bash <(curl -sSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/main/pg-limiter.sh) install
           ```
           
           ### 📦 Manual Installation
@@ -85,7 +85,7 @@ jobs:
           
           The Docker image is automatically built and available at:
           ```
-          ghcr.io/matindehghanian/pg-limiter:latest
+          ghcr.io/javadmoqaddam/pg-limiter:latest
           ```
           
           ### ✨ Features
@@ -100,7 +100,7 @@ jobs:
           
           ### 📄 Changelog
           
-          See [CHANGELOG.md](https://github.com/MatinDehghanian/PG-Limiter/blob/main/CHANGELOG.md) for details.
+          See [CHANGELOG.md](https://github.com/JavadMoqaddam/PG-Limiter/blob/main/CHANGELOG.md) for details.
         files: |
           release/pg-limiter-${{ steps.get_version.outputs.version }}.tar.gz
           release/pg-limiter-${{ steps.get_version.outputs.version }}.zip

@@ -91,9 +91,15 @@
 
 ### Quick Install with Docker (Recommended)
 
+One-line installation:
+```bash
+sudo bash <(curl -sSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/main/pg-limiter.sh) install
+```
+
+Or step-by-step:
 ```bash
 # Download and run the installer
-curl -sSL https://raw.githubusercontent.com/MatinDehghanian/PG-Limiter/main/pg-limiter.sh -o /tmp/pg-limiter.sh
+curl -sSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/main/pg-limiter.sh -o /tmp/pg-limiter.sh
 
 sudo bash /tmp/pg-limiter.sh install
 ```
@@ -123,7 +129,7 @@ pg-limiter uninstall  # Remove PG-Limiter
 
 ```bash
 # Clone repository
-git clone https://github.com/MatinDehghanian/PG-Limiter.git
+git clone https://github.com/JavadMoqaddam/PG-Limiter.git
 cd PG-Limiter
 
 # Install dependencies
@@ -513,7 +519,7 @@ The default `docker-compose.yml` includes Redis:
 ```yaml
 services:
   pg-limiter:
-    image: ghcr.io/matindehghanian/pg-limiter:latest
+    image: ghcr.io/javadmoqaddam/pg-limiter:latest
     depends_on:
       - redis
     environment:

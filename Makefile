@@ -1,7 +1,7 @@
 .PHONY: build run stop logs shell clean dev test install
 
 # Docker image name
-IMAGE_NAME = ghcr.io/matindehghanian/pg-limiter
+IMAGE_NAME = ghcr.io/javadmoqaddam/pg-limiter
 CONTAINER_NAME = pg-limiter
 
 # Install pg-limiter (recommended way)
