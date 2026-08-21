@@ -59,14 +59,15 @@ jobs:
             -x "*.egg-info/*"
     
     - name: Create/Update Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ steps.get_version.outputs.tag }}
         name: "PG-Limiter ${{ steps.get_version.outputs.version }}"
+        generate_release_notes: true
         body: |
           ## 🛡️ PG-Limiter ${{ steps.get_version.outputs.version }}
           
-          Advanced IP Connection Limiter for PasarGuard Panel with Redis caching, Telegram bot control, and modular architecture.
+          High-performance IP Connection Limiter for PasarGuard Panel with real-time SSE streaming, Telegram Forum Topics, Subnet Grouping, High Trust Mode, and Redis caching.
           
           ### 🚀 Quick Install (Docker - Recommended)
           
@@ -74,33 +75,12 @@ jobs:
           sudo bash <(curl -sSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/main/pg-limiter.sh) install
           ```
           
-          ### 📦 Manual Installation
+          ### 🐳 Docker Image
           
-          1. Download and extract the source code
-          2. Install dependencies: `pip install -r requirements.txt`
-          3. Configure `.env` file
-          4. Run: `python3 limiter.py`
-          
-          ### 🐳 Docker
-          
-          The Docker image is automatically built and available at:
+          The Multi-Arch Docker image is available at:
           ```
           ghcr.io/javadmoqaddam/pg-limiter:latest
           ```
-          
-          ### ✨ Features
-          
-          - 🔒 IP Limiting (global or per-user)
-          - 🚀 Redis Caching (with in-memory fallback)
-          - 🤖 Telegram Bot Control
-          - 🌐 REST API
-          - 📊 Real-time Monitoring
-          - ⚖️ Punishment System
-          - 📝 Enhanced Logging
-          
-          ### 📄 Changelog
-          
-          See [CHANGELOG.md](https://github.com/JavadMoqaddam/PG-Limiter/blob/main/CHANGELOG.md) for details.
         files: |
           release/pg-limiter-${{ steps.get_version.outputs.version }}.tar.gz
           release/pg-limiter-${{ steps.get_version.outputs.version }}.zip
