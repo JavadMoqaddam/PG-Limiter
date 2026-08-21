@@ -4,7 +4,7 @@ set -e
 # PG-Limiter Management Script
 # https://github.com/JavadMoqaddam/PG-Limiter
 
-VERSION="0.9.8"
+VERSION="1.0.0"
 
 # Configuration
 REPO_OWNER="JavadMoqaddam"
