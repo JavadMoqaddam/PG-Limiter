@@ -314,12 +314,27 @@ async def show_disabled_users_menu(query, page: int = 0):
             )
             keyboard = create_disabled_users_keyboard(disabled_dict, page=page)
         
-        await query.edit_message_text(
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
+        try:
+            await query.edit_message_text(
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        except Exception as edit_err:
+            if "Message is not modified" in str(edit_err):
+                try:
+                    await query.answer("🔄 Already up to date!", show_alert=False)
+                except Exception:
+                    pass
+                return
+            raise edit_err
     except Exception as e:
+        if "Message is not modified" in str(e):
+            try:
+                await query.answer("🔄 Already up to date!", show_alert=False)
+            except Exception:
+                pass
+            return
         await query.edit_message_text(
             text=f"❌ Error loading disabled users: {e}",
             reply_markup=create_back_to_users_keyboard(),
@@ -658,13 +673,28 @@ async def show_users_in_disabled_group(query, page: int = 0):
             InlineKeyboardButton("« Back to Disabled Users", callback_data=CallbackData.SHOW_DISABLED_USERS),
         ])
         
-        await query.edit_message_text(
-            text=text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="HTML"
-        )
+        try:
+            await query.edit_message_text(
+                text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML"
+            )
+        except Exception as edit_err:
+            if "Message is not modified" in str(edit_err):
+                try:
+                    await query.answer("🔄 Already up to date!", show_alert=False)
+                except Exception:
+                    pass
+                return
+            raise edit_err
         
     except Exception as e:
+        if "Message is not modified" in str(e):
+            try:
+                await query.answer("🔄 Already up to date!", show_alert=False)
+            except Exception:
+                pass
+            return
         await query.edit_message_text(
             text=f"❌ Error getting users in disabled group: {e}",
             reply_markup=create_back_to_users_keyboard(),
