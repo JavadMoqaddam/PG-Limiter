@@ -569,6 +569,13 @@ _dispatcher_instance: Optional[TelegramDispatcher] = None
 def get_dispatcher() -> TelegramDispatcher:
     """Get or create the global TelegramDispatcher singleton instance."""
     global _dispatcher_instance
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
     if _dispatcher_instance is None:
+        _dispatcher_instance = TelegramDispatcher()
+    elif current_loop and getattr(_dispatcher_instance.queue, "_loop", None) is not current_loop:
         _dispatcher_instance = TelegramDispatcher()
     return _dispatcher_instance

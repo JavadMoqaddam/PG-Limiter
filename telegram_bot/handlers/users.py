@@ -328,12 +328,38 @@ async def show_disabled_users_menu(query, page: int = 0):
 
 
 async def enable_single_user(query, username: str):
-    """Enable a single disabled user."""
+    """
+    Enable a single disabled user.
+    Handles both menu callbacks and inline buttons on disable notification messages.
+    """
+    from datetime import datetime
     from utils.handel_dis_users import DisabledUsers
     from utils.panel_api import enable_selected_users
     from utils.types import PanelType
+    from telegram_bot.send_message import remove_disable_message_tracking
     
     try:
+        dis_users = DisabledUsers()
+        disabled_data = await dis_users.get_all_disabled_users()
+        is_user_disabled = username in disabled_data
+        
+        # Check if callback is from an inline disable notification in the topic
+        msg_text = getattr(query.message, "text", "") or ""
+        is_notification_button = (
+            "USER DISABLED" in msg_text or 
+            "SUBSCRIPTION REVOKED" in msg_text or 
+            "INSTANT DISABLE" in msg_text
+        )
+        
+        # If user is already active (not in disabled list)
+        if is_notification_button and not is_user_disabled:
+            await query.answer(f"ℹ️ User {username} is already active!", show_alert=False)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
         # Load config for panel data
         config = await read_config()
         panel_config = config.get("panel", {})
@@ -349,30 +375,41 @@ async def enable_single_user(query, username: str):
         failed = result.get("failed", [])
         not_found = result.get("not_found", [])
         
-        dis_users = DisabledUsers()
-        
-        if username in enabled:
-            # Successfully enabled - remove from disabled users list
+        if username in enabled or username in not_found:
             await dis_users.remove_user(username)
-            await query.answer(f"✅ User {username} enabled!")
-        elif username in not_found:
-            # User was deleted from panel - remove from disabled list
-            await dis_users.remove_user(username)
-            await query.answer(f"🗑️ User {username} was deleted from panel")
+            await remove_disable_message_tracking(username)
+            
+            if is_notification_button:
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                orig_html = getattr(query.message, "text_html", None) or msg_text
+                updated_text = f"{orig_html}\n\n✅ <b>USER ENABLED MANUALLY</b> - <code>{now_str}</code>"
+                try:
+                    await query.edit_message_text(text=updated_text, parse_mode="HTML", reply_markup=None)
+                except Exception:
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                await query.answer(f"✅ User {username} enabled manually!")
+                return
+            else:
+                await query.answer(f"✅ User {username} enabled!")
+                await show_disabled_users_menu(query)
+                return
         elif username in failed:
-            await query.answer(f"❌ Failed to enable {username}!")
+            await query.answer(f"❌ Failed to enable {username} on panel!", show_alert=True)
+            return
         else:
             await query.answer(f"⚠️ Unknown result for {username}")
-        
-        # Show updated list
-        await show_disabled_users_menu(query)
+            if not is_notification_button:
+                await show_disabled_users_menu(query)
         
     except Exception as e:
-        await query.edit_message_text(
-            text=f"❌ Error enabling user {username}: {e}",
-            reply_markup=create_back_to_users_keyboard(),
-            parse_mode="HTML"
-        )
+        users_logger.error(f"Error in enable_single_user for {username}: {e}")
+        try:
+            await query.answer(f"❌ Error: {e}", show_alert=True)
+        except Exception:
+            pass
 
 
 async def enable_all_disabled_users(query):

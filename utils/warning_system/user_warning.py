@@ -42,6 +42,7 @@ class UserLimitWarning:
     isp_change_pattern: str = None  # "sim_swap" or "multi_device" or None
     connection_details: list = None  # List of connection info for analysis
     user_limit: int = 1  # The user's effective limit
+    consecutive_violations: int = 1  # Number of consecutive scan cycles user has violated
     
     def __post_init__(self):
         if self.monitoring_history is None:
@@ -104,11 +105,10 @@ class UserLimitWarning:
     
     def get_persistent_devices(self, min_duration_seconds: int = 120) -> Set[str]:
         """
-        Get IPs that have been active for at least min_duration_seconds (default 2 min).
-        These are considered "confirmed devices".
+        Get IPs that qualify as persistent active devices.
         
         Args:
-            min_duration_seconds: Minimum active duration to count as device (default 120s = 2 min)
+            min_duration_seconds: Minimum active duration in seconds (default 120s)
             
         Returns:
             Set of IPs that qualify as persistent devices
@@ -144,7 +144,7 @@ class UserLimitWarning:
             last_seen = self.ip_last_seen.get(ip, 0)
             is_recent = (current_time - last_seen) < 120
             
-            status = "✅" if duration >= 120 or seen_count >= 2 else "⏳"
+            status = "✅" if is_recent and (duration >= 60 or seen_count >= 2) else "⏳"
             if not is_recent:
                 status = "❌"
             

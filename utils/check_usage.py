@@ -1165,7 +1165,58 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         user_data=user_data, isp_info=user_isp_info, panel_data=panel_data,
                         send_telegram_notification=False
                     )
-                    logger.info(f"Updated monitoring for user {user_name} with {len(unique_ips)} IPs")
+                    logger.info(f"Updated monitoring for user {user_name} with {len(unique_ips)} IPs (result={result})")
+                    
+                    if result == "violation_limit_reached":
+                        from utils.warning_system import safe_disable_user_with_punishment
+                        from telegram_bot.send_message import safe_send_disable_notification
+                        from datetime import datetime
+                        
+                        punishment_result = await safe_disable_user_with_punishment(
+                            panel_data, UserType(name=user_name, ip=[])
+                        )
+                        disabled_users.add(user_name)
+                        time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        
+                        duration_text = ""
+                        if punishment_result.get("duration_minutes", 0) > 0:
+                            duration_text = f"Duration: <code>{punishment_result['duration_minutes']} minutes</code>\n"
+                        else:
+                            duration_text = "Duration: <code>Until manual enable</code>\n"
+                        
+                        w_obj = warning_system.warnings.get(user_name)
+                        trust_score = w_obj.trust_score if w_obj else 0.0
+                        trust_level = w_obj.get_trust_level() if w_obj else "🟡 MEDIUM"
+                        activity_summary = w_obj.get_ip_activity_summary() if w_obj else ""
+                        
+                        if punishment_result.get("action") == "revoked":
+                            revoke_note = "✅ Sub revoked" if punishment_result.get("revoke_success", False) else "⚠️ Revoke failed"
+                            uuid_note = "✅ UUID reset" if punishment_result.get("uuid_reset_success", False) else "⚠️ UUID failed"
+                            msg = (
+                                f"🔄 <b>SUBSCRIPTION REVOKED + DISABLED</b> - {time_str}\n\n"
+                                f"User: <code>{user_name}</code>\n"
+                                f"Active IPs: <code>{len(unique_ips)}</code>\n"
+                                f"User limit: <code>{user_limit_number}</code>\n"
+                                f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
+                                f"📊 Violation #{punishment_result.get('violation_count', 1)} (Step {punishment_result.get('step_index', 0) + 1})\n"
+                                f"{revoke_note}, {uuid_note}\n"
+                                f"Duration: <code>Until manual enable</code>\n"
+                                f"📊 IP Activity:\n<code>{activity_summary}</code>"
+                            )
+                        else:
+                            msg = (
+                                f"🚫 <b>USER DISABLED</b> - {time_str}\n\n"
+                                f"User: <code>{user_name}</code>\n"
+                                f"Active IPs: <code>{len(unique_ips)}</code>\n"
+                                f"User limit: <code>{user_limit_number}</code>\n"
+                                f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
+                                f"📊 Violation #{punishment_result.get('violation_count', 1)} (Step {punishment_result.get('step_index', 0) + 1})\n"
+                                f"{duration_text}"
+                                f"📊 IP Activity:\n<code>{activity_summary}</code>"
+                            )
+                        await safe_send_disable_notification(msg, user_name)
+                        await warning_system.clear_user_trust_data(user_name)
+                        logger.warning(f"🚫 Disabled user {user_name} after 3 consecutive violation scans (limit: {user_limit_number})")
                 else:
                     # New violation - may start monitoring or instant disable
                     result = await warning_system.add_warning(
@@ -1192,10 +1243,30 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         })
                         message = (
                             f"User {user_name} has {len(unique_ips)} active ips (limit: {user_limit_number}). "
-                            f"Warning issued - monitoring for 3 minutes."
+                            f"Warning issued - monitoring for 3 consecutive scans."
                         )
                         logger.warning(message)
     
+    # Check for users whose usage normalized (active IPs <= limit or disconnected)
+    for monitored_user in list(warning_system.warnings.keys()):
+        if monitored_user not in all_users_actual_ips:
+            await warning_system.clear_user_trust_data(monitored_user)
+            logger.info(f"✅ User {monitored_user} inactive, monitoring cleared")
+        else:
+            user_current_ips = all_users_actual_ips.get(monitored_user, set())
+            user_meta = users_metadata_usage.get(monitored_user, {})
+            u_lim = await resolve_effective_limit(
+                username=monitored_user,
+                config=config_data,
+                metadata=user_meta,
+                special_limit=special_limit,
+                group_limits=batched_group_limits,
+                auto_persist_pattern=False,
+            )
+            if len(user_current_ips) <= u_lim:
+                await warning_system.clear_user_trust_data(monitored_user)
+                logger.info(f"✅ User {monitored_user} normalized usage ({len(user_current_ips)} <= {u_lim}), monitoring cleared")
+
     # Log group filter stats if any users were filtered
     if group_filtered_users:
         logger.debug(f"Group filter: {len(group_filtered_users)} users skipped")

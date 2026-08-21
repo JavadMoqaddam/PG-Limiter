@@ -214,6 +214,23 @@ class PunishmentSystem:
         current_time = time.time()
         if force or (current_time - self._last_cleanup > 300):
             self.cleanup_old_violations()
+
+    async def get_violation_count_async(self, username: str) -> int:
+        """
+        Get the number of violations for a user within the time window from SQLite.
+        Falls back to in-memory/json cache if DB is unavailable.
+        """
+        try:
+            from db.database import get_db, DB_AVAILABLE
+            from db.crud.violations import ViolationHistoryCRUD
+            if DB_AVAILABLE:
+                async with get_db() as db:
+                    return await ViolationHistoryCRUD.get_violation_count(db, username, window_hours=self.window_hours)
+        except Exception as e:
+            punishment_logger.debug(f"DB get_violation_count fallback for {username}: {e}")
+            
+        self._ensure_cleanup()
+        return len(self.violations.get(username, []))
     
     def get_violation_count(self, username: str) -> int:
         """
@@ -257,19 +274,35 @@ class PunishmentSystem:
     
     async def record_violation(self, username: str, step_applied: int, duration_minutes: int):
         """
-        Record a new violation for a user.
+        Record a new violation for a user in SQLite and in-memory cache.
         
         Args:
             username: The username
             step_applied: Which step was applied (0-indexed)
             duration_minutes: Duration of disable in minutes (0 for warning or unlimited)
         """
+        now = time.time()
+        try:
+            from db.database import get_db, DB_AVAILABLE
+            from db.crud.violations import ViolationHistoryCRUD
+            if DB_AVAILABLE:
+                async with get_db() as db:
+                    await ViolationHistoryCRUD.add(
+                        db=db,
+                        username=username,
+                        step_applied=step_applied,
+                        disable_duration=duration_minutes
+                    )
+                    await db.commit()
+        except Exception as e:
+            punishment_logger.error(f"Error saving violation to DB for {username}: {e}")
+
         if username not in self.violations:
             self.violations[username] = []
         
         record = ViolationRecord(
             username=username,
-            timestamp=time.time(),
+            timestamp=now,
             step_applied=step_applied,
             disable_duration=duration_minutes
         )
@@ -281,6 +314,16 @@ class PunishmentSystem:
     
     async def clear_user_history(self, username: str):
         """Clear all violation history for a user"""
+        try:
+            from db.database import get_db, DB_AVAILABLE
+            from db.crud.violations import ViolationHistoryCRUD
+            if DB_AVAILABLE:
+                async with get_db() as db:
+                    await ViolationHistoryCRUD.clear_user(db, username)
+                    await db.commit()
+        except Exception as e:
+            punishment_logger.debug(f"DB clear_user_history error for {username}: {e}")
+
         if username in self.violations:
             del self.violations[username]
             await self.save_violations()
@@ -288,6 +331,16 @@ class PunishmentSystem:
     
     async def clear_all_history(self):
         """Clear all violation history"""
+        try:
+            from db.database import get_db, DB_AVAILABLE
+            from db.crud.violations import ViolationHistoryCRUD
+            if DB_AVAILABLE:
+                async with get_db() as db:
+                    await ViolationHistoryCRUD.clear_all(db)
+                    await db.commit()
+        except Exception as e:
+            punishment_logger.debug(f"DB clear_all_history error: {e}")
+
         self.violations = {}
         await self.save_violations()
         punishment_logger.info("🗑️ Cleared all violation history")
@@ -318,12 +371,11 @@ class PunishmentSystem:
             "is_unlimited_next": next_step.is_unlimited_disable(),
             "recent_violations": [
                 {
-                    "timestamp": v.timestamp,
-                    "time_ago": self._format_time_ago(v.timestamp),
                     "step": v.step_applied,
-                    "duration": v.disable_duration
+                    "duration": v.disable_duration,
+                    "timestamp": v.timestamp
                 }
-                for v in violations[-5:]  # Last 5 violations
+                for v in violations
             ]
         }
     
@@ -380,9 +432,9 @@ async def get_punishment_for_user(username: str, config_data: dict) -> tuple[Pun
         # Punishment system disabled - use unlimited disable as default
         return PunishmentStep("disable", 0), 0, 0
     
-    violation_count = system.get_violation_count(username)
-    step_index = system.get_next_step_index(username)
-    punishment = system.get_next_punishment(username)
+    violation_count = await system.get_violation_count_async(username)
+    step_index = min(violation_count, len(system.steps) - 1)
+    punishment = system.steps[step_index]
     
     return punishment, step_index, violation_count
 

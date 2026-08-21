@@ -21,8 +21,21 @@ _sync_lock: asyncio.Lock = asyncio.Lock()
 USER_METADATA_CACHE: dict[str, dict] = {}
 
 # Background Queue & Throttled Worker for Unknown Users
-_UNKNOWN_USERS_QUEUE: asyncio.Queue = asyncio.Queue()
+_UNKNOWN_USERS_QUEUE: Optional[asyncio.Queue] = None
 _UNKNOWN_USERS_FETCHING: set[str] = set()
+
+
+def get_unknown_users_queue() -> asyncio.Queue:
+    """Get or create the unknown users queue bound to current event loop."""
+    global _UNKNOWN_USERS_QUEUE
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+        
+    if _UNKNOWN_USERS_QUEUE is None or (current_loop and getattr(_UNKNOWN_USERS_QUEUE, "_loop", None) is not current_loop):
+        _UNKNOWN_USERS_QUEUE = asyncio.Queue()
+    return _UNKNOWN_USERS_QUEUE
 
 
 def resolve_group_limit(gid: int | str, group_limits: dict) -> int | None:
@@ -223,7 +236,8 @@ async def queue_unknown_user_fetch(username: str):
     """Queue an unknown user for background fetch without blocking or spamming the API."""
     if username and username not in USER_METADATA_CACHE and username not in _UNKNOWN_USERS_FETCHING:
         _UNKNOWN_USERS_FETCHING.add(username)
-        await _UNKNOWN_USERS_QUEUE.put(username)
+        queue = get_unknown_users_queue()
+        await queue.put(username)
 
 
 async def run_unknown_user_worker(panel_data: PanelType):
@@ -239,11 +253,12 @@ async def run_unknown_user_worker(panel_data: PanelType):
             finally:
                 _UNKNOWN_USERS_FETCHING.discard(u)
     
+    queue = get_unknown_users_queue()
     while True:
         try:
-            username = await _UNKNOWN_USERS_QUEUE.get()
+            username = await queue.get()
             asyncio.create_task(_fetch(username))
-            _UNKNOWN_USERS_QUEUE.task_done()
+            queue.task_done()
         except asyncio.CancelledError:
             break
         except Exception as e:

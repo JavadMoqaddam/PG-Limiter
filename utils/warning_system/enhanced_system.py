@@ -200,7 +200,8 @@ class EnhancedWarningSystem:
                             same_ip_multiple_inbounds=warning_data.get("same_ip_multiple_inbounds", False),
                             isp_change_pattern=warning_data.get("isp_change_pattern"),
                             connection_details=warning_data.get("connection_details", []),
-                            user_limit=warning_data.get("user_limit", 1)
+                            user_limit=warning_data.get("user_limit", 1),
+                            consecutive_violations=warning_data.get("consecutive_violations", 1)
                         )
                         warning.monitoring_history = monitoring_history
                         self.warnings[username] = warning
@@ -246,7 +247,8 @@ class EnhancedWarningSystem:
                 "same_ip_multiple_inbounds": warning.same_ip_multiple_inbounds,
                 "isp_change_pattern": warning.isp_change_pattern,
                 "connection_details": warning.connection_details,
-                "user_limit": getattr(warning, "user_limit", 1)
+                "user_limit": getattr(warning, "user_limit", 1),
+                "consecutive_violations": getattr(warning, "consecutive_violations", 1)
             }
         
         atomic_write_json(self.filename, data)
@@ -277,29 +279,29 @@ class EnhancedWarningSystem:
         
         if username in self.warnings:
             warning = self.warnings[username]
-            if warning.is_monitoring_active():
-                warning.ip_count = ip_count
-                warning.ips = ips
-                if user_limit:
-                    warning.user_limit = user_limit
-                warning.update_ip_activity(ips, current_time)
-                
-                if user_data and user_data.device_info:
-                    warning.inbound_protocols = user_data.device_info.inbound_protocols
-                    warning.ip_to_inbounds = self._extract_ip_to_inbounds(user_data)
-                if isp_info:
-                    warning.isp_names = set(info.get('isp', 'Unknown') for info in isp_info.values())
-                    warning.ip_subnets = self._extract_subnets(ips)
-                
-                warning.trust_score = warning.calculate_trust_score()
-                
-                await self.save_warnings()
-                warning_logger.debug(f"⚠️ Updated existing warning for {username} (trust={warning.trust_score:.0f})")
-                log_monitoring_event("warning_updated", username, {"ip_count": ip_count, "trust_score": warning.trust_score})
-                return "updated"
-            else:
-                del self.warnings[username]
-                warning_logger.debug(f"⚠️ Removed expired warning for {username}")
+            warning.consecutive_violations = getattr(warning, "consecutive_violations", 1) + 1
+            warning.ip_count = ip_count
+            warning.ips = ips
+            if user_limit:
+                warning.user_limit = user_limit
+            warning.update_ip_activity(ips, current_time)
+            
+            if user_data and user_data.device_info:
+                warning.inbound_protocols = user_data.device_info.inbound_protocols
+                warning.ip_to_inbounds = self._extract_ip_to_inbounds(user_data)
+            if isp_info:
+                warning.isp_names = set(info.get('isp', 'Unknown') for info in isp_info.values())
+                warning.ip_subnets = self._extract_subnets(ips)
+            
+            warning.trust_score = warning.calculate_trust_score()
+            
+            await self.save_warnings()
+            warning_logger.info(f"⚠️ User {username} consecutive violation scan #{warning.consecutive_violations} (trust={warning.trust_score:.0f})")
+            log_monitoring_event("warning_updated", username, {"ip_count": ip_count, "trust_score": warning.trust_score, "consecutive": warning.consecutive_violations})
+            
+            if warning.consecutive_violations >= 3:
+                return "violation_limit_reached"
+            return "updated"
         
         previous_warnings_12h = self.count_recent_warnings(username, hours=12)
         previous_warnings_24h = self.count_recent_warnings(username, hours=24)
@@ -343,7 +345,8 @@ class EnhancedWarningSystem:
             ip_to_inbounds=ip_to_inbounds,
             same_ip_multiple_inbounds=same_ip_multiple_inbounds,
             connection_details=connection_details,
-            user_limit=user_limit if user_limit and user_limit >= 1 else 1
+            user_limit=user_limit if user_limit and user_limit >= 1 else 1,
+            consecutive_violations=1
         )
         
         warning.trust_score = warning.calculate_trust_score()

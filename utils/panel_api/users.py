@@ -1275,10 +1275,10 @@ async def enable_dis_user(panel_data: PanelType):
                 for username in enabled:
                     await dis_obj.remove_user(username)
                     users_logger.info(f"✅ User {username} has been re-enabled")
-                    # Delete disable message and send enable notification
+                    # Send enable notification without deleting the disable audit message
                     try:
                         from telegram_bot.send_message import send_enable_notification
-                        await send_enable_notification(username, delete_disable_msg=True)
+                        await send_enable_notification(username, delete_disable_msg=False)
                     except Exception as notify_error:
                         users_logger.warning(f"Could not send enable notification for {username}: {notify_error}")
                 
