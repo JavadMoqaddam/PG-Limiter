@@ -467,7 +467,7 @@ async def enable_user_by_status(panel_data: PanelType, username: str) -> tuple[b
     return (False, False)  # failed, but user might still exist
 
 
-async def _clear_database_disable_flags(username: str, restored_groups: Optional[List[int]] = None) -> None:
+async def _clear_database_disable_flags(username: str, restored_groups: list[int] | None = None) -> None:
     """
     Clear disable flags in database when a user is enabled.
     
