@@ -9,11 +9,7 @@ import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-# Ensure mocks for optional external dependencies when running in bare test environments
-for mod_name in ["httpx", "sqlalchemy", "sqlalchemy.ext.asyncio", "sqlalchemy.orm", "aiosqlite", "redis", "redis.asyncio", "telegram", "telegram.ext", "telegram.error", "cachetools"]:
-    if mod_name not in sys.modules:
-        mock_m = MagicMock()
-        sys.modules[mod_name] = mock_m
+
 
 from telegram_bot.dispatcher import (
     ActionType,

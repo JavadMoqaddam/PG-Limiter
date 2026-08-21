@@ -122,13 +122,23 @@ class TestDisabledUsers:
     @pytest.mark.asyncio
     async def test_get_users_to_enable(self, disabled_users_instance):
         """Test finding users ready to be re-enabled"""
+        from utils.handel_dis_users import DisabledUserEntry
         current_time = time.time()
         
         # Add user with expired disable time
-        await disabled_users_instance.add_user("expired_user", enable_at=current_time - 50, disabled_at=current_time - 100)
+        disabled_users_instance._entries["expired_user"] = DisabledUserEntry(
+            username="expired_user",
+            disabled_at=current_time - 100,
+            enable_at=current_time - 50
+        )
         
         # Add user still disabled
-        await disabled_users_instance.add_user("active_user", enable_at=current_time + 3600, disabled_at=current_time)
+        disabled_users_instance._entries["active_user"] = DisabledUserEntry(
+            username="active_user",
+            disabled_at=current_time,
+            enable_at=current_time + 3600
+        )
+        disabled_users_instance._sync_views_from_entries()
         
         ready = await disabled_users_instance.get_users_to_enable(60)
         
