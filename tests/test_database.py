@@ -17,9 +17,9 @@ class TestUserModel:
         from db.models import User
         
         # Check model has expected columns
-        assert hasattr(User, 'id')
-        assert hasattr(User, 'username')
-        assert hasattr(User, 'status')
+        assert 'id' in User.__table__.columns
+        assert 'username' in User.__table__.columns
+        assert 'status' in User.__table__.columns
     
     def test_user_table_name(self):
         """Test User model table name"""
@@ -61,7 +61,7 @@ class TestUserCRUD:
         from db.models import User
         
         # Mock user
-        mock_user = MagicMock(spec=User)
+        mock_user = MagicMock()
         mock_user.username = "test_user"
         mock_user.status = "active"
         

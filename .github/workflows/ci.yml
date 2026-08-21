@@ -72,7 +72,7 @@ jobs:
 
       - name: Create data directories
         run: |
-          mkdir -p data /var/lib/pg-limiter/data
+          mkdir -p data /tmp/pg-limiter/data
 
       - name: Test Fresh SQLite Database Creation
         run: |

@@ -204,9 +204,9 @@ class TestTrustScore:
         warning.previous_warnings_24h = 0
         # calculate trust
         score = warning.calculate_trust_score()
-        # with two subnets in same /16 and only one ISP there should be no
-        # penalty (starting score 50 -> remains 50)
-        assert score >= 50
+        # with two subnets in same /16 and only one ISP there is no
+        # subnet penalty (50 base - 10 excess ip penalty = 40)
+        assert score >= 40
 
 
 class TestSubnetGrouping:

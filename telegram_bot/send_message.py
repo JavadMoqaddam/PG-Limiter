@@ -7,7 +7,7 @@ import asyncio
 import json
 import os
 import time
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from telegram_bot.dispatcher import Priority, get_dispatcher
 from telegram_bot.topics import TopicType, get_topics_manager

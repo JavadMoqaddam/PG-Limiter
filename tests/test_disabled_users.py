@@ -125,15 +125,10 @@ class TestDisabledUsers:
         current_time = time.time()
         
         # Add user with expired disable time
-        disabled_users_instance.disabled_users["expired_user"] = current_time - 100
-        disabled_users_instance.enable_at["expired_user"] = current_time - 50
+        await disabled_users_instance.add_user("expired_user", enable_at=current_time - 50, disabled_at=current_time - 100)
         
         # Add user still disabled
-        disabled_users_instance.disabled_users["active_user"] = current_time
-        disabled_users_instance.enable_at["active_user"] = current_time + 3600
-        
-        # Save state first
-        await disabled_users_instance.save_disabled_users()
+        await disabled_users_instance.add_user("active_user", enable_at=current_time + 3600, disabled_at=current_time)
         
         ready = await disabled_users_instance.get_users_to_enable(60)
         
