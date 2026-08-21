@@ -54,7 +54,7 @@ async def _build_node_status_message() -> str:
 
 _last_status_edit_time = 0.0
 _last_status_text = ""
-_pending_status_update_task: Optional[asyncio.Task] = None
+_pending_status_update_task: asyncio.Task | None = None
 
 
 async def _get_status_throttle_interval() -> float:

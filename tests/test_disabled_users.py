@@ -138,6 +138,7 @@ class TestDisabledUsers:
             disabled_at=current_time,
             enable_at=current_time + 3600
         )
+        disabled_users_instance._sync_save_disabled_users()
         disabled_users_instance._sync_views_from_entries()
         
         ready = await disabled_users_instance.get_users_to_enable(60)
