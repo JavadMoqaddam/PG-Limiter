@@ -5,6 +5,7 @@ Contains all settings-related handlers for panel, intervals, and configuration.
 
 import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     ContextTypes,
     ConversationHandler,
@@ -1611,20 +1612,26 @@ async def node_settings_menu_callback(query, context: ContextTypes.DEFAULT_TYPE)
         f"<b>Disabled Nodes:</b> {len(disabled_nodes)} configured"
     )
     
-    await query.edit_message_text(
-        text=(
-            "🖥️ <b>Node Settings</b>\n\n"
-            f"{status_text}\n\n"
-            "<b>CDN Nodes:</b>\n"
-            "All IPs from CDN nodes count as <b>1 device</b>.\n"
-            "Use for nodes behind CDN (Cloudflare, etc.)\n\n"
-            "<b>Disabled Nodes:</b>\n"
-            "Connections from disabled nodes are <b>ignored</b>.\n"
-            "Use for nodes you don't want to monitor."
-        ),
-        reply_markup=create_node_settings_keyboard(),
-        parse_mode="HTML"
-    )
+    try:
+        await query.edit_message_text(
+            text=(
+                "🖥️ <b>Node Settings</b>\n\n"
+                f"{status_text}\n\n"
+                "<b>CDN Nodes:</b>\n"
+                "All IPs from CDN nodes count as <b>1 device</b>.\n"
+                "Use for nodes behind CDN (Cloudflare, etc.)\n\n"
+                "<b>Disabled Nodes:</b>\n"
+                "Connections from disabled nodes are <b>ignored</b>.\n"
+                "Use for nodes you don't want to monitor."
+            ),
+            reply_markup=create_node_settings_keyboard(),
+            parse_mode="HTML"
+        )
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            await query.answer("🔄 Settings are already up to date")
+        else:
+            raise
 
 
 async def node_settings_refresh_callback(query, context: ContextTypes.DEFAULT_TYPE):
@@ -1644,19 +1651,25 @@ async def node_cdn_menu_callback(query, context: ContextTypes.DEFAULT_TYPE):
     nodes, error = await _get_nodes_list()
     
     if error:
-        await query.edit_message_text(
-            text=f"❌ Failed to get nodes: {error}",
-            reply_markup=create_node_settings_keyboard(),
-            parse_mode="HTML"
-        )
+        try:
+            await query.edit_message_text(
+                text=f"❌ Failed to get nodes: {error}",
+                reply_markup=create_node_settings_keyboard(),
+                parse_mode="HTML"
+            )
+        except BadRequest:
+            pass
         return
     
     if not nodes:
-        await query.edit_message_text(
-            text="❌ No nodes found in panel.",
-            reply_markup=create_node_settings_keyboard(),
-            parse_mode="HTML"
-        )
+        try:
+            await query.edit_message_text(
+                text="❌ No nodes found in panel.",
+                reply_markup=create_node_settings_keyboard(),
+                parse_mode="HTML"
+            )
+        except BadRequest:
+            pass
         return
     
     # Build node buttons
@@ -1673,17 +1686,23 @@ async def node_cdn_menu_callback(query, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("🗑️ Clear All CDN", callback_data=CallbackData.NODE_CDN_CLEAR)])
     keyboard.append([InlineKeyboardButton("« Back", callback_data=CallbackData.NODE_SETTINGS_MENU)])
     
-    await query.edit_message_text(
-        text=(
-            "☁️ <b>CDN Nodes</b>\n\n"
-            "Select nodes that are behind CDN.\n"
-            "All IPs from these nodes will count as <b>1 device</b>.\n\n"
-            f"<b>Currently enabled:</b> {len(cdn_nodes)} nodes\n\n"
-            "<i>Click a node to toggle CDN mode:</i>"
-        ),
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="HTML"
-    )
+    try:
+        await query.edit_message_text(
+            text=(
+                "☁️ <b>CDN Nodes</b>\n\n"
+                "Select nodes that are behind CDN.\n"
+                "All IPs from these nodes will count as <b>1 device</b>.\n\n"
+                f"<b>Currently enabled:</b> {len(cdn_nodes)} nodes\n\n"
+                "<i>Click a node to toggle CDN mode:</i>"
+            ),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            await query.answer()
+        else:
+            raise
 
 
 async def node_cdn_toggle_callback(query, context: ContextTypes.DEFAULT_TYPE, node_id: int):
@@ -1720,19 +1739,25 @@ async def node_disabled_menu_callback(query, context: ContextTypes.DEFAULT_TYPE)
     nodes, error = await _get_nodes_list()
     
     if error:
-        await query.edit_message_text(
-            text=f"❌ Failed to get nodes: {error}",
-            reply_markup=create_node_settings_keyboard(),
-            parse_mode="HTML"
-        )
+        try:
+            await query.edit_message_text(
+                text=f"❌ Failed to get nodes: {error}",
+                reply_markup=create_node_settings_keyboard(),
+                parse_mode="HTML"
+            )
+        except BadRequest:
+            pass
         return
     
     if not nodes:
-        await query.edit_message_text(
-            text="❌ No nodes found in panel.",
-            reply_markup=create_node_settings_keyboard(),
-            parse_mode="HTML"
-        )
+        try:
+            await query.edit_message_text(
+                text="❌ No nodes found in panel.",
+                reply_markup=create_node_settings_keyboard(),
+                parse_mode="HTML"
+            )
+        except BadRequest:
+            pass
         return
     
     # Build node buttons
@@ -1749,18 +1774,24 @@ async def node_disabled_menu_callback(query, context: ContextTypes.DEFAULT_TYPE)
         keyboard.append([InlineKeyboardButton("🗑️ Clear All Disabled", callback_data=CallbackData.NODE_DISABLED_CLEAR)])
     keyboard.append([InlineKeyboardButton("« Back", callback_data=CallbackData.NODE_SETTINGS_MENU)])
     
-    await query.edit_message_text(
-        text=(
-            "🚫 <b>Disabled Nodes</b>\n\n"
-            "Select nodes to exclude from monitoring.\n"
-            "Connections from these nodes will be <b>ignored</b>.\n\n"
-            f"<b>Currently disabled:</b> {len(disabled_nodes)} nodes\n\n"
-            "<i>Click a node to toggle:</i>\n"
-            "✅ = Monitored | 🚫 = Disabled"
-        ),
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="HTML"
-    )
+    try:
+        await query.edit_message_text(
+            text=(
+                "🚫 <b>Disabled Nodes</b>\n\n"
+                "Select nodes to exclude from monitoring.\n"
+                "Connections from these nodes will be <b>ignored</b>.\n\n"
+                f"<b>Currently disabled:</b> {len(disabled_nodes)} nodes\n\n"
+                "<i>Click a node to toggle:</i>\n"
+                "✅ = Monitored | 🚫 = Disabled"
+            ),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            await query.answer()
+        else:
+            raise
 
 
 async def node_disabled_toggle_callback(query, context: ContextTypes.DEFAULT_TYPE, node_id: int):

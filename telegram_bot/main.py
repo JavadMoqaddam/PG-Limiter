@@ -8,6 +8,7 @@ import sys
 
 try:
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.error import BadRequest, TelegramError
     from telegram.ext import (
         ApplicationBuilder,
         CommandHandler,
@@ -1551,3 +1552,28 @@ application.add_handler(CommandHandler("list_limit_patterns", list_limit_pattern
 
 # Fallback document handler (must be after all ConversationHandlers)
 application.add_handler(MessageHandler(filters.Document.ALL, document_message_handler))
+
+
+async def global_telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors occurring during Telegram update processing."""
+    error = context.error
+    if not error:
+        return
+
+    # Gracefully ignore benign Telegram API errors
+    if isinstance(error, BadRequest):
+        err_msg = str(error).lower()
+        if (
+            "message is not modified" in err_msg
+            or "query is too old" in err_msg
+            or "message to edit not found" in err_msg
+            or "chat not found" in err_msg
+        ):
+            bot_logger.debug(f"ℹ️ Benign Telegram BadRequest ignored: {error}")
+            return
+
+    bot_logger.warning(f"⚠️ Telegram handler error: {error}")
+
+
+# Register global error handler for the Telegram Application
+application.add_error_handler(global_telegram_error_handler)
