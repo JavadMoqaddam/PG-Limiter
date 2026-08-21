@@ -248,13 +248,14 @@ if __name__ == "__main__":
             log_crash_info(exc_type, exc_value, exc_tb, component="Limiter")
             log_shutdown_info("Limiter", f"Error: {er}")
             
+            try:
+                asyncio.run(cleanup_resources())
+            except Exception:
+                pass
+
             if restart_count >= max_restarts:
                 main_logger.error(f"Maximum restart attempts ({max_restarts}) reached")
                 main_logger.error("Please check the logs and fix the issue")
-                try:
-                    asyncio.run(cleanup_resources())
-                except Exception:
-                    pass
                 break
             
             # Exponential backoff for restarts

@@ -65,53 +65,6 @@ USERNAME_LIMIT_PATTERN = re.compile(r'\.(\d+)\.User$')
 # Pattern to match usernames ending with XUser where X is a number (e.g., Bastami22User, MVHHe2User)
 USERNAME_LIMIT_PATTERN_SIMPLE = re.compile(r'(\d+)User$')
 
-# Cache for limit patterns from database
-_limit_patterns_cache: list | None = None
-_limit_patterns_cache_time: float = 0
-
-
-async def get_limit_from_patterns(username: str) -> int | None:
-    """
-    Get IP limit from database patterns (prefix/postfix).
-    
-    Args:
-        username: The username to check
-        
-    Returns:
-        The IP limit if pattern matches, None otherwise
-    """
-    global _limit_patterns_cache, _limit_patterns_cache_time
-    import time
-    
-    # Refresh cache every 60 seconds
-    current_time = time.time()
-    if _limit_patterns_cache is None or (current_time - _limit_patterns_cache_time) > 60:
-        try:
-            from db.database import get_db
-            from db.crud import LimitPatternCRUD
-            
-            async with get_db() as db:
-                _limit_patterns_cache = await LimitPatternCRUD.get_all(db)
-                _limit_patterns_cache_time = current_time
-        except Exception as e:
-            logger.error(f"Failed to load limit patterns: {e}")
-            _limit_patterns_cache = []
-            return None
-    
-    if not _limit_patterns_cache:
-        return None
-    
-    # Check patterns in order of creation (first match wins)
-    for pattern in _limit_patterns_cache:
-        if pattern.pattern_type == "prefix":
-            if username.startswith(pattern.pattern):
-                return pattern.ip_limit
-        elif pattern.pattern_type == "postfix":
-            if username.endswith(pattern.pattern):
-                return pattern.ip_limit
-    
-    return None
-
 
 def extract_limit_from_username(username: str) -> int | None:
     """
@@ -160,10 +113,9 @@ async def resolve_effective_limit(
     Priority order:
     1. Special Limit (Direct user override in DB / special_limit dict)
     2. Pre-computed Metadata Limit (effective_ip_limit from RAM metadata)
-    3. Database Limit Patterns (Prefix/Postfix patterns from DB)
-    4. Username Regex Patterns (.X.User or XUser)
-    5. Group Limit (Batched group limit from Pasargad group)
-    6. General Fallback Limit (Default config limit, e.g. 2)
+    3. Username Regex Patterns (.X.User or XUser)
+    4. Group Limit (Batched group limit from Pasargad group)
+    5. General Fallback Limit (Default config limit, e.g. 2)
     
     Args:
         username: Username to resolve limit for
@@ -192,12 +144,8 @@ async def resolve_effective_limit(
             except (ValueError, TypeError):
                 pass
 
-    # 3. Check database limit patterns (prefix/postfix)
-    pattern_limit = await get_limit_from_patterns(username)
-    
-    # 4. Fallback to username regex pattern (.2.User or 2User)
-    if pattern_limit is None:
-        pattern_limit = extract_limit_from_username(username)
+    # 3. Check username regex pattern (.2.User or 2User)
+    pattern_limit = extract_limit_from_username(username)
         
     if pattern_limit is not None:
         if auto_persist_pattern:
@@ -1169,7 +1117,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     
                     if result == "violation_limit_reached":
                         from utils.warning_system import safe_disable_user_with_punishment
-                        from telegram_bot.send_message import safe_send_disable_notification
+                        from telegram_bot.send_message import send_disable_notification
                         from datetime import datetime
                         
                         punishment_result = await safe_disable_user_with_punishment(
@@ -1214,7 +1162,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                                 f"{duration_text}"
                                 f"📊 IP Activity:\n<code>{activity_summary}</code>"
                             )
-                        await safe_send_disable_notification(msg, user_name)
+                        await send_disable_notification(msg, user_name)
                         await warning_system.clear_user_trust_data(user_name)
                         logger.warning(f"🚫 Disabled user {user_name} after 3 consecutive violation scans (limit: {user_limit_number})")
                 else:

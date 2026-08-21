@@ -45,10 +45,6 @@ def create_settings_menu_keyboard():
             InlineKeyboardButton("👤 Admin Filter", callback_data=CallbackData.ADMIN_FILTER_MENU),
         ],
         [
-            InlineKeyboardButton("🏷️ Admin Patterns", callback_data=CallbackData.ADMIN_PATTERNS_MENU),
-            InlineKeyboardButton("🔢 Limit Patterns", callback_data=CallbackData.LIMIT_PATTERNS_MENU),
-        ],
-        [
             InlineKeyboardButton("🔄 User Sync", callback_data=CallbackData.USER_SYNC_MENU),
             InlineKeyboardButton("🌐 Subnet Grouping", callback_data=CallbackData.SUBNET_IP_GROUPING_MENU),
         ],

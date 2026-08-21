@@ -274,6 +274,10 @@ async def send_disable_notification(msg: str, username: str) -> None:
         await track_disable_message(username, message_info[0], message_info[1])
 
 
+# Backward-compatible alias
+safe_send_disable_notification = send_disable_notification
+
+
 async def cancel_or_delete_disable_message(username: str) -> bool:
     """
     Dual cancel/delete workflow:

@@ -29,12 +29,6 @@ from db.crud.config import ConfigCRUD
 # IP history operations
 from db.crud.ip_history import IPHistoryCRUD
 
-# Admin patterns (prefix/postfix) operations
-from db.crud.admin_patterns import AdminPatternCRUD
-
-# Limit patterns (prefix/postfix with IP limits) operations
-from db.crud.limit_patterns import LimitPatternCRUD
-
 __all__ = [
     "UserCRUD",
     "UserLimitCRUD",
@@ -44,6 +38,4 @@ __all__ = [
     "ViolationHistoryCRUD",
     "ConfigCRUD",
     "IPHistoryCRUD",
-    "AdminPatternCRUD",
-    "LimitPatternCRUD",
 ]
