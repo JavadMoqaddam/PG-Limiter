@@ -25,6 +25,15 @@ db_url = os.environ.get("DATABASE_URL")
 if db_url:
     config.set_main_option("sqlalchemy.url", db_url)
 
+# Ensure SQLite database directory exists
+effective_url = config.get_main_option("sqlalchemy.url")
+if effective_url and "sqlite" in effective_url:
+    db_path = effective_url.split(":///")[-1].split("?")[0]
+    if db_path and not db_path.startswith(":memory:"):
+        db_dir = os.path.dirname(os.path.abspath(db_path))
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+
 # Interpret the config file for Python logging.
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
