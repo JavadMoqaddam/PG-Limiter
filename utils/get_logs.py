@@ -224,7 +224,8 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
             consecutive_failures += 1
             await _update_node_status(node.node_id, node.node_name, "❌ HTTP Error")
             logger.error(f"HTTP error connecting to node {node.node_id}: {error}")
-            await asyncio.sleep(10)
+            retry_delay = min(60, 5 * (2 ** min(consecutive_failures - 1, 4)))
+            await asyncio.sleep(retry_delay)
             await _update_node_status(node.node_id, node.node_name, "⏳ Reconnecting...")
             continue
         
@@ -233,7 +234,8 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
             await _update_node_status(node.node_id, node.node_name, "❌ Connection Error")
             logger.error(f"Connection error for node {node.node_id}: {error}")
             # Shorter sleep if panel might be restarting
-            await asyncio.sleep(5 if consecutive_failures < max_failures_before_wait else 2)
+            retry_delay = min(30, 3 * (2 ** min(consecutive_failures - 1, 3))) if consecutive_failures < max_failures_before_wait else 2
+            await asyncio.sleep(retry_delay)
             await _update_node_status(node.node_id, node.node_name, "⏳ Reconnecting...")
             continue
             
@@ -241,7 +243,8 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
             consecutive_failures += 1
             await _update_node_status(node.node_id, node.node_name, "❌ Failed")
             logger.error(f"Failed to connect to node {node.node_id}: {error}")
-            await asyncio.sleep(10)
+            retry_delay = min(60, 5 * (2 ** min(consecutive_failures - 1, 4)))
+            await asyncio.sleep(retry_delay)
             await _update_node_status(node.node_id, node.node_name, "⏳ Reconnecting...")
             continue
 
@@ -365,11 +368,19 @@ async def check_and_add_new_nodes(panel_data: PanelType, tg: asyncio.TaskGroup) 
     
     while True:
         try:
+            # Clean up completed or cancelled tasks from mapping
+            dead_tasks = [t for t in list(TASKS) if t.done()]
+            for t in dead_tasks:
+                TASKS.remove(t)
+                task_node_mapping.pop(t, None)
+
+            active_node_ids = {n.node_id for t, n in task_node_mapping.items() if not t.done()}
+
             all_nodes = await get_nodes(panel_data)
             if all_nodes and not isinstance(all_nodes, ValueError):
                 for node in all_nodes:
                     if (
-                        node not in task_node_mapping.values()
+                        node.node_id not in active_node_ids
                         and node.status == "connected"
                     ):
                         _node_connection_status[node.node_id] = {
@@ -383,6 +394,7 @@ async def check_and_add_new_nodes(panel_data: PanelType, tg: asyncio.TaskGroup) 
                         except Exception as update_err:
                             logger.warning(f"Failed updating node status: {update_err}")
                         await create_node_task(panel_data, tg, node)
+                        active_node_ids.add(node.node_id)
         except asyncio.CancelledError:
             break
         except Exception as e:
