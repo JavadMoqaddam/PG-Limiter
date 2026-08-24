@@ -47,7 +47,9 @@ class ISPDetector:
         # Auto-enable fallback if no token provided (ipinfo.io rate limits quickly without token)
         self.use_fallback_only = use_fallback_only or (not token)
         self.use_db_cache = use_db_cache and DB_AVAILABLE
-        self.cache = {}  # Simple cache to avoid repeated API calls
+        self.cache: Dict[str, Dict[str, str]] = {}  # Bounded cache to avoid memory leak
+        self._max_cache_size = 5000  # Cap cache entries for RAM safety
+        self._background_tasks: set[asyncio.Task] = set()  # Retain references to avoid GC cleanup
         self.rate_limit_delay = 1  # 1 second delay between requests
         self.last_request_time = 0
         self.rate_limited = False  # Track if we're rate limited
@@ -60,6 +62,23 @@ class ISPDetector:
             logger.info("ISPDetector using ip-api.com (fallback mode - no token configured)")
         elif token:
             logger.info(f"ISPDetector initialized with token: {token[:20]}...")
+
+    def _set_cache(self, key: str, value: Dict[str, str]) -> None:
+        """Store ISP entry in RAM with LRU-style eviction to prevent memory leak."""
+        if len(self.cache) >= self._max_cache_size:
+            # Evict oldest 10% of entries
+            evict_count = max(1, self._max_cache_size // 10)
+            keys_to_evict = list(self.cache.keys())[:evict_count]
+            for k in keys_to_evict:
+                self.cache.pop(k, None)
+        self.cache[key] = value
+
+    def _create_background_task(self, coro) -> asyncio.Task:
+        """Create a background task and hold a strong reference until completed."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
     
     def update_token(self, token: Optional[str]):
         """Update ipinfo token dynamically"""
@@ -173,10 +192,10 @@ class ISPDetector:
                     "city": data.get("city", "Unknown"),
                     "region": data.get("region", "Unknown")
                 }
-                self.cache[ip] = isp_info
+                self._set_cache(ip, isp_info)
                 self.last_request_time = asyncio.get_event_loop().time()
-                # Save to all caches (Redis + database) - don't await, fire and forget
-                asyncio.create_task(self._cache_isp_result(ip, isp_info))
+                # Save to all caches (Redis + database) with protected task reference
+                self._create_background_task(self._cache_isp_result(ip, isp_info))
                 return isp_info
             elif response.status_code == 429:
                 # Rate limited - set flag and return default
@@ -186,7 +205,7 @@ class ISPDetector:
                 # Forbidden - try fallback API
                 logger.warning(f"ipinfo.io returned 403 for {ip}, trying fallback API...")
                 result = await self._get_isp_fallback(ip)
-                asyncio.create_task(self._cache_isp_result(ip, result))
+                self._create_background_task(self._cache_isp_result(ip, result))
                 return result
             else:
                 response_text = response.text
@@ -196,13 +215,13 @@ class ISPDetector:
             logger.warning(f"⏱️ Timeout getting ISP info for {ip}, trying fallback...")
             # Try fallback on timeout - don't wait for cache
             result = await self._get_isp_fallback(ip)
-            asyncio.create_task(self._cache_isp_result(ip, result))
+            self._create_background_task(self._cache_isp_result(ip, result))
             return result
         except Exception as e:
             logger.warning(f"❌ Error getting ISP info for {ip}: {type(e).__name__}, trying fallback...")
             # Try fallback on any error - don't wait for cache
             result = await self._get_isp_fallback(ip)
-            asyncio.create_task(self._cache_isp_result(ip, result))
+            self._create_background_task(self._cache_isp_result(ip, result))
             return result
         
         # Return default info if lookup fails
@@ -213,7 +232,7 @@ class ISPDetector:
             "city": "Unknown",
             "region": "Unknown"
         }
-        self.cache[ip] = default_info
+        self._set_cache(ip, default_info)
         return default_info
     
     async def _save_to_db_cache(self, ip: str, isp_info: Dict[str, str]):
@@ -281,7 +300,7 @@ class ISPDetector:
                         "region": data.get("regionName", "Unknown")
                     }
                     logger.debug(f"✓ Fallback API success for {ip}: {isp_info['isp']}")
-                    self.cache[ip] = isp_info
+                    self._set_cache(ip, isp_info)
                     return isp_info
                 else:
                     logger.warning(f"Fallback API returned failure for {ip}: {data.get('message', 'unknown')}")
@@ -302,7 +321,7 @@ class ISPDetector:
             "city": "Unknown",
             "region": "Unknown"
         }
-        self.cache[ip] = default_info
+        self._set_cache(ip, default_info)
         return default_info
     
     async def get_multiple_isp_info(self, ips: list[str], timeout: float = 8.0) -> Dict[str, Dict[str, str]]:
@@ -332,7 +351,7 @@ class ISPDetector:
             if subnet_key in self.cache:
                 info = dict(self.cache[subnet_key])
                 info["ip"] = ip
-                self.cache[ip] = info
+                self._set_cache(ip, info)
                 results[ip] = info
                 continue
             
@@ -349,11 +368,11 @@ class ISPDetector:
                 try:
                     db_cached = await self._db_cache.get_cached_isp(sample_ip)
                     if db_cached and db_cached.get("isp") != "Unknown ISP":
-                        self.cache[subnet_key] = db_cached
+                        self._set_cache(subnet_key, db_cached)
                         for ip in uncached_subnets[subnet_key]:
                             info = dict(db_cached)
                             info["ip"] = ip
-                            self.cache[ip] = info
+                            self._set_cache(ip, info)
                             results[ip] = info
                         del uncached_subnets[subnet_key]
                 except Exception:
@@ -385,14 +404,14 @@ class ISPDetector:
                                 "city": data.get("city", "Unknown"),
                                 "region": data.get("regionName", "Unknown")
                             }
-                            self.cache[subnet_key] = info
-                            asyncio.create_task(self._save_to_db_cache(sample_ip, info))
+                            self._set_cache(subnet_key, info)
+                            self._create_background_task(self._save_to_db_cache(sample_ip, info))
                             return subnet_key, info
                 except Exception:
                     pass
                 
                 default_res = _default_isp_info(sample_ip)
-                self.cache[subnet_key] = default_res
+                self._set_cache(subnet_key, default_res)
                 return subnet_key, default_res
 
         try:
@@ -406,7 +425,7 @@ class ISPDetector:
                         for ip in uncached_subnets.get(s_key, []):
                             ip_info = dict(info)
                             ip_info["ip"] = ip
-                            self.cache[ip] = ip_info
+                            self._set_cache(ip, ip_info)
                             results[ip] = ip_info
         except asyncio.TimeoutError:
             logger.warning(f"⏱️ ISP subnet lookup timeout ({timeout}s)")
@@ -415,7 +434,7 @@ class ISPDetector:
         for ip in ips:
             if ip not in results or not results[ip]:
                 def_info = _default_isp_info(ip)
-                self.cache[ip] = def_info
+                self._set_cache(ip, def_info)
                 results[ip] = def_info
 
         return results
