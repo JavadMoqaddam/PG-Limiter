@@ -64,7 +64,7 @@ async def safe_send_logs_panel(message: str):
 _auth_token_lock = asyncio.Lock()
 
 
-async def get_token(panel_data: PanelType, force_refresh: bool = False) -> PanelType | ValueError:
+async def get_token(panel_data: PanelType, force_refresh: bool = False) -> PanelType:
     """
     Get access token from the panel API with caching (Redis or in-memory).
     Tokens are cached for 30 minutes to minimize unnecessary API calls.
@@ -135,13 +135,20 @@ async def get_token(panel_data: PanelType, force_refresh: bool = False) -> Panel
         "username": f"{panel_data.panel_username}",
         "password": f"{panel_data.panel_password}",
     }
+    
+    from utils.panel_api.request_helper import _get_scheme_order, get_panel_client
+    schemes = _get_scheme_order(panel_data.panel_domain)
+    clean_domain = panel_data.panel_domain
+    if clean_domain.startswith("https://"):
+        clean_domain = clean_domain[8:]
+    elif clean_domain.startswith("http://"):
+        clean_domain = clean_domain[7:]
+
     max_attempts = 5
     for attempt in range(max_attempts):
         auth_logger.debug(f"🔑 Token fetch attempt {attempt + 1}/{max_attempts}")
-        for scheme in ["https", "http"]:
-            if scheme == "http" and ":443" in str(panel_data.panel_domain):
-                continue
-            url = f"{scheme}://{panel_data.panel_domain}/api/admin/token"
+        for scheme in schemes:
+            url = f"{scheme}://{clean_domain}/api/admin/token"
             start_time = time.perf_counter()
             try:
                 from utils.panel_api.request_helper import get_panel_client

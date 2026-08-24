@@ -94,8 +94,9 @@ async def get_panel_client() -> httpx.AsyncClient:
     global _panel_client
     if _panel_client is None or _panel_client.is_closed:
         limits = httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=30.0)
+        verify_ssl = os.getenv("PANEL_VERIFY_SSL", "false").lower() in ("true", "1", "yes")
         _panel_client = httpx.AsyncClient(
-            verify=False,
+            verify=verify_ssl,
             timeout=30.0,
             limits=limits,
         )
@@ -136,11 +137,15 @@ PANEL_CHECK_INTERVAL = 10  # Seconds between availability checks when panel is d
 MAX_WAIT_FOR_PANEL = 600  # Maximum seconds to wait for panel (10 minutes)
 
 
-def _get_scheme_order() -> list[str]:
-    """Get the order of schemes to try based on recent success/failure."""
-    # If HTTPS has too many failures, try HTTP first
-    if _panel_health["https_failures"] >= 3 and _panel_health["http_failures"] < _panel_health["https_failures"]:
-        return ["http", "https"]
+def _get_scheme_order(domain: str = "") -> list[str]:
+    """Get the order of schemes to try based on configured domain and recent health."""
+    if domain.startswith("http://"):
+        return ["http"]
+    if domain.startswith("https://"):
+        return ["https"]
+    # If domain contains :443 or default, use HTTPS
+    if ":443" in domain or not domain.startswith("http://"):
+        return ["https"]
     return ["https", "http"]
 
 
@@ -286,10 +291,15 @@ async def panel_request(
     last_error = None
     
     for attempt in range(max_retries):
-        schemes = _get_scheme_order()
+        schemes = _get_scheme_order(panel_data.panel_domain)
+        clean_domain = panel_data.panel_domain
+        if clean_domain.startswith("https://"):
+            clean_domain = clean_domain[8:]
+        elif clean_domain.startswith("http://"):
+            clean_domain = clean_domain[7:]
         
         for scheme in schemes:
-            url = f"{scheme}://{panel_data.panel_domain}{endpoint}"
+            url = f"{scheme}://{clean_domain}{endpoint}"
             start_time = time.perf_counter()
             
             try:
@@ -397,74 +407,62 @@ async def _get_token_for_request(panel_data: PanelType, force_refresh: bool = Fa
         return None
 
 
+async def _execute_panel_request(
+    panel_data: PanelType,
+    method: Literal["GET", "POST", "PUT", "DELETE"],
+    endpoint: str,
+    force_refresh: bool = False,
+    json_data: Optional[dict] = None,
+    form_data: Optional[dict] = None,
+    params: Optional[dict] = None,
+    **kwargs
+) -> Optional[httpx.Response]:
+    """Internal helper executing panel requests with automatic token handling and 401 retry."""
+    token = await _get_token_for_request(panel_data, force_refresh)
+    if not token:
+        return None
+    
+    response, error = await panel_request(
+        panel_data, method, endpoint, token,
+        params=params, json_data=json_data, form_data=form_data, **kwargs
+    )
+    
+    # On 401, retry once with fresh token
+    if response and response.status_code == 401 and not force_refresh:
+        await invalidate_token_cache()
+        token = await _get_token_for_request(panel_data, force_refresh=True)
+        if token:
+            response, error = await panel_request(
+                panel_data, method, endpoint, token,
+                params=params, json_data=json_data, form_data=form_data, **kwargs
+            )
+    
+    return response
+
+
 async def panel_get(
     panel_data: PanelType,
     endpoint: str,
     force_refresh: bool = False,
     **kwargs
 ) -> Optional[httpx.Response]:
-    """
-    Convenience wrapper for GET requests with automatic token handling.
-    
-    Args:
-        panel_data: Panel connection data
-        endpoint: API endpoint (e.g., "/api/users")
-        force_refresh: Force token refresh
-        **kwargs: Additional arguments passed to panel_request
-    
-    Returns:
-        Response on success, None on failure
-    """
-    token = await _get_token_for_request(panel_data, force_refresh)
-    if not token:
-        return None
-    
-    response, error = await panel_request(panel_data, "GET", endpoint, token, **kwargs)
-    
-    # On 401, retry with fresh token
-    if response and response.status_code == 401 and not force_refresh:
-        await invalidate_token_cache()
-        token = await _get_token_for_request(panel_data, force_refresh=True)
-        if token:
-            response, error = await panel_request(panel_data, "GET", endpoint, token, **kwargs)
-    
-    return response
+    """Convenience wrapper for GET requests with automatic token handling."""
+    return await _execute_panel_request(panel_data, "GET", endpoint, force_refresh=force_refresh, **kwargs)
 
 
 async def panel_post(
     panel_data: PanelType,
     endpoint: str,
     json_data: Optional[dict] = None,
+    form_data: Optional[dict] = None,
     force_refresh: bool = False,
     **kwargs
 ) -> Optional[httpx.Response]:
-    """
-    Convenience wrapper for POST requests with automatic token handling.
-    
-    Args:
-        panel_data: Panel connection data
-        endpoint: API endpoint
-        json_data: JSON body for the request
-        force_refresh: Force token refresh
-        **kwargs: Additional arguments passed to panel_request
-    
-    Returns:
-        Response on success, None on failure
-    """
-    token = await _get_token_for_request(panel_data, force_refresh)
-    if not token:
-        return None
-    
-    response, error = await panel_request(panel_data, "POST", endpoint, token, json_data=json_data, **kwargs)
-    
-    # On 401, retry with fresh token
-    if response and response.status_code == 401 and not force_refresh:
-        await invalidate_token_cache()
-        token = await _get_token_for_request(panel_data, force_refresh=True)
-        if token:
-            response, error = await panel_request(panel_data, "POST", endpoint, token, json_data=json_data, **kwargs)
-    
-    return response
+    """Convenience wrapper for POST requests with automatic token handling."""
+    return await _execute_panel_request(
+        panel_data, "POST", endpoint, force_refresh=force_refresh,
+        json_data=json_data, form_data=form_data, **kwargs
+    )
 
 
 async def panel_put(
@@ -474,33 +472,11 @@ async def panel_put(
     force_refresh: bool = False,
     **kwargs
 ) -> Optional[httpx.Response]:
-    """
-    Convenience wrapper for PUT requests with automatic token handling.
-    
-    Args:
-        panel_data: Panel connection data
-        endpoint: API endpoint
-        json_data: JSON body for the request
-        force_refresh: Force token refresh
-        **kwargs: Additional arguments passed to panel_request
-    
-    Returns:
-        Response on success, None on failure
-    """
-    token = await _get_token_for_request(panel_data, force_refresh)
-    if not token:
-        return None
-    
-    response, error = await panel_request(panel_data, "PUT", endpoint, token, json_data=json_data, **kwargs)
-    
-    # On 401, retry with fresh token
-    if response and response.status_code == 401 and not force_refresh:
-        await invalidate_token_cache()
-        token = await _get_token_for_request(panel_data, force_refresh=True)
-        if token:
-            response, error = await panel_request(panel_data, "PUT", endpoint, token, json_data=json_data, **kwargs)
-    
-    return response
+    """Convenience wrapper for PUT requests with automatic token handling."""
+    return await _execute_panel_request(
+        panel_data, "PUT", endpoint, force_refresh=force_refresh,
+        json_data=json_data, **kwargs
+    )
 
 
 async def panel_delete(
@@ -509,32 +485,8 @@ async def panel_delete(
     force_refresh: bool = False,
     **kwargs
 ) -> Optional[httpx.Response]:
-    """
-    Convenience wrapper for DELETE requests with automatic token handling.
-    
-    Args:
-        panel_data: Panel connection data
-        endpoint: API endpoint
-        force_refresh: Force token refresh
-        **kwargs: Additional arguments passed to panel_request
-    
-    Returns:
-        Response on success, None on failure
-    """
-    token = await _get_token_for_request(panel_data, force_refresh)
-    if not token:
-        return None
-    
-    response, error = await panel_request(panel_data, "DELETE", endpoint, token, **kwargs)
-    
-    # On 401, retry with fresh token
-    if response and response.status_code == 401 and not force_refresh:
-        await invalidate_token_cache()
-        token = await _get_token_for_request(panel_data, force_refresh=True)
-        if token:
-            response, error = await panel_request(panel_data, "DELETE", endpoint, token, **kwargs)
-    
-    return response
+    """Convenience wrapper for DELETE requests with automatic token handling."""
+    return await _execute_panel_request(panel_data, "DELETE", endpoint, force_refresh=force_refresh, **kwargs)
 
 
 def get_panel_health() -> dict:
