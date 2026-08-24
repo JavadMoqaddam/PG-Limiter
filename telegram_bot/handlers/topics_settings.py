@@ -18,25 +18,7 @@ from utils.logs import get_logger
 topics_handler_logger = get_logger("topics.handler")
 
 
-async def _send_response(update: Update, text: str, reply_markup=None):
-    """Helper to send response in both message and callback query contexts."""
-    if update.callback_query:
-        try:
-            await update.callback_query.edit_message_text(
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode="HTML"
-            )
-        except Exception:
-            await update.callback_query.message.reply_html(
-                text=text,
-                reply_markup=reply_markup
-            )
-    elif update.message:
-        await update.message.reply_html(
-            text=text,
-            reply_markup=reply_markup
-        )
+from telegram_bot.utils import send_response as _send_response
 
 
 def create_topics_menu_keyboard(enabled: bool) -> InlineKeyboardMarkup:

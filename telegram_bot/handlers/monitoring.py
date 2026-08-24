@@ -9,58 +9,15 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-from telegram_bot.utils import (
-    add_admin_to_config,
-    check_admin,
-)
 from telegram_bot.keyboards import create_back_to_main_keyboard
-
-
-async def check_admin_privilege(update: Update):
-    """
-    Checks if the user has admin privileges.
-    Returns ConversationHandler.END if user is not admin, None otherwise.
-    Uses effective_user.id to work correctly in groups.
-    """
-    user_id = update.effective_user.id if update.effective_user else None
-    if not user_id:
-        if update.message:
-            await update.message.reply_html(
-                text="Sorry, you do not have permission to execute this command."
-            )
-        elif update.callback_query:
-            await update.callback_query.edit_message_text(
-                text="Sorry, you do not have permission to execute this command."
-            )
-        return ConversationHandler.END
-    
-    admins = await check_admin()
-    if not admins:
-        await add_admin_to_config(user_id)
-    admins = await check_admin()
-    if user_id not in admins:
-        if update.message:
-            await update.message.reply_html(
-                text="Sorry, you do not have permission to execute this command."
-            )
-        elif update.callback_query:
-            await update.callback_query.edit_message_text(
-                text="Sorry, you do not have permission to execute this command."
-            )
-        return ConversationHandler.END
-    return None
+from telegram_bot.handlers.admin import check_admin_privilege
+from telegram_bot.utils import send_response
 
 
 async def _send_response(update: Update, text: str, parse_mode: str = "HTML"):
     """Helper to send response for both message and callback query contexts."""
-    if update.message:
-        await update.message.reply_html(text=text)
-    elif update.callback_query:
-        await update.callback_query.edit_message_text(
-            text=text,
-            reply_markup=create_back_to_main_keyboard(),
-            parse_mode=parse_mode
-        )
+    reply_markup = create_back_to_main_keyboard() if getattr(update, "callback_query", None) else None
+    await send_response(update, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 
 async def monitoring_status(update: Update, _context: ContextTypes.DEFAULT_TYPE):

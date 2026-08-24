@@ -8,8 +8,9 @@ import asyncio
 from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler
 
-from telegram_bot.utils import check_admin, add_admin_to_config
 from telegram_bot.keyboards import create_back_to_main_keyboard
+from telegram_bot.handlers.admin import check_admin_privilege
+from telegram_bot.utils import send_response as _send_response
 from utils.read_config import read_config
 from utils.connection_analyzer import (
     generate_connection_report,
@@ -18,52 +19,6 @@ from utils.connection_analyzer import (
     get_users_by_node,
     get_users_by_inbound_protocol
 )
-
-
-async def _send_response(update: Update, text: str, parse_mode: str = "HTML", reply_markup=None):
-    """
-    Helper to send response in both message and callback query contexts.
-    """
-    if update.callback_query:
-        # In callback query context, answer the callback first
-        await update.callback_query.answer()
-        # Then send a new message (can't use edit for long reports)
-        await update.callback_query.message.reply_text(
-            text=text,
-            parse_mode=parse_mode,
-            reply_markup=reply_markup
-        )
-    elif update.message:
-        await update.message.reply_text(
-            text=text,
-            parse_mode=parse_mode,
-            reply_markup=reply_markup
-        )
-
-
-async def check_admin_privilege(update: Update):
-    """
-    Checks if the user has admin privileges.
-    Uses effective_user.id to work correctly in groups.
-    """
-    user_id = update.effective_user.id if update.effective_user else None
-    if not user_id:
-        await _send_response(
-            update,
-            "Sorry, you do not have permission to execute this command."
-        )
-        return ConversationHandler.END
-    
-    admins = await check_admin()
-    if not admins:
-        await add_admin_to_config(user_id)
-    admins = await check_admin()
-    if user_id not in admins:
-        await _send_response(
-            update,
-            "Sorry, you do not have permission to execute this command."
-        )
-        return ConversationHandler.END
 
 
 async def connection_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

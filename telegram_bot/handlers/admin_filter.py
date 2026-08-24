@@ -6,51 +6,11 @@ Commands for managing admin-based user filtering.
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 
-from telegram_bot.utils import check_admin, add_admin_to_config, read_json_file, write_json_file
+from telegram_bot.utils import read_json_file, write_json_file, send_response as _send_response
 from telegram_bot.keyboards import create_back_to_main_keyboard
 from telegram_bot.constants import CallbackData
+from telegram_bot.handlers.admin import check_admin_privilege
 from utils.read_config import read_config
-
-
-async def _send_response(update: Update, text: str, reply_markup=None):
-    """Send response handling both message and callback query contexts."""
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            text=text,
-            parse_mode="HTML",
-            reply_markup=reply_markup
-        )
-    else:
-        await update.message.reply_html(
-            text=text,
-            reply_markup=reply_markup
-        )
-
-
-async def check_admin_privilege(update: Update):
-    """
-    Checks if the user has admin privileges.
-    Uses effective_user.id to work correctly in groups.
-    """
-    user_id = update.effective_user.id if update.effective_user else None
-    if not user_id:
-        await _send_response(
-            update,
-            "Sorry, you do not have permission to use this bot."
-        )
-        return ConversationHandler.END
-    
-    admins = await check_admin()
-    if not admins:
-        await add_admin_to_config(user_id)
-    admins = await check_admin()
-    if user_id not in admins:
-        await _send_response(
-            update,
-            "Sorry, you do not have permission to use this bot."
-        )
-        return ConversationHandler.END
 
 
 async def admin_filter_status(update: Update, _context: ContextTypes.DEFAULT_TYPE):

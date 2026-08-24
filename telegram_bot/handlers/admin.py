@@ -91,15 +91,12 @@ def create_back_to_admins_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-async def _send_response(update: Update, text: str):
+async def _send_response(update: Update, text: str, reply_markup=None):
     """
     Helper to send response in both message and callback query contexts.
     """
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.message.reply_html(text=text)
-    elif update.message:
-        await update.message.reply_html(text=text)
+    from telegram_bot.utils import send_response
+    await send_response(update, text=text, reply_markup=reply_markup, parse_mode="HTML")
 
 
 async def check_admin_privilege(update: Update):
@@ -117,13 +114,10 @@ async def check_admin_privilege(update: Update):
         return ConversationHandler.END
     
     admins = await check_admin()
-    if not admins:
-        await add_admin_to_config(user_id)
-    admins = await check_admin()
-    if user_id not in admins:
+    if not admins or user_id not in admins:
         await _send_response(
             update,
-            "Sorry, you do not have permission to use this bot."
+            "⚠️ Sorry, you do not have permission to use this bot (unauthorized)."
         )
         return ConversationHandler.END
     return None

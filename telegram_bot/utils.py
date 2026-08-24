@@ -29,31 +29,65 @@ except ImportError:
 _config_write_lock = asyncio.Lock()
 
 
-async def get_token(panel_data: PanelType) -> PanelType | ValueError:
+async def get_token(panel_data: PanelType) -> PanelType:
+    """Canonical token fetcher delegating to panel_api.auth module."""
+    from utils.panel_api.auth import get_token as auth_get_token
+    return await auth_get_token(panel_data)
+
+
+async def send_response(update, text: str, reply_markup=None, parse_mode: str = "HTML"):
     """
-    Duplicate function to handel 'circular import' error
+    Unified response helper that works for both callback queries and regular messages.
+    Gracefully handles Telegram 'Message is not modified' error.
     """
-    # pylint: disable=duplicate-code
-    payload = {
-        "username": f"{panel_data.panel_username}",
-        "password": f"{panel_data.panel_password}",
-    }
-    for scheme in ["https", "http"]:
-        url = f"{scheme}://{panel_data.panel_domain}/api/admin/token"
+    from telegram.error import BadRequest
+    if getattr(update, "callback_query", None):
         try:
-            async with httpx.AsyncClient(verify=False) as client:
-                response = await client.post(url, data=payload, timeout=5)
-                response.raise_for_status()
-            json_obj = response.json()
-            panel_data.panel_token = json_obj["access_token"]
-            return panel_data
-        except Exception:  # pylint: disable=broad-except
-            continue
-    message = (
-        "Failed to get token. make sure the panel is running "
-        + "and the username and password are correct."
-    )
-    raise ValueError(message)
+            await update.callback_query.answer()
+        except Exception:
+            pass
+        try:
+            await update.callback_query.edit_message_text(
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
+        except BadRequest as e:
+            if "message is not modified" in str(e).lower():
+                return
+            try:
+                await update.callback_query.message.reply_text(
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode,
+                )
+            except Exception:
+                pass
+        except Exception:
+            try:
+                await update.callback_query.message.reply_text(
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode,
+                )
+            except Exception:
+                pass
+    elif getattr(update, "message", None):
+        await update.message.reply_text(
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+
+
+async def safe_edit_message_text(query, text: str, **kwargs):
+    """Safely edit message text ignoring 'Message is not modified' errors."""
+    from telegram.error import BadRequest
+    try:
+        await query.edit_message_text(text, **kwargs)
+    except BadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
 
 
 def _sync_read_json_file() -> dict:
@@ -158,7 +192,7 @@ async def check_admin() -> list[int] | None:
     return []
 
 
-async def handel_special_limit(username: str, limit: int) -> list:
+async def handle_special_limit(username: str, limit: int) -> list:
     """
     Handles the special limit for a given username using database.
 
@@ -197,6 +231,10 @@ async def handel_special_limit(username: str, limit: int) -> list:
     data = {"limits": {"special": {username: limit}}}
     await write_json_file(data)
     return [0, limit]
+
+
+# Backward-compatible alias
+handel_special_limit = handle_special_limit
 
 
 async def remove_admin_from_config(admin_id: int) -> bool:

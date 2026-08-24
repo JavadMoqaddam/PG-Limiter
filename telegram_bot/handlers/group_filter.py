@@ -13,24 +13,8 @@ from telegram_bot.handlers.admin import check_admin_privilege
 from telegram_bot.utils import write_json_file
 from telegram_bot.keyboards import create_back_to_main_keyboard
 from telegram_bot.constants import CallbackData, SET_GROUP_LIMIT
+from telegram_bot.utils import send_response as _send_response
 from utils.read_config import read_config
-
-
-async def _send_response(update: Update, text: str, reply_markup=None):
-    """
-    Helper to send response in both message and callback query contexts.
-    """
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.message.reply_html(
-            text=text,
-            reply_markup=reply_markup
-        )
-    elif update.message:
-        await update.message.reply_html(
-            text=text,
-            reply_markup=reply_markup
-        )
 
 
 async def group_filter_status(update: Update, _context: ContextTypes.DEFAULT_TYPE):

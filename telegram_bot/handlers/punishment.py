@@ -37,29 +37,7 @@ async def _save_punishment_steps(steps: list) -> bool:
     return await _save_punishment_setting("punishment_steps", json.dumps(steps))
 
 
-async def _send_response(update: Update, text: str, reply_markup=None):
-    """
-    Helper to send response in both message and callback query contexts.
-    """
-    if update.callback_query:
-        # Don't call answer() here - it's already called in the main callback handler
-        try:
-            await update.callback_query.edit_message_text(
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode="HTML"
-            )
-        except Exception:
-            # If edit fails, reply instead
-            await update.callback_query.message.reply_html(
-                text=text,
-                reply_markup=reply_markup
-            )
-    elif update.message:
-        await update.message.reply_html(
-            text=text,
-            reply_markup=reply_markup
-        )
+from telegram_bot.utils import send_response as _send_response
 
 
 def create_punishment_menu_keyboard(enabled: bool = True):
