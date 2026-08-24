@@ -462,3 +462,10 @@ async def handle_topics_clear_cache_callback(query, context):
     """Handle callback for clearing message cache."""
     update = Update(update_id=0, callback_query=query)
     await topics_clear_cache(update, context)
+
+
+# Compatibility aliases for legacy and handler exports
+topics_settings_command = topics_menu
+handle_topic_edit_callback = handle_topics_menu_callback
+handle_topic_create_callback = handle_topics_setup_callback
+handle_topic_auto_create_callback = handle_topics_setup_callback
