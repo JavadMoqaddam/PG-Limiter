@@ -136,6 +136,76 @@ def calculate_user_effective_limit_and_monitoring(
     return (True, None)
 
 
+def _parse_panel_user_dict(user_data: dict, config: dict = None) -> dict | None:
+    """
+    Parse raw user dictionary from panel API into structured database/cache fields.
+    Single source of truth for parsing panel user dicts across sync loops and single-user sync.
+    """
+    if not isinstance(user_data, dict):
+        return None
+    username = user_data.get("username")
+    if not username:
+        return None
+    
+    panel_id = user_data.get("id")
+    status = user_data.get("status", "active")
+    
+    admin_info = user_data.get("admin", {}) or {}
+    owner_id = admin_info.get("id") if isinstance(admin_info, dict) else None
+    owner_username = admin_info.get("username") if isinstance(admin_info, dict) else None
+    if not owner_username:
+        owner_username = user_data.get("created_by")
+    
+    group_ids = user_data.get("group_ids") or user_data.get("groups") or []
+    if isinstance(group_ids, str):
+        group_ids = [int(g.strip()) for g in group_ids.split(",") if g.strip()]
+    
+    data_limit = user_data.get("data_limit")
+    if data_limit:
+        data_limit = data_limit / (1024 ** 3)
+    
+    used_traffic = user_data.get("used_traffic", 0)
+    if used_traffic:
+        used_traffic = used_traffic / (1024 ** 3)
+    
+    expire_at = None
+    expire_value = user_data.get("expire")
+    if expire_value:
+        if isinstance(expire_value, int):
+            if expire_value > 0:
+                expire_at = datetime.fromtimestamp(expire_value)
+        elif isinstance(expire_value, str):
+            try:
+                expire_at = datetime.fromisoformat(expire_value.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+    
+    note = user_data.get("note")
+    
+    is_monitored, effective_limit = calculate_user_effective_limit_and_monitoring(
+        username=username,
+        group_ids=group_ids,
+        is_excepted=False,
+        special_limit=None,
+        config=config,
+    )
+    
+    return {
+        "username": username,
+        "panel_id": panel_id,
+        "status": status,
+        "owner_id": owner_id,
+        "owner_username": owner_username,
+        "group_ids": group_ids,
+        "data_limit": data_limit,
+        "used_traffic": used_traffic,
+        "expire_at": expire_at,
+        "note": note,
+        "is_monitored": is_monitored,
+        "effective_ip_limit": effective_limit,
+    }
+
+
 async def recompute_all_user_limits(config: dict = None):
     """
     Instantly recompute is_monitored and effective_ip_limit for all users in RAM cache
@@ -341,68 +411,9 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
                 users_to_upsert = []
                 for user_data in users:
                     try:
-                        username = user_data.get("username")
-                        if not username:
-                            continue
-                        
-                        panel_id = user_data.get("id")
-                        status = user_data.get("status", "active")
-                        
-                        admin_info = user_data.get("admin", {}) or {}
-                        owner_id = admin_info.get("id") if isinstance(admin_info, dict) else None
-                        owner_username = admin_info.get("username") if isinstance(admin_info, dict) else None
-                        if not owner_username:
-                            owner_username = user_data.get("created_by")
-                        
-                        group_ids = user_data.get("group_ids") or user_data.get("groups") or []
-                        if isinstance(group_ids, str):
-                            group_ids = [int(g.strip()) for g in group_ids.split(",") if g.strip()]
-                        
-                        data_limit = user_data.get("data_limit")
-                        if data_limit:
-                            data_limit = data_limit / (1024 ** 3)
-                        
-                        used_traffic = user_data.get("used_traffic", 0)
-                        if used_traffic:
-                            used_traffic = used_traffic / (1024 ** 3)
-                        
-                        expire_at = None
-                        expire_value = user_data.get("expire")
-                        if expire_value:
-                            if isinstance(expire_value, int):
-                                if expire_value > 0:
-                                    expire_at = datetime.fromtimestamp(expire_value)
-                            elif isinstance(expire_value, str):
-                                try:
-                                    expire_at = datetime.fromisoformat(expire_value.replace("Z", "+00:00"))
-                                except ValueError:
-                                    pass
-                        
-                        note = user_data.get("note")
-                        
-                        # Pre-compute is_monitored and effective_ip_limit
-                        is_monitored, effective_limit = calculate_user_effective_limit_and_monitoring(
-                            username=username,
-                            group_ids=group_ids,
-                            is_excepted=False,
-                            special_limit=None,
-                            config=config,
-                        )
-                        
-                        users_to_upsert.append({
-                            "username": username,
-                            "panel_id": panel_id,
-                            "status": status,
-                            "owner_id": owner_id,
-                            "owner_username": owner_username,
-                            "group_ids": group_ids,
-                            "data_limit": data_limit,
-                            "used_traffic": used_traffic,
-                            "expire_at": expire_at,
-                            "note": note,
-                            "is_monitored": is_monitored,
-                            "effective_ip_limit": effective_limit,
-                        })
+                        parsed = _parse_panel_user_dict(user_data, config=config)
+                        if parsed:
+                            users_to_upsert.append(parsed)
                     except Exception as e:
                         sync_logger.error(f"Error parsing user {user_data.get('username', '?')}: {e}")
                         errors += 1
@@ -600,52 +611,11 @@ async def fetch_and_sync_single_user(username: str, panel_data: Optional[PanelTy
             sync_logger.error(f"❌ Error fetching user {username}: {user_data}")
             return None
         
-        # Extract user details (same logic as sync_users_to_database)
-        panel_id = user_data.get("id")
-        status = user_data.get("status", "active")
-        
-        # Get admin/owner info
-        admin_info = user_data.get("admin", {}) or {}
-        owner_id = admin_info.get("id") if isinstance(admin_info, dict) else None
-        owner_username = admin_info.get("username") if isinstance(admin_info, dict) else None
-        
-        # Alternative: check for "created_by" field
-        if not owner_username:
-            owner_username = user_data.get("created_by")
-        
-        # Get group IDs
-        group_ids = user_data.get("group_ids") or user_data.get("groups") or []
-        if isinstance(group_ids, str):
-            group_ids = [int(g.strip()) for g in group_ids.split(",") if g.strip()]
-        
-        # Get data limits
-        data_limit = user_data.get("data_limit")
-        if data_limit:
-            data_limit = data_limit / (1024 ** 3)  # Convert to GB
-        
-        used_traffic = user_data.get("used_traffic", 0)
-        if used_traffic:
-            used_traffic = used_traffic / (1024 ** 3)  # Convert to GB
-        
-        # Get expiry
-        expire_at = None
-        expire_value = user_data.get("expire")
-        if expire_value:
-            if isinstance(expire_value, int):
-                # Unix timestamp
-                if expire_value > 0:
-                    expire_at = datetime.fromtimestamp(expire_value)
-            elif isinstance(expire_value, str):
-                # ISO datetime string
-                try:
-                    expire_at = datetime.fromisoformat(
-                        expire_value.replace("Z", "+00:00")
-                    )
-                except ValueError:
-                    pass
-        
-        # Get note
-        note = user_data.get("note")
+        # Extract user details using unified parser
+        parsed = _parse_panel_user_dict(user_data)
+        if not parsed:
+            sync_logger.error(f"❌ Failed to parse user data for {username}")
+            return None
         
         # Save to database
         from db.database import get_db
@@ -654,16 +624,16 @@ async def fetch_and_sync_single_user(username: str, panel_data: Optional[PanelTy
         async with get_db() as db:
             user = await UserCRUD.create_or_update(
                 db,
-                username=username,
-                panel_id=panel_id,
-                status=status,
-                owner_id=owner_id,
-                owner_username=owner_username,
-                group_ids=group_ids,
-                data_limit=data_limit,
-                used_traffic=used_traffic,
-                expire_at=expire_at,
-                note=note,
+                username=parsed["username"],
+                panel_id=parsed["panel_id"],
+                status=parsed["status"],
+                owner_id=parsed["owner_id"],
+                owner_username=parsed["owner_username"],
+                group_ids=parsed["group_ids"],
+                data_limit=parsed["data_limit"],
+                used_traffic=parsed["used_traffic"],
+                expire_at=parsed["expire_at"],
+                note=parsed["note"],
             )
             await db.commit()
             
