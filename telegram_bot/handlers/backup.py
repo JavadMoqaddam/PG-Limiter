@@ -173,6 +173,12 @@ def _sync_restore_config_zip(file_content: bytearray) -> tuple[bool, str]:
         f.write(file_content)
     
     with zipfile.ZipFile(zip_path, 'r') as zipf:
+        # Validate against Zip Slip (directory traversal attack)
+        real_temp_dir = os.path.realpath(temp_dir)
+        for member in zipf.infolist():
+            target_path = os.path.realpath(os.path.join(temp_dir, member.filename))
+            if not (target_path == real_temp_dir or target_path.startswith(real_temp_dir + os.sep)):
+                raise ValueError(f"Dangerous zip archive detected (Zip Slip): {member.filename}")
         zipf.extractall(temp_dir)
     
     # Restore .env file if present

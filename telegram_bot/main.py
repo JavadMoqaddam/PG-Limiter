@@ -248,9 +248,12 @@ async def start(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     bot_logger.debug(f"Admin list: {admins}")
     
     if not admins:
-        bot_logger.info("No admins configured, adding first user as admin")
-        await add_admin_to_config(user_id)
-    admins = await check_admin()
+        bot_logger.warning(f"No admins configured in system. Access denied for user_id={user_id}")
+        await update.message.reply_html(
+            text="⚠️ <b>Bot is not configured.</b>\n"
+                 "Please configure <code>ADMIN_IDS</code> in your <code>.env</code> or <code>config.json</code> file to gain access."
+        )
+        return
     
     if user_id not in admins:
         bot_logger.warning(f"Unauthorized access attempt from user_id={user_id}")
