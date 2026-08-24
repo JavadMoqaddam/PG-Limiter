@@ -73,11 +73,16 @@ class ConfigResponse(BaseModel):
 # ═══════════════════════════════════════════════════════════════
 
 def load_config() -> dict:
-    """Load config from file"""
-    if not os.path.exists(CONFIG_FILE):
-        raise HTTPException(status_code=500, detail="Config file not found")
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    """Load config from file or environment defaults."""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    
+    from utils.read_config import get_config_sync
+    return get_config_sync()
 
 def save_config(config: dict):
     """Save config to file"""
@@ -118,12 +123,16 @@ def save_disabled_users(users: dict):
 
 
 def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
-    """Verify API credentials"""
+    """Verify API credentials with ENV override support"""
     config = load_config()
     api_config = config.get("api", {})
     
-    correct_username = api_config.get("username", "admin")
-    correct_password = api_config.get("password", "admin")
+    correct_username = os.getenv("API_USERNAME") or api_config.get("username", "admin")
+    correct_password = os.getenv("API_PASSWORD") or api_config.get("password", "")
+    
+    # If no password configured, require setting one
+    if not correct_password:
+        logger.warning("⚠️ API password not configured! Please set API_PASSWORD in .env")
     
     is_correct_username = secrets.compare_digest(
         credentials.username.encode("utf8"),
@@ -608,11 +617,11 @@ if __name__ == "__main__":
     try:
         config = load_config()
         api_config = config.get("api", {})
-        host = api_config.get("host", "0.0.0.0")
-        port = api_config.get("port", 8307)
+        host = os.getenv("API_HOST", api_config.get("host", "0.0.0.0"))
+        port = int(os.getenv("API_PORT", api_config.get("port", 8080)))
     except Exception:
         host = "0.0.0.0"
-        port = 8307
+        port = 8080
     
     print(f"""
 ╔═══════════════════════════════════════════╗
