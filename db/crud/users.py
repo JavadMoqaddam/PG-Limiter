@@ -21,14 +21,14 @@ async def _invalidate_user_caches(username: str, reason: str = "user_mutation"):
     try:
         from utils.user_sync import invalidate_user_metadata_cache
         invalidate_user_metadata_cache(username)
-    except Exception:
-        pass
+    except Exception as e:
+        db_users_logger.debug(f"Failed to invalidate user RAM cache for {username}: {e}")
         
     try:
         from utils.redis_cache import publish_cache_invalidation
         await publish_cache_invalidation(reason=reason, target_user=username)
-    except Exception:
-        pass
+    except Exception as e:
+        db_users_logger.debug(f"Failed to publish Redis cache invalidation for {username}: {e}")
 
 
 class UserCRUD:
