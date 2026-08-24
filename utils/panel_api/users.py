@@ -216,7 +216,6 @@ async def get_all_panel_users(
     except Exception as e:
         users_logger.error(f"Failed to get panel usernames: {e}")
         raise ValueError(f"Failed to get users: {e}") from e
-        offset += limit
 
 
 async def check_user_exists(panel_data: PanelType, username: str) -> bool:
@@ -253,17 +252,16 @@ async def check_user_exists(panel_data: PanelType, username: str) -> bool:
     return True
 
 
-async def get_user_details(panel_data: PanelType, username: str) -> dict | ValueError:
+async def get_user_details(panel_data: PanelType, username: str) -> dict | None | ValueError:
     """
     Get user details including group_ids from the panel API.
 
     Args:
-        panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        panel_data (PanelType): Panel connection data.
         username (str): The username to get details for.
 
     Returns:
-        dict: The user details including group_ids.
+        dict | None: The user details including group_ids, or None if not found.
 
     Raises:
         ValueError: If the function fails to get user details from the API.
@@ -271,42 +269,27 @@ async def get_user_details(panel_data: PanelType, username: str) -> dict | Value
     from utils.panel_api.request_helper import panel_get
     
     users_logger.debug(f"👤 Getting details for user: {username}")
-    max_attempts = 3
+    response = await panel_get(
+        panel_data, 
+        f"/api/user/{username}",
+        timeout=15.0,
+        max_retries=3
+    )
     
-    for attempt in range(max_attempts):
-        force_refresh = attempt > 0
-        
-        response = await panel_get(
-            panel_data, 
-            f"/api/user/{username}",
-            force_refresh=force_refresh,
-            timeout=10.0,
-            max_retries=2
-        )
-        
-        if response is not None:
-            if response.status_code == 200:
-                try:
-                    user_data = response.json()
-                    users_logger.debug(f"👤 Got details for {username}: groups={user_data.get('group_ids', [])}")
-                    return user_data
-                except Exception as json_error:
-                    users_logger.error(f"Failed to parse JSON for {username}: {json_error}")
-            elif response.status_code == 404:
-                users_logger.warning(f"User {username} not found")
-                return None
-            elif response.status_code == 401:
-                await invalidate_token_cache()
-                users_logger.warning("Got 401 error, invalidating token cache and retrying")
-                continue
-        
-        users_logger.warning(f"Attempt {attempt + 1}/{max_attempts} failed")
-        
-        if attempt < max_attempts - 1:
-            wait_time = min(10, random.randint(1, 3) * (attempt + 1))
-            await asyncio.sleep(wait_time)
+    if response is not None:
+        if response.status_code == 200:
+            try:
+                user_data = response.json()
+                users_logger.debug(f"👤 Got details for {username}: groups={user_data.get('group_ids', [])}")
+                return user_data
+            except Exception as json_error:
+                users_logger.error(f"Failed to parse JSON for {username}: {json_error}")
+                raise ValueError(f"Failed to parse JSON for {username}: {json_error}") from json_error
+        elif response.status_code == 404:
+            users_logger.warning(f"User {username} not found")
+            return None
     
-    message = f"Failed to get user details for {username} after {max_attempts} attempts."
+    message = f"Failed to get user details for {username} after retries."
     users_logger.error(message)
     raise ValueError(message)
 
@@ -804,39 +787,25 @@ async def revoke_user_subscription(panel_data: PanelType, username: str) -> bool
     from utils.panel_api.request_helper import panel_post
     
     users_logger.info(f"🔄 Revoking subscription for user: {username}")
-    max_attempts = 3
+    response = await panel_post(
+        panel_data,
+        f"/api/user/{username}/revoke_sub",
+        json_data={},
+        timeout=15.0,
+        max_retries=3
+    )
     
-    for attempt in range(max_attempts):
-        force_refresh = attempt > 0
-        
-        response = await panel_post(
-            panel_data,
-            f"/api/user/{username}/revoke_sub",
-            json_data={},
-            force_refresh=force_refresh,
-            timeout=10.0,
-            max_retries=2
-        )
-        
-        if response is not None:
-            if response.status_code in (200, 201):
-                log_user_action("REVOKE_SUB", username, "subscription revoked", success=True)
-                users_logger.info(f"🔄 Revoked subscription for user: {username}")
-                return True
-            elif response.status_code == 401:
-                await invalidate_token_cache()
-                users_logger.warning("Got 401 error, retrying...")
-                continue
-            elif response.status_code == 404:
-                log_user_action("REVOKE_SUB", username, "User not found", success=False)
-                users_logger.warning(f"User {username} not found in panel")
-                return False
-            else:
-                users_logger.error(f"Failed to revoke subscription: {response.status_code}")
-                continue
-        
-        wait_time = min(30, random.randint(2, 5) * (attempt + 1))
-        await asyncio.sleep(wait_time)
+    if response is not None:
+        if response.status_code in (200, 201):
+            log_user_action("REVOKE_SUB", username, "subscription revoked", success=True)
+            users_logger.info(f"🔄 Revoked subscription for user: {username}")
+            return True
+        elif response.status_code == 404:
+            log_user_action("REVOKE_SUB", username, "User not found", success=False)
+            users_logger.warning(f"User {username} not found in panel")
+            return False
+        else:
+            users_logger.error(f"Failed to revoke subscription for {username}: HTTP {response.status_code}")
     
     log_user_action("REVOKE_SUB", username, "Failed after retries", success=False)
     return False
@@ -863,47 +832,32 @@ async def reset_user_uuid(panel_data: PanelType, username: str) -> bool:
     new_vless_uuid = str(uuid.uuid4())
     new_vmess_uuid = str(uuid.uuid4())
     
-    max_attempts = 3
-    
-    for attempt in range(max_attempts):
-        force_refresh = attempt > 0
-        
-        # Build proxy_settings payload with new UUIDs
-        payload = {
-            "proxy_settings": {
-                "vless": {"id": new_vless_uuid},
-                "vmess": {"id": new_vmess_uuid}
-            }
+    payload = {
+        "proxy_settings": {
+            "vless": {"id": new_vless_uuid},
+            "vmess": {"id": new_vmess_uuid}
         }
-        
-        response = await panel_put(
-            panel_data,
-            f"/api/user/{username}",
-            json_data=payload,
-            force_refresh=force_refresh,
-            timeout=10.0,
-            max_retries=2
-        )
-        
-        if response is not None:
-            if response.status_code in (200, 201):
-                log_user_action("RESET_UUID", username, f"vless={new_vless_uuid[:8]}..., vmess={new_vmess_uuid[:8]}...", success=True)
-                users_logger.info(f"🔑 Reset UUID for user {username}: vless={new_vless_uuid[:8]}..., vmess={new_vmess_uuid[:8]}...")
-                return True
-            elif response.status_code == 401:
-                await invalidate_token_cache()
-                users_logger.warning("Got 401 error, retrying...")
-                continue
-            elif response.status_code == 404:
-                log_user_action("RESET_UUID", username, "User not found", success=False)
-                users_logger.warning(f"User {username} not found in panel")
-                return False
-            else:
-                users_logger.error(f"Failed to reset UUID: {response.status_code} - {response.text}")
-                continue
-        
-        wait_time = min(30, random.randint(2, 5) * (attempt + 1))
-        await asyncio.sleep(wait_time)
+    }
+    
+    response = await panel_put(
+        panel_data,
+        f"/api/user/{username}",
+        json_data=payload,
+        timeout=15.0,
+        max_retries=3
+    )
+    
+    if response is not None:
+        if response.status_code in (200, 201):
+            log_user_action("RESET_UUID", username, "UUID reset successful", success=True)
+            users_logger.info(f"🔑 Reset UUID for user {username} successfully")
+            return True
+        elif response.status_code == 404:
+            log_user_action("RESET_UUID", username, "User not found", success=False)
+            users_logger.warning(f"User {username} not found in panel")
+            return False
+        else:
+            users_logger.error(f"Failed to reset UUID for {username}: HTTP {response.status_code}")
     
     log_user_action("RESET_UUID", username, "Failed after retries", success=False)
     return False
