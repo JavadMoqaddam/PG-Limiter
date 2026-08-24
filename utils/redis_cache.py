@@ -67,8 +67,8 @@ class InMemoryCache:
             exp = entry.get("expires_at", 0)
             if exp == 0 or exp > time.time():
                 return entry.get("value")
-            # Key expired: schedule background cleanup without blocking read
-            asyncio.create_task(self.delete(key))
+            # Key expired: pop from cache immediately without spawning unreferenced tasks
+            self._cache.pop(key, None)
         return None
     
     async def set(self, key: str, value: str, ex: Optional[int] = None) -> bool:
@@ -304,18 +304,30 @@ class RedisCache:
             return False
     
     async def delete_pattern(self, pattern: str) -> int:
-        """Delete all keys matching pattern."""
+        """Delete all keys matching pattern using non-blocking SCAN iterator."""
         full_pattern = f"{CACHE_PREFIX}{pattern}"
+        count = 0
         try:
-            keys = await self.client.keys(full_pattern)
-            if keys:
-                count = 0
-                for key in keys:
-                    await self.client.delete(key)
-                    count += 1
-                redis_logger.debug(f"🗑️ Deleted {count} keys matching {pattern}")
-                return count
-            return 0
+            if self.is_redis():
+                keys_batch = []
+                async for key in self._client.scan_iter(match=full_pattern, count=100):
+                    keys_batch.append(key)
+                    if len(keys_batch) >= 100:
+                        await self._client.delete(*keys_batch)
+                        count += len(keys_batch)
+                        keys_batch = []
+                if keys_batch:
+                    await self._client.delete(*keys_batch)
+                    count += len(keys_batch)
+            else:
+                # In-memory fallback
+                if self._fallback:
+                    matching_keys = await self._fallback.keys(full_pattern)
+                    for key in matching_keys:
+                        await self._fallback.delete(key)
+                        count += 1
+            redis_logger.debug(f"🗑️ Deleted {count} keys matching {pattern}")
+            return count
         except Exception as e:
             redis_logger.error(f"❌ Redis delete pattern error for {pattern}: {e}")
             return 0
@@ -503,28 +515,65 @@ async def invalidate_panel_users(panel_domain: str) -> bool:
 
 
 async def cache_disabled_users(users: Dict[str, float]) -> bool:
-    """Cache disabled users dict."""
+    """Cache disabled users dict using Redis Hash or JSON fallback."""
     cache = await get_cache()
+    if cache.is_redis():
+        try:
+            full_key = f"{CACHE_PREFIX}disabled_users_hash"
+            await cache.client.delete(full_key)
+            if users:
+                str_dict = {k: str(v) for k, v in users.items()}
+                await cache.client.hset(full_key, mapping=str_dict)
+            return True
+        except Exception as e:
+            redis_logger.error(f"Error caching disabled users in Redis Hash: {e}")
+            return False
     return await cache.set_json("disabled_users", users, ttl_key="disabled_users")
 
 
 async def get_cached_disabled_users() -> Optional[Dict[str, float]]:
     """Get cached disabled users."""
     cache = await get_cache()
+    if cache.is_redis():
+        try:
+            full_key = f"{CACHE_PREFIX}disabled_users_hash"
+            raw = await cache.client.hgetall(full_key)
+            if raw:
+                return {k: float(v) for k, v in raw.items()}
+            return {}
+        except Exception as e:
+            redis_logger.error(f"Error getting disabled users from Redis Hash: {e}")
+            return None
     return await cache.get_json("disabled_users")
 
 
 async def add_disabled_user(username: str, timestamp: float) -> bool:
-    """Add a user to disabled cache."""
+    """Add a user to disabled cache atomically."""
     cache = await get_cache()
+    if cache.is_redis():
+        try:
+            full_key = f"{CACHE_PREFIX}disabled_users_hash"
+            await cache.client.hset(full_key, username, str(timestamp))
+            return True
+        except Exception as e:
+            redis_logger.error(f"Error adding disabled user to Redis Hash: {e}")
+            return False
     users = await get_cached_disabled_users() or {}
     users[username] = timestamp
     return await cache_disabled_users(users)
 
 
 async def remove_disabled_user(username: str) -> bool:
-    """Remove a user from disabled cache."""
+    """Remove a user from disabled cache atomically."""
     cache = await get_cache()
+    if cache.is_redis():
+        try:
+            full_key = f"{CACHE_PREFIX}disabled_users_hash"
+            await cache.client.hdel(full_key, username)
+            return True
+        except Exception as e:
+            redis_logger.error(f"Error removing disabled user from Redis Hash: {e}")
+            return False
     users = await get_cached_disabled_users() or {}
     if username in users:
         del users[username]
