@@ -1,8 +1,4 @@
-"""
-Database Connection and Session Management
-Uses async SQLAlchemy with aiosqlite for SQLite.
-"""
-
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -43,8 +39,8 @@ if DATABASE_URL.startswith("sqlite"):
         echo=False,
         connect_args={"check_same_thread": False, "timeout": 30.0},
         pool_pre_ping=True,
-        pool_size=1,
-        max_overflow=4,
+        pool_size=5,
+        max_overflow=10,
     )
     
     from sqlalchemy import event
@@ -63,8 +59,8 @@ else:
         DATABASE_URL,
         echo=False,
         pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=10,
+        pool_size=10,
+        max_overflow=20,
     )
 
 # Session factory
@@ -77,6 +73,7 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 
+_init_db_lock = asyncio.Lock()
 _DB_INITIALIZED = False
 
 
@@ -143,28 +140,32 @@ def _sync_deprecated_legacy_tables_sync(sync_conn):
 async def init_db():
     """
     Initialize the database - creates all tables and schema based on SQLAlchemy models.
-    Should be called once at application startup.
+    Thread-safe and async-safe: uses double-checked lock to prevent concurrent initialization.
     """
     global _DB_INITIALIZED
     if _DB_INITIALIZED:
         return
 
-    # Ensure data directory exists
-    db_path = _get_db_path()
-    db_dir = os.path.dirname(db_path)
-    if db_dir and not os.path.exists(db_dir):
-        os.makedirs(db_dir, exist_ok=True)
-        db_logger.info(f"📁 Created database directory: {db_dir}")
-    
-    db_logger.debug("🔄 Initializing database schema...")
-    
-    # Create all tables and indexes via SQLAlchemy declarative metadata
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.run_sync(_sync_deprecated_legacy_tables_sync)
-    
-    _DB_INITIALIZED = True
-    db_logger.info(f"✅ Database initialized: {DATABASE_URL}")
+    async with _init_db_lock:
+        if _DB_INITIALIZED:
+            return
+
+        # Ensure data directory exists
+        db_path = _get_db_path()
+        db_dir = os.path.dirname(db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+            db_logger.info(f"📁 Created database directory: {db_dir}")
+        
+        db_logger.debug("🔄 Initializing database schema...")
+        
+        # Create all tables and indexes via SQLAlchemy declarative metadata
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(_sync_deprecated_legacy_tables_sync)
+        
+        _DB_INITIALIZED = True
+        db_logger.info(f"✅ Database initialized: {DATABASE_URL}")
 
 
 async def close_db():
