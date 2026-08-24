@@ -867,13 +867,14 @@ async def dispatch_chunked_warnings(new_warnings: list[dict], check_interval: fl
     total_chunks = (total_violators + chunk_size - 1) // chunk_size
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
+    period_min = max(1, round(check_interval * 3 / 60))
     for idx in range(0, total_violators, chunk_size):
         chunk = new_warnings[idx : idx + chunk_size]
         batch_num = (idx // chunk_size) + 1
         
         header = (
             f"⚠️ <b>WARNINGS REPORT</b> ({batch_num}/{total_chunks}) - <code>{now_str}</code>\n"
-            f"📡 Monitoring for: <code>3 minutes</code>\n"
+            f"📡 Monitoring Window: <code>~{period_min} min</code>\n"
             f"📊 Violators in cycle: <code>{total_violators}</code> | In batch: <code>{len(chunk)}</code>"
         )
         
@@ -901,7 +902,7 @@ async def dispatch_chunked_warnings(new_warnings: list[dict], check_interval: fl
                 
         footer = (
             f"📈 Total users currently monitored: <code>{total_monitored}</code>\n"
-            f"IPs active for 2+ min will be counted as devices."
+            f"Users with persistent violations across warning cycles will be disabled."
         )
         
         batch_msg = f"{header}\n\n" + "\n\n".join(user_blocks) + f"\n\n{footer}"
@@ -935,6 +936,11 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     
     # Initialize or update ISP detector
     isp_detector = _ensure_isp_detector(config_data)
+    
+    # Sync dynamic check interval and max warning count to warning system
+    check_interval = config_data.get("check_interval", 60)
+    max_warning_count = config_data.get("max_warning_count", 3)
+    warning_system.update_settings(check_interval, max_warning_count)
     
     logger.info("📊 Building user info from active connections...")
     

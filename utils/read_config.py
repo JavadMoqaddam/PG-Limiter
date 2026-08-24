@@ -107,6 +107,7 @@ def load_env_config() -> Dict[str, Any]:
         "except_users": [],  # Loaded from DB
         # Monitoring settings (from ENV)
         "check_interval": _get_env("CHECK_INTERVAL", 60, int),
+        "max_warning_count": _get_env("MAX_WARNING_COUNT", 3, int),
         "time_to_active_users": _get_env("TIME_TO_ACTIVE_USERS", 900, int),
         "country_code": _get_env("COUNTRY_CODE", ""),
         # User sync settings

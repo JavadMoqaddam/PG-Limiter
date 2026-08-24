@@ -103,34 +103,23 @@ class UserLimitWarning:
             return 0.0
         return self.ip_last_seen[ip] - self.ip_first_seen[ip]
     
-    def get_persistent_devices(self, min_duration_seconds: int = 120) -> Set[str]:
+    def get_persistent_devices(self, min_duration_seconds: int = 0) -> Set[str]:
         """
-        Get IPs that qualify as persistent active devices.
-        
-        Args:
-            min_duration_seconds: Minimum active duration in seconds (default 120s)
-            
-        Returns:
-            Set of IPs that qualify as persistent devices
+        Get IPs that qualify as persistent active devices during monitoring.
         """
         persistent_ips = set()
         current_time = time.time()
         
         for ip in self.ip_first_seen:
             last_seen = self.ip_last_seen.get(ip, 0)
-            if current_time - last_seen > 120:
+            if current_time - last_seen > 300:
                 continue
-            
-            duration = self.get_ip_active_duration(ip)
-            seen_count = self.ip_seen_count.get(ip, 0)
-            
-            if duration >= min_duration_seconds or seen_count >= 2:
-                persistent_ips.add(ip)
+            persistent_ips.add(ip)
         
-        return persistent_ips
+        return persistent_ips or self.ips
     
-    def get_device_count(self, min_duration_seconds: int = 120) -> int:
-        """Get the count of confirmed devices (IPs active for min duration)."""
+    def get_device_count(self, min_duration_seconds: int = 0) -> int:
+        """Get the count of confirmed devices (active IPs)."""
         return len(self.get_persistent_devices(min_duration_seconds))
     
     def get_ip_activity_summary(self) -> str:

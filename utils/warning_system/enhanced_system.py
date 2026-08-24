@@ -27,31 +27,34 @@ warning_logger = get_logger("warning_system")
 
 
 class EnhancedWarningSystem:
-    """
-    Enhanced warning system that monitors users for 3 minutes after warning.
-    Counts IPs as devices only if active for 2+ minutes during monitoring.
-    Instantly disables users with very low trust scores (skip monitoring).
-    """
-    
-    # Trust score threshold for instant disable (skip monitoring)
+    # Class-level constants for compatibility and test suite
     INSTANT_DISABLE_THRESHOLD = -60
-    # Minimum duration (seconds) for an IP to count as a device
     MIN_DEVICE_DURATION = 120  # 2 minutes
-    
+
     def __init__(
         self,
         filename: str = "/var/lib/pg-limiter/user_warnings.json",
         history_filename: str = "/var/lib/pg-limiter/warning_history.json",
+        check_interval: int = 60,
+        max_warnings: int = 3,
     ):
         self.filename = filename
         self.history_filename = history_filename
         self.warnings: Dict[str, UserLimitWarning] = {}
         self.warning_history: Dict[str, list] = {}
-        self.monitoring_period = 180  # 3 minutes in seconds
+        self.check_interval = max(5, int(check_interval))
+        self.max_warnings = max(1, int(max_warnings))
+        self.monitoring_period = self.check_interval * self.max_warnings
         self._write_lock = asyncio.Lock()
         self.load_warnings()
         self.load_warning_history()
-        warning_logger.debug(f"⚠️ EnhancedWarningSystem initialized (monitoring_period={self.monitoring_period}s)")
+        warning_logger.debug(f"⚠️ EnhancedWarningSystem initialized (monitoring_period={self.monitoring_period}s, max_warnings={self.max_warnings})")
+
+    def update_settings(self, check_interval: int, max_warnings: int = 3) -> None:
+        """Dynamically update monitoring settings based on runtime configuration."""
+        self.check_interval = max(5, int(check_interval))
+        self.max_warnings = max(1, int(max_warnings))
+        self.monitoring_period = self.check_interval * self.max_warnings
     
     def load_warning_history(self):
         """Load warning history from file"""
@@ -299,7 +302,7 @@ class EnhancedWarningSystem:
             warning_logger.info(f"⚠️ User {username} consecutive violation scan #{warning.consecutive_violations} (trust={warning.trust_score:.0f})")
             log_monitoring_event("warning_updated", username, {"ip_count": ip_count, "trust_score": warning.trust_score, "consecutive": warning.consecutive_violations})
             
-            if warning.consecutive_violations >= 3:
+            if warning.consecutive_violations >= self.max_warnings:
                 return "violation_limit_reached"
             return "updated"
         
@@ -353,76 +356,7 @@ class EnhancedWarningSystem:
         trust_level = warning.get_trust_level()
         behavior_summary = warning.get_behavior_summary()
         
-        # INSTANT DISABLE: If trust score is very low, skip monitoring
-        if warning.trust_score <= self.INSTANT_DISABLE_THRESHOLD and panel_data:
-            warning_logger.warning(f"⚡ INSTANT DISABLE triggered for {username} (trust={warning.trust_score:.0f} <= {self.INSTANT_DISABLE_THRESHOLD})")
-            time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            limit_text = f"User limit: <code>{user_limit}</code>\n" if user_limit else ""
-            
-            await self.add_to_warning_history(username)
-            
-            try:
-                punishment_result = await safe_disable_user_with_punishment(panel_data, UserType(name=username, ip=[]))
-                
-                if punishment_result["action"] == "warning":
-                    await safe_send_warning_log(
-                        f"⚠️ <b>WARNING (Instant)</b> - {time_str}\n\n"
-                        f"User: <code>{username}</code>\n"
-                        f"Active IPs: <code>{ip_count}</code>\n"
-                        f"{limit_text}"
-                        f"Trust Level: {trust_level} (<code>{warning.trust_score:.0f}</code>)\n"
-                        f"Behavior: <code>{behavior_summary}</code>\n\n"
-                        f"📊 Violation #{punishment_result['violation_count']} in time window\n"
-                        f"⚡ Next violation will result in disable.",
-                    )
-                    warning_logger.warning(f"⚠️ WARNING (instant): User {username} - violation #{punishment_result['violation_count']}")
-                    log_monitoring_event("instant_warning", username, {"violation": punishment_result['violation_count'], "trust": warning.trust_score})
-                    return "warning"
-                elif punishment_result["action"] == "disabled":
-                    duration_text = ""
-                    if punishment_result["duration_minutes"] > 0:
-                        duration_text = f"Duration: <code>{punishment_result['duration_minutes']} minutes</code>\n"
-                    else:
-                        duration_text = "Duration: <code>Until manual enable</code>\n"
-                    
-                    await safe_send_disable_notification(
-                        f"🚫 <b>INSTANT DISABLE</b> - {time_str}\n\n"
-                        f"User: <code>{username}</code>\n"
-                        f"Active IPs: <code>{ip_count}</code>\n"
-                        f"{limit_text}"
-                        f"Trust Level: {trust_level} (<code>{warning.trust_score:.0f}</code>)\n"
-                        f"Behavior: <code>{behavior_summary}</code>\n\n"
-                        f"📊 Violation #{punishment_result['violation_count']} (Step {punishment_result['step_index'] + 1})\n"
-                        f"{duration_text}"
-                        f"⚡ <b>Monitoring skipped</b> - Trust score too low (≤{self.INSTANT_DISABLE_THRESHOLD})",
-                        username
-                    )
-                elif punishment_result["action"] == "revoked":
-                    revoke_note = "✅ Sub revoked" if punishment_result.get("revoke_success", False) else "⚠️ Revoke failed"
-                    uuid_note = "✅ UUID reset" if punishment_result.get("uuid_reset_success", False) else "⚠️ UUID failed"
-                    
-                    await safe_send_disable_notification(
-                        f"🔄 <b>INSTANT REVOKE + DISABLE</b> - {time_str}\n\n"
-                        f"User: <code>{username}</code>\n"
-                        f"Active IPs: <code>{ip_count}</code>\n"
-                        f"{limit_text}"
-                        f"Trust Level: {trust_level} (<code>{warning.trust_score:.0f}</code>)\n"
-                        f"Behavior: <code>{behavior_summary}</code>\n\n"
-                        f"📊 Violation #{punishment_result['violation_count']} (Step {punishment_result['step_index'] + 1})\n"
-                        f"{revoke_note}, {uuid_note}\n"
-                        f"Duration: <code>Until manual enable</code>\n"
-                        f"⚡ <b>Monitoring skipped</b> - Trust score too low (≤{self.INSTANT_DISABLE_THRESHOLD})",
-                        username
-                    )
-                
-                warning_logger.info(f"🚫 INSTANT DISABLE: User {username} disabled immediately (trust={warning.trust_score:.0f})")
-                log_monitoring_event("instant_disabled", username, {"trust": warning.trust_score, "duration_min": punishment_result.get("duration_minutes", 0)})
-                return "instant_disabled"
-                
-            except Exception as e:
-                warning_logger.error(f"Failed to instant disable user {username}: {e}")
-        
-        # NORMAL WARNING: Start 3-minute monitoring period
+        # Track initial activity and record active warning
         warning.update_ip_activity(ips, current_time)
         
         self.warnings[username] = warning
@@ -440,8 +374,7 @@ class EnhancedWarningSystem:
             trust_details.append(f"📲 Multi-device ISP pattern")
         
         if len(ip_subnets) > 1 and len(isp_names) == 1:
-            # show /24 count but also indicate collapsed /16 groups if they
-            # exist.  this mirrors the penalty logic above.
+            # show /24 count but also indicate collapsed /16 groups if they exist
             grouped_16 = set()
             for s in ip_subnets:
                 parts = s.split('.')
@@ -467,6 +400,7 @@ class EnhancedWarningSystem:
         
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         limit_text = f"User limit: <code>{user_limit}</code>\n" if user_limit else ""
+        period_min = max(1, round(self.monitoring_period / 60))
         
         if send_telegram_notification:
             await safe_send_warning_log(
@@ -477,9 +411,8 @@ class EnhancedWarningSystem:
                 f"Trust Level: {trust_level} (<code>{warning.trust_score:.0f}</code>)\n"
                 f"Behavior: <code>{behavior_summary}</code>\n"
                 f"Trust Factors:\n{trust_info}\n\n"
-                f"📡 Monitoring for: <code>3 minutes</code>\n"
-                f"IPs active for 2+ min will be counted as devices.\n"
-                f"If devices exceed limit after 3 min, user will be disabled."
+                f"📡 Monitoring Window: <code>{self.max_warnings} cycles (~{period_min} min)</code>\n"
+                f"If violations persist across {self.max_warnings} consecutive scans, user will be disabled."
             )
         
         logger.warning(f"Warning issued for user {username} with {ip_count} active IPs (limit: {user_limit}, trust: {warning.trust_score:.0f})")
@@ -563,18 +496,14 @@ class EnhancedWarningSystem:
                 
                 if username in all_users_actual_ips:
                     current_ips = all_users_actual_ips[username]
-                    
-                    persistent_devices = warning.get_persistent_devices(self.MIN_DEVICE_DURATION)
-                    device_count = len(persistent_devices)
-                    
-                    current_persistent = current_ips.intersection(persistent_devices)
+                    device_count = len(current_ips)
                     activity_summary = warning.get_ip_activity_summary()
                     
-                    warning_logger.info(f"⚠️ User {username}: {device_count} devices (limit: {user_limit_number}), trust={trust_score:.0f}")
+                    warning_logger.info(f"⚠️ User {username}: {device_count} IPs (limit: {user_limit_number}, violations: {warning.consecutive_violations}/{self.max_warnings}), trust={trust_score:.0f}")
                     
                     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     
-                    if device_count > user_limit_number:
+                    if device_count > user_limit_number and warning.consecutive_violations >= self.max_warnings:
                         # ===== DOUBLE-CHECK BEFORE BAN (O(1) FAST RAM CHECK) =====
                         try:
                             if username in USER_METADATA_CACHE:
@@ -620,13 +549,13 @@ class EnhancedWarningSystem:
                                 await safe_send_warning_log(
                                     f"⚠️ <b>WARNING</b> - {time_str}\n\n"
                                     f"User: <code>{username}</code>\n"
-                                    f"Confirmed Devices: <code>{device_count}</code> (active 2+ min)\n"
+                                    f"Active IPs: <code>{device_count}</code>\n"
                                     f"User limit: <code>{user_limit_number}</code>\n"
                                     f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                                     f"📊 Violation #{punishment_result['violation_count']} in time window\n"
                                     f"⚡ Next violation will result in disable."
                                 )
-                                warning_logger.warning(f"⚠️ WARNING: User {username} - {device_count} devices (limit: {user_limit_number}) - violation #{punishment_result['violation_count']}")
+                                warning_logger.warning(f"⚠️ WARNING: User {username} - {device_count} IPs (limit: {user_limit_number}) - violation #{punishment_result['violation_count']}")
                                 log_monitoring_event("persistent_warning", username, {"devices": device_count, "limit": user_limit_number, "violation": punishment_result['violation_count']})
                                 warned_users.add(username)  # Track warned users to prevent double processing
                             elif punishment_result["action"] == "disabled":
@@ -641,8 +570,7 @@ class EnhancedWarningSystem:
                                 await safe_send_disable_notification(
                                     f"🚫 <b>USER DISABLED</b> - {time_str}\n\n"
                                     f"User: <code>{username}</code>\n"
-                                    f"Confirmed Devices: <code>{device_count}</code> (active 2+ min)\n"
-                                    f"Current IPs: <code>{len(current_ips)}</code>\n"
+                                    f"Active IPs: <code>{len(current_ips)}</code>\n"
                                     f"User limit: <code>{user_limit_number}</code>\n"
                                     f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                                     f"📊 Violation #{punishment_result['violation_count']} (Step {punishment_result['step_index'] + 1})\n"
@@ -651,7 +579,7 @@ class EnhancedWarningSystem:
                                     username
                                 )
                                 
-                                warning_logger.warning(f"🚫 Disabled user {username}: {device_count} devices (limit: {user_limit_number}) - step {punishment_result['step_index'] + 1}")
+                                warning_logger.warning(f"🚫 Disabled user {username}: {device_count} IPs (limit: {user_limit_number}) - step {punishment_result['step_index'] + 1}")
                                 log_monitoring_event("user_disabled", username, {"devices": device_count, "limit": user_limit_number, "duration_min": punishment_result.get("duration_minutes", 0)})
                             elif punishment_result["action"] == "revoked":
                                 disabled_users.add(username)
@@ -662,8 +590,7 @@ class EnhancedWarningSystem:
                                 await safe_send_disable_notification(
                                     f"🔄 <b>SUBSCRIPTION REVOKED + DISABLED</b> - {time_str}\n\n"
                                     f"User: <code>{username}</code>\n"
-                                    f"Confirmed Devices: <code>{device_count}</code> (active 2+ min)\n"
-                                    f"Current IPs: <code>{len(current_ips)}</code>\n"
+                                    f"Active IPs: <code>{len(current_ips)}</code>\n"
                                     f"User limit: <code>{user_limit_number}</code>\n"
                                     f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                                     f"📊 Violation #{punishment_result['violation_count']} (Step {punishment_result['step_index'] + 1})\n"
@@ -673,7 +600,7 @@ class EnhancedWarningSystem:
                                     username
                                 )
                                 
-                                warning_logger.warning(f"🔄 Revoked + disabled user {username}: {device_count} devices (limit: {user_limit_number}) - step {punishment_result['step_index'] + 1}")
+                                warning_logger.warning(f"🔄 Revoked + disabled user {username}: {device_count} IPs (limit: {user_limit_number}) - step {punishment_result['step_index'] + 1}")
                                 log_monitoring_event("user_revoked", username, {"devices": device_count, "limit": user_limit_number, "revoke_success": punishment_result.get("revoke_success", False)})
                             else:
                                 warning_logger.error(f"Punishment action error for {username}: {punishment_result['message']}")
@@ -682,12 +609,8 @@ class EnhancedWarningSystem:
                             warning_logger.error(f"Failed to disable user {username}: {e}")
                             await safe_send_logs(f"❌ <b>Error:</b> Failed to disable user {username}: {e}")
                     
-                    elif len(current_ips) > user_limit_number and device_count <= user_limit_number:
-                        warning_logger.info(f"✅ User {username}: {len(current_ips)} IPs but only {device_count} devices - no action")
-                        log_monitoring_event("monitoring_cleared", username, {"ips": len(current_ips), "devices": device_count, "limit": user_limit_number})
-                    
-                    else:
-                        warning_logger.info(f"✅ User {username} is now within limits ({device_count} devices, limit: {user_limit_number})")
+                    elif device_count <= user_limit_number:
+                        warning_logger.info(f"✅ User {username} is now within limits ({device_count} IPs, limit: {user_limit_number})")
                         log_monitoring_event("monitoring_ended", username, {"devices": device_count, "limit": user_limit_number})
                 else:
                     warning_logger.info(f"ℹ️ User {username} not found in current logs - monitoring ended")
@@ -767,7 +690,8 @@ class EnhancedWarningSystem:
         if not active_warnings:
             return None
         
-        summary_lines = ["📊 <b>Active Monitoring (3 min)</b>", "─" * 25]
+        period_min = max(1, round(self.monitoring_period / 60))
+        summary_lines = [f"📊 <b>Active Monitoring (~{period_min} min)</b>", "─" * 25]
         
         for user, warning in active_warnings.items():
             time_left = warning.time_remaining()
@@ -775,11 +699,9 @@ class EnhancedWarningSystem:
             seconds = time_left % 60
             trust_level = warning.get_trust_level()
             
-            confirmed_devices = warning.get_device_count(self.MIN_DEVICE_DURATION)
-            
             summary_lines.append(
                 f"👤 <code>{user}</code>\n"
-                f"   ⏱ {minutes}m{seconds}s | 📍 {warning.ip_count} IPs | 📱 {confirmed_devices} devices\n"
+                f"   ⏱ {minutes}m{seconds}s | 📍 {warning.ip_count} IPs | Violations: {warning.consecutive_violations}/{self.max_warnings}\n"
                 f"   {trust_level}"
             )
         
