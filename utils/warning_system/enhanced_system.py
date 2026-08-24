@@ -556,7 +556,6 @@ class EnhancedWarningSystem:
                     metadata=cached_meta,
                     special_limit=special_limit,
                     group_limits=batched_group_limits,
-                    auto_persist_pattern=False,
                 )
                 
                 trust_score = warning.trust_score

@@ -60,44 +60,6 @@ def _ensure_isp_detector(config_data: dict) -> ISPDetector:
         
     return isp_detector
 
-# Pattern to match usernames ending with .X.User where X is a number (e.g., amir.2.User)
-USERNAME_LIMIT_PATTERN = re.compile(r'\.(\d+)\.User$')
-# Pattern to match usernames ending with XUser where X is a number (e.g., Bastami22User, MVHHe2User)
-USERNAME_LIMIT_PATTERN_SIMPLE = re.compile(r'(\d+)User$')
-
-
-def extract_limit_from_username(username: str) -> int | None:
-    """
-    Extract limit number from username if it ends with pattern like .2.User or 2User.
-    
-    Args:
-        username: The username to check
-        
-    Returns:
-        The limit number if pattern matches, None otherwise
-        
-    Examples:
-        "amir.1.User" -> 1
-        "mjd.2.User" -> 2
-        "Bastami22User" -> 2 (takes last digit before 'User')
-        "MVHHe2User" -> 2
-        "normal_user" -> None
-    """
-    # First try the .X.User pattern
-    match = USERNAME_LIMIT_PATTERN.search(username)
-    if match:
-        return int(match.group(1))
-    
-    # Then try the simple XUser pattern (like 2User at the end)
-    match = USERNAME_LIMIT_PATTERN_SIMPLE.search(username)
-    if match:
-        # Get the number - if it's multi-digit like "22User", take the last digit
-        number_str = match.group(1)
-        # Take only the last digit to get the limit
-        return int(number_str[-1])
-    
-    return None
-
 
 async def resolve_effective_limit(
     username: str,
@@ -105,7 +67,6 @@ async def resolve_effective_limit(
     metadata: dict | None = None,
     special_limit: dict[str, int] | None = None,
     group_limits: dict[str, int] | None = None,
-    auto_persist_pattern: bool = False,
 ) -> int:
     """
     Single source of truth for resolving a user's effective IP limit.
@@ -113,8 +74,8 @@ async def resolve_effective_limit(
     Priority order:
     1. Special Limit (Direct user override in DB / special_limit dict)
     2. Pre-computed Metadata Limit (effective_ip_limit from RAM metadata)
-    3. Username Regex Patterns (.X.User or XUser)
-    4. Group Limit (Batched group limit from Pasargad group)
+    3. Group Limit (Batched group limit from Pasargad group)
+    4. Direct Group Limit Fallback (Defense-in-depth from config & user group_ids)
     5. General Fallback Limit (Default config limit, e.g. 2)
     
     Args:
@@ -123,7 +84,6 @@ async def resolve_effective_limit(
         metadata: Cached metadata dictionary for the user (optional)
         special_limit: Mapping of username -> special limit override (optional)
         group_limits: Mapping of username -> group limit (optional)
-        auto_persist_pattern: If True, save auto-detected pattern limits into DB
         
     Returns:
         int: The resolved effective IP limit (>= 1)
@@ -144,32 +104,14 @@ async def resolve_effective_limit(
             except (ValueError, TypeError):
                 pass
 
-    # 3. Check username regex pattern (.2.User or 2User)
-    pattern_limit = extract_limit_from_username(username)
-        
-    if pattern_limit is not None:
-        if auto_persist_pattern:
-            try:
-                from db.database import get_db
-                from db.crud import UserCRUD
-                async with get_db() as db:
-                    await UserCRUD.set_special_limit(db, username, pattern_limit)
-                    await db.commit()
-                if special_limit is not None:
-                    special_limit[username] = pattern_limit
-                logger.info(f"✅ Auto-set limit for {username} to {pattern_limit} based on username pattern")
-            except Exception as e:
-                logger.error(f"Failed to auto-set limit for {username}: {e}")
-        return int(pattern_limit)
-
-    # 5. Check Group Limit (from pre-batched mapping)
+    # 3. Check Group Limit (from pre-batched mapping)
     if group_limits and username in group_limits:
         try:
             return int(group_limits[username])
         except (ValueError, TypeError):
             pass
 
-    # 5b. Direct Group Limit Fallback (Defense-in-depth from config & user group_ids)
+    # 4. Direct Group Limit Fallback (Defense-in-depth from config & user group_ids)
     cfg_group_limits = config.get("group_limits", {}) if (config and isinstance(config, dict)) else {}
     if cfg_group_limits:
         user_gids = None
@@ -189,7 +131,7 @@ async def resolve_effective_limit(
             if max_glim is not None:
                 return max_glim
 
-    # 6. General Fallback Limit
+    # 5. General Fallback Limit
     general_limit = 2
     if config and isinstance(config, dict):
         limits_sec = config.get("limits", {})
@@ -828,7 +770,6 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
             metadata=None,
             special_limit=special_limit,
             group_limits=batched_group_limits,
-            auto_persist_pattern=(not is_except),
         )
         has_special_limit = (email in special_limit)
         has_group_limit = (not has_special_limit_before) and bool(batched_group_limits and email in batched_group_limits)
@@ -1097,7 +1038,6 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                 metadata=user_meta,
                 special_limit=special_limit,
                 group_limits=batched_group_limits,
-                auto_persist_pattern=False,
             )
             
             if len(unique_ips) > user_limit_number:
@@ -1209,7 +1149,6 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                 metadata=user_meta,
                 special_limit=special_limit,
                 group_limits=batched_group_limits,
-                auto_persist_pattern=False,
             )
             if len(user_current_ips) <= u_lim:
                 await warning_system.clear_user_trust_data(monitored_user)

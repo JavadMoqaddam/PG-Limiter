@@ -132,16 +132,7 @@ def calculate_user_effective_limit_and_monitoring(
         if max_glim is not None:
             return (True, max_glim)
 
-    # Priority C: Username Suffix Regex Pattern (e.g. .2.User or 2User)
-    try:
-        from utils.check_usage import extract_limit_from_username
-        pattern_limit = extract_limit_from_username(username)
-        if pattern_limit is not None:
-            return (True, pattern_limit)
-    except Exception:
-        pass
-
-    # Priority D: Default to General Limit (None indicates use default general limit)
+    # Priority C: Default to General Limit (None indicates use default general limit)
     return (True, None)
 
 
