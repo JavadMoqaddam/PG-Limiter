@@ -360,10 +360,13 @@ async def enable_single_user(query, username: str):
         
         # Check if callback is from an inline disable notification in the topic
         msg_text = getattr(query.message, "text", "") or ""
+        msg_text_upper = msg_text.upper()
         is_notification_button = (
-            "USER DISABLED" in msg_text or 
-            "SUBSCRIPTION REVOKED" in msg_text or 
-            "INSTANT DISABLE" in msg_text
+            "DISABLED" in msg_text_upper or 
+            "REVOKED" in msg_text_upper or 
+            "VIOLATION" in msg_text_upper or
+            "LIMIT" in msg_text_upper or
+            "NODE" in msg_text_upper
         )
         
         # If user is already active (not in disabled list)

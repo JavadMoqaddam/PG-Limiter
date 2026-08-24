@@ -134,6 +134,16 @@ from telegram_bot.handlers.admin_filter import (
     handle_admin_filter_toggle_admin_callback,
 )
 
+from telegram_bot.handlers.topics_settings import (
+    topics_settings_command,
+    handle_topics_menu_callback,
+    handle_topics_toggle_callback,
+    handle_topics_set_group_callback,
+    handle_topic_edit_callback,
+    handle_topic_create_callback,
+    handle_topic_auto_create_callback,
+)
+
 __all__ = [
     # Admin handlers
     "add_admin",
@@ -246,4 +256,12 @@ __all__ = [
     "handle_admin_filter_toggle_callback",
     "handle_admin_filter_mode_callback",
     "handle_admin_filter_toggle_admin_callback",
+    # Topics settings handlers
+    "topics_settings_command",
+    "handle_topics_menu_callback",
+    "handle_topics_toggle_callback",
+    "handle_topics_set_group_callback",
+    "handle_topic_edit_callback",
+    "handle_topic_create_callback",
+    "handle_topic_auto_create_callback",
 ]

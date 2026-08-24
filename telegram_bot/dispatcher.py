@@ -151,7 +151,12 @@ class TelegramDispatcher:
         self._worker_task: Optional[asyncio.Task] = None
         self._persistence_lock = asyncio.Lock()
         self._pending_storage: Dict[str, dict] = {}
+        self._bot = None
         self._load_pending_storage()
+
+    def set_bot(self, bot) -> None:
+        """Inject bot instance directly to decouple dispatcher from application import."""
+        self._bot = bot
 
     def _load_pending_storage(self) -> None:
         """Load pending notifications from persistent JSON storage."""
@@ -426,12 +431,19 @@ class TelegramDispatcher:
 
     async def _execute_item(self, item: QueueItem) -> bool:
         """Execute a single queue item via the Telegram Bot API."""
-        from telegram_bot.main import application
-        if not application or not application.bot:
+        bot = self._bot
+        if not bot:
+            try:
+                from telegram_bot.main import application
+                if application and application.bot:
+                    bot = application.bot
+            except Exception:
+                pass
+
+        if not bot:
             dispatcher_logger.warning("⚠ Telegram application or bot instance not initialized")
             return False
 
-        bot = application.bot
         topics_manager = get_topics_manager()
 
         try:

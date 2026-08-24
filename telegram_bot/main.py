@@ -223,6 +223,11 @@ if bot_token:
     bot_logger.debug("Creating Telegram application with real token...")
     application = ApplicationBuilder().token(bot_token).build()
     bot_logger.info("✓ Telegram application created successfully")
+    try:
+        from telegram_bot.dispatcher import get_dispatcher
+        get_dispatcher().set_bot(application.bot)
+    except Exception as e:
+        bot_logger.debug(f"Dispatcher injection note: {e}")
 else:
     # Dummy token for module loading - replaced at runtime
     bot_logger.warning("⚠ Using dummy token for module loading")
