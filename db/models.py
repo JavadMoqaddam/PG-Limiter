@@ -16,6 +16,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     JSON,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship, DeclarativeBase
 
@@ -193,6 +194,7 @@ class SubnetISP(Base):
     __table_args__ = (
         Index("ix_subnet_isp_country", "country"),
         Index("ix_subnet_isp_isp", "isp"),
+        Index("ix_subnet_isp_cached_at", "cached_at"),
     )
     
     def __repr__(self):
@@ -230,6 +232,7 @@ class ViolationHistory(Base):
     )
     
     __table_args__ = (
+        Index("ix_violation_username_timestamp", "username", "timestamp"),
         Index("ix_violation_history_timestamp", "timestamp"),
     )
     
@@ -277,7 +280,9 @@ class IPHistory(Base):
     connection_count = Column(Integer, default=1)
     
     __table_args__ = (
+        UniqueConstraint("username", "ip", name="uq_ip_history_username_ip"),
         Index("ix_ip_history_username_ip", "username", "ip"),
+        Index("ix_ip_history_username_last_seen", "username", "last_seen"),
         Index("ix_ip_history_last_seen", "last_seen"),
     )
     
