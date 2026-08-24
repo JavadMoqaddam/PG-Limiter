@@ -19,26 +19,37 @@ class SubnetISPCRUD:
     
     @staticmethod
     def get_subnet_from_ip(ip: str) -> str:
-        """Extract /24 subnet from IP address. e.g., 192.168.1.100 -> 192.168.1"""
+        """Extract standard /24 subnet from IP address (e.g. 192.168.1.100 -> 192.168.1.0/24)."""
         parts = ip.split(".")
         if len(parts) == 4:
-            return ".".join(parts[:3])
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
         if ":" in ip:
             parts = ip.split(":")
-            return ":".join(parts[:4])
+            return ":".join(parts[:4]) + "::/64"
         return ip
     
     @staticmethod
     async def get_by_ip(db: AsyncSession, ip: str) -> Optional[SubnetISP]:
-        """Get ISP info for an IP (looks up by subnet)."""
+        """Get ISP info for an IP (looks up by subnet, read-only without lock)."""
         subnet = SubnetISPCRUD.get_subnet_from_ip(ip)
         db_isp_logger.debug(f"🔍 Looking up ISP for {ip} (subnet: {subnet})")
-        result = await db.execute(select(SubnetISP).where(SubnetISP.subnet == subnet))
+        
+        # Look up standard subnet or legacy prefix
+        parts = ip.split(".")
+        legacy_subnet = ".".join(parts[:3]) if len(parts) == 4 else None
+        
+        if legacy_subnet:
+            result = await db.execute(
+                select(SubnetISP).where(
+                    (SubnetISP.subnet == subnet) | (SubnetISP.subnet == legacy_subnet)
+                )
+            )
+        else:
+            result = await db.execute(select(SubnetISP).where(SubnetISP.subnet == subnet))
+            
         isp = result.scalar_one_or_none()
         
         if isp:
-            isp.hit_count += 1
-            await db.flush()
             db_isp_logger.debug(f"✅ Cache hit for {subnet}: {isp.isp}")
         else:
             db_isp_logger.debug(f"❌ Cache miss for {subnet}")

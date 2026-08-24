@@ -117,7 +117,9 @@ class DBSubnetISPCache:
 
     @staticmethod
     def _get_subnet(ip: str) -> str:
-        """Extract /24 subnet from IP (e.g., 192.168.1.5 -> 192.168.1.0/24)"""
+        """Extract /24 subnet from IP using SubnetISPCRUD canonical helper."""
+        if DB_AVAILABLE:
+            return SubnetISPCRUD.get_subnet_from_ip(ip)
         parts = ip.split(".")
         if len(parts) == 4:
             return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
