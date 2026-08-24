@@ -19,9 +19,8 @@ from utils.get_logs import (
     handle_cancel_all,
     init_node_status_message,
 )
-from utils.handel_dis_users import DisabledUsers
 from utils.logs import get_logger, log_startup_info, log_shutdown_info, log_crash_info
-from utils.panel_api import enable_selected_users, get_nodes
+from utils.panel_api import get_nodes
 from utils.parse_logs import close_geo_client
 from utils.read_config import read_config
 from utils.types import PanelType
@@ -44,8 +43,6 @@ parser = argparse.ArgumentParser(
 parser.add_argument("--version", action="version", version=f"Limiter v{VERSION}")
 args = parser.parse_args()
 
-dis_obj = DisabledUsers()
-
 
 async def main():
     """Main function to run the limiter."""
@@ -53,126 +50,120 @@ async def main():
     main_logger.info(f"🚀 Starting Limiter v{VERSION}")
     main_logger.info("=" * 50)
     
-    # Ensure database tables and columns are initialized
-    from db.database import init_db
     try:
-        await init_db()
-        main_logger.info("✓ Database initialized")
-    except Exception as db_err:
-        main_logger.error(f"Database initialization error: {db_err}")
-    
-    # Initialize Redis cache
-    if REDIS_AVAILABLE:
+        # Ensure database tables and columns are initialized
+        from db.database import init_db
         try:
-            cache = await get_cache()
-            if cache.is_connected:
-                main_logger.info("✓ Redis cache connected")
-            else:
-                main_logger.info("⚠ Redis not available, using in-memory cache fallback")
-        except Exception as e:
-            main_logger.warning(f"Redis initialization failed: {e}, using in-memory fallback")
-    else:
-        main_logger.info("ℹ Redis cache module not available, using in-memory cache")
-    
-    # Start Telegram bot and message dispatcher in background tasks
-    main_logger.debug("Starting Telegram bot and dispatcher tasks...")
-    from telegram_bot.dispatcher import get_dispatcher
-    dispatcher = get_dispatcher()
-    asyncio.create_task(dispatcher.start_worker())
-    asyncio.create_task(run_telegram_bot())
-    await asyncio.sleep(2)
-    main_logger.info("✓ Telegram bot and dispatcher started")
-
-    # Load configuration
-    main_logger.debug("Loading configuration...")
-    while True:
-        try:
-            config_file = await read_config(check_required_elements=True)
-            main_logger.info("✓ Configuration loaded successfully")
-            break
-        except ValueError as error:
-            main_logger.error(f"Configuration error: {error}")
-            await send_logs(f"<code>{error}</code>")
-            await send_logs(
-                "Please configure the required settings:\n"
-                "/create_config - Panel credentials\n"
-                "/set_general_limit_number - Default IP limit\n"
-                "/set_check_interval - Check interval\n"
-                "/set_time_to_active_users - Re-enable timeout\n\n"
-                "Retrying in <b>60 seconds</b>..."
-            )
-            await asyncio.sleep(60)
-    
-    # Initialize panel connection
-    panel_data = PanelType(
-        config_file["panel"]["username"],
-        config_file["panel"]["password"],
-        config_file["panel"]["domain"],
-    )
-    main_logger.info(f"✓ Panel configured: {config_file['panel']['domain']}")
-    
-    # Preserve disabled users across restarts (enable_dis_user background loop handles expired bans)
-    main_logger.info("✓ Disabled users state preserved across restarts")
-    
-    # Get available nodes
-    main_logger.debug("Fetching available nodes...")
-    await get_nodes(panel_data)
-    
-    async with asyncio.TaskGroup() as tg:
-        # Start Telegram Dispatcher worker in TaskGroup
-        tg.create_task(dispatcher.start_worker(), name="telegram_dispatcher")
-        main_logger.info("✓ Telegram Dispatcher registered in TaskGroup")
-
-        await asyncio.sleep(0.5)
+            await init_db()
+            main_logger.info("✓ Database initialized")
+        except Exception as db_err:
+            main_logger.error(f"Database initialization error: {db_err}")
         
-        # Start Redis Pub/Sub listener for L1/L2 cache invalidations
+        # Initialize Redis cache
         if REDIS_AVAILABLE:
-            from utils.redis_cache import start_pubsub_listener
-            tg.create_task(start_pubsub_listener(), name="redis_pubsub")
-            main_logger.info("✓ Redis Pub/Sub listener registered in TaskGroup")
-
-        # Start unknown user background worker
-        from utils.user_sync import run_unknown_user_worker
-        tg.create_task(run_unknown_user_worker(panel_data), name="unknown_user_worker")
-        main_logger.info("✓ Unknown user worker registered in TaskGroup")
-
-        nodes_list = await get_nodes(panel_data)
-        
-        if nodes_list and not isinstance(nodes_list, ValueError):
-            await init_node_status_message(nodes_list)
-            connected_nodes = [n for n in nodes_list if n.status == "connected"]
-            main_logger.info(f"🖥️ Found {len(nodes_list)} nodes ({len(connected_nodes)} connected)")
-            
-            for node in nodes_list:
-                if node.status == "connected":
-                    main_logger.debug(f"Connecting to node: {node.node_name} (id={node.node_id})")
-                    await create_node_task(panel_data, tg, node)
-            
-            main_logger.info(f"✓ Connected to {len(connected_nodes)} nodes")
+            try:
+                cache = await get_cache()
+                if cache.is_connected:
+                    main_logger.info("✓ Redis cache connected")
+                else:
+                    main_logger.info("⚠ Redis not available, using in-memory cache fallback")
+            except Exception as e:
+                main_logger.warning(f"Redis initialization failed: {e}, using in-memory fallback")
         else:
-            main_logger.warning("No nodes available or error fetching nodes")
+            main_logger.info("ℹ Redis cache module not available, using in-memory cache")
+        
+        # Start Telegram bot and message dispatcher in background tasks
+        main_logger.debug("Starting Telegram bot and dispatcher tasks...")
+        from telegram_bot.dispatcher import get_dispatcher
+        dispatcher = get_dispatcher()
+        asyncio.create_task(dispatcher.start_worker())
+        asyncio.create_task(run_telegram_bot())
+        await asyncio.sleep(2)
+        main_logger.info("✓ Telegram bot and dispatcher started")
 
-        # Start background management tasks
-        main_logger.info("🔄 Starting background tasks...")
-        tg.create_task(check_and_add_new_nodes(panel_data, tg), name="add_new_nodes")
-        tg.create_task(handle_cancel(panel_data, TASKS), name="cancel_disable_nodes")
-        tg.create_task(handle_cancel_all(TASKS, panel_data, tg), name="cancel_all")
+        # Load configuration
+        main_logger.debug("Loading configuration...")
+        while True:
+            try:
+                config_file = await read_config(check_required_elements=True)
+                main_logger.info("✓ Configuration loaded successfully")
+                break
+            except ValueError as error:
+                main_logger.error(f"Configuration error: {error}")
+                await send_logs(f"<code>{error}</code>")
+                await send_logs(
+                    "Please configure the required settings:\n"
+                    "/create_config - Panel credentials\n"
+                    "/set_general_limit_number - Default IP limit\n"
+                    "/set_check_interval - Check interval\n"
+                    "/set_time_to_active_users - Re-enable timeout\n\n"
+                    "Retrying in <b>60 seconds</b>..."
+                )
+                await asyncio.sleep(60)
         
-        from utils.panel_api import enable_dis_user
-        tg.create_task(enable_dis_user(panel_data), name="enable_disabled_users")
+        # Initialize panel connection
+        panel_data = PanelType(
+            config_file["panel"]["username"],
+            config_file["panel"]["password"],
+            config_file["panel"]["domain"],
+        )
+        main_logger.info(f"✓ Panel configured: {config_file['panel']['domain']}")
         
-        from utils.user_sync import run_user_sync_loop
-        tg.create_task(run_user_sync_loop(panel_data), name="user_sync")
+        # Preserve disabled users across restarts (enable_dis_user background loop handles expired bans)
+        main_logger.info("✓ Disabled users state preserved across restarts")
         
-        main_logger.info("✓ All background tasks registered in TaskGroup")
-        main_logger.info("=" * 50)
-        main_logger.info("🟢 Limiter is now running and monitoring connections")
-        
-        from utils.user_sync import refresh_user_metadata_cache, recompute_all_user_limits
-        await refresh_user_metadata_cache()
-        await recompute_all_user_limits()
-        
-        await run_check_users_usage(panel_data)
+        async with asyncio.TaskGroup() as tg:
+            # Start Redis Pub/Sub listener for L1/L2 cache invalidations
+            if REDIS_AVAILABLE:
+                from utils.redis_cache import start_pubsub_listener
+                tg.create_task(start_pubsub_listener(), name="redis_pubsub")
+                main_logger.info("✓ Redis Pub/Sub listener registered in TaskGroup")
+
+            # Start unknown user background worker
+            from utils.user_sync import run_unknown_user_worker
+            tg.create_task(run_unknown_user_worker(panel_data), name="unknown_user_worker")
+            main_logger.info("✓ Unknown user worker registered in TaskGroup")
+
+            main_logger.debug("Fetching available nodes...")
+            nodes_list = await get_nodes(panel_data)
+            
+            if nodes_list and not isinstance(nodes_list, ValueError):
+                await init_node_status_message(nodes_list)
+                connected_nodes = [n for n in nodes_list if n.status == "connected"]
+                main_logger.info(f"🖥️ Found {len(nodes_list)} nodes ({len(connected_nodes)} connected)")
+                
+                for node in nodes_list:
+                    if node.status == "connected":
+                        main_logger.debug(f"Connecting to node: {node.node_name} (id={node.node_id})")
+                        await create_node_task(panel_data, tg, node)
+                
+                main_logger.info(f"✓ Connected to {len(connected_nodes)} nodes")
+            else:
+                main_logger.warning("No nodes available or error fetching nodes")
+
+            # Start background management tasks
+            main_logger.info("🔄 Starting background tasks...")
+            tg.create_task(check_and_add_new_nodes(panel_data, tg), name="add_new_nodes")
+            tg.create_task(handle_cancel(panel_data, TASKS), name="cancel_disable_nodes")
+            tg.create_task(handle_cancel_all(TASKS, panel_data, tg), name="cancel_all")
+            
+            from utils.panel_api import enable_dis_user
+            tg.create_task(enable_dis_user(panel_data), name="enable_disabled_users")
+            
+            from utils.user_sync import run_user_sync_loop
+            tg.create_task(run_user_sync_loop(panel_data), name="user_sync")
+            
+            main_logger.info("✓ All background tasks registered in TaskGroup")
+            main_logger.info("=" * 50)
+            main_logger.info("🟢 Limiter is now running and monitoring connections")
+            
+            from utils.user_sync import refresh_user_metadata_cache, recompute_all_user_limits
+            await refresh_user_metadata_cache()
+            await recompute_all_user_limits()
+            
+            await run_check_users_usage(panel_data)
+    finally:
+        await cleanup_resources()
 
 
 async def cleanup_resources():
