@@ -324,7 +324,13 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
             import json
             parsed_limits = json.loads(group_limits_str)
             if isinstance(parsed_limits, dict):
-                config["group_limits"] = {int(k): int(v) for k, v in parsed_limits.items()}
+                normalized_limits = {}
+                for k, v in parsed_limits.items():
+                    try:
+                        normalized_limits[int(k)] = int(v)
+                    except (ValueError, TypeError):
+                        pass
+                config["group_limits"] = normalized_limits
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
     
