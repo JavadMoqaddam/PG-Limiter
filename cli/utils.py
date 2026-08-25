@@ -1,6 +1,5 @@
-"""
-CLI utility functions
-"""
+"""CLI utility functions"""
+import fcntl
 import json
 import os
 from typing import List, Tuple
@@ -51,30 +50,46 @@ def info(message: str):
 
 
 def load_config() -> dict:
-    """Load the config file"""
+    """Load the config file with shared file lock for cross-process safety."""
     if not os.path.exists(CONFIG_FILE):
         error(f"Config file '{CONFIG_FILE}' not found. Run the limiter first to create it.")
-    
+
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+        try:
+            return json.load(f)
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def save_config(config: dict):
-    """Save the config file"""
+    """Save the config file with exclusive file lock for cross-process safety."""
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            json.dump(config, f, indent=2)
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def load_backup() -> dict:
-    """Load the backup file (for special limits)"""
+    """Load the backup file with shared file lock for cross-process safety."""
     if not os.path.exists(BACKUP_FILE):
         return {"special": {}, "except_users": []}
-    
+
     with open(BACKUP_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+        try:
+            return json.load(f)
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def save_backup(backup: dict):
-    """Save the backup file"""
+    """Save the backup file with exclusive file lock for cross-process safety."""
     with open(BACKUP_FILE, "w", encoding="utf-8") as f:
-        json.dump(backup, f, indent=2)
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            json.dump(backup, f, indent=2)
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
