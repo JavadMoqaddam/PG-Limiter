@@ -1169,7 +1169,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         logger.debug(f"Admin filter: {len(admin_filtered_users)} users skipped")
     
     # Dispatch chunked warning reports in batches of 10
-    check_interval = float(config_data.get("monitoring", {}).get("check_interval", 60)) if config_data else 60.0
+    check_interval = float(config_data.get("check_interval") or config_data.get("monitoring", {}).get("check_interval", 60)) if config_data else 60.0
     total_monitored = len(warning_system.get_monitoring_users())
     if cycle_new_warnings:
         await dispatch_chunked_warnings(cycle_new_warnings, check_interval, total_monitored)
@@ -1185,5 +1185,5 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
     while True:
         config_data = await read_config()
         await check_users_usage(panel_data, config_data=config_data)
-        check_interval = config_data.get("monitoring", {}).get("check_interval", 60)
+        check_interval = config_data.get("check_interval") or config_data.get("monitoring", {}).get("check_interval", 60)
         await asyncio.sleep(int(check_interval))

@@ -62,7 +62,7 @@ async def _get_status_throttle_interval() -> float:
     try:
         from utils.read_config import read_config
         config = await read_config()
-        return float(config.get("monitoring", {}).get("check_interval", 60))
+        return float(config.get("check_interval") or config.get("monitoring", {}).get("check_interval", 60))
     except Exception:
         return 60.0
 

@@ -106,6 +106,12 @@ def load_env_config() -> Dict[str, Any]:
         },
         "except_users": [],  # Loaded from DB
         # Monitoring settings (from ENV)
+        "monitoring": {
+            "check_interval": _get_env("CHECK_INTERVAL", 60, int),
+            "max_warning_count": _get_env("MAX_WARNING_COUNT", 3, int),
+            "time_to_active_users": _get_env("TIME_TO_ACTIVE_USERS", 900, int),
+            "country_code": _get_env("COUNTRY_CODE", ""),
+        },
         "check_interval": _get_env("CHECK_INTERVAL", 60, int),
         "max_warning_count": _get_env("MAX_WARNING_COUNT", 3, int),
         "time_to_active_users": _get_env("TIME_TO_ACTIVE_USERS", 900, int),
@@ -216,8 +222,32 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     # Merge DB config (dynamic settings changeable via Telegram)
     db_config = db_data.get("db_config", {})
     
-    # Note: check_interval, time_to_active_users, and country_code are ENV-only
-    # They cannot be changed via Telegram bot
+    # Merge monitoring and timing settings from DB
+    if "check_interval" in db_config:
+        try:
+            config["check_interval"] = int(db_config["check_interval"])
+        except (ValueError, TypeError):
+            pass
+    if "time_to_active_users" in db_config:
+        try:
+            config["time_to_active_users"] = int(db_config["time_to_active_users"])
+        except (ValueError, TypeError):
+            pass
+    if "max_warning_count" in db_config:
+        try:
+            config["max_warning_count"] = int(db_config["max_warning_count"])
+        except (ValueError, TypeError):
+            pass
+    if "country_code" in db_config:
+        config["country_code"] = str(db_config["country_code"])
+        
+    # Synchronize monitoring sub-dictionary
+    config["monitoring"] = {
+        "check_interval": config["check_interval"],
+        "max_warning_count": config["max_warning_count"],
+        "time_to_active_users": config["time_to_active_users"],
+        "country_code": config["country_code"],
+    }
     
     if "general_limit" in db_config:
         try:
