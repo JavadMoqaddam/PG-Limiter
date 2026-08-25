@@ -19,6 +19,8 @@ _sync_lock: asyncio.Lock = asyncio.Lock()
 # In-Memory User Metadata Cache populated during User Sync
 # Format: {username: {"group_ids": [...], "owner_username": "...", "is_excepted": bool, "special_limit": int, "is_monitored": bool, "effective_ip_limit": int}}
 USER_METADATA_CACHE: dict[str, dict] = {}
+# Lock to guard write operations on USER_METADATA_CACHE (reads are lock-free)
+_metadata_cache_lock: asyncio.Lock = asyncio.Lock()
 
 # Background Queue & Throttled Worker for Unknown Users
 _UNKNOWN_USERS_QUEUE: Optional[asyncio.Queue] = None
@@ -221,7 +223,7 @@ async def recompute_all_user_limits(config: dict = None):
             config = {}
     
     recomputed_count = 0
-    for username, data in USER_METADATA_CACHE.items():
+    for username, data in list(USER_METADATA_CACHE.items()):
         is_monitored, effective_limit = calculate_user_effective_limit_and_monitoring(
             username=username,
             group_ids=data.get("group_ids", []),

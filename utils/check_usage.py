@@ -31,11 +31,13 @@ _active_users_lock = ACTIVE_USERS_LOCK
 # (previously a separate instance; having two caused reset button to
 # clear one copy but leave the other untouched)
 isp_detector = None  # Will be initialized when needed
+_isp_detector_lock = asyncio.Lock()
 
 
-def _ensure_isp_detector(config_data: dict) -> ISPDetector:
+async def _ensure_isp_detector(config_data: dict) -> ISPDetector:
     """
     Ensure the global ISPDetector singleton is initialized and updated with the latest config.
+    Uses asyncio.Lock to prevent double-initialization if called concurrently.
     
     Args:
         config_data: Configuration dictionary containing ipinfo_token or api config.
@@ -44,19 +46,20 @@ def _ensure_isp_detector(config_data: dict) -> ISPDetector:
         ISPDetector: The global ISPDetector instance.
     """
     global isp_detector
-    api_config = config_data.get("api", {}) if isinstance(config_data.get("api"), dict) else {}
-    ipinfo_token = config_data.get("ipinfo_token") or api_config.get("ipinfo_token", "")
-    use_fallback_api = api_config.get("use_fallback_isp_api", False)
-    
-    if isp_detector is None:
-        logger.info(f"Loading IPINFO_TOKEN from config: {'Present' if ipinfo_token else 'NOT FOUND'}")
-        if ipinfo_token:
-            logger.info(f"Token preview: {ipinfo_token[:20]}...")
-        if use_fallback_api:
-            logger.info("Using fallback ISP API (ip-api.com) for all requests")
-        isp_detector = ISPDetector(token=ipinfo_token if ipinfo_token else None, use_fallback_only=use_fallback_api)
-    elif ipinfo_token and getattr(isp_detector, "token", None) != ipinfo_token:
-        isp_detector.update_token(ipinfo_token)
+    async with _isp_detector_lock:
+        api_config = config_data.get("api", {}) if isinstance(config_data.get("api"), dict) else {}
+        ipinfo_token = config_data.get("ipinfo_token") or api_config.get("ipinfo_token", "")
+        use_fallback_api = api_config.get("use_fallback_isp_api", False)
+        
+        if isp_detector is None:
+            logger.info(f"Loading IPINFO_TOKEN from config: {'Present' if ipinfo_token else 'NOT FOUND'}")
+            if ipinfo_token:
+                logger.info(f"Token preview: {ipinfo_token[:20]}...")
+            if use_fallback_api:
+                logger.info("Using fallback ISP API (ip-api.com) for all requests")
+            isp_detector = ISPDetector(token=ipinfo_token if ipinfo_token else None, use_fallback_only=use_fallback_api)
+        elif ipinfo_token and getattr(isp_detector, "token", None) != ipinfo_token:
+            isp_detector.update_token(ipinfo_token)
         
     return isp_detector
 
@@ -561,7 +564,7 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     )
     
     # Initialize or update ISP detector with token from config
-    isp_detector = _ensure_isp_detector(config_data)
+    isp_detector = await _ensure_isp_detector(config_data)
     
     if active_users_snapshot is None:
         active_users_snapshot = await get_active_users_snapshot()
@@ -944,7 +947,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         special_limit = await UserCRUD.get_all_special_limits(db)
     
     # Initialize or update ISP detector
-    isp_detector = _ensure_isp_detector(config_data)
+    isp_detector = await _ensure_isp_detector(config_data)
     
     # Sync dynamic check interval and max warning count to warning system
     check_interval = config_data.get("check_interval", 60)
