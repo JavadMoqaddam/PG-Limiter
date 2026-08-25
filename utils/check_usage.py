@@ -845,7 +845,12 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     return all_users_log
 
 
-async def dispatch_chunked_warnings(new_warnings: list[dict], check_interval: float, total_monitored: int) -> None:
+async def dispatch_chunked_warnings(
+    new_warnings: list[dict], 
+    check_interval: float, 
+    total_monitored: int,
+    max_warnings: int = 3
+) -> None:
     """
     Dispatch new warnings aggregated into chunks of 10 to avoid rate limits and message drops.
     Includes item-level error handling and HTML escaping.
@@ -853,7 +858,8 @@ async def dispatch_chunked_warnings(new_warnings: list[dict], check_interval: fl
     Args:
         new_warnings: List of warning dicts collected in this scan cycle
         check_interval: Dynamic scan interval from config/ENV used as TTL
-        total_monitored: Total count of users currently in 3-min monitoring
+        total_monitored: Total count of users currently in monitoring
+        max_warnings: Configurable max warning cycles before disable
     """
     if not new_warnings:
         return
@@ -867,14 +873,14 @@ async def dispatch_chunked_warnings(new_warnings: list[dict], check_interval: fl
     total_chunks = (total_violators + chunk_size - 1) // chunk_size
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    period_min = max(1, round(check_interval * 3 / 60))
+    period_min = max(1, round(check_interval * max_warnings / 60))
     for idx in range(0, total_violators, chunk_size):
         chunk = new_warnings[idx : idx + chunk_size]
         batch_num = (idx // chunk_size) + 1
         
         header = (
             f"⚠️ <b>WARNINGS REPORT</b> ({batch_num}/{total_chunks}) - <code>{now_str}</code>\n"
-            f"📡 Monitoring Window: <code>~{period_min} min</code>\n"
+            f"📡 Monitoring Window: <code>{max_warnings} cycles (~{period_min} min)</code>\n"
             f"📊 Violators in cycle: <code>{total_violators}</code> | In batch: <code>{len(chunk)}</code>"
         )
         
@@ -1194,7 +1200,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     check_interval = float(config_data.get("check_interval") or config_data.get("monitoring", {}).get("check_interval", 60)) if config_data else 60.0
     total_monitored = len(warning_system.get_monitoring_users())
     if cycle_new_warnings:
-        await dispatch_chunked_warnings(cycle_new_warnings, check_interval, total_monitored)
+        await dispatch_chunked_warnings(cycle_new_warnings, check_interval, total_monitored, max_warnings=int(max_warning_count))
 
     # Clean up expired warnings
     await warning_system.cleanup_expired_warnings()
