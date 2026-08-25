@@ -67,8 +67,8 @@ class InMemoryCache:
             exp = entry.get("expires_at", 0)
             if exp == 0 or exp > time.time():
                 return entry.get("value")
-            # Key expired: pop from cache immediately without spawning unreferenced tasks
-            self._cache.pop(key, None)
+            # Key expired: defer cleanup to next keys()/set() call under lock
+            # Do NOT mutate _cache here without holding _lock
         return None
     
     async def set(self, key: str, value: str, ex: Optional[int] = None) -> bool:
