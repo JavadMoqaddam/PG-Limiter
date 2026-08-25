@@ -887,9 +887,12 @@ async def dispatch_chunked_warnings(new_warnings: list[dict], check_interval: fl
                 trust_level = item.get("trust_level", "🟡 MEDIUM")
                 trust_score = item.get("trust_score", 0.0)
                 behavior = html.escape(str(item.get("behavior", "")))
+                consecutive = item.get("consecutive_violations", 1)
+                max_warnings = item.get("max_warnings", 3)
                 
                 user_line = (
                     f"👤 <code>{username}</code>\n"
+                    f"   ⚠️ Warning: <code>{consecutive}/{max_warnings}</code> (Scan {consecutive} of {max_warnings})\n"
                     f"   🌐 Active IPs: <code>{ip_count}</code> (Limit: <code>{limit}</code>)\n"
                     f"   Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)"
                 )
@@ -1110,7 +1113,23 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                             )
                         await send_disable_notification(msg, user_name)
                         await warning_system.clear_user_trust_data(user_name)
-                        logger.warning(f"🚫 Disabled user {user_name} after 3 consecutive violation scans (limit: {user_limit_number})")
+                        logger.warning(f"🚫 Disabled user {user_name} after {max_warning_count} consecutive violation scans (limit: {user_limit_number})")
+                    elif result == "updated":
+                        w_obj = warning_system.warnings.get(user_name)
+                        trust_score = w_obj.trust_score if w_obj else 0.0
+                        trust_level = w_obj.get_trust_level() if w_obj else "🟡 MEDIUM"
+                        behavior = w_obj.get_behavior_summary() if w_obj else ""
+                        consecutive = getattr(w_obj, "consecutive_violations", 2) if w_obj else 2
+                        cycle_new_warnings.append({
+                            "username": user_name,
+                            "ip_count": len(unique_ips),
+                            "limit": user_limit_number,
+                            "trust_score": trust_score,
+                            "trust_level": trust_level,
+                            "behavior": behavior,
+                            "consecutive_violations": consecutive,
+                            "max_warnings": max_warning_count,
+                        })
                 else:
                     # New violation - may start monitoring or instant disable
                     result = await warning_system.add_warning(
@@ -1127,17 +1146,20 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         trust_score = w_obj.trust_score if w_obj else 0.0
                         trust_level = w_obj.get_trust_level() if w_obj else "🟡 MEDIUM"
                         behavior = w_obj.get_behavior_summary() if w_obj else ""
+                        consecutive = getattr(w_obj, "consecutive_violations", 1) if w_obj else 1
                         cycle_new_warnings.append({
                             "username": user_name,
                             "ip_count": len(unique_ips),
                             "limit": user_limit_number,
                             "trust_score": trust_score,
                             "trust_level": trust_level,
-                            "behavior": behavior
+                            "behavior": behavior,
+                            "consecutive_violations": consecutive,
+                            "max_warnings": max_warning_count,
                         })
                         message = (
                             f"User {user_name} has {len(unique_ips)} active ips (limit: {user_limit_number}). "
-                            f"Warning issued - monitoring for 3 consecutive scans."
+                            f"Warning issued - monitoring for {max_warning_count} consecutive scans."
                         )
                         logger.warning(message)
     
