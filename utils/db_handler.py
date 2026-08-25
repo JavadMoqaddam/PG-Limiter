@@ -12,6 +12,7 @@ import asyncio
 import time
 from typing import Dict, List, Optional, Set
 
+from cachetools import LRUCache
 from utils.logs import logger
 from utils.handel_dis_users import DisableStatus, RemainingTimeResult
 
@@ -101,7 +102,7 @@ class DBSubnetISPCache:
 
     def __init__(self):
         self._initialized = False
-        self._memory_cache: Dict[str, Dict[str, str]] = {}  # Subnet -> ISP info
+        self._memory_cache: LRUCache = LRUCache(maxsize=10000)  # Subnet -> ISP info
 
     async def _ensure_initialized(self):
         if not self._initialized:
