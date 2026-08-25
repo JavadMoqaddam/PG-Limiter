@@ -384,10 +384,11 @@ async def panel_request(
                 request_logger.error(last_error)
                 continue
         
-        # All schemes failed for this attempt, wait before retry with REAL RANDOM JITTER
+        # All schemes failed for this attempt, wait before retry with proportional jitter
         if attempt < max_retries - 1:
-            jitter = random.uniform(0.1, 0.5)
-            wait_time = min(10.0, retry_delay * (2 ** attempt)) + jitter
+            base_delay = min(10.0, retry_delay * (2 ** attempt))
+            jitter = random.uniform(0, base_delay * 0.5)
+            wait_time = base_delay + jitter
             request_logger.debug(f"Retrying in {wait_time:.2f}s (attempt {attempt + 1}/{max_retries})")
             await asyncio.sleep(wait_time)
     
