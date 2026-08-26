@@ -540,6 +540,13 @@ class TelegramDispatcher:
             err_msg = str(e)
             if "timed out" in err_msg.lower() or "timeout" in err_name.lower() or "network" in err_name.lower() or "connection" in err_msg.lower():
                 dispatcher_logger.warning(f"⚠️ Network error / timeout sending Telegram message: {e}")
+            elif "message is too long" in err_msg.lower() or "message_too_long" in err_msg.lower():
+                # Permanent failure: message exceeds Telegram's 4096 char limit, retrying will never succeed
+                text_len = len(item.text or "")
+                dispatcher_logger.error(f"❌ Message too long ({text_len} chars), dropping permanently to unblock queue: {e}")
+                if item.future and not item.future.done():
+                    item.future.set_result(None)
+                return True  # Do NOT retry — message will never fit
             else:
                 dispatcher_logger.error(f"❌ Unexpected error sending Telegram message: {e}", exc_info=True)
             return False

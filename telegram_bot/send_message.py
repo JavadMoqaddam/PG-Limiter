@@ -82,6 +82,43 @@ def _sanitize_html_message(msg: str) -> str:
     return msg
 
 
+def _split_message(msg: str, max_length: int) -> list[str]:
+    """
+    Split a long message into chunks that fit within Telegram's character limit.
+    Splits on double-newline boundaries first (paragraph breaks), then single newlines,
+    to preserve HTML formatting as much as possible.
+    """
+    if len(msg) <= max_length:
+        return [msg]
+
+    chunks = []
+    remaining = msg
+    while remaining:
+        if len(remaining) <= max_length:
+            chunks.append(remaining)
+            break
+
+        # Try splitting at double-newline (paragraph break) within limit
+        split_pos = remaining.rfind("\n\n", 0, max_length)
+        if split_pos > max_length // 4:
+            chunks.append(remaining[:split_pos])
+            remaining = remaining[split_pos + 2:]
+            continue
+
+        # Try splitting at single newline
+        split_pos = remaining.rfind("\n", 0, max_length)
+        if split_pos > max_length // 4:
+            chunks.append(remaining[:split_pos])
+            remaining = remaining[split_pos + 1:]
+            continue
+
+        # Hard split at max_length as last resort
+        chunks.append(remaining[:max_length])
+        remaining = remaining[max_length:]
+
+    return chunks
+
+
 async def send_logs(
     msg: str,
     return_message_id: bool = False,
@@ -122,6 +159,32 @@ async def send_logs(
     if message_key and topics_manager.is_message_sent(topic_type, message_key):
         tg_send_logger.debug(f"⏭️ Skipping duplicate message: {message_key[:50]}...")
         return None
+
+    # Auto-split messages exceeding Telegram's 4096 char limit (use 3900 safe margin for HTML overhead)
+    TELEGRAM_MAX_LENGTH = 3900
+    if len(msg) > TELEGRAM_MAX_LENGTH:
+        tg_send_logger.warning(f"⚠️ Message too long ({len(msg)} chars), auto-splitting into chunks")
+        chunks = _split_message(msg, TELEGRAM_MAX_LENGTH)
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            dispatcher = get_dispatcher()
+            chunk_future = await dispatcher.enqueue_send(
+                text=chunk,
+                topic_type=topic_type,
+                priority=priority,
+                reply_markup=reply_markup if i == len(chunks) - 1 else None,
+                ttl=ttl,
+                cancel_key=f"{cancel_key}_part{i}" if cancel_key else None,
+                return_future=return_message_id,
+            )
+            if return_message_id and chunk_future:
+                try:
+                    last_result = await asyncio.wait_for(chunk_future, timeout=10.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+        if message_key:
+            await topics_manager.mark_message_sent(topic_type, message_key)
+        return last_result
 
     dispatcher = get_dispatcher()
     future = await dispatcher.enqueue_send(
