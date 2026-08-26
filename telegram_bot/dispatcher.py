@@ -593,6 +593,8 @@ def get_dispatcher() -> TelegramDispatcher:
 
     if _dispatcher_instance is None:
         _dispatcher_instance = TelegramDispatcher()
-    elif current_loop and getattr(_dispatcher_instance.queue, "_loop", None) is not current_loop:
+        _dispatcher_instance._loop = current_loop
+    elif current_loop and getattr(_dispatcher_instance, "_loop", None) is not None and _dispatcher_instance._loop is not current_loop:
         _dispatcher_instance = TelegramDispatcher()
+        _dispatcher_instance._loop = current_loop
     return _dispatcher_instance
