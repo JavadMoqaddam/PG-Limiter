@@ -145,7 +145,7 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
         msg_text = first_call_args[0][0]
         self.assertIn("<b>WARNINGS REPORT</b> (1/3)", msg_text)
         self.assertIn("user_0", msg_text)
-        self.assertEqual(first_call_args[1]["ttl"], 60.0)
+        self.assertEqual(first_call_args[1]["ttl"], 600.0)
 
     async def test_duplicate_text_node_edit_guard(self):
         """Test that editing node status with identical text is ignored."""
