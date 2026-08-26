@@ -166,7 +166,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(
     title="Limiter API",
     description="REST API for IP Connection Limiter Management",
-    version="1.2.3",
+    version="1.2.4",
     lifespan=lifespan,
 )
 
