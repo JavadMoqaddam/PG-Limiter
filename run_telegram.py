@@ -52,6 +52,14 @@ async def run_telegram_bot():
         
         telegram_runner_logger.debug("Starting application...")
         await application.start()
+
+        # Register initialized bot instance with Dispatcher
+        try:
+            from telegram_bot.dispatcher import get_dispatcher
+            get_dispatcher().set_bot(application.bot)
+            telegram_runner_logger.debug("✓ Dispatcher bot instance synchronized")
+        except Exception as disp_err:
+            telegram_runner_logger.debug(f"Dispatcher sync note: {disp_err}")
         
         # Start polling for updates
         telegram_runner_logger.info("🔄 Starting polling for updates...")

@@ -330,20 +330,27 @@ class TelegramDispatcher:
         self._is_running = True
         self._worker_task = asyncio.current_task()
         dispatcher_logger.info("🚀 Telegram Dispatcher worker started")
-        await self.reload_pending_critical_messages()
-
         try:
-            while self._is_running:
-                try:
-                    priority, seq, item = await self.queue.get()
-                except asyncio.CancelledError:
-                    break
+            await self.reload_pending_critical_messages()
+        except Exception as reload_err:
+            dispatcher_logger.error(f"Error reloading pending critical messages: {reload_err}")
 
+        while self._is_running:
+            item = None
+            try:
+                priority, seq, item = await self.queue.get()
+            except asyncio.CancelledError:
+                break
+            except Exception as get_err:
+                dispatcher_logger.error(f"Error getting item from queue: {get_err}")
+                await asyncio.sleep(0.5)
+                continue
+
+            try:
                 # Check if item was cancelled before sending
                 if item.is_cancelled:
                     if item.cancel_key and item.cancel_key in self._active_cancel_keys:
                         self._active_cancel_keys.pop(item.cancel_key, None)
-                    self.queue.task_done()
                     continue
 
                 # Check if item expired (TTL)
@@ -352,7 +359,6 @@ class TelegramDispatcher:
                     dispatcher_logger.debug(f"⏰ Dropped expired item (topic={item.topic_type.value}, age={now - item.created_at:.1f}s, ttl={item.ttl}s)")
                     if item.future and not item.future.done():
                         item.future.set_result(None)
-                    self.queue.task_done()
                     continue
 
                 # Enforce global pause if currently in backoff from 429
@@ -392,14 +398,15 @@ class TelegramDispatcher:
                         del self._pending_storage[item.db_id]
                         await self._save_pending_storage()
 
+            except asyncio.CancelledError:
+                break
+            except Exception as item_err:
+                dispatcher_logger.error(f"❌ Error processing queue item: {item_err}", exc_info=True)
+            finally:
                 self.queue.task_done()
 
-        except asyncio.CancelledError:
-            dispatcher_logger.info("🛑 Telegram Dispatcher worker cancelled")
-        except Exception as e:
-            dispatcher_logger.error(f"❌ Unexpected error in Telegram Dispatcher worker: {e}", exc_info=True)
-        finally:
-            self._is_running = False
+        self._is_running = False
+        dispatcher_logger.info("🛑 Telegram Dispatcher worker ended")
 
     async def _execute_item(self, item: QueueItem) -> bool:
         """Execute a single queue item via the Telegram Bot API."""
