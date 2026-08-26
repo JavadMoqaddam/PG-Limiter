@@ -875,6 +875,7 @@ async def dispatch_chunked_warnings(
     total_violators = len(new_warnings)
     total_chunks = (total_violators + chunk_size - 1) // chunk_size
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    logger.info(f"📨 Enqueueing {total_chunks} warning report batches ({total_violators} users) to Warnings topic")
     
     period_min = max(1, round(check_interval * max_warnings / 60))
     for idx in range(0, total_violators, chunk_size):
