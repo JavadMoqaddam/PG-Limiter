@@ -324,17 +324,14 @@ async def send_disable_notification(msg: str, username: str) -> None:
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     cancel_key = f"disable:{username}"
-    message_info = await send_logs(
+    await send_logs(
         msg,
-        return_message_id=True,
+        return_message_id=False,
         reply_markup=reply_markup,
         topic_type=TopicType.DISABLE_ENABLE,
         priority=Priority.CRITICAL,
         cancel_key=cancel_key,
     )
-
-    if message_info:
-        await track_disable_message(username, message_info[0], message_info[1])
 
 
 # Backward-compatible alias

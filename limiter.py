@@ -37,6 +37,9 @@ VERSION = "1.2.4"
 # Main logger
 main_logger = get_logger("limiter.main")
 
+# Strong references container for root background tasks
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
 parser = argparse.ArgumentParser(
     description="Limiter - IP connection limiter for PasarGuard panel"
 )
@@ -72,12 +75,16 @@ async def main():
         else:
             main_logger.info("ℹ Redis cache module not available, using in-memory cache")
         
-        # Start Telegram bot and message dispatcher in background tasks
+        # Start Telegram bot and message dispatcher in background tasks (keep strong references)
         main_logger.debug("Starting Telegram bot and dispatcher tasks...")
         from telegram_bot.dispatcher import get_dispatcher
         dispatcher = get_dispatcher()
-        asyncio.create_task(dispatcher.start_worker())
-        asyncio.create_task(run_telegram_bot())
+        dispatcher_task = asyncio.create_task(dispatcher.start_worker(), name="dispatcher_worker")
+        bot_task = asyncio.create_task(run_telegram_bot(), name="telegram_bot_runner")
+        _BACKGROUND_TASKS.add(dispatcher_task)
+        _BACKGROUND_TASKS.add(bot_task)
+        dispatcher_task.add_done_callback(_BACKGROUND_TASKS.discard)
+        bot_task.add_done_callback(_BACKGROUND_TASKS.discard)
         await asyncio.sleep(2)
         main_logger.info("✓ Telegram bot and dispatcher started")
 

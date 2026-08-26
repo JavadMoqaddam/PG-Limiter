@@ -469,6 +469,15 @@ class TelegramDispatcher:
                 result_info = (sent_msg.message_id, group_id)
                 dispatcher_logger.debug(f"✅ Sent message {sent_msg.message_id} to topic '{item.topic_type.value}' (thread={thread_id})")
 
+                # Auto-track disable notification message_id asynchronously for later deletion
+                if item.cancel_key and item.cancel_key.startswith("disable:"):
+                    username_part = item.cancel_key.split("disable:", 1)[1]
+                    try:
+                        from telegram_bot.send_message import track_disable_message
+                        asyncio.create_task(track_disable_message(username_part, sent_msg.message_id, group_id))
+                    except Exception as track_err:
+                        dispatcher_logger.debug(f"Disable tracking note: {track_err}")
+
                 if item.future and not item.future.done():
                     item.future.set_result(result_info)
                 return True

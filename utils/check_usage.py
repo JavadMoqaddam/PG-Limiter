@@ -897,11 +897,11 @@ async def dispatch_chunked_warnings(
                 trust_score = item.get("trust_score", 0.0)
                 behavior = html.escape(str(item.get("behavior", "")))
                 consecutive = item.get("consecutive_violations", 1)
-                max_warnings = item.get("max_warnings", 3)
+                item_max_warnings = item.get("max_warnings", 3)
                 
                 user_line = (
                     f"👤 <code>{username}</code>\n"
-                    f"   ⚠️ Warning: <code>{consecutive}/{max_warnings}</code> (Scan {consecutive} of {max_warnings})\n"
+                    f"   ⚠️ Warning: <code>{consecutive}/{item_max_warnings}</code> (Scan {consecutive} of {item_max_warnings})\n"
                     f"   🌐 Active IPs: <code>{ip_count}</code> (Limit: <code>{limit}</code>)\n"
                     f"   Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)"
                 )
@@ -918,8 +918,9 @@ async def dispatch_chunked_warnings(
         )
         
         batch_msg = f"{header}\n\n" + "\n\n".join(user_blocks) + f"\n\n{footer}"
-        # Enqueue with dynamic TTL = check_interval
-        await send_warning_log(batch_msg, ttl=check_interval)
+        # Enqueue with safe TTL (10 minutes) so reports are not prematurely dropped
+        warning_ttl = max(600.0, check_interval * 10)
+        await send_warning_log(batch_msg, ttl=warning_ttl)
 
 
 async def check_users_usage(panel_data: PanelType, config_data: dict | None = None):
