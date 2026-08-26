@@ -26,7 +26,10 @@ from telegram_bot.keyboards import (
     create_back_to_main_keyboard,
     create_users_menu_keyboard,
 )
+from utils.logs import get_logger
 from utils.read_config import read_config
+
+users_logger = get_logger("telegram.handlers.users")
 
 
 def create_back_to_users_keyboard():
