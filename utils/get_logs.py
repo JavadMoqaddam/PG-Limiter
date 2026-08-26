@@ -83,9 +83,13 @@ async def _delayed_status_update(delay: float) -> None:
         logger.debug(f"Delayed node status update note: {e}")
 
 
+_status_lock = asyncio.Lock()
+_status_initializing: bool = False
+
+
 async def _update_node_status(node_id: int, node_name: str, status: str) -> None:
     """Update the status of a node in memory and refresh the message with rate throttling and trailing flush."""
-    global _node_connection_status, _node_status_message_id, _last_status_edit_time, _last_status_text, _pending_status_update_task
+    global _node_connection_status, _node_status_message_id, _last_status_edit_time, _last_status_text, _pending_status_update_task, _status_initializing
     
     _node_connection_status[node_id] = {"name": node_name, "status": status}
     
@@ -94,33 +98,42 @@ async def _update_node_status(node_id: int, node_name: str, status: str) -> None
     throttle_interval = await _get_status_throttle_interval()
     elapsed = now - _last_status_edit_time
     
+    if _status_initializing:
+        # Initial status message is in flight; trailing update will flush latest states
+        return
+        
     if _node_status_message_id and elapsed < throttle_interval:
         # Schedule trailing update so latest states are flushed at the end of the throttle window
         if _pending_status_update_task is None or _pending_status_update_task.done():
             _pending_status_update_task = asyncio.create_task(_delayed_status_update(throttle_interval - elapsed))
         return
     
-    message = await _build_node_status_message()
-    if message == _last_status_text:
-        return
-    
-    _last_status_edit_time = now
-    _last_status_text = message
-    
-    if _node_status_message_id:
-        # Try to edit the existing message
-        result = await edit_message(_node_status_message_id, message)
-        if not result:
-            # If edit fails, send a new message
-            _node_status_message_id = await send_logs(message, return_message_id=True)
-    else:
-        # Send initial message
-        _node_status_message_id = await send_logs(message, return_message_id=True)
+    async with _status_lock:
+        message = await _build_node_status_message()
+        if message == _last_status_text:
+            return
+        
+        _last_status_edit_time = now
+        _last_status_text = message
+        
+        if _node_status_message_id:
+            # Try to edit the existing message
+            result = await edit_message(_node_status_message_id, message)
+            if not result:
+                # If edit fails, send a new message
+                _node_status_message_id = await send_logs(message, return_message_id=True)
+        else:
+            # Send initial message (guarded against concurrent duplicate sends)
+            _status_initializing = True
+            try:
+                _node_status_message_id = await send_logs(message, return_message_id=True)
+            finally:
+                _status_initializing = False
 
 
 async def init_node_status_message(nodes: list) -> None:
     """Initialize the status message with all nodes showing as connecting."""
-    global _node_connection_status, _node_status_message_id
+    global _node_connection_status, _node_status_message_id, _status_initializing, _last_status_edit_time, _last_status_text
     
     _node_connection_status = {}
     _node_status_message_id = None
@@ -134,7 +147,13 @@ async def init_node_status_message(nodes: list) -> None:
     
     if _node_connection_status:
         message = await _build_node_status_message()
-        _node_status_message_id = await send_logs(message, return_message_id=True)
+        _last_status_edit_time = time.time()
+        _last_status_text = message
+        _status_initializing = True
+        try:
+            _node_status_message_id = await send_logs(message, return_message_id=True)
+        finally:
+            _status_initializing = False
 
 
 async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:

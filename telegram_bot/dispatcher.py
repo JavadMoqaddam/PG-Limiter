@@ -21,39 +21,6 @@ import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-try:
-    from telegram.error import (
-        BadRequest,
-        ChatNotFound,
-        Forbidden,
-        NetworkError,
-        RetryAfter,
-        TimedOut,
-    )
-except ImportError:
-    class TelegramError(Exception):
-        """Fallback base exception when telegram package is not installed."""
-        pass
-
-    class BadRequest(TelegramError):
-        pass
-
-    class ChatNotFound(TelegramError):
-        pass
-
-    class Forbidden(TelegramError):
-        pass
-
-    class NetworkError(TelegramError):
-        pass
-
-    class RetryAfter(TelegramError):
-        def __init__(self, retry_after: float = 0.0, *args):
-            super().__init__(*args)
-            self.retry_after = retry_after
-
-    class TimedOut(TelegramError):
-        pass
 
 from telegram_bot.topics import TopicType, get_topics_manager
 from utils.atomic_io import atomic_write_json
@@ -404,7 +371,12 @@ class TelegramDispatcher:
                     # Critical messages (Disable/Enable) retry indefinitely; non-critical retry up to max_retries
                     if item.priority == Priority.CRITICAL or item.retry_count < item.max_retries:
                         item.retry_count += 1
-                        backoff = min(2.0 ** min(item.retry_count, 6), 30.0)
+                        base_backoff = min(2.0 ** min(item.retry_count, 6), 30.0)
+                        now_mono = time.monotonic()
+                        if now_mono < self._paused_until:
+                            backoff = max(base_backoff, self._paused_until - now_mono)
+                        else:
+                            backoff = base_backoff
                         dispatcher_logger.warning(f"⚠️ Retrying item (attempt {item.retry_count}) in {backoff:.1f}s...")
                         await asyncio.sleep(backoff)
                         new_seq = next(self._sequence_counter)
@@ -504,60 +476,70 @@ class TelegramDispatcher:
                     item.future.set_result(True)
                 return True
 
-        except RetryAfter as e:
-            dispatcher_logger.warning(f"⚠️ Telegram 429 Flood Control: retry after {e.retry_after}s")
-            self._paused_until = time.monotonic() + e.retry_after + 1.0
-            return False
-
-        except BadRequest as e:
-            err_str = str(e).lower()
-            if "message is not modified" in err_str:
-                dispatcher_logger.debug("ℹ Message not modified (ignoring no-op)")
-                if item.future and not item.future.done():
-                    item.future.set_result(True)
-                return True
-
-            if "message thread not found" in err_str or "thread not found" in err_str:
-                dispatcher_logger.error(f"❌ Forum topic '{item.topic_type.value}' thread ID not found in group: {e}")
-                if item.future and not item.future.done():
-                    item.future.set_result(None)
-                return True  # Do not retry broken topic thread endlessly
-
-            if "message to delete not found" in err_str or "message can't be deleted" in err_str:
-                dispatcher_logger.debug(f"ℹ Message to delete already removed or expired: {e}")
-                if item.future and not item.future.done():
-                    item.future.set_result(False)
-                return True
-
-            dispatcher_logger.error(f"❌ Telegram BadRequest error: {e}")
-            if item.future and not item.future.done():
-                item.future.set_result(None)
-            return True  # Discard permanent 400 Bad Request to prevent queue blockage (DLQ)
-
-        except (Forbidden, ChatNotFound) as e:
-            dispatcher_logger.error(f"❌ Bot lacks permission or chat not found: {e}")
-            if item.future and not item.future.done():
-                item.future.set_result(None)
-            return True
-
-        except (TimedOut, NetworkError, TimeoutError) as e:
-            dispatcher_logger.warning(f"⚠️ Network error / timeout sending Telegram message: {e}")
-            return False
-
         except Exception as e:
             err_name = type(e).__name__
             err_msg = str(e)
-            if "timed out" in err_msg.lower() or "timeout" in err_name.lower() or "network" in err_name.lower() or "connection" in err_msg.lower():
-                dispatcher_logger.warning(f"⚠️ Network error / timeout sending Telegram message: {e}")
-            elif "message is too long" in err_msg.lower() or "message_too_long" in err_msg.lower():
-                # Permanent failure: message exceeds Telegram's 4096 char limit, retrying will never succeed
-                text_len = len(item.text or "")
-                dispatcher_logger.error(f"❌ Message too long ({text_len} chars), dropping permanently to unblock queue: {e}")
+            err_lower = err_msg.lower()
+
+            # 1. Detect Flood Control / RetryAfter (Telegram 429)
+            if err_name == "RetryAfter" or "flood control" in err_lower or "retry after" in err_lower or hasattr(e, "retry_after"):
+                retry_seconds = getattr(e, "retry_after", None)
+                if retry_seconds is None:
+                    import re
+                    m = re.search(r"(\d+(?:\.\d+)?)\s*sec", err_msg, re.IGNORECASE)
+                    retry_seconds = float(m.group(1)) if m else 30.0
+                retry_seconds = float(retry_seconds)
+                dispatcher_logger.warning(f"⚠️ Telegram 429 Flood Control: pausing dispatcher for {retry_seconds:.1f}s")
+                self._paused_until = time.monotonic() + retry_seconds + 1.0
+                await asyncio.sleep(retry_seconds + 1.0)
+                return False
+
+            # 2. Detect BadRequest errors
+            if err_name == "BadRequest" or "bad request" in err_lower or "message is not modified" in err_lower or "message thread not found" in err_lower or "message is too long" in err_lower:
+                if "message is not modified" in err_lower:
+                    dispatcher_logger.debug("ℹ Message not modified (ignoring no-op)")
+                    if item.future and not item.future.done():
+                        item.future.set_result(True)
+                    return True
+
+                if "message thread not found" in err_lower or "thread not found" in err_lower:
+                    dispatcher_logger.error(f"❌ Forum topic '{item.topic_type.value}' thread ID not found in group: {e}")
+                    if item.future and not item.future.done():
+                        item.future.set_result(None)
+                    return True
+
+                if "message to delete not found" in err_lower or "message can't be deleted" in err_lower:
+                    dispatcher_logger.debug(f"ℹ Message to delete already removed or expired: {e}")
+                    if item.future and not item.future.done():
+                        item.future.set_result(False)
+                    return True
+
+                if "message is too long" in err_lower or "message_too_long" in err_lower:
+                    text_len = len(item.text or "")
+                    dispatcher_logger.error(f"❌ Message too long ({text_len} chars), dropping permanently to unblock queue: {e}")
+                    if item.future and not item.future.done():
+                        item.future.set_result(None)
+                    return True
+
+                dispatcher_logger.error(f"❌ Telegram BadRequest error: {e}")
                 if item.future and not item.future.done():
                     item.future.set_result(None)
-                return True  # Do NOT retry — message will never fit
-            else:
-                dispatcher_logger.error(f"❌ Unexpected error sending Telegram message: {e}", exc_info=True)
+                return True
+
+            # 3. Detect Bot lacks permission or chat not found (Permanent 403 / 404)
+            if err_name in ("Forbidden", "ChatNotFound") or "chat not found" in err_lower or "forbidden" in err_lower or "bot was blocked" in err_lower:
+                dispatcher_logger.error(f"❌ Bot lacks permission or chat not found: {e}")
+                if item.future and not item.future.done():
+                    item.future.set_result(None)
+                return True
+
+            # 4. Network / Timeout transient errors
+            if "timed out" in err_lower or "timeout" in err_name.lower() or "network" in err_name.lower() or "connection" in err_lower:
+                dispatcher_logger.warning(f"⚠️ Network error / timeout sending Telegram message: {e}")
+                return False
+
+            # 5. Generic unhandled error
+            dispatcher_logger.error(f"❌ Unexpected error sending Telegram message: {e}", exc_info=True)
             return False
 
         return True
