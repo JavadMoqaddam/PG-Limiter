@@ -32,7 +32,7 @@ try:
 except ImportError:
     REDIS_AVAILABLE = False
 
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 
 # Main logger
 main_logger = get_logger("limiter.main")

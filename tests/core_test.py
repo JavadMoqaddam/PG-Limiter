@@ -32,7 +32,7 @@ from utils.read_config import read_config
 from utils.types import PanelType, UserType
 
 parser = argparse.ArgumentParser(description="Help message")
-parser.add_argument("--version", action="version", version="1.2.4")
+parser.add_argument("--version", action="version", version="1.2.5")
 args = parser.parse_args()
 
 panel_data = PanelType("admin", "admin", "192.168.1.37:8000")
