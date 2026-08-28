@@ -371,13 +371,13 @@ async def cancel_or_delete_disable_message(username: str) -> bool:
     return False
 
 
-async def send_enable_notification(username: str, delete_disable_msg: bool = True) -> None:
+async def send_enable_notification(username: str, delete_disable_msg: bool = False) -> None:
     """
-    Send an enable notification and optionally cancel/delete the original disable message.
+    Send an enable notification without deleting the original disable message.
     
     Args:
         username: The username that was enabled
-        delete_disable_msg: Whether to cancel/delete the original disable message
+        delete_disable_msg: Whether to cancel/delete the original disable message (default: False)
     """
     from datetime import datetime
 

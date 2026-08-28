@@ -400,18 +400,19 @@ async def enable_single_user(query, username: str):
             await dis_users.remove_user(username)
             await remove_disable_message_tracking(username)
             
+            # Send standard enable notification to Disable/Enable topic
+            try:
+                from telegram_bot.send_message import send_enable_notification
+                await send_enable_notification(username, delete_disable_msg=False)
+            except Exception as notify_err:
+                users_logger.warning(f"Could not send enable notification for {username}: {notify_err}")
+
             if is_notification_button:
-                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                orig_html = getattr(query.message, "text_html", None) or msg_text
-                updated_text = f"{orig_html}\n\n✅ <b>USER ENABLED MANUALLY</b> - <code>{now_str}</code>"
                 try:
-                    await query.edit_message_text(text=updated_text, parse_mode="HTML", reply_markup=None)
+                    await query.edit_message_reply_markup(reply_markup=None)
                 except Exception:
-                    try:
-                        await query.edit_message_reply_markup(reply_markup=None)
-                    except Exception:
-                        pass
-                await query.answer(f"✅ User {username} enabled manually!")
+                    pass
+                await query.answer(f"✅ User {username} enabled!")
                 return
             else:
                 await query.answer(f"✅ User {username} enabled!")
@@ -474,6 +475,11 @@ async def enable_all_disabled_users(query):
         # Only remove successfully enabled users from list
         for username in enabled:
             await dis_users.remove_user(username)
+            try:
+                from telegram_bot.send_message import send_enable_notification
+                await send_enable_notification(username, delete_disable_msg=False)
+            except Exception as notify_err:
+                users_logger.warning(f"Could not send enable notification for {username}: {notify_err}")
         
         # Also remove users that were deleted from panel
         for username in not_found:
