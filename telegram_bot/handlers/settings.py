@@ -1152,31 +1152,57 @@ async def subnet_ip_grouping_menu_callback(query, context: ContextTypes.DEFAULT_
     """Handle subnet IP grouping menu display."""
     config_data = await read_config()
     current_status = config_data.get("subnet_ip_grouping", False)
+    current_mode = config_data.get("subnet_grouping_mode", "/24")
+    if current_mode not in ["/24", "/16"]:
+        current_mode = "/24"
     
     status_emoji = "✅" if current_status else "❌"
     status_text = "enabled" if current_status else "disabled"
     
+    if current_mode == "/16":
+        mode_label = "🌐 Mode: /16 (Wide - 65k IPs + ISP)"
+        mode_desc = (
+            "• <b>Active Subnet Mode:</b> <code>/16 Subnet (Wide)</code>\n"
+            "• IPs sharing the same <b>/16 block</b> (<code>192.168.x.x</code>) + <b>same ISP</b> count as <b>1 device</b>.\n"
+            "• <i>Best for aggressive cellular carrier IP rotation across different subnets.</i>"
+        )
+        example_text = (
+            "• <code>192.146.2.57</code> → Node1 | VLESS\n"
+            "• <code>192.146.24.35</code> → Node1 | VLESS (same /16 & ISP: Irancell)\n"
+            "Counts as: <b>1 device</b>"
+        )
+    else:
+        mode_label = "🎯 Mode: /24 (Standard - 256 IPs)"
+        mode_desc = (
+            "• <b>Active Subnet Mode:</b> <code>/24 Subnet (Standard - Recommended)</code>\n"
+            "• IPs in the same <b>/24 block</b> (<code>192.168.1.x</code>) count as <b>1 device</b> (256 IPs).\n"
+            "• <i>Safest setting: Prevents multi-location account sharing while stopping false CGNAT bans.</i>"
+        )
+        example_text = (
+            "• <code>31.7.122.108</code> → Node1 | VLESS\n"
+            "• <code>31.7.122.66</code> → Node1 | VLESS (same /24: Mokhaberat)\n"
+            "Counts as: <b>1 device</b>"
+        )
+    
     await query.edit_message_text(
         text=(
             f"🌐 <b>Subnet IP Grouping</b>\n\n"
-            f"<b>Status:</b> {status_emoji} {status_text.title()}\n\n"
-            "<b>What it does:</b>\n"
-            "Groups IPs from the <b>same ISP</b> using <b>same node</b> AND <b>same inbound</b> "
-            "as <b>one device</b>.\n\n"
-            "<b>How it works:</b>\n"
-            "• With ISP info: IPs in same <b>/16 subnet</b> (192.168.x.x) + same ISP = 1 device\n"
-            "• Without ISP: IPs in same <b>/24 subnet</b> (192.168.1.x) = 1 device\n\n"
-            "<b>Example (same ISP - Irancell):</b>\n"
-            "• <code>192.146.2.57</code> → Node1 | VLESS\n"
-            "• <code>192.146.24.35</code> → Node1 | VLESS\n\n"
-            "With grouping <b>enabled</b>: counts as <b>1 device</b>\n"
-            "With grouping <b>disabled</b>: counts as <b>2 devices</b>\n\n"
-            "<i>💡 Use this for ISPs that frequently change user IPs within their IP range.</i>"
+            f"<b>Status:</b> {status_emoji} {status_text.title()}\n"
+            f"{mode_desc}\n\n"
+            f"<b>Example ({'Irancell' if current_mode == '/16' else 'Mokhaberat'}):</b>\n"
+            f"{example_text}\n\n"
+            f"With grouping <b>enabled</b>: counts as <b>1 device</b>\n"
+            f"With grouping <b>disabled</b>: counts as <b>2 devices</b>\n\n"
+            "<i>💡 Use the toggle button below to switch between /24 and /16 modes.</i>"
         ),
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 f"{'❌ Disable' if current_status else '✅ Enable'} Subnet Grouping",
                 callback_data=CallbackData.SUBNET_IP_GROUPING_TOGGLE
+            )],
+            [InlineKeyboardButton(
+                mode_label,
+                callback_data=CallbackData.SUBNET_IP_GROUPING_MODE_TOGGLE
             )],
             [InlineKeyboardButton("« Back to Settings", callback_data=CallbackData.SETTINGS_MENU)]
         ]),
@@ -1195,6 +1221,22 @@ async def subnet_ip_grouping_toggle_callback(query, context: ContextTypes.DEFAUL
     
     status_text = "enabled" if new_status else "disabled"
     await query.answer(f"Subnet IP Grouping {status_text}")
+    
+    # Reload the menu
+    await subnet_ip_grouping_menu_callback(query, context)
+
+
+async def subnet_ip_grouping_mode_toggle_callback(query, context: ContextTypes.DEFAULT_TYPE):
+    """Handle subnet IP grouping mode toggle callback (/24 <-> /16)."""
+    config_data = await read_config()
+    current_mode = config_data.get("subnet_grouping_mode", "/24")
+    
+    # Toggle between /24 and /16
+    new_mode = "/16" if current_mode == "/24" else "/24"
+    await save_config_value("subnet_grouping_mode", new_mode)
+    
+    mode_text = "Wide /16 (+ISP)" if new_mode == "/16" else "Standard /24"
+    await query.answer(f"Subnet Mode: {mode_text}")
     
     # Reload the menu
     await subnet_ip_grouping_menu_callback(query, context)

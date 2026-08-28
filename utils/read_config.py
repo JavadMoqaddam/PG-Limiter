@@ -361,9 +361,12 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
         except ValueError:
             pass
     
-    # Subnet IP Grouping - relaxed mode where IPs in the same /24 subnet
+    # Subnet IP Grouping - relaxed mode where IPs in the same /24 or /16 subnet
     # that use the same node AND inbound are counted as a single device
     config["subnet_ip_grouping"] = db_config.get("subnet_ip_grouping", "false").lower() == "true"
+    config["subnet_grouping_mode"] = db_config.get("subnet_grouping_mode", "/24")
+    if config["subnet_grouping_mode"] not in ["/24", "/16"]:
+        config["subnet_grouping_mode"] = "/24"
     
     # High Trust IP Grouping - for users with high trust score, multiple IPs
     # using the SAME node AND inbound are counted as one device

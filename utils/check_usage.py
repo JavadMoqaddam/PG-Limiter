@@ -353,6 +353,7 @@ class DeviceCountingConfig:
     cdn_nodes: list[int] = field(default_factory=list)
     disabled_nodes: list[int] = field(default_factory=list)
     subnet_ip_grouping: bool = False
+    subnet_grouping_mode: str = "/24"  # "/24" (standard) or "/16" (wide + ISP)
     high_trust_ip_grouping: bool = False
     high_trust_threshold: int = 20
 
@@ -364,6 +365,7 @@ class DeviceCountingConfig:
             cdn_nodes=config_data.get("cdn_nodes", []) or [],
             disabled_nodes=config_data.get("disabled_nodes", []) or [],
             subnet_ip_grouping=config_data.get("subnet_ip_grouping", False),
+            subnet_grouping_mode=config_data.get("subnet_grouping_mode", "/24"),
             high_trust_ip_grouping=config_data.get("high_trust_ip_grouping", False),
             high_trust_threshold=config_data.get("high_trust_threshold", 20),
         )
@@ -476,15 +478,17 @@ def _build_ip_details(
             unique_devices.add(("HIGH_TRUST", conn.node_id, conn.inbound_protocol))
         elif subnet_ip_grouping:
             # Subnet IP Grouping mode:
-            # - If ISP info available: use /16 subnet + ISP + node + inbound
-            # - Otherwise: use /24 subnet + node + inbound
-            ip_isp = get_isp_name(conn.ip)
-            if ip_isp:
-                # Wide subnet grouping (/16) with ISP matching
-                wide_subnet_key = get_wide_subnet_key(conn.ip)
-                unique_devices.add(("SUBNET_ISP_GROUP", wide_subnet_key, ip_isp, conn.node_id, conn.inbound_protocol))
+            # - Mode "/16": Wide /16 subnet (192.168.x.x) + ISP + node + inbound (if ISP info available)
+            # - Mode "/24": Standard /24 subnet (192.168.1.x) + node + inbound (recommended)
+            if getattr(device_config, "subnet_grouping_mode", "/24") == "/16":
+                ip_isp = get_isp_name(conn.ip)
+                if ip_isp:
+                    wide_subnet_key = get_wide_subnet_key(conn.ip)
+                    unique_devices.add(("SUBNET_ISP_GROUP", wide_subnet_key, ip_isp, conn.node_id, conn.inbound_protocol))
+                else:
+                    subnet_key = get_subnet_key(conn.ip)
+                    unique_devices.add(("SUBNET_GROUP", subnet_key, conn.node_id, conn.inbound_protocol))
             else:
-                # Narrow subnet grouping (/24) without ISP info
                 subnet_key = get_subnet_key(conn.ip)
                 unique_devices.add(("SUBNET_GROUP", subnet_key, conn.node_id, conn.inbound_protocol))
         else:
@@ -1060,20 +1064,35 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                 group_limits=batched_group_limits,
             )
             
-            if len(unique_ips) > user_limit_number:
-                # Get user data and ISP info for this user
-                user_data = all_users_data.get(user_name)
-                user_isp_info = {ip: isp_info_batch.get(ip, {}) for ip in unique_ips if ip in isp_info_batch}
-                
+            # Get user data and ISP info for this user
+            user_data = all_users_data.get(user_name)
+            user_isp_info = {ip: isp_info_batch.get(ip, {}) for ip in unique_ips if ip in isp_info_batch}
+            
+            # Compute effective device count considering subnet grouping & CDN settings
+            effective_device_count = len(unique_ips)
+            if user_data and user_data.device_info and user_data.device_info.connections:
+                device_config = DeviceCountingConfig.from_config(config_data)
+                w_curr = warning_system.warnings.get(user_name)
+                curr_trust = w_curr.trust_score if w_curr else 0.0
+                _, effective_device_count = _build_ip_details(
+                    user_info=EnhancedUserInfo(user=user_data, formatted_ips=list(unique_ips)),
+                    original_user=user_data,
+                    show_enhanced_details=False,
+                    device_config=device_config,
+                    user_trust_score=curr_trust,
+                    isp_info=user_isp_info,
+                )
+            
+            if effective_device_count > user_limit_number:
                 # Check if user is already being monitored
                 if warning_system.is_user_being_monitored(user_name):
                     # User is being monitored, update their IP count and activity tracking
                     result = await warning_system.add_warning(
-                        user_name, len(unique_ips), unique_ips, user_limit_number,
+                        user_name, effective_device_count, unique_ips, user_limit_number,
                         user_data=user_data, isp_info=user_isp_info, panel_data=panel_data,
                         send_telegram_notification=False
                     )
-                    logger.info(f"Updated monitoring for user {user_name} with {len(unique_ips)} IPs (result={result})")
+                    logger.info(f"Updated monitoring for user {user_name} with {effective_device_count} devices ({len(unique_ips)} IPs, limit={user_limit_number}) (result={result})")
                     
                     if result == "violation_limit_reached":
                         from utils.warning_system import safe_disable_user_with_punishment
@@ -1103,7 +1122,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                             msg = (
                                 f"🔄 <b>SUBSCRIPTION REVOKED + DISABLED</b> - {time_str}\n\n"
                                 f"User: <code>{user_name}</code>\n"
-                                f"Active IPs: <code>{len(unique_ips)}</code>\n"
+                                f"Active Devices: <code>{effective_device_count}</code> ({len(unique_ips)} IPs)\n"
                                 f"User limit: <code>{user_limit_number}</code>\n"
                                 f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                                 f"📊 Violation #{punishment_result.get('violation_count', 1)} (Step {punishment_result.get('step_index', 0) + 1})\n"
@@ -1115,7 +1134,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                             msg = (
                                 f"🚫 <b>USER DISABLED</b> - {time_str}\n\n"
                                 f"User: <code>{user_name}</code>\n"
-                                f"Active IPs: <code>{len(unique_ips)}</code>\n"
+                                f"Active Devices: <code>{effective_device_count}</code> ({len(unique_ips)} IPs)\n"
                                 f"User limit: <code>{user_limit_number}</code>\n"
                                 f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                                 f"📊 Violation #{punishment_result.get('violation_count', 1)} (Step {punishment_result.get('step_index', 0) + 1})\n"
@@ -1133,7 +1152,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         consecutive = getattr(w_obj, "consecutive_violations", 2) if w_obj else 2
                         cycle_new_warnings.append({
                             "username": user_name,
-                            "ip_count": len(unique_ips),
+                            "ip_count": effective_device_count,
                             "limit": user_limit_number,
                             "trust_score": trust_score,
                             "trust_level": trust_level,
@@ -1144,7 +1163,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                 else:
                     # New violation - may start monitoring or instant disable
                     result = await warning_system.add_warning(
-                        user_name, len(unique_ips), unique_ips, user_limit_number,
+                        user_name, effective_device_count, unique_ips, user_limit_number,
                         user_data=user_data, isp_info=user_isp_info, panel_data=panel_data,
                         send_telegram_notification=False
                     )
@@ -1160,7 +1179,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         consecutive = getattr(w_obj, "consecutive_violations", 1) if w_obj else 1
                         cycle_new_warnings.append({
                             "username": user_name,
-                            "ip_count": len(unique_ips),
+                            "ip_count": effective_device_count,
                             "limit": user_limit_number,
                             "trust_score": trust_score,
                             "trust_level": trust_level,

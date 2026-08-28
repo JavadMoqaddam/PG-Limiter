@@ -935,6 +935,11 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         from telegram_bot.handlers.settings import subnet_ip_grouping_toggle_callback
         await subnet_ip_grouping_toggle_callback(query, context)
         return
+        
+    if data == CallbackData.SUBNET_IP_GROUPING_MODE_TOGGLE:
+        from telegram_bot.handlers.settings import subnet_ip_grouping_mode_toggle_callback
+        await subnet_ip_grouping_mode_toggle_callback(query, context)
+        return
     
     # High Trust IP Grouping callback
     if data == CallbackData.HIGH_TRUST_IP_GROUPING_MENU:
