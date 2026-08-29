@@ -2193,3 +2193,106 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
         if "message is not modified" not in str(e).lower():
             raise
         await query.answer("🔄 No new cycle yet")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEVICE COUNTING MODE (DEVICE / IP)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def create_device_count_keyboard(current_mode: str):
+    """Create the device counting mode keyboard with the active mode marked."""
+    device_prefix = "✅" if current_mode == "device" else "⬜"
+    ip_prefix = "✅" if current_mode == "ip" else "⬜"
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{device_prefix} 🖥️ Per Device (node-aware)",
+            callback_data=CallbackData.DEVICE_COUNT_SET_DEVICE
+        )],
+        [InlineKeyboardButton(
+            f"{ip_prefix} 🌐 Per IP (ignore node)",
+            callback_data=CallbackData.DEVICE_COUNT_SET_IP
+        )],
+        [InlineKeyboardButton("« Back to Settings", callback_data=CallbackData.SETTINGS_MENU)],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _build_device_count_text(config_data: dict) -> str:
+    """Render the device counting menu body for the current configuration."""
+    current_mode = str(config_data.get("device_count_mode") or "device")
+    ip_source = str(config_data.get("ip_source") or "logs")
+    subnet_on = "✅ on" if config_data.get("subnet_ip_grouping") else "❌ off"
+    subnet_mode = str(config_data.get("subnet_grouping_mode") or "/24")
+    high_trust_on = "✅ on" if config_data.get("high_trust_ip_grouping") else "❌ off"
+
+    if current_mode == "ip":
+        active = "🌐 <b>Per IP (node ignored)</b>"
+        active_note = (
+            "One client IP counts as <b>one device</b> even when several nodes report "
+            "it. Use this when more than one node serves the same core config/inbound, "
+            "so a single client is registered on all of them at once."
+        )
+    else:
+        active = "🖥️ <b>Per Device (node-aware)</b>"
+        active_note = (
+            "The node is part of the device key, so the same IP seen on two nodes "
+            "counts as <b>two devices</b>. Use this when each inbound has a single "
+            "node and simultaneous connections from one IP mean several people."
+        )
+
+    return (
+        "🧮 <b>Device Counting</b>\n\n"
+        f"<b>Active:</b> {active}\n"
+        f"<i>{active_note}</i>\n\n"
+        "<b>Related settings:</b>\n"
+        f"• IP source: <code>{ip_source}</code>\n"
+        f"• Subnet grouping: {subnet_on} (<code>{subnet_mode}</code>)\n"
+        f"• High trust grouping: {high_trust_on}\n\n"
+        "<b>Notes:</b>\n"
+        "• Only affects the grouped keys (subnet / high-trust). Plain "
+        "<code>(IP, inbound)</code> counting is already node-agnostic.\n"
+        "• CDN nodes and CDN inbounds keep their own grouping rules.\n"
+        "• In API mode the inbound is a sentinel value, so the node is the only "
+        "splitting dimension — <b>Per IP</b> is usually the correct choice there."
+    )
+
+
+async def handle_device_count_menu_callback(query, _context: ContextTypes.DEFAULT_TYPE):
+    """Show the device counting mode menu."""
+    config_data = await read_config()
+    current_mode = str(config_data.get("device_count_mode") or "device")
+
+    try:
+        await query.edit_message_text(
+            text=_build_device_count_text(config_data),
+            reply_markup=create_device_count_keyboard(current_mode),
+            parse_mode="HTML"
+        )
+    except BadRequest as e:
+        if "message is not modified" in str(e).lower():
+            await query.answer("🔄 Already up to date")
+        else:
+            raise
+
+
+async def _set_device_count_mode(query, context, mode: str, label: str):
+    """Persist the device counting mode and refresh the menu."""
+    config_data = await read_config()
+    if str(config_data.get("device_count_mode") or "device") == mode:
+        await query.answer(f"Already counting {label}")
+        return
+
+    await save_config_value("device_count_mode", mode)
+    await query.answer(f"✅ Now counting {label}")
+    await handle_device_count_menu_callback(query, context)
+
+
+async def handle_device_count_set_device_callback(query, context: ContextTypes.DEFAULT_TYPE):
+    """Switch to node-aware device counting (legacy behaviour)."""
+    await _set_device_count_mode(query, context, "device", "per device (node-aware)")
+
+
+async def handle_device_count_set_ip_callback(query, context: ContextTypes.DEFAULT_TYPE):
+    """Switch to node-agnostic IP counting."""
+    await _set_device_count_mode(query, context, "ip", "per IP (node ignored)")

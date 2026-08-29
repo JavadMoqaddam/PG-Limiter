@@ -379,6 +379,19 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     except (ValueError, TypeError):
         config["high_trust_threshold"] = 20
     
+    # Device counting mode:
+    #   "device" -> node_id is part of the device key (default, legacy behavior).
+    #               One IP seen on two different nodes counts as two devices.
+    #   "ip"     -> node_id is ignored when building the device key, so the same
+    #               IP reported by several nodes counts as a single device.
+    # Useful when several nodes serve the same inbound/core config: a single
+    # client is then registered on every one of those nodes at the same time.
+    config["device_count_mode"] = str(
+        db_config.get("device_count_mode", "device")
+    ).strip().lower()
+    if config["device_count_mode"] not in ("device", "ip"):
+        config["device_count_mode"] = "device"
+
     # Disabled nodes - list of node IDs to exclude from monitoring
     # Connections from these nodes are completely ignored
     config["disabled_nodes"] = []
@@ -574,6 +587,7 @@ def get_config_value(config: dict, key: str, default: Any = None) -> Any:
         "SHOW_SINGLE_IP_USERS": lambda c: c.get("show_single_ip_users"),
         "IPINFO_TOKEN": lambda c: c.get("ipinfo_token"),
         "IP_SOURCE": lambda c: c.get("ip_source"),
+        "DEVICE_COUNT_MODE": lambda c: c.get("device_count_mode"),
     }
     
     if key in key_map:

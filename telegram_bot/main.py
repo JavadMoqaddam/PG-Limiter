@@ -1078,6 +1078,22 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         await handle_ip_source_stats_callback(query, context)
         return
 
+    # Device counting mode callbacks (node-aware devices vs node-agnostic IPs)
+    if data == CallbackData.DEVICE_COUNT_MENU:
+        from telegram_bot.handlers.settings import handle_device_count_menu_callback
+        await handle_device_count_menu_callback(query, context)
+        return
+
+    if data == CallbackData.DEVICE_COUNT_SET_DEVICE:
+        from telegram_bot.handlers.settings import handle_device_count_set_device_callback
+        await handle_device_count_set_device_callback(query, context)
+        return
+
+    if data == CallbackData.DEVICE_COUNT_SET_IP:
+        from telegram_bot.handlers.settings import handle_device_count_set_ip_callback
+        await handle_device_count_set_ip_callback(query, context)
+        return
+
     # Handle dynamic callbacks
     if data.startswith("enable_user:"):
         username = data.split(":", 1)[1]

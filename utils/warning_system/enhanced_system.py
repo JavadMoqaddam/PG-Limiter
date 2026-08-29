@@ -288,6 +288,13 @@ class EnhancedWarningSystem:
             if user_limit:
                 warning.user_limit = user_limit
             warning.update_ip_activity(ips, current_time)
+
+            # Rolling monitoring window: every confirmed violation scan extends the
+            # deadline. Without this the window (check_interval * max_warnings) can
+            # expire before the required consecutive scans complete whenever a cycle
+            # runs slower than check_interval, and the record is dropped at scan
+            # max_warnings-1 - so the user is never disabled.
+            warning.monitoring_end_time = current_time + self.monitoring_period
             
             if user_data and user_data.device_info:
                 warning.inbound_protocols = user_data.device_info.inbound_protocols
@@ -445,11 +452,15 @@ class EnhancedWarningSystem:
                 subnets.add(ip)
         return subnets
     
-    async def check_persistent_violations(self, panel_data: PanelType, all_users_actual_ips: Dict[str, Set[str]], config_data: dict, batched_group_limits: dict = None) -> tuple[Set[str], Set[str]]:
+    async def check_persistent_violations(self, panel_data: PanelType, all_users_actual_ips: Dict[str, Set[str]], config_data: dict, batched_group_limits: dict = None, device_counts: Dict[str, int] = None) -> tuple[Set[str], Set[str]]:
         """
-        Check for users who still violate limits after 3-minute warning period.
-        Uses device counting: only IPs active for 2+ minutes count as devices.
-        
+        Check for users who still violate limits after the monitoring window ended.
+
+        Args:
+            device_counts: Optional cycle-wide {username: device_count} map. When
+                given, the ban decision uses exactly the same number the warning
+                path used, instead of the raw unique-IP count.
+
         Returns:
             Tuple[Set[str], Set[str]]: (disabled_users, warned_users) - sets of users who were disabled or warned
         """
@@ -496,10 +507,15 @@ class EnhancedWarningSystem:
                 
                 if username in all_users_actual_ips:
                     current_ips = all_users_actual_ips[username]
-                    device_count = len(current_ips)
+                    # Prefer the unified device count of this cycle; fall back to
+                    # the raw unique-IP count when it was not supplied.
+                    if device_counts is not None and username in device_counts:
+                        device_count = device_counts[username]
+                    else:
+                        device_count = len(current_ips)
                     activity_summary = warning.get_ip_activity_summary()
-                    
-                    warning_logger.info(f"⚠️ User {username}: {device_count} IPs (limit: {user_limit_number}, violations: {warning.consecutive_violations}/{self.max_warnings}), trust={trust_score:.0f}")
+
+                    warning_logger.info(f"⚠️ User {username}: {device_count} devices / {len(current_ips)} IPs (limit: {user_limit_number}, violations: {warning.consecutive_violations}/{self.max_warnings}), trust={trust_score:.0f}")
                     
                     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     
@@ -549,7 +565,7 @@ class EnhancedWarningSystem:
                                 await safe_send_warning_log(
                                     f"⚠️ <b>WARNING</b> - {time_str}\n\n"
                                     f"User: <code>{username}</code>\n"
-                                    f"Active IPs: <code>{device_count}</code>\n"
+                                    f"Active Devices: <code>{device_count}</code> ({len(current_ips)} IPs)\n"
                                     f"User limit: <code>{user_limit_number}</code>\n"
                                     f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                                     f"📊 Violation #{punishment_result['violation_count']} in time window\n"
@@ -570,7 +586,7 @@ class EnhancedWarningSystem:
                                 await safe_send_disable_notification(
                                     f"🚫 <b>USER DISABLED</b> - {time_str}\n\n"
                                     f"User: <code>{username}</code>\n"
-                                    f"Active IPs: <code>{len(current_ips)}</code>\n"
+                                    f"Active Devices: <code>{device_count}</code> ({len(current_ips)} IPs)\n"
                                     f"User limit: <code>{user_limit_number}</code>\n"
                                     f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                                     f"📊 Violation #{punishment_result['violation_count']} (Step {punishment_result['step_index'] + 1})\n"
@@ -590,7 +606,7 @@ class EnhancedWarningSystem:
                                 await safe_send_disable_notification(
                                     f"🔄 <b>SUBSCRIPTION REVOKED + DISABLED</b> - {time_str}\n\n"
                                     f"User: <code>{username}</code>\n"
-                                    f"Active IPs: <code>{len(current_ips)}</code>\n"
+                                    f"Active Devices: <code>{device_count}</code> ({len(current_ips)} IPs)\n"
                                     f"User limit: <code>{user_limit_number}</code>\n"
                                     f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                                     f"📊 Violation #{punishment_result['violation_count']} (Step {punishment_result['step_index'] + 1})\n"
