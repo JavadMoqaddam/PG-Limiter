@@ -6,7 +6,7 @@ endpoints. There is no bulk variant, so callers perform a bounded-concurrency
 fan-out over a narrowed candidate set:
 
     GET /api/node/online_stats/{user_id}/ip
-        -> {"nodes": {<node_id>: {"ips": {"<ip>": <count>}} | null}}
+        -> {"nodes": {<node_id>: {"ips": {"<ip>": <last_seen_epoch>}} | null}}
 
     GET /api/users?group=..&status=..&online=true
         -> {"users": [...], "total": N}
@@ -32,6 +32,10 @@ OUTCOME_ERROR = "error"
 
 # Panel-side fixed window used by the `online=true` filter (app/db/crud/user.py)
 PANEL_ONLINE_WINDOW_SECONDS = 120
+
+# Per-IP values at or above this are Unix timestamps (last seen), below it they
+# are treated as legacy connection counts and are never filtered for staleness.
+STALE_EPOCH_FLOOR = 1_000_000_000
 
 
 async def resolve_panel_token(
@@ -127,7 +131,13 @@ async def fetch_online_candidates(
 
 def _parse_ip_payload(payload: dict) -> dict[int, dict[str, int]]:
     """
-    Normalise a ``UserIPListAll`` body into ``{node_id: {ip: connection_count}}``.
+    Normalise a ``UserIPListAll`` body into ``{node_id: {ip: value}}``.
+
+    The per-IP value is the panel's **last-seen Unix timestamp** for that IP on
+    that node (verified against a live panel: e.g. ``1788078039`` = 2026-08-30
+    08:20 UTC). Older panel builds documented it as a connection count, so
+    callers must treat any value below ``STALE_EPOCH_FLOOR`` as a count and skip
+    freshness filtering for it.
 
     Nodes the panel could not reach come back as ``null`` and are skipped, as
     are nodes that reported no IPs at all.
@@ -148,17 +158,17 @@ def _parse_ip_payload(payload: dict) -> dict[int, dict[str, int]]:
         except (ValueError, TypeError):
             continue
 
-        ip_counts: dict[str, int] = {}
-        for ip, count in raw_ips.items():
+        ip_values: dict[str, int] = {}
+        for ip, value in raw_ips.items():
             ip_str = str(ip).strip()
             if not ip_str:
                 continue
             try:
-                ip_counts[ip_str] = max(1, int(count))
+                ip_values[ip_str] = max(1, int(value))
             except (ValueError, TypeError):
-                ip_counts[ip_str] = 1
-        if ip_counts:
-            parsed[node_id] = ip_counts
+                ip_values[ip_str] = 1
+        if ip_values:
+            parsed[node_id] = ip_values
     return parsed
 
 

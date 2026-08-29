@@ -1920,6 +1920,10 @@ def _build_ip_source_text(config_data: dict) -> str:
     window_label = (
         f"auto ({max(60, interval + 30)}s = interval + 30s)" if window == 0 else f"{window}s"
     )
+    freshness = int(config_data.get("api_ip_freshness") or 0)
+    freshness_label = (
+        f"auto ({max(60, interval)}s = check interval)" if freshness == 0 else f"{freshness}s"
+    )
     coverage = float(config_data.get("api_ip_min_coverage") or 0.0)
     auto_fallback = "✅ on" if config_data.get("api_ip_auto_fallback", True) else "❌ off"
 
@@ -1944,11 +1948,15 @@ def _build_ip_source_text(config_data: dict) -> str:
         f"• Check interval: <code>{interval}s</code>\n"
         f"• Candidate mode: <code>{candidate_mode}</code>\n"
         f"• Online window: <code>{window_label}</code>\n"
+        f"• IP freshness: <code>{freshness_label}</code>\n"
         f"• Min coverage: <code>{coverage:.0%}</code>\n"
         f"• Auto-fallback to logs: {auto_fallback}\n\n"
         "<b>Trade-offs of API mode:</b>\n"
         "• A cycle is an <b>instant snapshot</b>, not the union of a whole interval, "
         "so it reports fewer violations — never more.\n"
+        "• The panel keeps every IP with its last-seen timestamp, so IPs older "
+        "than the freshness window above are dropped; without that a user who "
+        "changed network looks like several devices.\n"
         "• A cycle with too few successful lookups is <b>skipped entirely</b>, "
         "keeping consecutive-violation counters intact.\n"
         "• Inbound protocol is not exposed by the API, so per-inbound CDN grouping "
@@ -2183,6 +2191,7 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
         "<b>Result:</b>\n"
         f"• Users with IPs: <code>{stats.get('users_with_ips', 0)}</code>\n"
         f"• Accepted IPs: <code>{stats.get('total_ips', 0)}</code>\n"
+        f"• Stale IPs dropped: <code>{stats.get('stale_ips', 0)}</code>\n"
         f"• Nodes seen: <code>{stats.get('nodes_seen', 0)}</code>\n"
         f"• Geo lookups: <code>{stats.get('geo_lookups', 0)}</code>"
     )
@@ -2193,3 +2202,109 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
         if "message is not modified" not in str(e).lower():
             raise
         await query.answer("🔄 No new cycle yet")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEVICE COUNTING MODE (DEVICE / IP)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def create_device_count_keyboard(current_mode: str):
+    """Create the device counting mode keyboard with the active mode marked."""
+    device_prefix = "✅" if current_mode == "device" else "⬜"
+    ip_prefix = "✅" if current_mode == "ip" else "⬜"
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{device_prefix} 🖥️ Per Device (by inbound)",
+            callback_data=CallbackData.DEVICE_COUNT_SET_DEVICE
+        )],
+        [InlineKeyboardButton(
+            f"{ip_prefix} 🌐 Per IP",
+            callback_data=CallbackData.DEVICE_COUNT_SET_IP
+        )],
+        [InlineKeyboardButton("« Back to Settings", callback_data=CallbackData.SETTINGS_MENU)],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _build_device_count_text(config_data: dict) -> str:
+    """Render the device counting menu body for the current configuration."""
+    current_mode = str(config_data.get("device_count_mode") or "device")
+    ip_source = str(config_data.get("ip_source") or "logs")
+    subnet_on = "✅ on" if config_data.get("subnet_ip_grouping") else "❌ off"
+    subnet_mode = str(config_data.get("subnet_grouping_mode") or "/24")
+    high_trust_on = "✅ on" if config_data.get("high_trust_ip_grouping") else "❌ off"
+
+    if current_mode == "ip":
+        active = "🌐 <b>Per IP</b>"
+        active_note = (
+            "One client IP counts as <b>one device</b>, whatever it connects to. "
+            "Use this when only the number of distinct internet connections "
+            "matters."
+        )
+    else:
+        active = "🖥️ <b>Per Device (by inbound)</b>"
+        active_note = (
+            "The inbound stays in the device key, so one IP reaching two inbounds "
+            "counts as <b>two devices</b> - this is what catches several people "
+            "sharing a single connection."
+        )
+
+    return (
+        "🧮 <b>Device Counting</b>\n\n"
+        f"<b>Active:</b> {active}\n"
+        f"<i>{active_note}</i>\n\n"
+        "<b>Related settings:</b>\n"
+        f"• IP source: <code>{ip_source}</code>\n"
+        f"• Subnet grouping: {subnet_on} (<code>{subnet_mode}</code>)\n"
+        f"• High trust grouping: {high_trust_on}\n\n"
+        "<b>Notes:</b>\n"
+        "• The node is <b>never</b> part of the device key in either mode: when "
+        "several nodes serve the same core config, one client is registered on "
+        "all of them at once.\n"
+        "• Subnet grouping applies in both modes (same <code>/24</code> counts "
+        "once). High Trust grouping is inactive in <b>Per IP</b> mode.\n"
+        "• CDN nodes and CDN inbounds keep their own grouping rules.\n"
+        "• In API mode the panel does not expose the inbound, so both modes "
+        "behave the same there."
+    )
+
+
+async def handle_device_count_menu_callback(query, _context: ContextTypes.DEFAULT_TYPE):
+    """Show the device counting mode menu."""
+    config_data = await read_config()
+    current_mode = str(config_data.get("device_count_mode") or "device")
+
+    try:
+        await query.edit_message_text(
+            text=_build_device_count_text(config_data),
+            reply_markup=create_device_count_keyboard(current_mode),
+            parse_mode="HTML"
+        )
+    except BadRequest as e:
+        if "message is not modified" in str(e).lower():
+            await query.answer("🔄 Already up to date")
+        else:
+            raise
+
+
+async def _set_device_count_mode(query, context, mode: str, label: str):
+    """Persist the device counting mode and refresh the menu."""
+    config_data = await read_config()
+    if str(config_data.get("device_count_mode") or "device") == mode:
+        await query.answer(f"Already counting {label}")
+        return
+
+    await save_config_value("device_count_mode", mode)
+    await query.answer(f"✅ Now counting {label}")
+    await handle_device_count_menu_callback(query, context)
+
+
+async def handle_device_count_set_device_callback(query, context: ContextTypes.DEFAULT_TYPE):
+    """Switch to inbound-aware device counting (default)."""
+    await _set_device_count_mode(query, context, "device", "per device (by inbound)")
+
+
+async def handle_device_count_set_ip_callback(query, context: ContextTypes.DEFAULT_TYPE):
+    """Switch to pure IP counting."""
+    await _set_device_count_mode(query, context, "ip", "per IP")

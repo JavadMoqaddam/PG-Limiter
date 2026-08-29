@@ -379,6 +379,22 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     except (ValueError, TypeError):
         config["high_trust_threshold"] = 20
     
+    # Device counting mode. node_id is never part of the device key: several
+    # nodes can serve the same core config, so one client is registered on all
+    # of them simultaneously.
+    #   "device" -> the inbound stays in the key (default). One IP reaching two
+    #               inbounds counts as two devices, which is how several people
+    #               sharing a single connection are detected.
+    #   "ip"     -> the inbound is dropped too: one client IP is exactly one
+    #               device. Subnet grouping still applies when enabled; High
+    #               Trust grouping has no effect (IP counting is already the
+    #               most lenient key).
+    config["device_count_mode"] = str(
+        db_config.get("device_count_mode", "device")
+    ).strip().lower()
+    if config["device_count_mode"] not in ("device", "ip"):
+        config["device_count_mode"] = "device"
+
     # Disabled nodes - list of node IDs to exclude from monitoring
     # Connections from these nodes are completely ignored
     config["disabled_nodes"] = []
@@ -432,6 +448,17 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
         config["api_ip_online_window"] = 0
     if config["api_ip_online_window"] < 0:
         config["api_ip_online_window"] = 0
+
+    # Max age of a reported IP, in seconds. The panel's online-stats map keeps an
+    # IP with its last-seen timestamp long after the client left, so anything
+    # older than this is not a currently connected device.
+    # 0 = auto (check_interval), which matches log mode's sample width.
+    try:
+        config["api_ip_freshness"] = int(db_config.get("api_ip_freshness", "0"))
+    except (ValueError, TypeError):
+        config["api_ip_freshness"] = 0
+    if config["api_ip_freshness"] < 0:
+        config["api_ip_freshness"] = 0
 
     # Page size for the candidate /api/users query
     try:
@@ -574,6 +601,7 @@ def get_config_value(config: dict, key: str, default: Any = None) -> Any:
         "SHOW_SINGLE_IP_USERS": lambda c: c.get("show_single_ip_users"),
         "IPINFO_TOKEN": lambda c: c.get("ipinfo_token"),
         "IP_SOURCE": lambda c: c.get("ip_source"),
+        "DEVICE_COUNT_MODE": lambda c: c.get("device_count_mode"),
     }
     
     if key in key_map:

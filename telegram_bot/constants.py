@@ -258,6 +258,11 @@ class CallbackData:
     IP_SOURCE_SET_API = "ip_source_set_api"
     IP_SOURCE_SET_CONCURRENCY = "ip_source_set_concurrency"
     IP_SOURCE_STATS = "ip_source_stats"
+
+    # Device counting mode (node-aware devices vs node-agnostic IPs)
+    DEVICE_COUNT_MENU = "device_count_menu"
+    DEVICE_COUNT_SET_DEVICE = "device_count_set_device"
+    DEVICE_COUNT_SET_IP = "device_count_set_ip"
     
     # Auto-backup settings
     AUTO_BACKUP_MENU = "auto_backup_menu"
@@ -307,6 +312,9 @@ HELP_TEXT = """
 
 <b>🛰️ IP Source:</b>
 Settings → IP Source - Switch between node logs (SSE) and the panel API
+
+<b>🧮 Device Counting:</b>
+Settings → Device Counting - Count per device (by inbound) or per IP
 
 <b>📡 Monitoring:</b>
 /monitoring_status - Current monitoring status

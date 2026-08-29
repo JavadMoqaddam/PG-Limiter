@@ -61,7 +61,8 @@ def create_settings_menu_keyboard():
             InlineKeyboardButton("💾 Auto-Backup", callback_data=CallbackData.AUTO_BACKUP_MENU),
         ],
         [
-            InlineKeyboardButton("🛰️ IP Source (Logs / API)", callback_data=CallbackData.IP_SOURCE_MENU),
+            InlineKeyboardButton("🛰️ IP Source", callback_data=CallbackData.IP_SOURCE_MENU),
+            InlineKeyboardButton("🧮 Device Counting", callback_data=CallbackData.DEVICE_COUNT_MENU),
         ],
         [
             InlineKeyboardButton("🔙 Back", callback_data=CallbackData.BACK_MAIN),

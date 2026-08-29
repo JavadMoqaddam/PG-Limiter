@@ -44,6 +44,7 @@ LAST_CYCLE_STATS: dict = {
     "nodes_seen": 0,
     "duration_ms": 0,
     "geo_lookups": 0,
+    "stale_ips": 0,
     "skipped_reason": "",
 }
 
@@ -360,31 +361,44 @@ async def _build_users_from_payloads(
     """
     Convert the fan-out payloads into the ``ACTIVE_USERS`` structure.
 
-    The panel reports ``{node_id: {ip: count}}`` with no inbound information,
-    so a single sentinel inbound name stands in for all of them. The
-    device-counting key therefore keeps its ``(ip, inbound_protocol)`` shape
-    and per-node, subnet and CDN-node grouping continue to work unchanged.
+    The panel reports ``{node_id: {ip: last_seen_epoch}}`` with no inbound
+    information, so a single sentinel inbound name stands in for all of them.
+    The device-counting key therefore keeps its ``(ip, inbound_protocol)`` shape
+    and subnet and CDN-node grouping continue to work unchanged.
+
+    The panel keeps an IP in that map long after the client stopped using it, so
+    every IP older than the freshness window is dropped here. Without it a user
+    who simply changed network during the window looks like several simultaneous
+    devices - the main source of false positives in API mode.
 
     Returns:
         ``({username: UserType}, stats)``
     """
+    from utils.panel_api.online_ips import STALE_EPOCH_FLOOR
     from utils.parse_logs import update_user_device_info_with_node
 
     sentinel_inbound = str(config_data.get("api_ip_sentinel_inbound") or "API")
+    stale_cutoff = time.time() - _resolve_freshness_window(config_data)
 
     # Flatten first so IP validation runs once per unique IP for the whole
     # cycle instead of once per (user, node, ip) triple.
     per_user_pairs: dict[str, list[tuple[int, str]]] = {}
     raw_ips: set[str] = set()
     nodes_seen: set[int] = set()
+    stale_dropped = 0
 
     for username, node_map in payloads.items():
         pairs: list[tuple[int, str]] = []
-        for node_id, ip_counts in node_map.items():
+        for node_id, ip_values in node_map.items():
             if node_id in disabled_nodes:
                 continue
             nodes_seen.add(node_id)
-            for ip in ip_counts:
+            for ip, value in ip_values.items():
+                # Values below the floor are legacy connection counts, not
+                # timestamps, and carry no freshness information.
+                if value >= STALE_EPOCH_FLOOR and value < stale_cutoff:
+                    stale_dropped += 1
+                    continue
                 pairs.append((node_id, ip))
                 raw_ips.add(ip)
         if pairs:
@@ -429,6 +443,7 @@ async def _build_users_from_payloads(
         "nodes_seen": len(nodes_seen),
         "total_ips": total_ips,
         "users_with_ips": len(new_users),
+        "stale_ips": stale_dropped,
     }
     return new_users, stats
 
@@ -480,6 +495,29 @@ def _resolve_online_window(config_data: dict) -> int:
     except (ValueError, TypeError):
         interval = 60
     return max(60, interval + 30)
+
+
+def _resolve_freshness_window(config_data: dict) -> int:
+    """
+    Age limit for a reported IP, in seconds.
+
+    The panel's online-stats map retains an IP with its last-seen timestamp long
+    after the client left, so anything older than this window is not a currently
+    connected device. ``api_ip_freshness = 0`` means auto: the check interval
+    itself, which is exactly the sample width log mode produces.
+    """
+    configured = int(config_data.get("api_ip_freshness") or 0)
+    if configured > 0:
+        return max(30, configured)
+
+    interval = config_data.get("check_interval") or (
+        config_data.get("monitoring") or {}
+    ).get("check_interval", 60)
+    try:
+        interval = int(float(interval))
+    except (ValueError, TypeError):
+        interval = 60
+    return max(60, interval)
 
 
 def _reset_cycle_stats() -> None:
@@ -667,6 +705,7 @@ async def collect_active_users_from_api(
         f"🛰️ API IP collection: {len(new_users)} users / "
         f"{build_stats['total_ips']} IPs across {build_stats['nodes_seen']} nodes "
         f"(candidates {len(candidates)} → targets {len(targets)}, "
-        f"coverage {coverage:.1%}, {LAST_CYCLE_STATS['duration_ms']}ms)"
+        f"coverage {coverage:.1%}, {build_stats['stale_ips']} stale IPs dropped, "
+        f"{LAST_CYCLE_STATS['duration_ms']}ms)"
     )
     return True
