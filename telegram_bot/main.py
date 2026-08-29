@@ -1052,6 +1052,32 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         await node_disabled_toggle_callback(query, context, node_id)
         return
     
+    # IP source callbacks (SSE logs vs panel API)
+    if data == CallbackData.IP_SOURCE_MENU:
+        from telegram_bot.handlers.settings import handle_ip_source_menu_callback
+        await handle_ip_source_menu_callback(query, context)
+        return
+
+    if data == CallbackData.IP_SOURCE_SET_LOGS:
+        from telegram_bot.handlers.settings import handle_ip_source_set_logs_callback
+        await handle_ip_source_set_logs_callback(query, context)
+        return
+
+    if data == CallbackData.IP_SOURCE_SET_API:
+        from telegram_bot.handlers.settings import handle_ip_source_set_api_callback
+        await handle_ip_source_set_api_callback(query, context)
+        return
+
+    if data == CallbackData.IP_SOURCE_SET_CONCURRENCY:
+        from telegram_bot.handlers.settings import handle_ip_source_concurrency_callback
+        await handle_ip_source_concurrency_callback(query, context)
+        return
+
+    if data == CallbackData.IP_SOURCE_STATS:
+        from telegram_bot.handlers.settings import handle_ip_source_stats_callback
+        await handle_ip_source_stats_callback(query, context)
+        return
+
     # Handle dynamic callbacks
     if data.startswith("enable_user:"):
         username = data.split(":", 1)[1]
@@ -1303,6 +1329,14 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["waiting_for"] = None
         return
     
+    # Handle IP source concurrency input. ``waiting_for`` is cleared first so
+    # the handler can re-arm it when the value is rejected.
+    if waiting_for == "ip_source_concurrency":
+        from telegram_bot.handlers.settings import ip_source_concurrency_handler
+        context.user_data["waiting_for"] = None
+        await ip_source_concurrency_handler(update, context)
+        return
+
     # Handle forum group ID input
     if waiting_for == "forum_group_id":
         from telegram_bot.handlers.topics_settings import topics_set_group_receive

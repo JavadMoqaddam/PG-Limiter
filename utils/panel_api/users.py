@@ -28,10 +28,13 @@ async def fetch_all_users_raw(
     search: str | None = None,
     limit: int = 1000,
     max_concurrent: int = 10,
+    online: bool = False,
+    online_after: str | None = None,
+    sort: str | None = None,
 ) -> list[dict]:
     """
     Unified high-performance fetch of all users from Panel API using parallel pagination.
-    
+
     Args:
         panel_data: Panel connection configuration.
         status: Optional status filter (e.g. 'active', 'disabled').
@@ -40,12 +43,18 @@ async def fetch_all_users_raw(
         search: Optional search query.
         limit: Number of users per page (default: 1000).
         max_concurrent: Max concurrent requests for remaining pages (default: 10).
-        
+        online: If True, panel restricts results to users seen online within
+            its own 2-minute window (online_at >= now - 2min).
+        online_after: ISO-8601 timestamp; panel restricts results to
+            online_at >= this value. Use instead of `online` when the desired
+            freshness window is wider than the panel's fixed 2 minutes.
+        sort: Optional sort expression (e.g. '-online_at').
+
     Returns:
         list[dict]: List of raw user dictionaries from the panel API.
     """
     from utils.panel_api.request_helper import panel_get
-    
+
     filter_desc = []
     if status:
         filter_desc.append(f"status={status}")
@@ -55,9 +64,13 @@ async def fetch_all_users_raw(
         filter_desc.append(f"group={group}")
     if search:
         filter_desc.append(f"search={search}")
+    if online:
+        filter_desc.append("online=true")
+    if online_after:
+        filter_desc.append(f"online_after={online_after}")
     filter_str = f" ({', '.join(filter_desc)})" if filter_desc else ""
     users_logger.debug(f"📋 Fetching users from panel{filter_str}...")
-    
+
     params = {"offset": 0, "limit": limit}
     if status:
         params["status"] = status
@@ -67,6 +80,12 @@ async def fetch_all_users_raw(
         params["group"] = group
     if search:
         params["search"] = search
+    if online:
+        params["online"] = "true"
+    if online_after:
+        params["online_after"] = online_after
+    if sort:
+        params["sort"] = sort
         
     start_time = time.perf_counter()
     response = await panel_get(

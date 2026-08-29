@@ -397,6 +397,77 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
             config["user_sync_interval"] = int(db_config["user_sync_interval"])
         except (ValueError, TypeError):
             pass
+
+    # ------------------------------------------------------------------
+    # IP source selection: "logs" (SSE log streaming) or "api" (panel API)
+    # In "api" mode the connected IPs are pulled from the panel's
+    # online-stats endpoints instead of parsing node logs. The rest of the
+    # pipeline (device counting, warning system, punishment) is identical.
+    # ------------------------------------------------------------------
+    config["ip_source"] = str(db_config.get("ip_source", "logs")).strip().lower()
+    if config["ip_source"] not in ("logs", "api"):
+        config["ip_source"] = "logs"
+
+    # Max concurrent per-user online-IP requests during the API fan-out.
+    # Sized against the shared httpx pool (max_connections=50).
+    try:
+        config["api_ip_concurrency"] = int(db_config.get("api_ip_concurrency", "20"))
+    except (ValueError, TypeError):
+        config["api_ip_concurrency"] = 20
+    config["api_ip_concurrency"] = max(1, min(40, config["api_ip_concurrency"]))
+
+    # Candidate selection strategy:
+    #   "online"         -> only users the panel reports as recently online
+    #   "all_monitored"  -> every monitored user (heavier, no freshness window)
+    config["api_ip_candidate_mode"] = str(
+        db_config.get("api_ip_candidate_mode", "online")
+    ).strip().lower()
+    if config["api_ip_candidate_mode"] not in ("online", "all_monitored"):
+        config["api_ip_candidate_mode"] = "online"
+
+    # Online freshness window in seconds. 0 = auto (check_interval + 30s).
+    try:
+        config["api_ip_online_window"] = int(db_config.get("api_ip_online_window", "0"))
+    except (ValueError, TypeError):
+        config["api_ip_online_window"] = 0
+    if config["api_ip_online_window"] < 0:
+        config["api_ip_online_window"] = 0
+
+    # Page size for the candidate /api/users query
+    try:
+        config["api_ip_page_size"] = int(db_config.get("api_ip_page_size", "500"))
+    except (ValueError, TypeError):
+        config["api_ip_page_size"] = 500
+    config["api_ip_page_size"] = max(50, min(1000, config["api_ip_page_size"]))
+
+    # Timeout for a single per-user online-IP request
+    try:
+        config["api_ip_timeout"] = float(db_config.get("api_ip_timeout", "8.0"))
+    except (ValueError, TypeError):
+        config["api_ip_timeout"] = 8.0
+    config["api_ip_timeout"] = max(2.0, min(60.0, config["api_ip_timeout"]))
+
+    # Placeholder inbound protocol name: the panel API returns {ip: count}
+    # per node without any inbound information, so a sentinel is used to
+    # keep the (ip, inbound) device-counting key shape intact.
+    config["api_ip_sentinel_inbound"] = str(
+        db_config.get("api_ip_sentinel_inbound", "API")
+    ).strip() or "API"
+
+    # Minimum successful-fetch ratio required to run enforcement for a cycle.
+    # Below this the cycle is skipped entirely so that a flaky panel cannot
+    # mass-reset the consecutive-violation counters of real offenders.
+    try:
+        config["api_ip_min_coverage"] = float(db_config.get("api_ip_min_coverage", "0.8"))
+    except (ValueError, TypeError):
+        config["api_ip_min_coverage"] = 0.8
+    config["api_ip_min_coverage"] = max(0.0, min(1.0, config["api_ip_min_coverage"]))
+
+    # Automatically fall back to log mode after repeated total failures
+    # (e.g. the panel account is missing the nodes:stats permission).
+    config["api_ip_auto_fallback"] = db_config.get(
+        "api_ip_auto_fallback", "true"
+    ).lower() == "true"
     
     # Validate required elements
     if check_required_elements:
@@ -502,6 +573,7 @@ def get_config_value(config: dict, key: str, default: Any = None) -> Any:
         "ENHANCED_DETAILS": lambda c: c.get("enhanced_details"),
         "SHOW_SINGLE_IP_USERS": lambda c: c.get("show_single_ip_users"),
         "IPINFO_TOKEN": lambda c: c.get("ipinfo_token"),
+        "IP_SOURCE": lambda c: c.get("ip_source"),
     }
     
     if key in key_map:

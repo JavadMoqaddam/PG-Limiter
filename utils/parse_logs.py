@@ -12,6 +12,9 @@ from cachetools import TTLCache
 from utils.shared_state import ACTIVE_USERS, ACTIVE_USERS_LOCK
 from utils.read_config import read_config
 from utils.types import ConnectionInfo, DeviceInfo, UserType
+from utils.logs import get_logger
+
+parse_logger = get_logger("parse_logs")
 
 try:
     import httpx

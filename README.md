@@ -30,6 +30,7 @@
   - [High Trust Mode](#3-high-trust-mode)
   - [CDN & Cloudflare Support](#4-cdn-mode--x-forwarded-for-xff)
   - [Fast User Sync & In-RAM Cache](#5-fast-parallel-user-sync)
+  - [IP Source: Logs or Panel API](#6-ip-source-node-logs-sse-or-panel-api)
 - [Configuration](#-configuration)
 - [CLI Interface](#-cli-interface)
 - [REST API](#-rest-api)
@@ -48,6 +49,7 @@
 |---------|-------------|
 | 🔒 **IP Limiting** | Limit concurrent connections per user globally or with special per-user limits |
 | 📊 **Real-time SSE Monitoring** | SSE-based live log streaming across all connected PasarGuard nodes |
+| 🛰️ **Switchable IP Source** | Collect connected IPs from node logs (SSE) or from the panel API, switchable live from Telegram |
 | 🛡️ **3-Cycle Verification** | Monitors violations across 3 consecutive scans before penalty, eliminating false positives |
 | 🌐 **Subnet Grouping (/24)** | Consolidates dynamic cellular carrier IPs into single `/24` subnets |
 | ⭐ **High Trust Mode** | Dynamically scores long-term stable users to prevent accidental disconnects |
@@ -78,7 +80,7 @@
 ## 📋 Requirements
 
 - **Docker** and **Docker Compose** (installed automatically by the installer)
-- **PasarGuard Panel** (latest version with SSE logs enabled)
+- **PasarGuard Panel** (latest version with SSE logs enabled, or an account with `nodes:stats` for API mode)
 - **Telegram Bot Token** (from [@BotFather](https://t.me/BotFather))
 - **Redis** (included in the default Docker Compose stack)
 
@@ -179,6 +181,27 @@ When running proxy frontends or Cloudflare CDN layers, PG-Limiter extracts the r
 
 ### 5. Fast Parallel User Sync
 Synchronizes 20,000+ users from PasarGuard API using parallel pagination batches (up to 10 concurrent requests) and writes them to SQLite in a single transaction via native `INSERT ... ON CONFLICT DO UPDATE`, caching metadata and limits in RAM for $O(1)$ 0ms lookups.
+
+### 6. IP Source: Node Logs (SSE) or Panel API
+The connected IPs of each user can come from either of two sources, switchable at runtime from **Settings → 🛰️ IP Source (Logs / API)** with no restart:
+
+| | 📜 **Node Logs (SSE)** — default | 🛰️ **Panel API** |
+|---|---|---|
+| Transport | One persistent SSE stream per node | `GET /api/node/online_stats/{id}/ip`, once per online user per cycle |
+| Timing | Continuous, accumulated between cycles | One instant snapshot taken immediately before enforcement |
+| Inbound detail | Real inbound name per connection | Single sentinel inbound (`API`) |
+| Requires | Node logs reachable over SSE | Panel account with the `nodes:stats` permission |
+
+Both modes write into the same `ACTIVE_USERS` structure, so device counting, subnet/CDN/high-trust grouping, the 3-cycle warning system, trust scoring and punishment behave identically.
+
+**How API mode keeps a cycle safe:**
+* **Candidate narrowing.** `GET /api/users` is filtered panel-side by the group IDs from Group Limits / Group Filter, by `status=active`, and by an online-freshness window equal to `CHECK_INTERVAL + 30s`, so only the handful of currently-online monitored users is queried.
+* **Coverage gate.** If fewer than `api_ip_min_coverage` (default **80%**) of the candidates answered, the whole cycle is skipped rather than enforced on partial data — an under-covered snapshot could otherwise clear the counters of real offenders.
+* **Never a false positive.** A snapshot can only report *fewer* IPs than continuous log streaming, never more, and a failed candidate query leaves the previous state untouched instead of wiping pending warnings.
+* **Auto-fallback.** After 3 consecutive cycles with no usable data (for example a missing `nodes:stats` permission) the IP source reverts to logs automatically and a Telegram alert is sent.
+* **Per-inbound CDN grouping is inactive** in API mode because the panel reports no inbound names — use **CDN Nodes** (per-node) instead of CDN Inbounds.
+
+Switching to API mode runs a pre-flight probe against a real online user first, and refuses to switch if the endpoint is not reachable. **Settings → 🛰️ IP Source → 📊 Last API Cycle** shows the last cycle's candidate narrowing, coverage, 403/404 counts and duration.
 
 ---
 
@@ -291,6 +314,7 @@ PG-Limiter/
 │
 ├── utils/                      # Core Business Logic & Workers
 │   ├── check_usage.py          # IP analysis, limits resolution & enforcement
+│   ├── ip_source_api.py        # API-mode IP collector (panel online-stats)
 │   ├── user_sync.py            # Fast parallel panel user synchronization
 │   ├── isp_detector.py         # Subnet & ISP detection engine
 │   ├── redis_cache.py          # Redis async client & Pub/Sub invalidation
@@ -316,6 +340,11 @@ No. With the 3-cycle consecutive verification system, if a user disconnects or n
 <details>
 <summary><b>How does Subnet Grouping work?</b></summary>
 When Subnet Grouping is enabled, multiple connections originating from the same <code>/24</code> subnet (common in mobile cellular carrier networks) are recognized as a single device session.
+</details>
+
+<details>
+<summary><b>When should I switch the IP source to the panel API?</b></summary>
+Use API mode when node logs are unavailable or too noisy to stream reliably. It queries <code>online_stats</code> once per online user per cycle, so with a <code>CHECK_INTERVAL</code> of 180–300 seconds the panel load stays negligible. It needs a panel account with the <code>nodes:stats</code> permission; the bot pre-flights that before switching, and reverts to logs automatically if the endpoint stops answering.
 </details>
 
 <details>

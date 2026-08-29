@@ -50,6 +50,21 @@ from utils.panel_api.groups import (
     get_groups,
 )
 
+# Online IP statistics (used by the API-based IP source)
+from utils.panel_api.online_ips import (
+    fetch_online_candidates,
+    fetch_user_online_ips,
+    check_online_stats_permission,
+    resolve_panel_token,
+    build_online_after,
+    PANEL_ONLINE_WINDOW_SECONDS,
+    OUTCOME_OK,
+    OUTCOME_NOT_FOUND,
+    OUTCOME_FORBIDDEN,
+    OUTCOME_UNAUTHORIZED,
+    OUTCOME_ERROR,
+)
+
 # Admin operations
 from utils.panel_api.admins import (
     get_admins,
@@ -93,6 +108,18 @@ __all__ = [
     "invalidate_nodes_cache",
     # Groups
     "get_groups",
+    # Online IPs
+    "fetch_online_candidates",
+    "fetch_user_online_ips",
+    "check_online_stats_permission",
+    "resolve_panel_token",
+    "build_online_after",
+    "PANEL_ONLINE_WINDOW_SECONDS",
+    "OUTCOME_OK",
+    "OUTCOME_NOT_FOUND",
+    "OUTCOME_FORBIDDEN",
+    "OUTCOME_UNAUTHORIZED",
+    "OUTCOME_ERROR",
     # Admins
     "get_admins",
     # Request helper

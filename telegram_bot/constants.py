@@ -251,6 +251,13 @@ class CallbackData:
     
     # Cleanup
     CLEANUP_DELETED_USERS = "cleanup_deleted_users"
+
+    # IP source selection (SSE log streaming vs panel API)
+    IP_SOURCE_MENU = "ip_source_menu"
+    IP_SOURCE_SET_LOGS = "ip_source_set_logs"
+    IP_SOURCE_SET_API = "ip_source_set_api"
+    IP_SOURCE_SET_CONCURRENCY = "ip_source_set_concurrency"
+    IP_SOURCE_STATS = "ip_source_stats"
     
     # Auto-backup settings
     AUTO_BACKUP_MENU = "auto_backup_menu"
@@ -297,6 +304,9 @@ HELP_TEXT = """
 <b>⚙️ Settings:</b>
 /show_enhanced_details - Toggle enhanced info
 /set_ipinfo_token - Set IPInfo API token
+
+<b>🛰️ IP Source:</b>
+Settings → IP Source - Switch between node logs (SSE) and the panel API
 
 <b>📡 Monitoring:</b>
 /monitoring_status - Current monitoring status

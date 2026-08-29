@@ -36,12 +36,29 @@ async def _build_node_status_message() -> str:
         return "🔄 <b>SSE Node Connections</b>\n\nNo nodes to connect."
     
     time_str = datetime.now().strftime("%H:%M:%S")
-    lines = [f"🔄 <b>SSE Node Connections</b> - {time_str}\n"]
+    # When every node reports the API-mode marker the streams are intentionally
+    # closed, so the header says so instead of implying a broken SSE.
+    api_mode = all(
+        "🛰️" in info["status"] for info in _node_connection_status.values()
+    )
+    title = (
+        "🛰️ <b>IP Source: Panel API</b>"
+        if api_mode
+        else "🔄 <b>SSE Node Connections</b>"
+    )
+    lines = [f"{title} - {time_str}\n"]
     
     for node_id in sorted(_node_connection_status.keys()):
         info = _node_connection_status[node_id]
         lines.append(f"  {info['status']} Node {node_id}: <code>{info['name']}</code>")
     
+    if api_mode:
+        lines.append(
+            f"\n📊 Nodes: {len(_node_connection_status)} | "
+            "IPs are collected from the panel API each check cycle"
+        )
+        return "\n".join(lines)
+
     # Count statuses
     connected = sum(1 for info in _node_connection_status.values() if "✅" in info['status'])
     connecting = sum(1 for info in _node_connection_status.values() if "⏳" in info['status'])
@@ -55,6 +72,26 @@ async def _build_node_status_message() -> str:
 _last_status_edit_time = 0.0
 _last_status_text = ""
 _pending_status_update_task: asyncio.Task | None = None
+
+# How often a live SSE stream re-checks whether the IP source was switched
+# to API mode from the Telegram bot.
+_IP_SOURCE_RECHECK_SECONDS = 15.0
+
+
+async def _ip_source_is_api() -> bool:
+    """
+    Report whether the limiter is currently configured to pull IPs from the API.
+
+    ``read_config()`` is backed by a 2-second in-memory cache, so this stays
+    cheap enough to poll from inside the streaming loop.
+    """
+    from utils.read_config import read_config
+
+    try:
+        config_data = await read_config()
+    except Exception:  # pylint: disable=broad-except
+        return False
+    return str(config_data.get("ip_source") or "logs") == "api"
 
 
 async def _get_status_throttle_interval() -> float:
@@ -179,6 +216,15 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
     max_failures_before_wait = 3  # Wait for panel after 3 consecutive connection failures
     
     while True:
+        # API mode owns the IP collection, so the SSE stream must stay closed;
+        # otherwise both writers would feed ACTIVE_USERS and double-count
+        # devices. The task idles instead of exiting so that switching back to
+        # log mode from Telegram resumes streaming without a restart.
+        if await _ip_source_is_api():
+            await _update_node_status(node.node_id, node.node_name, "🛰️ API mode")
+            await asyncio.sleep(10)
+            continue
+
         # If we've had multiple consecutive failures, panel might be restarting
         if consecutive_failures >= max_failures_before_wait:
             await _update_node_status(node.node_id, node.node_name, "⏳ Waiting for panel...")
@@ -233,7 +279,21 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
                     if cleared_count > 0:
                         logger.info(f"🧹 Cleared {cleared_count} stale connections for node {node.node_id} ({node.node_name}) before reading SSE stream")
                     
+                    next_mode_check = time.time() + _IP_SOURCE_RECHECK_SECONDS
                     async for line in response.aiter_lines():
+                        # Honour a runtime switch to API mode: the stream is
+                        # abandoned so the outer loop can park the task.
+                        now = time.time()
+                        if now >= next_mode_check:
+                            next_mode_check = now + _IP_SOURCE_RECHECK_SECONDS
+                            if await _ip_source_is_api():
+                                logger.info(
+                                    f"🛰️ IP source switched to API, closing SSE stream "
+                                    f"for node {node.node_id} ({node.node_name})"
+                                )
+                                await clear_node_active_connections(node.node_id)
+                                break
+
                         if line.startswith("data: "):
                             log_data = line[6:]  # Remove "data: " prefix
                             if log_data.strip():  # Only process non-empty log data
@@ -340,7 +400,14 @@ async def handle_cancel_all(tasks: list[Task], panel_data: PanelType, tg: asynci
     while True:
         # Wait for 2 hours before restarting all SSE connections
         await asyncio.sleep(2 * 60 * 60)  # 2 hours
-        
+
+        # Nothing to refresh in API mode — the node tasks are parked and no
+        # stream is open, so a restart would only produce a misleading
+        # "SSE Refresh" notification.
+        if await _ip_source_is_api():
+            logger.debug("🛰️ Skipping SSE refresh: IP source is API mode")
+            continue
+
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"[{time_str}] Restarting all SSE connections (2-hour refresh)")
         await send_logs(f"🔄 <b>SSE Refresh</b> - {time_str}\n\nRestarting all node connections...")

@@ -1236,6 +1236,26 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
     """run check_ip_used() function and then run check_users_usage()"""
     while True:
         config_data = await read_config()
-        await check_users_usage(panel_data, config_data=config_data)
+
+        # In API mode the connected IPs are collected right here, immediately
+        # before enforcement, instead of being streamed in continuously by the
+        # SSE log tasks. When the collector reports an untrustworthy sample the
+        # cycle is skipped entirely: feeding partial data to check_users_usage
+        # would clear the consecutive-violation counters of real offenders.
+        run_enforcement = True
+        if str(config_data.get("ip_source") or "logs") == "api":
+            from utils.ip_source_api import collect_active_users_from_api
+
+            try:
+                run_enforcement = await collect_active_users_from_api(
+                    panel_data, config_data
+                )
+            except Exception as error:  # pylint: disable=broad-except
+                logger.error(f"🛰️ API IP collection failed: {error}")
+                run_enforcement = False
+
+        if run_enforcement:
+            await check_users_usage(panel_data, config_data=config_data)
+
         check_interval = config_data.get("check_interval") or config_data.get("monitoring", {}).get("check_interval", 60)
         await asyncio.sleep(int(check_interval))
