@@ -183,17 +183,69 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 log_step 4 "Running database migrations..."
 
-# Run alembic migrations
-MIGRATION_OUTPUT=$(timeout 30 python -m alembic upgrade head 2>&1)
+# STEP 3 builds the whole schema with create_all, so on a database that was never
+# stamped `alembic upgrade head` starts at 001_initial and tries to create tables
+# that already exist. That failure used to be downgraded to a warning, which is
+# why alembic_version stayed empty forever and no migration ever applied on a real
+# install - a missing index or column then shows up as a silent per-cycle failure
+# instead of a loud one at boot. Stamp such a database first, then upgrade.
+STATE_OUTPUT=$(timeout 30 python -u -c "
+import os, sqlite3, sys
+
+url = os.environ.get('DATABASE_URL', 'sqlite+aiosqlite:////var/lib/pg-limiter/data/pg_limiter.db')
+if 'sqlite' not in url:
+    print('NOT_SQLITE', flush=True)
+    sys.exit(0)
+
+path = url.split(':///')[-1].split('?')[0]
+if not os.path.exists(path):
+    print('FRESH', flush=True)
+    sys.exit(0)
+
+con = sqlite3.connect(path)
+tables = {r[0] for r in con.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")}
+if 'users' not in tables:
+    print('FRESH', flush=True)
+elif 'alembic_version' in tables and con.execute('SELECT COUNT(*) FROM alembic_version').fetchone()[0] > 0:
+    print('VERSIONED', flush=True)
+else:
+    print('NEEDS_STAMP', flush=True)
+con.close()
+" 2>&1)
+
+case "$STATE_OUTPUT" in
+    *NEEDS_STAMP*)
+        log_info "Existing schema with no migration version - stamping it as current"
+        if ! STAMP_OUTPUT=$(timeout 30 python -m alembic stamp head 2>&1); then
+            log_error "Could not stamp the database as current:"
+            echo "$STAMP_OUTPUT" | while read -r line; do log_error "$line"; done
+            exit 1
+        fi
+        ;;
+    *FRESH*|*VERSIONED*|*NOT_SQLITE*)
+        ;;
+    *)
+        log_error "Could not determine the database migration state:"
+        echo "$STATE_OUTPUT" | while read -r line; do log_error "$line"; done
+        exit 1
+        ;;
+esac
+
+MIGRATION_OUTPUT=$(timeout 60 python -m alembic upgrade head 2>&1)
 MIGRATION_EXIT=$?
 
 if [ $MIGRATION_EXIT -eq 0 ]; then
     log_info "Migrations applied successfully"
 elif [ $MIGRATION_EXIT -eq 124 ]; then
-    log_warn "Migration timed out, continuing..."
+    log_error "Migrations timed out after 60s - refusing to start on an unverified schema"
+    exit 1
 else
-    log_warn "Migrations skipped (may already be applied)"
-    log_debug "Details: ${MIGRATION_OUTPUT:0:100}..."
+    # Deliberately fatal. A schema the code does not expect is worse than a
+    # container that will not start: enforcement would keep banning while some
+    # write silently failed every cycle.
+    log_error "Migrations failed - refusing to start:"
+    echo "$MIGRATION_OUTPUT" | while read -r line; do log_error "$line"; done
+    exit 1
 fi
 
 # Migrate from JSON to database if old JSON files exist
