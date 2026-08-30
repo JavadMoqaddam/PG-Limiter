@@ -9,7 +9,7 @@ from ssl import SSLError
 
 import httpx
 
-from utils.handel_dis_users import get_disabled_users
+from utils import handel_dis_users as dis_users
 from utils.user_groups_storage import UserGroupsStorage
 from utils.logs import logger, log_api_request, log_user_action, get_logger
 from utils.read_config import read_config
@@ -1042,9 +1042,18 @@ async def disable_user(panel_data: PanelType, username: UserType, duration_secon
         success = await disable_user_by_status(panel_data, username.name)
     
     if success:
-        dis_obj = get_disabled_users()
-        await dis_obj.add_user(username.name, duration_seconds, permanent=permanent)
-        users_logger.info(f"🚫 User {username.name} added to disabled users list (permanent={permanent})")
+        tracked = await dis_users.disable(
+            username.name, duration_seconds, permanent=permanent
+        )
+        if tracked:
+            users_logger.info(f"🚫 User {username.name} added to disabled users list (permanent={permanent})")
+        else:
+            # The panel disable happened but the registry did not record it, so
+            # nothing will auto-enable this user. Surfaced loudly on purpose.
+            users_logger.error(
+                f"🚫 User {username.name} was disabled on the panel but could NOT be "
+                f"recorded in the database - they will need a manual enable"
+            )
         return None
     
     message = f"Failed to disable user: {username.name}"
@@ -1233,8 +1242,7 @@ async def enable_dis_user(panel_data: PanelType):
             data = await read_config()
             time_to_active = data.get("monitoring", {}).get("time_to_active_users", 1800)
             
-            dis_obj = get_disabled_users()
-            users_to_enable = await dis_obj.get_users_to_enable(time_to_active)
+            users_to_enable = await dis_users.users_to_enable(time_to_active)
             
             if users_to_enable:
                 users_logger.info(f"✅ Enabling {len(users_to_enable)} users: {users_to_enable}")
@@ -1246,7 +1254,7 @@ async def enable_dis_user(panel_data: PanelType):
                 not_found = result.get("not_found", [])
                 
                 for username in enabled:
-                    await dis_obj.remove_user(username)
+                    await dis_users.enable(username)
                     users_logger.info(f"✅ User {username} has been re-enabled")
                     # Send enable notification without deleting the disable audit message
                     try:
@@ -1257,7 +1265,7 @@ async def enable_dis_user(panel_data: PanelType):
                 
                 # Remove users that were deleted from panel (404) to stop retry loops
                 for username in not_found:
-                    await dis_obj.remove_user(username)
+                    await dis_users.enable(username)
                     users_logger.info(f"🗑️ User {username} was deleted from panel, removed from disabled list")
                     # Also delete the disable message for deleted users
                     try:
@@ -1372,16 +1380,14 @@ async def fix_stuck_disabled_users(panel_data: PanelType) -> dict:
             
             if not_found:
                 # User was deleted from panel
-                dis_obj = get_disabled_users()
-                await dis_obj.remove_user(username)
+                await dis_users.enable(username)
                 users_logger.info(f"🗑️ User {username} was deleted from panel")
                 continue
-            
+
             if success:
                 # Also remove from disabled users tracking if present
-                dis_obj = get_disabled_users()
-                await dis_obj.remove_user(username)
-                
+                await dis_users.enable(username)
+
                 fixed_users.append(username)
                 users_logger.info(f"✅ Fixed stuck user: {username}")
             else:

@@ -26,11 +26,9 @@ logger = logging.getLogger(__name__)
 # Config files
 CONFIG_FILE = "config.json"
 BACKUP_FILE = "backup.json"
-DISABLED_USERS_FILE = "/var/lib/pg-limiter/disable_users.json"
 
 _config_lock = asyncio.Lock()
 _backup_lock = asyncio.Lock()
-_disabled_lock = asyncio.Lock()
 
 # Security
 security = HTTPBasic()
@@ -99,27 +97,18 @@ def save_backup(backup: dict):
     """Save backup file"""
     atomic_write_json(BACKUP_FILE, backup)
 
-def load_disabled_users() -> dict:
-    """Load disabled users"""
-    if not os.path.exists(DISABLED_USERS_FILE):
-        return {}
-    try:
-        with open(DISABLED_USERS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if "disabled_users" in data:
-                return data["disabled_users"]
-            elif "disable_user" in data:
-                old_users = data.get("disable_user", [])
-                if isinstance(old_users, list):
-                    return {user: time.time() for user in old_users}
-                return old_users
-            return {}
-    except Exception:
-        return {}
+async def load_disabled_users() -> dict:
+    """
+    ``{username: disabled_at}`` straight from the limiter's database.
 
-def save_disabled_users(users: dict):
-    """Save disabled users"""
-    atomic_write_json(DISABLED_USERS_FILE, {"disabled_users": users})
+    This used to parse the JSON registry, and its writer wrote back only
+    ``{"disabled_users": ...}`` - dropping the ``enable_at`` map, which turned
+    every other user's permanent or timed ban into a default-window one. The
+    ``users`` table is the single store now, so that class of accident is gone.
+    """
+    from utils import handel_dis_users as dis_registry
+
+    return await dis_registry.disabled_at_map()
 
 
 def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
@@ -194,8 +183,7 @@ async def get_status(username: str = Depends(verify_credentials)):
     """Get current limiter status"""
     async with _config_lock:
         config = await asyncio.to_thread(load_config)
-    async with _disabled_lock:
-        disabled = await asyncio.to_thread(load_disabled_users)
+    disabled = await load_disabled_users()
     
     limits = config.get("limits", {})
     timing = config.get("timing", {})
@@ -425,8 +413,7 @@ async def delete_except_user(user: str, username: str = Depends(verify_credentia
 @app.get("/users/disabled", tags=["Disabled Users"])
 async def list_disabled_users_route(username: str = Depends(verify_credentials)):
     """List all currently disabled users"""
-    async with _disabled_lock:
-        disabled = await asyncio.to_thread(load_disabled_users)
+    disabled = await load_disabled_users()
     current_time = time.time()
     
     data = []
@@ -447,29 +434,26 @@ async def list_disabled_users_route(username: str = Depends(verify_credentials))
 
 @app.delete("/users/disabled/{user}", tags=["Disabled Users"])
 async def enable_disabled_user(user: str, username: str = Depends(verify_credentials)):
-    """Enable a disabled user (remove from disabled list)"""
-    async with _disabled_lock:
-        disabled = await asyncio.to_thread(load_disabled_users)
-        
-        if user not in disabled:
-            raise HTTPException(status_code=404, detail=f"User {user} is not in disabled list")
-        
-        del disabled[user]
-        await asyncio.to_thread(save_disabled_users, disabled)
-    
+    """Enable a disabled user (clear their disable record)"""
+    from utils import handel_dis_users as dis_registry
+
+    if not await dis_registry.is_disabled(user):
+        raise HTTPException(status_code=404, detail=f"User {user} is not in disabled list")
+
+    if not await dis_registry.enable(user):
+        raise HTTPException(status_code=500, detail=f"Could not clear the disable record for {user}")
+
     return {"success": True, "message": f"User {user} removed from disabled list"}
 
 
 @app.delete("/users/disabled", tags=["Disabled Users"])
 async def enable_all_disabled_users(username: str = Depends(verify_credentials)):
-    """Enable all disabled users (clear the disabled list)"""
-    async with _disabled_lock:
-        disabled = await asyncio.to_thread(load_disabled_users)
-        count = len(disabled)
-        
-        await asyncio.to_thread(save_disabled_users, {})
-    
-    return {"success": True, "message": f"Cleared {count} users from disabled list"}
+    """Enable all disabled users (clear every disable record)"""
+    from utils import handel_dis_users as dis_registry
+
+    cleared = await dis_registry.clear_all()
+
+    return {"success": True, "message": f"Cleared {len(cleared)} users from disabled list"}
 
 
 # ═══════════════════════════════════════════════════════════════

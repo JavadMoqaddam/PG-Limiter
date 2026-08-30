@@ -17,7 +17,7 @@ from utils.get_logs import (
     handle_cancel,
     handle_cancel_one,
 )
-from utils.handel_dis_users import DisabledUsers
+from utils import handel_dis_users as dis_registry
 from utils.panel_api import (
     all_user,
     disable_user,
@@ -41,7 +41,6 @@ users = [
     UserType(name="Test"),
 ]
 INVALID_EMAILS.append("Irancell")
-dis_obj = DisabledUsers()
 
 LOGS = """
 2023/07/07 03:08:59 [2a01:5ec0:5011:9962:d8ed:c723:c32:ac2a]:62316 accepted tcp:2.56.98.255:8000 [GRPC 6 >> DIRECT] email: 6.TEST_user+canyoudetec-t=me
@@ -118,8 +117,8 @@ async def main():  # pylint: disable=too-many-statements
     except ValueError as error:
         print(error)
         return
-    dis_users = await dis_obj.read_and_clear_users()
-    print("Data in '.disable_users.json' file Test:", dis_users)
+    dis_users = await dis_registry.clear_all()
+    print("Disabled users cleared from the registry Test:", dis_users)
     await enable_selected_users(panel_data, dis_users)
     try:
         print("Get All Users Test: ", await all_user(panel_data))

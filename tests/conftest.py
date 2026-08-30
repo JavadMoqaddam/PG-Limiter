@@ -126,9 +126,9 @@ def reset_globals():
     # Import and reset globals that might persist between tests
     try:
         import utils.handel_dis_users as dis_mod
-        # Drop the shared registry so the next test builds its own; there are no
-        # mirror collections left to clear.
-        dis_mod._registry = None
+        # The registry itself lives in SQLite; the only process state left is the
+        # one-shot flag for importing the retired JSON file.
+        dis_mod._migrated = False
     except ImportError:
         pass
     

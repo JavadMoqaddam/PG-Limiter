@@ -417,7 +417,12 @@ class UserCRUD:
             user.is_disabled_by_limiter = True
             user.disabled_at = disabled_at
             user.enable_at = enable_at
-            user.original_groups = original_groups or []
+            # Only overwrite the saved groups when the caller actually supplies
+            # them: the group-based disable path stores them first, and the
+            # registry then records the timing with original_groups=None. Blindly
+            # writing [] there destroyed the backup the re-enable path reads.
+            if original_groups is not None:
+                user.original_groups = original_groups
             user.disable_reason = reason
             user.punishment_step = punishment_step
             db_users_logger.info(f"🚫 User {username} disabled (step={punishment_step})")

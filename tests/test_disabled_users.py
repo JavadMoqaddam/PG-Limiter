@@ -2,241 +2,273 @@
 """
 Tests for the disabled-users registry.
 
-This registry decides when a punished user gets their service back, so what is
-pinned here is the timing (custom timer, permanent, default window) and the fact
-that every read comes from the single ``_entries`` store. The parallel ``set``
-and ``dict`` mirrors this class used to publish were rebound on every mutation,
-so anything that imported them kept a snapshot that never updated again.
+The registry decides when a punished user gets their service back, so the rules
+pinned here are the ones a mistake would be felt on: the custom timer, the
+permanent (manual-only) ban, the default window, and the guarantee that a user
+who is not in the local database still gets recorded - otherwise they would be
+disabled on the panel with nothing left to ever re-enable them.
+
+Every test runs against a real throw-away SQLite file, so the SQL itself is
+covered rather than a mock of it.
 """
 
 import json
+import os
 import time
 
 import pytest
 
 
 @pytest.fixture
-def registry_file(tmp_path):
-    """Path for a throw-away registry file."""
-    return str(tmp_path / "test_disabled.json")
+async def registry(tmp_path, monkeypatch):
+    """Point the registry at a throw-away database and return its module."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    import db.database as database
+    import utils.handel_dis_users as dis_registry
+    from db.models import Base
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    monkeypatch.setattr(
+        database,
+        "AsyncSessionLocal",
+        async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False),
+    )
+    # Never let a test touch the real /var/lib registry.
+    monkeypatch.setattr(dis_registry, "LEGACY_JSON_PATH", str(tmp_path / "absent.json"))
+    monkeypatch.setattr(dis_registry, "_migrated", False)
+
+    yield dis_registry
+
+    await engine.dispose()
 
 
-@pytest.fixture
-def registry(registry_file):
-    """A registry bound to a temporary file."""
-    from utils.handel_dis_users import DisabledUsers
+class TestRecordingADisable:
+    """What ``disable()`` stores."""
 
-    return DisabledUsers(filename=registry_file)
+    async def test_default_window(self, registry):
+        assert await registry.disable("user1") is True
+        entry = await registry.entry_of("user1")
+        assert entry.disabled_at > 0
+        # No explicit timer: time_to_active_users decides later.
+        assert entry.enable_at is None
+        assert entry.is_permanent is False
 
-
-class TestLoading:
-    """What the registry holds after reading its file."""
-
-    def test_empty_when_the_file_is_missing(self, registry):
-        assert len(registry) == 0
-        assert registry.disabled_usernames() == set()
-
-    def test_existing_file_is_loaded(self, registry_file):
-        from utils.handel_dis_users import DisabledUsers
-
-        with open(registry_file, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "disabled_users": {"user1": 1234567890.0},
-                    "enable_at": {"user1": 1234567900.0},
-                },
-                handle,
-            )
-
-        dus = DisabledUsers(filename=registry_file)
-        assert dus.is_disabled("user1")
-        assert dus.disabled_at_of("user1") == 1234567890.0
-        assert dus.enable_at_of("user1") == 1234567900.0
-
-    def test_legacy_list_format_is_migrated(self, registry_file):
-        from utils.handel_dis_users import DisabledUsers
-
-        # Very old files stored a bare list with no timestamps.
-        with open(registry_file, "w", encoding="utf-8") as handle:
-            json.dump({"disable_user": ["user1", "user2"]}, handle)
-
-        dus = DisabledUsers(filename=registry_file)
-        assert dus.disabled_usernames() == {"user1", "user2"}
-        assert isinstance(dus.disabled_at_of("user1"), float)
-        # No timer is known for them, so the default window applies.
-        assert dus.enable_at_of("user1") is None
-
-    def test_corrupted_file_is_set_aside(self, registry_file):
-        from utils.handel_dis_users import DisabledUsers
-
-        with open(registry_file, "w", encoding="utf-8") as handle:
-            handle.write("{not json")
-
-        dus = DisabledUsers(filename=registry_file)
-        # An unreadable file must not disable anybody, and must not crash boot.
-        assert len(dus) == 0
-
-    def test_unknown_user_reads_as_not_disabled(self, registry):
-        assert registry.is_disabled("nobody") is False
-        assert registry.disabled_at_of("nobody") is None
-        assert registry.enable_at_of("nobody") is None
-
-
-class TestAddAndRemove:
-    """Adding, removing and clearing entries."""
-
-    @pytest.mark.asyncio
-    async def test_add_user_uses_the_default_window(self, registry):
-        await registry.add_user("test_user")
-        assert registry.is_disabled("test_user")
-        assert registry.disabled_at_of("test_user") > 0
-        # No explicit timer: the default time_to_active decides.
-        assert registry.enable_at_of("test_user") is None
-
-    @pytest.mark.asyncio
-    async def test_add_user_with_duration_sets_a_timer(self, registry):
+    async def test_custom_duration(self, registry):
         before = time.time()
-        await registry.add_user("timed_user", duration_seconds=3600)
-        assert abs(registry.enable_at_of("timed_user") - (before + 3600)) < 5
+        assert await registry.disable("user1", duration_seconds=600) is True
+        assert abs(await registry.enable_at_of("user1") - (before + 600)) < 5
 
-    @pytest.mark.asyncio
-    async def test_permanent_disable_is_marked_with_minus_one(self, registry):
-        await registry.add_user("banned_user", permanent=True)
-        assert registry.enable_at_of("banned_user") == -1.0
+    async def test_permanent(self, registry):
+        assert await registry.disable("user1", permanent=True) is True
+        entry = await registry.entry_of("user1")
+        assert entry.enable_at == registry.PERMANENT
+        assert entry.is_permanent is True
 
-    @pytest.mark.asyncio
-    async def test_remove_user(self, registry):
-        await registry.add_user("to_remove")
-        await registry.remove_user("to_remove")
-        assert registry.is_disabled("to_remove") is False
-        assert registry.disabled_at_map() == {}
+    async def test_permanent_wins_over_duration(self, registry):
+        await registry.disable("user1", duration_seconds=600, permanent=True)
+        assert (await registry.entry_of("user1")).is_permanent is True
 
-    @pytest.mark.asyncio
-    async def test_removing_an_absent_user_is_harmless(self, registry):
-        await registry.remove_user("never_added")
-        assert len(registry) == 0
+    async def test_a_user_missing_from_the_database_is_still_recorded(self, registry):
+        # UserCRUD.set_disabled is a no-op for a user it cannot find, which would
+        # mean disabling somebody on the panel and keeping no record of it.
+        assert await registry.disable("never_synced") is True
+        assert await registry.is_disabled("never_synced") is True
 
-    @pytest.mark.asyncio
-    async def test_read_and_clear_returns_and_empties(self, registry):
-        await registry.add_user("user1")
-        await registry.add_user("user2")
-        assert await registry.read_and_clear_users() == {"user1", "user2"}
-        assert len(registry) == 0
+    async def test_disable_is_idempotent(self, registry):
+        await registry.disable("user1", duration_seconds=60)
+        await registry.disable("user1", permanent=True)
+        assert (await registry.entry_of("user1")).is_permanent is True
+        assert len(await registry.entries()) == 1
 
-    @pytest.mark.asyncio
-    async def test_state_survives_a_reload(self, registry_file):
-        from utils.handel_dis_users import DisabledUsers
 
-        first = DisabledUsers(filename=registry_file)
-        await first.add_user("persistent_user", duration_seconds=1800)
+class TestClearing:
+    """Giving the service back."""
 
-        second = DisabledUsers(filename=registry_file)
-        assert second.is_disabled("persistent_user")
-        assert second.enable_at_of("persistent_user") is not None
+    async def test_enable_clears_the_record(self, registry):
+        await registry.disable("user1", duration_seconds=600)
+        assert await registry.enable("user1") is True
+        assert await registry.is_disabled("user1") is False
+        assert await registry.entry_of("user1") is None
+
+    async def test_enabling_an_untracked_user_is_harmless(self, registry):
+        # No row at all: nothing to clear, and no exception either.
+        assert await registry.enable("never_seen") is False
+
+    async def test_clear_all_returns_the_names_it_cleared(self, registry):
+        await registry.disable("user1")
+        await registry.disable("user2", permanent=True)
+        assert await registry.clear_all() == {"user1", "user2"}
+        assert await registry.entries() == {}
+
+    async def test_clear_all_on_an_empty_registry(self, registry):
+        assert await registry.clear_all() == set()
+
+
+class TestReads:
+    """The shapes the bot, the API and the CLI consume."""
+
+    async def test_unknown_user(self, registry):
+        assert await registry.is_disabled("nobody") is False
+        assert await registry.entry_of("nobody") is None
+        assert await registry.disabled_at_of("nobody") is None
+        assert await registry.enable_at_of("nobody") is None
+
+    async def test_maps_and_sets_agree(self, registry):
+        await registry.disable("user1")
+        await registry.disable("user2")
+
+        entries = await registry.entries()
+        assert set(entries) == {"user1", "user2"}
+        assert await registry.disabled_usernames() == {"user1", "user2"}
+        assert set(await registry.disabled_at_map()) == {"user1", "user2"}
+        assert (await registry.disabled_at_map())["user1"] == entries["user1"].disabled_at
+
+    async def test_an_enabled_user_disappears_from_every_read(self, registry):
+        await registry.disable("user1")
+        await registry.enable("user1")
+        assert await registry.entries() == {}
+        assert await registry.disabled_usernames() == set()
+        assert await registry.disabled_at_map() == {}
 
 
 class TestUsersToEnable:
-    """Who gets their service back on this pass."""
+    """Who is due to come back on this pass."""
 
-    def _put(self, registry, username, disabled_ago, enable_at=None):
-        """Write one entry straight into the store and persist it."""
-        from utils.handel_dis_users import DisabledUserEntry
-
-        registry._entries[username] = DisabledUserEntry(
-            username=username,
-            disabled_at=time.time() - disabled_ago,
-            enable_at=enable_at,
-        )
-        registry._sync_save_disabled_users()
-
-    @pytest.mark.asyncio
-    async def test_expired_custom_timer_is_ready(self, registry):
+    async def test_expired_timer_is_due_and_a_live_one_is_not(self, registry):
         now = time.time()
-        self._put(registry, "expired_user", 100, enable_at=now - 50)
-        self._put(registry, "waiting_user", 10, enable_at=now + 3600)
+        await registry.disable("expired_user", enable_at=now - 50)
+        await registry.disable("waiting_user", enable_at=now + 3600)
+        assert await registry.users_to_enable(60) == ["expired_user"]
 
-        ready = await registry.get_users_to_enable(60)
-        assert ready == ["expired_user"]
+    async def test_permanent_is_never_due(self, registry):
+        await registry.disable("banned_user", permanent=True)
+        # Even with a zero default window a permanent ban holds.
+        assert await registry.users_to_enable(0) == []
 
-    @pytest.mark.asyncio
-    async def test_permanent_is_never_ready(self, registry):
-        self._put(registry, "banned_user", 86400, enable_at=-1)
-        # Even with a zero default window, a permanent disable holds.
-        assert await registry.get_users_to_enable(0) == []
+    async def test_default_window_applies_when_no_timer_is_set(self, registry):
+        now = time.time()
+        await registry.disable("old_enough", disabled_at=now - 400)
+        await registry.disable("too_recent", disabled_at=now - 10)
+        assert await registry.users_to_enable(300) == ["old_enough"]
 
-    @pytest.mark.asyncio
-    async def test_default_window_decides_when_no_timer_is_set(self, registry):
-        self._put(registry, "old_enough", 400)
-        self._put(registry, "too_recent", 10)
-
-        ready = await registry.get_users_to_enable(300)
-        assert ready == ["old_enough"]
+    async def test_nobody_disabled_means_nobody_due(self, registry):
+        assert await registry.users_to_enable(0) == []
 
 
 class TestRemainingTime:
     """What the Telegram menus show next to a disabled user."""
 
-    def test_not_disabled(self, registry):
-        from utils.handel_dis_users import DisableStatus
-
-        result = registry.get_user_remaining_time("nobody", 300)
-        assert result.status == DisableStatus.NOT_DISABLED
+    async def test_not_disabled(self, registry):
+        result = await registry.remaining_time("nobody", 300)
+        assert result.status == registry.DisableStatus.NOT_DISABLED
         assert result.is_disabled is False
 
-    @pytest.mark.asyncio
     async def test_permanent(self, registry):
-        from utils.handel_dis_users import DisableStatus
-
-        await registry.add_user("banned_user", permanent=True)
-        result = registry.get_user_remaining_time("banned_user", 300)
-        assert result.status == DisableStatus.PERMANENT
+        await registry.disable("banned_user", permanent=True)
+        result = await registry.remaining_time("banned_user", 300)
+        assert result.status == registry.DisableStatus.PERMANENT
         assert result.is_permanent is True
         assert result.seconds == 0
 
-    @pytest.mark.asyncio
     async def test_timed_counts_down(self, registry):
-        from utils.handel_dis_users import DisableStatus
-
-        await registry.add_user("timed_user", duration_seconds=600)
-        result = registry.get_user_remaining_time("timed_user", 300)
-        assert result.status == DisableStatus.TIMED
+        await registry.disable("timed_user", duration_seconds=600)
+        result = await registry.remaining_time("timed_user", 300)
+        assert result.status == registry.DisableStatus.TIMED
         assert 500 < result.seconds <= 600
 
-    @pytest.mark.asyncio
     async def test_ready_once_the_default_window_passed(self, registry):
-        from utils.handel_dis_users import DisableStatus, DisabledUserEntry
-
-        registry._entries["old_user"] = DisabledUserEntry(
-            username="old_user", disabled_at=time.time() - 400
-        )
-        result = registry.get_user_remaining_time("old_user", 300)
-        assert result.status == DisableStatus.READY_TO_ENABLE
+        await registry.disable("old_user", disabled_at=time.time() - 400)
+        result = await registry.remaining_time("old_user", 300)
+        assert result.status == registry.DisableStatus.READY_TO_ENABLE
         assert result.is_ready is True
 
 
-class TestSharedRegistry:
-    """Everything in the process must read and write the same registry."""
+class TestLegacyJsonImport:
+    """Nobody may be left disabled invisibly by the move to SQLite."""
 
-    def test_accessor_returns_one_instance(self, monkeypatch):
-        import utils.handel_dis_users as dis_mod
+    def _write(self, path, payload):
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
 
-        # monkeypatch restores the module global afterwards, so a singleton built
-        # here cannot leak into the next test.
-        monkeypatch.setattr(dis_mod, "_registry", None)
-        first = dis_mod.get_disabled_users()
-        second = dis_mod.get_disabled_users()
-        assert first is second
+    async def test_entries_and_timers_are_carried_over(self, registry, tmp_path):
+        legacy = tmp_path / "disable_users.json"
+        now = time.time()
+        self._write(
+            legacy,
+            {
+                "disabled_users": {"timed": now - 10, "forever": now - 20, "plain": now - 30},
+                "enable_at": {"timed": now + 600, "forever": -1},
+            },
+        )
 
-    @pytest.mark.asyncio
-    async def test_a_write_is_visible_to_every_reader(self, registry):
-        # There are no mirrors left to fall out of sync: the map is derived from
-        # the store on every call.
-        await registry.add_user("shared_user", duration_seconds=120)
-        assert "shared_user" in registry.disabled_at_map()
-        assert "shared_user" in registry.disabled_usernames()
-        assert registry.entries()["shared_user"].enable_at is not None
+        assert await registry.import_legacy_json(str(legacy)) == 3
 
-        await registry.remove_user("shared_user")
-        assert registry.disabled_at_map() == {}
-        assert registry.disabled_usernames() == set()
-        assert registry.entries() == {}
+        assert (await registry.entry_of("timed")).enable_at == pytest.approx(now + 600)
+        assert (await registry.entry_of("forever")).is_permanent is True
+        assert (await registry.entry_of("plain")).enable_at is None
+        # The file is retired so a later restart cannot import it twice.
+        assert not os.path.exists(legacy)
+        assert os.path.exists(str(legacy) + ".migrated")
+
+    async def test_the_old_list_format_is_understood(self, registry, tmp_path):
+        legacy = tmp_path / "disable_users.json"
+        self._write(legacy, {"disable_user": ["user1", "user2"]})
+
+        assert await registry.import_legacy_json(str(legacy)) == 2
+        assert await registry.disabled_usernames() == {"user1", "user2"}
+
+    async def test_a_lifted_ban_is_not_resurrected(self, registry, tmp_path):
+        legacy = tmp_path / "disable_users.json"
+        self._write(legacy, {"disabled_users": {"user1": time.time()}})
+
+        await registry.disable("user1", permanent=True)
+        assert await registry.import_legacy_json(str(legacy)) == 0
+        # The database record wins; the JSON copy cannot downgrade it.
+        assert (await registry.entry_of("user1")).is_permanent is True
+
+    async def test_a_missing_file_is_not_an_error(self, registry, tmp_path):
+        assert await registry.import_legacy_json(str(tmp_path / "nope.json")) == 0
+
+
+class TestDegradedDatabase:
+    """
+    An outage must fail in the safe direction.
+
+    Reads report "nobody is disabled" so no user is auto-enabled on guesswork,
+    and writes report failure so the caller can log that the user is disabled on
+    the panel with nothing tracking them.
+    """
+
+    async def test_reads_are_empty_and_writes_report_failure(self, registry, monkeypatch):
+        import db.database as database
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("database is gone")
+
+        monkeypatch.setattr(database, "AsyncSessionLocal", explode)
+
+        assert await registry.entries() == {}
+        assert await registry.disabled_at_map() == {}
+        assert await registry.disabled_usernames() == set()
+        assert await registry.users_to_enable(0) == []
+        assert await registry.is_disabled("user1") is False
+        assert await registry.entry_of("user1") is None
+
+        assert await registry.disable("user1") is False
+        assert await registry.enable("user1") is False
+        assert await registry.clear_all() == set()
+
+    async def test_remaining_time_of_an_unreachable_user(self, registry, monkeypatch):
+        import db.database as database
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("database is gone")
+
+        monkeypatch.setattr(database, "AsyncSessionLocal", explode)
+
+        result = await registry.remaining_time("user1", 300)
+        assert result.status == registry.DisableStatus.NOT_DISABLED

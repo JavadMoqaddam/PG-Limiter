@@ -1,27 +1,22 @@
 """
-Database Handler Module
-This module provides database-backed replacements for JSON-based utilities.
-It integrates with the db module to provide persistent storage for:
-- Disabled users
-- ISP caching (by subnet)
-- Violation history
-- Configuration
+Database-backed helpers that used to have JSON counterparts.
+
+What remains here is the ISP subnet cache, the violation history and the config
+store. The disabled-users wrapper that used to live here is gone: it only
+delegated to the JSON registry, and that registry is now the ``users`` table
+itself - see utils/handel_dis_users.py.
 """
 
-import asyncio
-import time
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 from cachetools import LRUCache
 from utils.logs import logger
-from utils.handel_dis_users import DisableStatus, RemainingTimeResult
 
 # Try to import database module, fall back to JSON if not available
 try:
     from db import (
         init_db,
         get_db,
-        DisabledUserCRUD,
         SubnetISPCRUD,
         ViolationHistoryCRUD,
         ConfigCRUD,
@@ -31,67 +26,6 @@ try:
 except ImportError as e:
     DB_AVAILABLE = False
     logger.warning(f"Database module not available ({e}), falling back to JSON storage")
-
-
-from utils.handel_dis_users import DisabledUsers, DisableStatus, RemainingTimeResult
-
-
-class DBDisabledUsers:
-    """
-    Unified disabled users manager interface.
-    Delegates directly to the single source of truth DisabledUsers engine
-    with synchronized SQLite and JSON persistence.
-    """
-
-    def __init__(self):
-        self._store = DisabledUsers()
-
-    async def add_user(
-        self,
-        username: str,
-        duration_seconds: int = 0,
-        original_groups: Optional[List[str]] = None,
-        punishment_step: Optional[int] = None,
-        permanent: bool = False,
-    ):
-        """Add a user to disabled users using unified store."""
-        await self._store.add_user(username, duration_seconds=duration_seconds, permanent=permanent)
-
-    async def remove_user(self, username: str):
-        """Remove a user from disabled users using unified store."""
-        await self._store.remove_user(username)
-
-    async def get_users_to_enable(self, default_time_to_active: int) -> List[str]:
-        """Get list of users ready to be enabled using unified store."""
-        return await self._store.get_users_to_enable(default_time_to_active)
-
-    def get_user_remaining_time(self, username: str, default_time_to_active: int) -> RemainingTimeResult:
-        """Get remaining disable time using unified store."""
-        return self._store.get_user_remaining_time(username, default_time_to_active)
-
-    def is_disabled(self, username: str) -> bool:
-        """Check if user is disabled."""
-        return self._store.is_disabled(username)
-
-    def get_original_groups(self, username: str) -> Optional[List[str]]:
-        """Get user's original groups."""
-        return None
-
-    def get_punishment_step(self, username: str) -> Optional[int]:
-        """Get user's applied punishment step."""
-        return None
-
-    @property
-    def disabled_users(self) -> Set[str]:
-        """Get set of disabled usernames."""
-        return set(self._store._entries.keys())
-
-    async def read_and_clear_users(self) -> Set[str]:
-        """Clear all disabled users and return their usernames."""
-        users = set(self._store._entries.keys())
-        for u in list(users):
-            await self._store.remove_user(u)
-        return users
 
 
 class DBSubnetISPCache:
@@ -382,18 +316,9 @@ class DBConfig:
 # Singleton instances
 # ============================================================================
 
-_db_disabled_users: Optional[DBDisabledUsers] = None
 _db_subnet_cache: Optional[DBSubnetISPCache] = None
 _db_violation_history: Optional[DBViolationHistory] = None
 _db_config: Optional[DBConfig] = None
-
-
-def get_db_disabled_users() -> DBDisabledUsers:
-    """Get or create the database-backed disabled users handler"""
-    global _db_disabled_users
-    if _db_disabled_users is None:
-        _db_disabled_users = DBDisabledUsers()
-    return _db_disabled_users
 
 
 def get_db_subnet_cache() -> DBSubnetISPCache:
