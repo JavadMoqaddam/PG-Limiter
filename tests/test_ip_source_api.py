@@ -7,6 +7,8 @@ the same ACTIVE_USERS structure log mode produces, and the fail-safe rules that
 decide whether a cycle is trustworthy enough for enforcement to run at all.
 """
 
+import time
+
 import pytest
 
 
@@ -353,7 +355,38 @@ class TestBuildUsersFromPayloads:
         assert {c.inbound_protocol for c in user.device_info.connections} == {"API"}
         assert stats == {
             "geo_lookups": 0, "nodes_seen": 1, "total_ips": 2, "users_with_ips": 1,
+            "stale_ips": 0,
         }
+
+    @pytest.mark.asyncio
+    async def test_stale_ips_are_dropped(self, api_config):
+        from utils.ip_source_api import _build_users_from_payloads
+
+        # The panel keeps an IP in the map with its last-seen timestamp long
+        # after the client left; anything older than the freshness window is not
+        # a currently connected device.
+        now = int(time.time())
+        api_config["check_interval"] = 180
+        payloads = {"alice": {1: {"5.6.7.8": now, "9.9.9.9": now - 3600}}}
+        users, stats = await _build_users_from_payloads(
+            payloads, {}, {1: "node"}, set(), api_config
+        )
+        assert users["alice"].ip == ["5.6.7.8"]
+        assert stats["stale_ips"] == 1
+
+    @pytest.mark.asyncio
+    async def test_legacy_connection_counts_are_kept(self, api_config):
+        from utils.ip_source_api import _build_users_from_payloads
+
+        # Older panel builds returned a connection count instead of a
+        # timestamp. It carries no freshness information, so it must never be
+        # read as an ancient last-seen value and dropped.
+        payloads = {"alice": {1: {"5.6.7.8": 3}}}
+        users, stats = await _build_users_from_payloads(
+            payloads, {}, {1: "node"}, set(), api_config
+        )
+        assert users["alice"].ip == ["5.6.7.8"]
+        assert stats["stale_ips"] == 0
 
     @pytest.mark.asyncio
     async def test_disabled_nodes_are_excluded(self, api_config):
@@ -466,6 +499,28 @@ class TestOnlineWindow:
         api_config.pop("check_interval")
         api_config["monitoring"] = {"check_interval": 180}
         assert _resolve_online_window(api_config) == 210
+
+
+class TestFreshnessWindow:
+    """An IP older than this window is not a currently connected device."""
+
+    def test_auto_window_is_the_check_interval(self, api_config):
+        from utils.ip_source_api import _resolve_freshness_window
+
+        api_config["check_interval"] = 240
+        assert _resolve_freshness_window(api_config) == 240
+
+    def test_explicit_value_wins(self, api_config):
+        from utils.ip_source_api import _resolve_freshness_window
+
+        api_config["api_ip_freshness"] = 90
+        assert _resolve_freshness_window(api_config) == 90
+
+    def test_short_interval_keeps_a_floor(self, api_config):
+        from utils.ip_source_api import _resolve_freshness_window
+
+        api_config["check_interval"] = 10
+        assert _resolve_freshness_window(api_config) == 60
 
 
 class TestCollectFailSafe:
