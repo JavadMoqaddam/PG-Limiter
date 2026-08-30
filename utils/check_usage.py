@@ -153,10 +153,26 @@ async def resolve_effective_limit(
         return 2
 
 
+class MetadataUnavailable(RuntimeError):
+    """
+    The local database could not be read, so limits and monitoring flags are unknown.
+
+    Raised only when the caller asked for a strict read. The enforcement path does,
+    because the alternative - carrying on with a partial mapping - makes a database
+    hiccup indistinguishable from "these users have no group limit", and the general
+    fallback is stricter than most group limits.
+    """
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # NEW: Smart Batching for Group Limits (Performance Optimized)
 # ═══════════════════════════════════════════════════════════════════════════════
-async def get_group_limits_batch(usernames: list[str], config_data: dict, panel_data: PanelType) -> dict[str, int]:
+async def get_group_limits_batch(
+    usernames: list[str],
+    config_data: dict,
+    panel_data: PanelType,
+    strict: bool = False,
+) -> dict[str, int]:
     """
     Smart Batching: Fetches group limits for MULTIPLE users in ONE query / RAM cache.
     Handles multi-group logic by taking the maximum limit.
@@ -195,12 +211,21 @@ async def get_group_limits_batch(usernames: list[str], config_data: dict, panel_
                     for row in result:
                         gids = row.group_ids or []
                         users_group_mapping[row.username] = gids
-                        # Cache write-back to RAM for O(1) in future cycles
+                        # Cache write-back to RAM for O(1) in future cycles.
+                        # A fresh entry created here carries only group_ids, so it
+                        # is flagged partial: get_active_users_metadata_batch used
+                        # to treat mere presence in this cache as "fully cached"
+                        # and skip the read that fills in is_monitored,
+                        # is_excepted and effective_ip_limit.
                         if row.username not in USER_METADATA_CACHE:
-                            USER_METADATA_CACHE[row.username] = {}
+                            USER_METADATA_CACHE[row.username] = {"_partial": True}
                         USER_METADATA_CACHE[row.username]["group_ids"] = gids
         except Exception as e:
             logger.error(f"Batch fetch group_ids failed: {e}")
+            if strict:
+                raise MetadataUnavailable(
+                    "group limits could not be read from the local database"
+                ) from e
 
     # 3. Process limits (and fallback to API only if user is completely missing from local DB)
     for username in usernames:
@@ -216,9 +241,11 @@ async def get_group_limits_batch(usernames: list[str], config_data: dict, panel_
                     gids = user_info.get("group_ids", [])
                     if not gids and "group_id" in user_info and user_info["group_id"] is not None:
                         gids = [user_info["group_id"]]
-                    # Cache write-back to RAM for O(1) in future cycles
+                    # Cache write-back to RAM for O(1) in future cycles.
+                    # Flagged partial for the same reason as the local-DB branch
+                    # above: this entry holds group_ids and nothing else.
                     if username not in USER_METADATA_CACHE:
-                        USER_METADATA_CACHE[username] = {}
+                        USER_METADATA_CACHE[username] = {"_partial": True}
                     USER_METADATA_CACHE[username]["group_ids"] = gids
             except Exception:
                 gids = []
@@ -233,7 +260,10 @@ async def get_group_limits_batch(usernames: list[str], config_data: dict, panel_
     return result_limits
 
 
-async def get_active_users_metadata_batch(usernames: list[str]) -> dict[str, dict]:
+async def get_active_users_metadata_batch(
+    usernames: list[str],
+    strict: bool = False,
+) -> dict[str, dict]:
     """
     Fetch group_ids, owner_username, is_excepted, and special_limit for multiple users.
     FIRST checks RAM cache (USER_METADATA_CACHE). Zero database queries if cached!
@@ -247,8 +277,14 @@ async def get_active_users_metadata_batch(usernames: list[str]) -> dict[str, dic
     from utils.user_sync import USER_METADATA_CACHE
 
     for u in usernames:
-        if u in USER_METADATA_CACHE:
-            metadata[u] = USER_METADATA_CACHE[u]
+        cached = USER_METADATA_CACHE.get(u)
+        # A partial entry (group_ids only, written by get_group_limits_batch) is a
+        # cache MISS here. Treating it as a hit left the user without is_monitored,
+        # is_excepted or effective_ip_limit for the rest of the sync period, which
+        # silently disabled their whitelist and dropped their limit to the general
+        # fallback. The full read below replaces the entry wholesale.
+        if cached is not None and not cached.get("_partial"):
+            metadata[u] = cached
         else:
             missing_usernames.append(u)
 
@@ -287,6 +323,10 @@ async def get_active_users_metadata_batch(usernames: list[str]) -> dict[str, dic
                     USER_METADATA_CACHE[row.username] = item
     except Exception as e:
         logger.error(f"Batch fetch active users metadata failed: {e}")
+        if strict:
+            raise MetadataUnavailable(
+                "user metadata could not be read from the local database"
+            ) from e
     return metadata
 
 
@@ -743,10 +783,29 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     logger.debug("📝 Recording IPs to history tracker...")
     await ip_history_tracker.record_many(all_users_actual_ips)
 
-    # Batch fetch group limits & metadata for active users
+    # Batch fetch group limits & metadata for active users.
+    #
+    # Strict here on purpose. A partial read used to be indistinguishable from
+    # "this user has no group limit", which resolve_effective_limit turns into the
+    # general limit - and that is stricter than most group limits, so a single
+    # database hiccup warned and then banned users who were inside their real
+    # limit. Skipping the cycle costs nothing: no counter is touched, and the next
+    # cycle re-evaluates everyone from scratch.
     active_usernames = list(all_users_actual_ips.keys())
-    batched_group_limits = await get_group_limits_batch(active_usernames, config_data, panel_data)
-    users_metadata_usage = await get_active_users_metadata_batch(active_usernames)
+    try:
+        batched_group_limits = await get_group_limits_batch(
+            active_usernames, config_data, panel_data, strict=True
+        )
+        users_metadata_usage = await get_active_users_metadata_batch(
+            active_usernames, strict=True
+        )
+    except MetadataUnavailable as error:
+        logger.error(
+            f"⛔ Enforcement skipped this cycle: {error}. Nobody is warned, banned "
+            f"or cleared while limits and monitoring flags are unknown."
+        )
+        all_users_log.clear()
+        return
 
     # ------------------------------------------------------------------
     # Single source of truth for the device count of this cycle.
@@ -800,11 +859,20 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # Track users skipped due to group filter or admin filter
     group_filtered_users = set()
     admin_filtered_users = set()
+    unknown_metadata_users = set()
     cycle_new_warnings = []
 
     for user_name, unique_ips in all_users_actual_ips.items():
         if user_name not in except_users and user_name not in processed_users:
-            user_meta = users_metadata_usage.get(user_name, {})
+            if user_name not in users_metadata_usage:
+                # No local row for this user, so neither their monitoring flag nor
+                # their limit is known. Enforcing on defaults would judge somebody
+                # the operator never asked us to watch against the general limit;
+                # the unknown-user worker syncs them within a cycle or two.
+                unknown_metadata_users.add(user_name)
+                continue
+
+            user_meta = users_metadata_usage[user_name]
 
             # Check group filter (In-Memory)
             # Check pre-computed group_filter status (O(1) RAM lookup)
@@ -946,7 +1014,12 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
             logger.info(f"✅ User {monitored_user} inactive, monitoring cleared")
         else:
             user_current_ips = all_users_actual_ips.get(monitored_user, set())
-            user_meta = users_metadata_usage.get(monitored_user, {})
+            if monitored_user not in users_metadata_usage:
+                # Their limit is unknown, so "within limit" cannot be established.
+                # Clearing on a guess would hand a real offender a fresh start
+                # every cycle, so the record is left exactly as it is.
+                continue
+            user_meta = users_metadata_usage[monitored_user]
             u_lim = await resolve_effective_limit(
                 username=monitored_user,
                 config=config_data,
@@ -971,6 +1044,15 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # Log admin filter stats if any users were filtered
     if admin_filtered_users:
         logger.debug(f"Admin filter: {len(admin_filtered_users)} users skipped")
+
+    # Users the local database knows nothing about yet. Visible on purpose: a count
+    # that keeps growing means user_sync is not keeping up, and every one of these
+    # users is currently unenforced.
+    if unknown_metadata_users:
+        logger.warning(
+            f"⏭️ {len(unknown_metadata_users)} active users skipped - not synced to the "
+            f"local database yet, so their limit is unknown"
+        )
 
     # Dispatch chunked warning reports in batches of 10
     check_interval = float(config_data.get("check_interval") or config_data.get("monitoring", {}).get("check_interval", 60)) if config_data else 60.0
