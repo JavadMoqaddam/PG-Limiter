@@ -282,7 +282,32 @@ class EnhancedWarningSystem:
         
         if username in self.warnings:
             warning = self.warnings[username]
-            warning.consecutive_violations = getattr(warning, "consecutive_violations", 1) + 1
+
+            # consecutive_violations counts *scans*, and a scan only means something
+            # once per check_interval. Nothing here used to compare the clock, so any
+            # fast loop advanced the counter - above all a process that crashes and is
+            # restarted by the supervisor, since every fresh cycle calls this again and
+            # the counters are reloaded from disk. Three such calls a few seconds apart
+            # reached max_warnings and banned a user who should have had
+            # check_interval * max_warnings to correct themselves.
+            #
+            # monitoring_end_time was set to "that scan's time + monitoring_period" on
+            # the previous scan, so it recovers the previous scan time exactly, with no
+            # extra field to persist.
+            previous_scan_time = warning.monitoring_end_time - self.monitoring_period
+            elapsed_since_scan = current_time - previous_scan_time
+            min_scan_gap = max(1.0, self.check_interval * 0.5)
+
+            if elapsed_since_scan >= min_scan_gap:
+                warning.consecutive_violations = getattr(warning, "consecutive_violations", 1) + 1
+            else:
+                warning_logger.warning(
+                    f"⏱️ User {username} violated again only {elapsed_since_scan:.0f}s after the "
+                    f"previous scan (minimum {min_scan_gap:.0f}s) - the record is refreshed but "
+                    f"the violation is not counted, so a fast loop cannot shortcut the "
+                    f"{self.max_warnings}-scan rule"
+                )
+
             warning.ip_count = ip_count
             warning.ips = ips
             if user_limit:

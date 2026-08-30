@@ -1090,7 +1090,22 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
                 run_enforcement = False
 
         if run_enforcement:
-            await check_users_usage(panel_data, config_data=config_data)
+            # One cycle must not be able to end the process. check_users_usage is
+            # awaited directly inside limiter.py's TaskGroup, so anything raising
+            # here - one malformed user, one Telegram error, one DB hiccup - used to
+            # abort the whole group and exit non-zero for a supervisor restart. The
+            # restart then ran a fresh cycle, and because consecutive_violations
+            # counts add_warning calls rather than elapsed time, a crash loop could
+            # walk a user from first sighting to ban far faster than
+            # check_interval * max_warnings.
+            try:
+                await check_users_usage(panel_data, config_data=config_data)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.error(
+                    f"❌ Enforcement cycle failed and was abandoned: {error}. "
+                    f"Counters keep their values; the next cycle re-evaluates everyone.",
+                    exc_info=True,
+                )
 
         check_interval = int(
             config_data.get("check_interval")
