@@ -148,21 +148,22 @@ class TestLogLineParsing:
 
 class TestCacheSystem:
     """Tests for IP location caching"""
-    
+
     def test_cache_initialization(self):
-        """Test that cache dict exists"""
-        from utils.parse_logs import CACHE
-        
-        assert isinstance(CACHE, dict)
-    
+        """The country cache is bounded and shared through utils.ip_facts"""
+        from cachetools import TTLCache
+        from utils.ip_facts import COUNTRY_CACHE
+
+        assert isinstance(COUNTRY_CACHE, TTLCache)
+        assert COUNTRY_CACHE.maxsize > 0
+
     def test_cache_lookup(self):
         """Test cached IP lookup returns cached value"""
-        from utils.parse_logs import CACHE
-        
-        # Manually populate cache
-        CACHE["test.ip.addr.ess"] = "US"
-        
-        assert CACHE.get("test.ip.addr.ess") == "US"
-        
+        from utils.ip_facts import COUNTRY_CACHE
+
+        COUNTRY_CACHE["203.0.113.7"] = "US"
+
+        assert COUNTRY_CACHE.get("203.0.113.7") == "US"
+
         # Clean up
-        del CACHE["test.ip.addr.ess"]
+        del COUNTRY_CACHE["203.0.113.7"]

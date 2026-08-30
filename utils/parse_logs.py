@@ -11,8 +11,8 @@ from cachetools import TTLCache
 
 from utils.shared_state import ACTIVE_USERS, ACTIVE_USERS_LOCK
 from utils.ip_facts import (
+    BLOCKED_IPS,
     COUNTRY_CACHE,
-    NODE_IPS,
     VERDICT_CACHE,
     is_ip_accepted,
     is_public_ip,
@@ -40,9 +40,9 @@ INVALID_EMAILS = {
 }
 
 # Kept as module-level names for the callers and tests that still import them.
-# ``INVALID_IPS`` is the node/static blocklist and ``VALID_IPS`` the accepted-IP
-# view of the shared verdict cache; both live in utils.ip_facts now.
-INVALID_IPS = NODE_IPS
+# ``INVALID_IPS`` is the node/resolver blocklist and ``VALID_IPS`` the verdict
+# cache; both live in utils.ip_facts now.
+INVALID_IPS = BLOCKED_IPS
 VALID_IPS = VERDICT_CACHE
 
 LOCAL_ID_CACHE = TTLCache(maxsize=30000, ttl=600)

@@ -5,7 +5,8 @@ Both IP sources ask the same questions - is this a real public address, is it a
 node's own address, and is it in the country we monitor - and both used to answer
 them from their own set of caches. Everything lives here now:
 
-* ``NODE_IPS``     - the nodes' own addresses; never counted as a user device.
+* ``BLOCKED_IPS``   - the nodes' own addresses plus well-known resolvers; never
+  counted as a user device.
 * ``COUNTRY_CACHE`` - geo lookup results, bounded and expiring.
 * ``VERDICT_CACHE`` - the final accept/reject decision per IP, bounded.
 
@@ -24,12 +25,13 @@ ip_facts_logger = get_logger("ip_facts")
 # Values that mean "do not filter by country" in the COUNTRY_CODE setting.
 GEO_DISABLED_VALUES = {"", "none", "off", "disabled", "any", "all"}
 
-# The nodes' own IPs. Seeded whenever the node list is refreshed; inter-node
-# relay traffic must never be attributed to a user.
-NODE_IPS: set[str] = set()
+# Addresses that are never a user device: the nodes' own addresses (registered
+# whenever the node list is refreshed, so inter-node relay traffic is not
+# attributed to a user) plus well-known public resolvers.
+BLOCKED_IPS: set[str] = {"1.1.1.1", "8.8.8.8"}
 
-# Addresses that are never a user device even when a node forgets to report.
-STATIC_BLOCKED_IPS: set[str] = {"1.1.1.1", "8.8.8.8"}
+# Historical name kept for the callers and tests that import it.
+NODE_IPS = BLOCKED_IPS
 
 # ip -> ISO country code, 12 hours. Long enough that a busy cycle never repeats
 # a lookup, short enough that a reassigned address is re-checked.
@@ -60,13 +62,13 @@ def register_node_ips(ips) -> int:
     """Add node addresses to the blocklist. Returns how many are known now."""
     for ip in ips:
         if ip:
-            NODE_IPS.add(str(ip).strip())
-    return len(NODE_IPS)
+            BLOCKED_IPS.add(str(ip).strip())
+    return len(BLOCKED_IPS)
 
 
 def is_blocked(ip: str) -> bool:
-    """Whether the address belongs to a node or the static blocklist."""
-    return ip in NODE_IPS or ip in STATIC_BLOCKED_IPS
+    """Whether the address is a node address or a known public resolver."""
+    return ip in BLOCKED_IPS
 
 
 def is_public_ip(ip: str) -> bool:
@@ -153,7 +155,7 @@ async def is_ip_accepted(ip: str, config_data: dict) -> bool:
 def cache_stats() -> dict:
     """Sizes of the bounded caches, for diagnostics."""
     return {
-        "node_ips": len(NODE_IPS),
+        "blocked_ips": len(BLOCKED_IPS),
         "country_cache": len(COUNTRY_CACHE),
         "verdict_cache": len(VERDICT_CACHE),
     }

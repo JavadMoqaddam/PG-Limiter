@@ -44,11 +44,11 @@ def api_config():
 def clean_collector_state():
     """Reset collector globals, shared maps and the IP caches per test."""
     import utils.ip_source_api as api_mod
-    from utils.ip_facts import COUNTRY_CACHE, NODE_IPS, VERDICT_CACHE
+    from utils.ip_facts import BLOCKED_IPS, COUNTRY_CACHE, VERDICT_CACHE
     from utils.shared_state import ACTIVE_USERS
     from utils.user_sync import USER_METADATA_CACHE
 
-    node_ip_seed = set(NODE_IPS)
+    blocklist_seed = set(BLOCKED_IPS)
 
     ACTIVE_USERS.clear()
     USER_METADATA_CACHE.clear()
@@ -61,10 +61,10 @@ def clean_collector_state():
     USER_METADATA_CACHE.clear()
     VERDICT_CACHE.clear()
     COUNTRY_CACHE.clear()
-    # The node blocklist is process state; restore it so an address blocked by
-    # one test cannot reject an address another test relies on.
-    NODE_IPS.clear()
-    NODE_IPS.update(node_ip_seed)
+    # The blocklist is process state; restore it so an address blocked by one
+    # test cannot reject an address another test relies on.
+    BLOCKED_IPS.clear()
+    BLOCKED_IPS.update(blocklist_seed)
     api_mod._consecutive_dead_cycles = 0
     api_mod._forbidden_alert_sent = False
 
@@ -256,10 +256,10 @@ class TestValidateIps:
 
     @pytest.mark.asyncio
     async def test_blocklisted_node_ips_are_rejected(self, api_config):
-        from utils.ip_facts import NODE_IPS
+        from utils.ip_facts import BLOCKED_IPS
         from utils.ip_source_api import _validate_ips
 
-        NODE_IPS.add("77.77.77.77")
+        BLOCKED_IPS.add("77.77.77.77")
         accepted, _ = await _validate_ips({"77.77.77.77", "5.6.7.8"}, api_config)
         assert accepted == {"5.6.7.8"}
 
