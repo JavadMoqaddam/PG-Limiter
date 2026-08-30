@@ -261,12 +261,16 @@ async def _fetch_all_online_ips(
     targets: list[tuple[str, int, dict]],
     concurrency: int,
     timeout: float,
-) -> tuple[dict[str, dict[int, dict[str, int]]], dict[str, int]]:
+) -> tuple[dict[str, dict[int, dict[str, int]]], dict[str, int], dict[str, float]]:
     """
     Run the bounded-concurrency fan-out over the candidate users.
 
     Returns:
-        ``({username: {node_id: {ip: count}}}, counters)``
+        ``({username: {node_id: {ip: last_seen}}}, counters, {username: fetched_at})``
+
+    ``fetched_at`` matters because the fan-out can take minutes on a slow
+    panel: freshness has to be judged against the moment that user was
+    sampled, not against the moment the whole pass finished.
     """
     from utils.panel_api.online_ips import (
         OUTCOME_FORBIDDEN,
@@ -279,13 +283,14 @@ async def _fetch_all_online_ips(
 
     counters = {"ok": 0, "failed": 0, "not_found": 0, "forbidden": 0, "unauthorized": 0}
     payloads: dict[str, dict[int, dict[str, int]]] = {}
+    fetch_times: dict[str, float] = {}
     if not targets:
-        return payloads, counters
+        return payloads, counters, fetch_times
 
     token = await resolve_panel_token(panel_data)
     if not token:
         counters["failed"] = len(targets)
-        return payloads, counters
+        return payloads, counters, fetch_times
 
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
@@ -294,7 +299,7 @@ async def _fetch_all_online_ips(
             payload, outcome = await fetch_user_online_ips(
                 panel_data, user_id, active_token, timeout=timeout
             )
-            return username, user_id, payload, outcome
+            return username, user_id, payload, outcome, time.time()
 
     async def _run(batch: list[tuple[str, int]], active_token: str) -> list[tuple[str, int]]:
         """Execute one pass; return the subset that needs a token refresh."""
@@ -307,11 +312,12 @@ async def _fetch_all_online_ips(
             if not isinstance(item, tuple):
                 counters["failed"] += 1
                 continue
-            username, user_id, payload, outcome = item
+            username, user_id, payload, outcome, fetched_at = item
             if outcome == OUTCOME_OK:
                 counters["ok"] += 1
                 if payload:
                     payloads[username] = payload
+                    fetch_times[username] = fetched_at
             elif outcome == OUTCOME_NOT_FOUND:
                 counters["not_found"] += 1
             elif outcome == OUTCOME_FORBIDDEN:
@@ -338,7 +344,7 @@ async def _fetch_all_online_ips(
             counters["unauthorized"] += len(retry_batch)
             counters["failed"] += len(retry_batch)
 
-    return payloads, counters
+    return payloads, counters, fetch_times
 
 
 def _extract_admin_username(raw: dict) -> Optional[str]:
@@ -357,6 +363,7 @@ async def _build_users_from_payloads(
     node_name_map: dict[int, str],
     disabled_nodes: set,
     config_data: dict,
+    fetch_times: dict[str, float] | None = None,
 ) -> tuple[dict[str, UserType], dict]:
     """
     Convert the fan-out payloads into the ``ACTIVE_USERS`` structure.
@@ -369,7 +376,9 @@ async def _build_users_from_payloads(
     The panel keeps an IP in that map long after the client stopped using it, so
     every IP older than the freshness window is dropped here. Without it a user
     who simply changed network during the window looks like several simultaneous
-    devices - the main source of false positives in API mode.
+    devices - the main source of false positives in API mode. Freshness is
+    measured against the moment that user was sampled, because a slow fan-out
+    can finish minutes after the first users were fetched.
 
     Returns:
         ``({username: UserType}, stats)``
@@ -378,7 +387,9 @@ async def _build_users_from_payloads(
     from utils.parse_logs import update_user_device_info_with_node
 
     sentinel_inbound = str(config_data.get("api_ip_sentinel_inbound") or "API")
-    stale_cutoff = time.time() - _resolve_freshness_window(config_data)
+    freshness = _resolve_freshness_window(config_data)
+    fetch_times = fetch_times or {}
+    now = time.time()
 
     # Flatten first so IP validation runs once per unique IP for the whole
     # cycle instead of once per (user, node, ip) triple.
@@ -389,6 +400,7 @@ async def _build_users_from_payloads(
 
     for username, node_map in payloads.items():
         pairs: list[tuple[int, str]] = []
+        stale_cutoff = fetch_times.get(username, now) - freshness
         for node_id, ip_values in node_map.items():
             if node_id in disabled_nodes:
                 continue
@@ -645,7 +657,7 @@ async def collect_active_users_from_api(
         api_ip_logger.info("🛰️ No online candidates this cycle")
         return True
 
-    payloads, counters = await _fetch_all_online_ips(
+    payloads, counters, fetch_times = await _fetch_all_online_ips(
         panel_data,
         targets,
         concurrency=int(config_data.get("api_ip_concurrency") or 20),
@@ -694,8 +706,25 @@ async def collect_active_users_from_api(
 
     raw_by_name = {name: raw for name, _, raw in targets}
     new_users, build_stats = await _build_users_from_payloads(
-        payloads, raw_by_name, node_name_map, set(disabled_nodes), config_data
+        payloads, raw_by_name, node_name_map, set(disabled_nodes), config_data,
+        fetch_times=fetch_times,
     )
+
+    # Every IP filtered out as stale while the panel answered normally means the
+    # timestamps cannot be trusted (clock skew between panel and limiter is the
+    # usual cause). Publishing the resulting empty snapshot would clear every
+    # pending warning, so the cycle is abandoned instead.
+    if not new_users and build_stats["stale_ips"] and payloads:
+        LAST_CYCLE_STATS.update(build_stats)
+        LAST_CYCLE_STATS["skipped_reason"] = "every IP filtered as stale"
+        LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        api_ip_logger.error(
+            f"🛰️ Skipping enforcement: all {build_stats['stale_ips']} reported IPs were "
+            f"older than the freshness window. Check the clock skew between the panel "
+            f"and this container, or raise api_ip_freshness."
+        )
+        return False
+
     await _publish_active_users(new_users)
 
     LAST_CYCLE_STATS.update(build_stats)

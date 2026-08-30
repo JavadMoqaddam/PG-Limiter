@@ -97,7 +97,9 @@ def _patch_collector(
     async def fake_fetch(_panel, targets, **_kwargs):
         default = {"ok": len(targets), "failed": 0, "not_found": 0,
                    "forbidden": 0, "unauthorized": 0}
-        return dict(payloads or {}), dict(counters or default)
+        resolved = dict(payloads or {})
+        now = time.time()
+        return resolved, dict(counters or default), {name: now for name in resolved}
 
     async def fake_notify(message: str):
         notifications.append(message)
@@ -389,6 +391,24 @@ class TestBuildUsersFromPayloads:
         assert stats["stale_ips"] == 0
 
     @pytest.mark.asyncio
+    async def test_freshness_is_measured_from_the_fetch_time(self, api_config):
+        from utils.ip_source_api import _build_users_from_payloads
+
+        # A slow fan-out can finish minutes after the first users were sampled.
+        # Judging their IPs against "now" would discard data that was live when
+        # it was read, silently turning early users into inactive ones.
+        now = int(time.time())
+        api_config["check_interval"] = 180
+        fetched_at = now - 400
+        payloads = {"alice": {1: {"5.6.7.8": fetched_at - 10, "9.9.9.9": fetched_at - 900}}}
+        users, stats = await _build_users_from_payloads(
+            payloads, {}, {1: "node"}, set(), api_config,
+            fetch_times={"alice": fetched_at},
+        )
+        assert users["alice"].ip == ["5.6.7.8"]
+        assert stats["stale_ips"] == 1
+
+    @pytest.mark.asyncio
     async def test_disabled_nodes_are_excluded(self, api_config):
         from utils.ip_source_api import _build_users_from_payloads
 
@@ -611,6 +631,27 @@ class TestCollectFailSafe:
         # A 404 is a definitive answer, so coverage is full and enforcement runs.
         assert await collect_active_users_from_api(panel, api_config) is True
         assert get_last_cycle_stats()["coverage"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_all_stale_ips_skip_the_cycle(self, panel, api_config, monkeypatch):
+        from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
+        from utils.shared_state import ACTIVE_USERS
+        from utils.types import UserType
+
+        # Timestamps that are uniformly ancient point at clock skew, not at
+        # 1300 users going offline at once. Publishing the empty snapshot would
+        # clear every pending warning, so the cycle must be abandoned.
+        ACTIVE_USERS["carol"] = UserType(name="carol", ip=["5.6.7.8"])
+        _patch_collector(
+            monkeypatch,
+            candidates=[{"username": "alice", "id": 1}],
+            payloads={"alice": {1: {"5.6.7.8": int(time.time()) - 86400}}},
+            node_name_map={1: "de"},
+        )
+
+        assert await collect_active_users_from_api(panel, api_config) is False
+        assert list(ACTIVE_USERS) == ["carol"]
+        assert get_last_cycle_stats()["skipped_reason"] == "every IP filtered as stale"
 
     @pytest.mark.asyncio
     async def test_low_coverage_does_not_count_as_a_dead_cycle(

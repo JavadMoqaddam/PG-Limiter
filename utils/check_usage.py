@@ -1066,7 +1066,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     total_ips_cycle = sum(len(v) for v in all_users_actual_ips.values())
     logger.info(
         f"📊 Counting mode '{device_config.count_mode}': {total_devices_cycle} devices "
-        f"from {total_ips_cycle} unique IPs"
+        f"from {total_ips_cycle} per-user IPs"
     )
 
     # Check for users who still violate limits after warning period
