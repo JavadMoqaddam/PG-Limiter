@@ -125,10 +125,10 @@ def reset_globals():
     """Reset global state before each test"""
     # Import and reset globals that might persist between tests
     try:
-        from utils.handel_dis_users import DISABLED_USERS, DISABLED_USERS_TIMESTAMPS, DISABLED_USERS_ENABLE_AT
-        DISABLED_USERS.clear()
-        DISABLED_USERS_TIMESTAMPS.clear()
-        DISABLED_USERS_ENABLE_AT.clear()
+        import utils.handel_dis_users as dis_mod
+        # Drop the shared registry so the next test builds its own; there are no
+        # mirror collections left to clear.
+        dis_mod._registry = None
     except ImportError:
         pass
     

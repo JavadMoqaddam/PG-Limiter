@@ -9,7 +9,7 @@ from ssl import SSLError
 
 import httpx
 
-from utils.handel_dis_users import DisabledUsers
+from utils.handel_dis_users import get_disabled_users
 from utils.user_groups_storage import UserGroupsStorage
 from utils.logs import logger, log_api_request, log_user_action, get_logger
 from utils.read_config import read_config
@@ -1042,7 +1042,7 @@ async def disable_user(panel_data: PanelType, username: UserType, duration_secon
         success = await disable_user_by_status(panel_data, username.name)
     
     if success:
-        dis_obj = DisabledUsers()
+        dis_obj = get_disabled_users()
         await dis_obj.add_user(username.name, duration_seconds, permanent=permanent)
         users_logger.info(f"🚫 User {username.name} added to disabled users list (permanent={permanent})")
         return None
@@ -1233,7 +1233,7 @@ async def enable_dis_user(panel_data: PanelType):
             data = await read_config()
             time_to_active = data.get("monitoring", {}).get("time_to_active_users", 1800)
             
-            dis_obj = DisabledUsers()
+            dis_obj = get_disabled_users()
             users_to_enable = await dis_obj.get_users_to_enable(time_to_active)
             
             if users_to_enable:
@@ -1372,14 +1372,14 @@ async def fix_stuck_disabled_users(panel_data: PanelType) -> dict:
             
             if not_found:
                 # User was deleted from panel
-                dis_obj = DisabledUsers()
+                dis_obj = get_disabled_users()
                 await dis_obj.remove_user(username)
                 users_logger.info(f"🗑️ User {username} was deleted from panel")
                 continue
             
             if success:
                 # Also remove from disabled users tracking if present
-                dis_obj = DisabledUsers()
+                dis_obj = get_disabled_users()
                 await dis_obj.remove_user(username)
                 
                 fixed_users.append(username)

@@ -270,13 +270,13 @@ async def show_except_users(update: Update, _context: ContextTypes.DEFAULT_TYPE)
 
 async def show_disabled_users_menu(query, page: int = 0):
     """Display the disabled users menu with enable buttons."""
-    from utils.handel_dis_users import DisabledUsers
+    from utils.handel_dis_users import get_fresh_disabled_users
     
     try:
         # Load disabled users
-        dis_users = DisabledUsers()
-        disabled_dict = dis_users.disabled_users
-        
+        dis_users = await get_fresh_disabled_users()
+        disabled_dict = dis_users.disabled_at_map()
+
         if not disabled_dict:
             text = (
                 "🚫 <b>Disabled Users</b>\n\n"
@@ -351,14 +351,14 @@ async def enable_single_user(query, username: str):
     Handles both menu callbacks and inline buttons on disable notification messages.
     """
     from datetime import datetime
-    from utils.handel_dis_users import DisabledUsers
+    from utils.handel_dis_users import get_fresh_disabled_users
     from utils.panel_api import enable_selected_users
     from utils.types import PanelType
     from telegram_bot.send_message import remove_disable_message_tracking
     
     try:
-        dis_users = DisabledUsers()
-        disabled_data = await dis_users.get_all_disabled_users()
+        dis_users = await get_fresh_disabled_users()
+        disabled_data = dis_users.disabled_usernames()
         is_user_disabled = username in disabled_data
         
         # Check if callback is from an inline disable notification in the topic
@@ -436,14 +436,14 @@ async def enable_single_user(query, username: str):
 
 async def enable_all_disabled_users(query):
     """Enable all disabled users."""
-    from utils.handel_dis_users import DisabledUsers
+    from utils.handel_dis_users import get_fresh_disabled_users
     from utils.panel_api import enable_selected_users
     from utils.types import PanelType
     
     try:
         # Load disabled users
-        dis_users = DisabledUsers()
-        disabled_dict = dis_users.disabled_users.copy()
+        dis_users = await get_fresh_disabled_users()
+        disabled_dict = dis_users.disabled_at_map()
         
         if not disabled_dict:
             await query.answer("No disabled users to enable!")
@@ -716,10 +716,10 @@ async def show_users_in_disabled_group(query, page: int = 0):
 
 async def show_user_info(query, username: str):
     """Show detailed info for a disabled user."""
-    from utils.handel_dis_users import DisabledUsers
+    from utils.handel_dis_users import get_fresh_disabled_users
     
-    dis_users = DisabledUsers()
-    disabled_time = dis_users.disabled_users.get(username)
+    dis_users = await get_fresh_disabled_users()
+    disabled_time = dis_users.disabled_at_of(username)
     
     if disabled_time:
         elapsed = int(time.time() - disabled_time)

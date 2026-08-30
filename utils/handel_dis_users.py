@@ -55,42 +55,55 @@ class DisabledUserEntry:
 DISABLED_USERS_LOCK = asyncio.Lock()
 _disabled_users_lock = DISABLED_USERS_LOCK
 
-# Global state collections maintained for backward-compatibility
-DISABLED_USERS: set[str] = set()
-DISABLED_USERS_TIMESTAMPS: dict[str, float] = {}
-DISABLED_USERS_ENABLE_AT: dict[str, float] = {}
-
 
 class DisabledUsers:
     """
-    Unified manager for disabled users using DisabledUserEntry dataclass.
-    Thread-safe with atomic JSON persistence and cross-instance asyncio.Lock synchronization.
+    The registry of users this limiter has disabled.
+
+    ``_entries`` is the only store. The parallel ``set`` and two ``dict``
+    mirrors this class used to publish were rebuilt on every mutation and
+    *rebound* as module globals, so any module that had imported them held a
+    snapshot that never changed again. Read state through the accessors below.
     """
     _lock = _disabled_users_lock
 
     def __init__(self, filename: str = "/var/lib/pg-limiter/disable_users.json"):
         self.filename = filename
         self._entries: dict[str, DisabledUserEntry] = {}
-        self.disabled_users: dict[str, float] = {}  # {username: disabled_timestamp}
-        self.enable_at: dict[str, float] = {}  # {username: enable_at_timestamp}
         self._write_lock = self._lock
         self.load_disabled_users()
 
-    def _sync_views_from_entries(self):
-        """Synchronize internal views and global structures from the single source of truth (_entries)."""
-        self.disabled_users = {u: e.disabled_at for u, e in self._entries.items()}
-        self.enable_at = {u: e.enable_at for u, e in self._entries.items() if e.enable_at is not None}
-        
-        global DISABLED_USERS, DISABLED_USERS_TIMESTAMPS, DISABLED_USERS_ENABLE_AT
-        DISABLED_USERS = set(self.disabled_users.keys())
-        DISABLED_USERS_TIMESTAMPS = self.disabled_users.copy()
-        DISABLED_USERS_ENABLE_AT = self.enable_at.copy()
+    # ── read accessors ──────────────────────────────────────────────────────
+
+    def disabled_usernames(self) -> set[str]:
+        """Every username currently registered as disabled."""
+        return set(self._entries)
+
+    def entries(self) -> dict[str, DisabledUserEntry]:
+        """Snapshot of the registry, safe to iterate while it is mutated."""
+        return dict(self._entries)
+
+    def disabled_at_map(self) -> dict[str, float]:
+        """``{username: disabled_at}`` for display; derived on call, never cached."""
+        return {u: e.disabled_at for u, e in self._entries.items()}
+
+    def disabled_at_of(self, username: str) -> float | None:
+        """When the user was disabled, or ``None`` when they are not disabled."""
+        entry = self._entries.get(username)
+        return entry.disabled_at if entry else None
+
+    def enable_at_of(self, username: str) -> float | None:
+        """Custom re-enable timestamp (``-1`` = permanent), ``None`` when unset."""
+        entry = self._entries.get(username)
+        return entry.enable_at if entry else None
+
+    def __len__(self) -> int:
+        return len(self._entries)
 
     def load_disabled_users(self):
         """
         Loads the disabled users from the JSON file into unified DisabledUserEntry registry.
         """
-        global DISABLED_USERS, DISABLED_USERS_TIMESTAMPS, DISABLED_USERS_ENABLE_AT
         try:
             if os.path.exists(self.filename) and os.path.getsize(self.filename) > 0:
                 with open(self.filename, "r", encoding="utf-8") as file:
@@ -117,14 +130,8 @@ class DisabledUsers:
                             disabled_at=float(dis_time),
                             enable_at=float(enable_time) if enable_time is not None else None
                         )
-                    self._sync_views_from_entries()
             else:
                 self._entries.clear()
-                self.disabled_users = {}
-                self.enable_at = {}
-                DISABLED_USERS = set()
-                DISABLED_USERS_TIMESTAMPS = {}
-                DISABLED_USERS_ENABLE_AT = {}
         except Exception as error:  # pylint: disable=broad-except
             logger.error(f"Failed to load disabled users file: {error}")
             try:
@@ -134,11 +141,6 @@ class DisabledUsers:
             except OSError:
                 pass
             self._entries.clear()
-            self.disabled_users = {}
-            self.enable_at = {}
-            DISABLED_USERS = set()
-            DISABLED_USERS_TIMESTAMPS = {}
-            DISABLED_USERS_ENABLE_AT = {}
 
     async def reload_disabled_users(self):
         """
@@ -199,7 +201,6 @@ class DisabledUsers:
                 disabled_at=current_time,
                 enable_at=enable_at_val
             )
-            self._sync_views_from_entries()
             await asyncio.to_thread(self._sync_save_disabled_users)
         
         # Synchronize with SQLite database if available
@@ -229,7 +230,6 @@ class DisabledUsers:
         async with self._lock:
             if username in self._entries:
                 del self._entries[username]
-            self._sync_views_from_entries()
             await asyncio.to_thread(self._sync_save_disabled_users)
         
         # Synchronize with SQLite database if available
@@ -334,7 +334,35 @@ class DisabledUsers:
         async with self._lock:
             disabled_users = set(self._entries.keys())
             self._entries.clear()
-            self._sync_views_from_entries()
             await asyncio.to_thread(self._sync_save_disabled_users)
         return disabled_users
+
+
+# ── shared registry ─────────────────────────────────────────────────────────
+# One process, one registry. Every call site used to build its own
+# ``DisabledUsers()``, which re-read the JSON file and then kept a private copy
+# of the state, so a write through one object stayed invisible to the others
+# until they happened to reload. Pass ``filename`` only in tests.
+_registry: DisabledUsers | None = None
+
+
+def get_disabled_users() -> DisabledUsers:
+    """Return the process-wide disabled-users registry, building it on first use."""
+    global _registry
+    if _registry is None:
+        _registry = DisabledUsers()
+    return _registry
+
+
+async def get_fresh_disabled_users() -> DisabledUsers:
+    """
+    The registry with its state re-read from the JSON file first.
+
+    Use this in read-only display paths. ``api_server.py`` writes the same file
+    from outside this process, so a menu that only ever read memory could show a
+    user as disabled seconds after the API released them.
+    """
+    registry = get_disabled_users()
+    await registry.reload_disabled_users()
+    return registry
 
