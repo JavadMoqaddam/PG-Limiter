@@ -28,14 +28,15 @@ _UNKNOWN_USERS_FETCHING: set[str] = set()
 
 
 def get_unknown_users_queue() -> asyncio.Queue:
-    """Get or create the unknown users queue bound to current event loop."""
+    """
+    Return the process-wide queue of usernames waiting for a panel lookup.
+
+    Created once per process. It used to be rebuilt whenever the caller ran on
+    a different event loop - a leftover from the in-process restart in
+    ``limiter.py`` - and every username still queued was dropped with it.
+    """
     global _UNKNOWN_USERS_QUEUE
-    try:
-        current_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        current_loop = None
-        
-    if _UNKNOWN_USERS_QUEUE is None or (current_loop and getattr(_UNKNOWN_USERS_QUEUE, "_loop", None) is not current_loop):
+    if _UNKNOWN_USERS_QUEUE is None:
         _UNKNOWN_USERS_QUEUE = asyncio.Queue()
     return _UNKNOWN_USERS_QUEUE
 

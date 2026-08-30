@@ -584,17 +584,20 @@ _dispatcher_instance: Optional[TelegramDispatcher] = None
 
 
 def get_dispatcher() -> TelegramDispatcher:
-    """Get or create the global TelegramDispatcher singleton instance."""
-    global _dispatcher_instance
-    try:
-        current_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        current_loop = None
+    """
+    Get or create the global TelegramDispatcher singleton instance.
 
+    Built exactly once per process. The previous version rebuilt the instance
+    whenever it was called from a different event loop, which only ever
+    happened while ``limiter.py`` restarted itself in-process. The rebuild
+    silently dropped everything held in memory: the queued Priority 2/3
+    backlog, ``_active_cancel_keys`` (so a disable notice could no longer be
+    cancelled or deleted) and every future a caller was still awaiting.
+    Priority 1 messages survived it only because they are on disk before they
+    are queued. A crash now ends the process instead, so there is only ever one
+    loop to serve.
+    """
+    global _dispatcher_instance
     if _dispatcher_instance is None:
         _dispatcher_instance = TelegramDispatcher()
-        _dispatcher_instance._loop = current_loop
-    elif current_loop and getattr(_dispatcher_instance, "_loop", None) is not None and _dispatcher_instance._loop is not current_loop:
-        _dispatcher_instance = TelegramDispatcher()
-        _dispatcher_instance._loop = current_loop
     return _dispatcher_instance

@@ -6,7 +6,6 @@ Monitors active connections and limits users based on their IP count.
 import argparse
 import asyncio
 import sys
-import time
 
 from run_telegram import run_telegram_bot
 from telegram_bot.send_message import send_logs
@@ -274,9 +273,8 @@ async def cleanup_resources():
     except Exception as e:
         main_logger.debug(f"Error stopping Dispatcher: {e}")
 
-    # 5. Stop the Telegram application so a restarted event loop does not find
-    #    an application that still reports itself as running (its polling tasks
-    #    would belong to the dead loop and the bot would never answer again).
+    # 5. Stop the Telegram application so polling ends before the process does,
+    #    instead of leaving the updater to be killed mid-request.
     try:
         from telegram_bot.main import application
 
@@ -292,47 +290,38 @@ async def cleanup_resources():
 
 
 if __name__ == "__main__":
-    restart_count = 0
-    max_restarts = 5
-    
-    while True:
-        try:
-            asyncio.run(main())
-        except KeyboardInterrupt:
-            main_logger.info("🛑 Received keyboard interrupt, shutting down...")
-            try:
-                asyncio.run(cleanup_resources())
-            except Exception:
-                pass
-            log_shutdown_info("Limiter", "Keyboard interrupt")
-            break
-        except SystemExit as e:
-            if e.code != 0 and e.code is not None:
-                main_logger.error(f"System exit with code: {e.code}")
-            try:
-                asyncio.run(cleanup_resources())
-            except Exception:
-                pass
-            break
-        except Exception as er:  # pylint: disable=broad-except
-            restart_count += 1
-            exc_type, exc_value, exc_tb = sys.exc_info()
-            
-            # Use centralized crash logging
-            log_crash_info(exc_type, exc_value, exc_tb, component="Limiter")
-            log_shutdown_info("Limiter", f"Error: {er}")
-            
-            try:
-                asyncio.run(cleanup_resources())
-            except Exception:
-                pass
+    # One process, one event loop, one lifetime.
+    #
+    # This used to be `while True: asyncio.run(main())` with its own restart
+    # counter. Restarting inside the process left every module global bound to
+    # the event loop that had just died - above all
+    # `telegram_bot.main.application`, which still reported itself as running,
+    # so `run_telegram_bot()` returned immediately and its polling tasks stayed
+    # on the dead loop: the limiter kept banning users while the bot was mute.
+    # A crash now exits non-zero and the supervisor already wrapped around us
+    # (start.sh in the container, then Docker's `restart: always`) starts a
+    # fresh interpreter, which is the only way to get a genuinely clean loop.
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        main_logger.info("🛑 Received keyboard interrupt, shutting down...")
+        log_shutdown_info("Limiter", "Keyboard interrupt")
+    except SystemExit as exit_request:
+        if exit_request.code not in (0, None):
+            main_logger.error(f"System exit with code: {exit_request.code}")
+        log_shutdown_info("Limiter", f"System exit: {exit_request.code}")
+        raise
+    except Exception as er:  # pylint: disable=broad-except
+        exc_type, exc_value, exc_tb = sys.exc_info()
 
-            if restart_count >= max_restarts:
-                main_logger.error(f"Maximum restart attempts ({max_restarts}) reached")
-                main_logger.error("Please check the logs and fix the issue")
-                break
-            
-            # Exponential backoff for restarts
-            delay = min(10 * (2 ** (restart_count - 1)), 120)
-            main_logger.info(f"⏳ Restart #{restart_count}/{max_restarts} in {delay} seconds...")
-            time.sleep(delay)
+        # Use centralized crash logging
+        log_crash_info(exc_type, exc_value, exc_tb, component="Limiter")
+        log_shutdown_info("Limiter", f"Error: {er}")
+        sys.exit(1)
+    else:
+        # main() is an endless loop; returning at all means monitoring stopped.
+        # Exit non-zero so the supervisor retries instead of treating it as a
+        # requested shutdown and leaving the container down.
+        main_logger.warning("⚠️ Main loop returned unexpectedly, exiting for a supervisor restart")
+        log_shutdown_info("Limiter", "Main loop returned")
+        sys.exit(1)
