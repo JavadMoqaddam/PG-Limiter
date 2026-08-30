@@ -76,15 +76,15 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
     """
     Build the node lookup table and refresh the node-IP blocklist.
 
-    In log mode ``create_node_task`` adds every node IP to ``INVALID_IPS`` so
-    that inter-node relay traffic is never counted as a user device. API mode
+    In log mode ``create_node_task`` adds every node IP to the shared blocklist
+    so that inter-node relay traffic is never counted as a user device. API mode
     does not go through that path, so the same seeding happens here.
 
     Returns:
         ``(node_name_map, disabled_node_ids)``
     """
+    from utils.ip_facts import register_node_ips
     from utils.panel_api.nodes import get_nodes
-    from utils.parse_logs import INVALID_IPS
 
     node_name_map: dict[int, str] = {}
     try:
@@ -94,10 +94,9 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
         nodes = None
 
     if nodes and not isinstance(nodes, ValueError):
+        register_node_ips(node.node_ip for node in nodes)
         for node in nodes:
             node_name_map[node.node_id] = node.node_name
-            if node.node_ip:
-                INVALID_IPS.add(node.node_ip)
 
     disabled_nodes = set(config_data.get("disabled_nodes") or [])
     return node_name_map, disabled_nodes
@@ -186,74 +185,40 @@ def _prefilter_candidates(candidates: list[dict]) -> list[tuple[str, int, dict]]
 
 async def _validate_ips(raw_ips: set[str], config_data: dict) -> tuple[set[str], int]:
     """
-    Apply the same IP admission rules that log mode applies.
+    Apply the shared IP admission rule to the whole cycle at once.
 
-    Reuses the parser's caches and blocklists so both modes converge on the
-    same verdict for a given IP: private/malformed addresses and node IPs are
-    rejected, and when a country code is configured the address must resolve
-    to it. A failed geo lookup is accepted but not cached as verified, which
-    matches log-mode behaviour.
+    The decision itself lives in ``utils.ip_facts`` so log mode and API mode can
+    never diverge on whether an address counts: private/malformed addresses and
+    node addresses are rejected, and when a country is configured the address
+    must resolve to it. A failed geo lookup is accepted and left uncached.
 
     Returns:
         ``(accepted_ips, geo_lookup_count)``
     """
-    from utils.parse_logs import INVALID_IPS, VALID_IPS, check_ip, is_valid_ip
+    from utils.ip_facts import geo_lookup_count, is_ip_accepted
 
-    # Read the country code from config/ENV rather than hardcoding it.
-    country_code = str(config_data.get("country_code") or "").strip()
-    if not country_code:
-        country_code = str(
-            (config_data.get("monitoring") or {}).get("country_code") or ""
-        ).strip()
-    geo_enabled = bool(country_code) and country_code.lower() not in (
-        "none", "off", "disabled", "any", "all",
-    )
+    if not raw_ips:
+        return set(), 0
+
+    lookups_before = geo_lookup_count()
+    semaphore = asyncio.Semaphore(5)
+
+    async def _decide(ip: str) -> tuple[str, bool]:
+        async with semaphore:
+            try:
+                return ip, await is_ip_accepted(ip, config_data)
+            except Exception:
+                return ip, False
 
     accepted: set[str] = set()
-    needs_geo: list[str] = []
+    results = await asyncio.gather(
+        *[_decide(ip) for ip in raw_ips], return_exceptions=True
+    )
+    for item in results:
+        if isinstance(item, tuple) and item[1]:
+            accepted.add(item[0])
 
-    for ip in raw_ips:
-        if ip in VALID_IPS:
-            accepted.add(ip)
-            continue
-        if ip in INVALID_IPS:
-            continue
-        if not await is_valid_ip(ip):
-            continue
-        if not geo_enabled:
-            accepted.add(ip)
-            continue
-        needs_geo.append(ip)
-
-    geo_lookups = 0
-    if needs_geo:
-        semaphore = asyncio.Semaphore(5)
-
-        async def _resolve(ip: str) -> tuple[str, Optional[str]]:
-            async with semaphore:
-                try:
-                    return ip, await check_ip(ip)
-                except Exception:
-                    return ip, None
-
-        results = await asyncio.gather(
-            *[_resolve(ip) for ip in needs_geo], return_exceptions=True
-        )
-        target = country_code.upper()
-        for item in results:
-            if not isinstance(item, tuple):
-                continue
-            ip, country = item
-            geo_lookups += 1
-            if not country:
-                accepted.add(ip)
-            elif str(country).upper() == target:
-                VALID_IPS[ip] = True
-                accepted.add(ip)
-            else:
-                INVALID_IPS.add(ip)
-
-    return accepted, geo_lookups
+    return accepted, geo_lookup_count() - lookups_before
 
 
 async def _fetch_all_online_ips(

@@ -42,27 +42,29 @@ def api_config():
 
 @pytest.fixture(autouse=True)
 def clean_collector_state():
-    """Reset collector globals, shared maps and the parser caches per test."""
+    """Reset collector globals, shared maps and the IP caches per test."""
     import utils.ip_source_api as api_mod
-    from utils.parse_logs import INVALID_IPS, VALID_IPS
+    from utils.ip_facts import COUNTRY_CACHE, NODE_IPS, VERDICT_CACHE
     from utils.shared_state import ACTIVE_USERS
     from utils.user_sync import USER_METADATA_CACHE
 
-    invalid_ip_seed = set(INVALID_IPS)
+    node_ip_seed = set(NODE_IPS)
 
     ACTIVE_USERS.clear()
     USER_METADATA_CACHE.clear()
-    VALID_IPS.clear()
+    VERDICT_CACHE.clear()
+    COUNTRY_CACHE.clear()
     api_mod._consecutive_dead_cycles = 0
     api_mod._forbidden_alert_sent = False
     yield
     ACTIVE_USERS.clear()
     USER_METADATA_CACHE.clear()
-    VALID_IPS.clear()
-    # The blocklist is module state seeded at import time; put it back so node
-    # IPs added by one test cannot reject an IP another test relies on.
-    INVALID_IPS.clear()
-    INVALID_IPS.update(invalid_ip_seed)
+    VERDICT_CACHE.clear()
+    COUNTRY_CACHE.clear()
+    # The node blocklist is process state; restore it so an address blocked by
+    # one test cannot reject an address another test relies on.
+    NODE_IPS.clear()
+    NODE_IPS.update(node_ip_seed)
     api_mod._consecutive_dead_cycles = 0
     api_mod._forbidden_alert_sent = False
 
@@ -254,10 +256,10 @@ class TestValidateIps:
 
     @pytest.mark.asyncio
     async def test_blocklisted_node_ips_are_rejected(self, api_config):
+        from utils.ip_facts import NODE_IPS
         from utils.ip_source_api import _validate_ips
-        from utils.parse_logs import INVALID_IPS
 
-        INVALID_IPS.add("77.77.77.77")
+        NODE_IPS.add("77.77.77.77")
         accepted, _ = await _validate_ips({"77.77.77.77", "5.6.7.8"}, api_config)
         assert accepted == {"5.6.7.8"}
 
@@ -268,10 +270,10 @@ class TestValidateIps:
 
         countries = {"5.6.7.1": "IR", "5.6.7.2": "DE"}
 
-        async def fake_check_ip(ip):
+        async def fake_lookup(ip):
             return countries.get(ip)
 
-        monkeypatch.setattr(parse_logs_mod, "check_ip", fake_check_ip)
+        monkeypatch.setattr(parse_logs_mod, "lookup_country", fake_lookup)
         api_config["country_code"] = "IR"
 
         accepted, geo_lookups = await _validate_ips(set(countries), api_config)
@@ -283,10 +285,10 @@ class TestValidateIps:
         import utils.parse_logs as parse_logs_mod
         from utils.ip_source_api import _validate_ips
 
-        async def fake_check_ip(_ip):
+        async def fake_lookup(_ip):
             return "DE"
 
-        monkeypatch.setattr(parse_logs_mod, "check_ip", fake_check_ip)
+        monkeypatch.setattr(parse_logs_mod, "lookup_country", fake_lookup)
         api_config["country_code"] = ""
         api_config["monitoring"] = {"country_code": "IR"}
 
@@ -298,10 +300,10 @@ class TestValidateIps:
         import utils.parse_logs as parse_logs_mod
         from utils.ip_source_api import _validate_ips
 
-        async def fail_check_ip(_ip):
+        async def fail_lookup(_ip):
             raise AssertionError("geo lookup must not run when geo is disabled")
 
-        monkeypatch.setattr(parse_logs_mod, "check_ip", fail_check_ip)
+        monkeypatch.setattr(parse_logs_mod, "lookup_country", fail_lookup)
         for value in ("", "none", "OFF", "any", "all", "disabled"):
             api_config["country_code"] = value
             accepted, geo_lookups = await _validate_ips({"5.6.7.8"}, api_config)
@@ -311,20 +313,20 @@ class TestValidateIps:
     @pytest.mark.asyncio
     async def test_failed_geo_lookup_accepts_the_ip(self, api_config, monkeypatch):
         import utils.parse_logs as parse_logs_mod
+        from utils.ip_facts import VERDICT_CACHE
         from utils.ip_source_api import _validate_ips
-        from utils.parse_logs import VALID_IPS
 
-        async def fake_check_ip(_ip):
+        async def fake_lookup(_ip):
             return None
 
-        monkeypatch.setattr(parse_logs_mod, "check_ip", fake_check_ip)
+        monkeypatch.setattr(parse_logs_mod, "lookup_country", fake_lookup)
         api_config["country_code"] = "IR"
 
         accepted, _ = await _validate_ips({"5.6.7.8"}, api_config)
         # Accepted so a geo outage cannot hide traffic, but deliberately not
-        # cached as verified.
+        # cached, so the address is re-checked once the provider recovers.
         assert accepted == {"5.6.7.8"}
-        assert "5.6.7.8" not in VALID_IPS
+        assert "5.6.7.8" not in VERDICT_CACHE
 
 
 class TestBuildUsersFromPayloads:

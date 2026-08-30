@@ -10,6 +10,13 @@ import time
 from cachetools import TTLCache
 
 from utils.shared_state import ACTIVE_USERS, ACTIVE_USERS_LOCK
+from utils.ip_facts import (
+    COUNTRY_CACHE,
+    NODE_IPS,
+    VERDICT_CACHE,
+    is_ip_accepted,
+    is_public_ip,
+)
 from utils.read_config import read_config
 from utils.types import ConnectionInfo, DeviceInfo, UserType
 from utils.logs import get_logger
@@ -31,13 +38,13 @@ INVALID_EMAILS = {
     "INFO",
     "request",
 }
-INVALID_IPS = {
-    "1.1.1.1",
-    "8.8.8.8",
-}
 
-VALID_IPS = TTLCache(maxsize=50000, ttl=86400)
-CACHE = {}
+# Kept as module-level names for the callers and tests that still import them.
+# ``INVALID_IPS`` is the node/static blocklist and ``VALID_IPS`` the accepted-IP
+# view of the shared verdict cache; both live in utils.ip_facts now.
+INVALID_IPS = NODE_IPS
+VALID_IPS = VERDICT_CACHE
+
 LOCAL_ID_CACHE = TTLCache(maxsize=30000, ttl=600)
 
 # API endpoints with fallback order (from most reliable to least)
@@ -85,13 +92,12 @@ async def close_geo_client() -> None:
         _geo_client = None
 
 
-async def check_ip(ip_address: str) -> None | str:
+async def lookup_country(ip_address: str) -> None | str:
     """
-    Check the geographical location of an IP address with fallback through multiple APIs.
+    Resolve the country of an IP through the geo providers, in reliability order.
 
-    Get the location of the IP address.
-    The result is cached to avoid unnecessary requests for the same IP address.
-    Uses fallback mechanism - if one API fails, tries the next one.
+    Callers should go through ``utils.ip_facts.resolve_country`` so the result is
+    cached; this function performs the actual network lookup.
 
     Args:
         ip_address (str): The IP address to check.
@@ -100,10 +106,7 @@ async def check_ip(ip_address: str) -> None | str:
         str: The country code of the IP address location, or None
     """
     global _endpoint_failures, _endpoint_last_success
-    
-    if ip_address in CACHE:
-        return CACHE[ip_address]
-    
+
     # Sort endpoints by reliability (fewer failures first, recent success preferred)
     current_time = time.time()
     sorted_endpoints = sorted(
@@ -133,7 +136,7 @@ async def check_ip(ip_address: str) -> None | str:
                     country = info.get(key)
                 
                 if country and len(country) == 2:  # Valid country code
-                    CACHE[ip_address] = country
+                    COUNTRY_CACHE[ip_address] = country
                     _endpoint_failures[name] = max(0, _endpoint_failures.get(name, 0) - 1)
                     _endpoint_last_success[name] = current_time
                     return country
@@ -154,23 +157,24 @@ async def check_ip(ip_address: str) -> None | str:
     return None
 
 
+async def check_ip(ip_address: str) -> None | str:
+    """Cached country lookup (kept for callers that only need the country)."""
+    from utils.ip_facts import resolve_country
+
+    return await resolve_country(ip_address)
+
+
 async def is_valid_ip(ip: str) -> bool:
     """
-    Check if a string is a valid IP address.
-
-    This function uses the ipaddress module to try to create an IP address object from the string.
+    Check if a string is a valid, public IP address.
 
     Args:
         ip (str): The string to check.
 
     Returns:
-        bool: True if the string is a valid IP address, False otherwise.
+        bool: True if the string is a valid public IP address, False otherwise.
     """
-    try:
-        ip_obj = ipaddress.ip_address(ip)
-        return not ip_obj.is_private
-    except ValueError:
-        return False
+    return is_public_ip(ip)
 
 
 IP_V6_REGEX = re.compile(r"\[([0-9a-fA-F:]+)\]:\d+\s+accepted")
@@ -408,22 +412,10 @@ async def parse_logs(
                 if real_ip_match:
                     ip = real_ip_match.group(1)
         
-        # Get IP location from config (new format)
-        ip_location = data.get("monitoring", {}).get("ip_location", "IR")
-        
-        # Validate IP
-        if ip not in VALID_IPS:
-            is_valid_ip_test = await is_valid_ip(ip)
-            if is_valid_ip_test and ip not in INVALID_IPS:
-                if ip_location != "None":
-                    country = await check_ip(ip)
-                    if country and country == ip_location:
-                        VALID_IPS[ip] = True
-                    elif country and country != ip_location:
-                        INVALID_IPS.add(ip)
-                        continue
-            else:
-                continue
+        # Admission decision (validity, node blocklist, country) - shared with
+        # API mode so both sources accept exactly the same addresses.
+        if not await is_ip_accepted(ip, data):
+            continue
         
         # Extract email
         if email_match:
