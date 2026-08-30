@@ -113,16 +113,14 @@ def _patch_collector(
 
 
 def _no_redis(monkeypatch):
-    """Keep ``_publish_active_users`` from reaching for a real Redis server."""
-    import utils.redis_cache as redis_mod
+    """
+    Kept as a no-op shim.
 
-    class _Disconnected:
-        is_connected = False
-
-    async def fake_get_cache():
-        return _Disconnected()
-
-    monkeypatch.setattr(redis_mod, "get_cache", fake_get_cache)
+    The collector used to mirror the active-user set into Redis; nothing in the
+    pipeline talks to an external cache any more, so the tests have nothing to
+    stub out here.
+    """
+    return None
 
 
 class TestResolveMonitoredGroupIds:

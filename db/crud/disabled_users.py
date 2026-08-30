@@ -100,13 +100,5 @@ class DisabledUserCRUD:
                 disable_reason=None,
             )
         )
-        # Invalidate caches
-        try:
-            from utils.redis_cache import cache_disabled_users, publish_cache_invalidation
-            await cache_disabled_users({})
-            await publish_cache_invalidation(reason="clear_all_disabled")
-        except Exception as e:
-            db_disabled_logger.debug(f"Cache invalidation note on clear_all: {e}")
-
         db_disabled_logger.info(f"✅ Cleared {result.rowcount} disabled users")
         return result.rowcount

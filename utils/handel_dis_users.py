@@ -220,13 +220,6 @@ class DisabledUsers:
         except Exception as e:
             logger.debug(f"Database sync on disable skipped for {username}: {e}")
 
-        # Synchronize with Redis cache if available
-        try:
-            from utils.redis_cache import add_disabled_user
-            await add_disabled_user(username, current_time)
-        except Exception:
-            pass
-
         logger.info(f"Saved {len(self._entries)} disabled users to {self.filename}")
 
     async def remove_user(self, username: str):
@@ -254,13 +247,6 @@ class DisabledUsers:
                     await session.commit()
         except Exception as e:
             logger.debug(f"Database sync on enable skipped for {username}: {e}")
-
-        # Synchronize with Redis cache if available
-        try:
-            from utils.redis_cache import remove_disabled_user
-            await remove_disabled_user(username)
-        except Exception:
-            pass
 
         logger.info(f"Saved {len(self._entries)} disabled users to {self.filename}")
 

@@ -15,19 +15,11 @@ except ImportError as exc:
 from utils.logs import logger, log_api_request, get_logger
 from utils.types import PanelType
 
-# Try to import Redis cache
-try:
-    from utils.redis_cache import (
-        get_cached_token, cache_token, invalidate_token as redis_invalidate_token
-    )
-    REDIS_CACHE_AVAILABLE = True
-except ImportError:
-    REDIS_CACHE_AVAILABLE = False
-
 # Module logger
 auth_logger = get_logger("panel_api.auth")
 
-# Fallback in-memory token cache (used if Redis not available)
+# In-process token cache (the token is per-process, so nothing is gained by
+# sharing it through an external store)
 _token_cache = {
     "token": None,
     "expires_at": 0,
@@ -37,14 +29,6 @@ _token_cache = {
 
 async def invalidate_token_cache():
     """Invalidate the cached token (useful when getting 401 errors)"""
-    if REDIS_CACHE_AVAILABLE:
-        # Invalidate Redis cache
-        try:
-            await redis_invalidate_token(_token_cache.get("panel_domain", "default"))
-        except Exception as e:
-            auth_logger.warning(f"Failed to invalidate Redis token cache: {e}")
-    
-    # Always clear in-memory cache too
     _token_cache["token"] = None
     _token_cache["expires_at"] = 0
     auth_logger.info("🔑 Token cache invalidated")
@@ -83,21 +67,10 @@ async def get_token(panel_data: PanelType, force_refresh: bool = False) -> Panel
         and HTTPS endpoints.
     """
     current_time = time.time()
-    
-    # Fast path: Check Redis cache first without lock if not force_refresh
-    if not force_refresh and REDIS_CACHE_AVAILABLE:
-        try:
-            cached_token = await get_cached_token(panel_data.panel_domain)
-            if cached_token:
-                panel_data.panel_token = cached_token
-                auth_logger.debug(f"🔑 Using Redis cached token")
-                return panel_data
-        except Exception as e:
-            auth_logger.warning(f"Redis cache error: {e}, falling back to in-memory")
-    
+
     # Fast path: Check in-memory cache without lock if not force_refresh
-    if (not force_refresh and 
-        _token_cache["token"] is not None and 
+    if (not force_refresh and
+        _token_cache["token"] is not None and
         _token_cache["panel_domain"] == panel_data.panel_domain and
         current_time < _token_cache["expires_at"]):
         panel_data.panel_token = _token_cache["token"]
@@ -108,26 +81,16 @@ async def get_token(panel_data: PanelType, force_refresh: bool = False) -> Panel
     # Acquire lock for fetching/refreshing token to prevent thundering herd
     async with _auth_token_lock:
         current_time = time.time()
-        
-        # Double-check cache inside lock (in case another task fetched the token while we waited for lock)
-        if not force_refresh and REDIS_CACHE_AVAILABLE:
-            try:
-                cached_token = await get_cached_token(panel_data.panel_domain)
-                if cached_token:
-                    panel_data.panel_token = cached_token
-                    auth_logger.debug(f"🔑 Using Redis cached token (resolved after lock)")
-                    return panel_data
-            except Exception:
-                pass
 
-        if (not force_refresh and 
-            _token_cache["token"] is not None and 
+        # Double-check cache inside lock (in case another task fetched the token while we waited for lock)
+        if (not force_refresh and
+            _token_cache["token"] is not None and
             _token_cache["panel_domain"] == panel_data.panel_domain and
             current_time < _token_cache["expires_at"]):
             panel_data.panel_token = _token_cache["token"]
             auth_logger.debug(f"🔑 Using in-memory cached token (resolved after lock)")
             return panel_data
-        
+
         auth_logger.info(f"🔑 Fetching new token for {panel_data.panel_domain} (force_refresh={force_refresh})")
     
     # Need to fetch a new token
@@ -177,17 +140,8 @@ async def get_token(panel_data: PanelType, force_refresh: bool = False) -> Panel
                     continue
                     
                 token = json_obj["access_token"]
-                
+
                 # Cache the token for 30 minutes (1800 seconds)
-                # Store in Redis if available
-                if REDIS_CACHE_AVAILABLE:
-                    try:
-                        await cache_token(panel_data.panel_domain, token)
-                        auth_logger.debug("🔑 Token cached in Redis")
-                    except Exception as e:
-                        auth_logger.warning(f"Failed to cache token in Redis: {e}")
-                
-                # Always store in in-memory cache as fallback
                 _token_cache["token"] = token
                 _token_cache["expires_at"] = current_time + 1800
                 _token_cache["panel_domain"] = panel_data.panel_domain

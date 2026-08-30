@@ -20,7 +20,7 @@ log_debug() { echo -e "[$(get_timestamp)] ${CYAN}→${NC} $1"; }
 log_step() { echo -e "[$(get_timestamp)] ${BLUE}[$1/${TOTAL_STEPS}]${NC} $2"; }
 log_crash() { echo -e "[$(get_timestamp)] ${MAGENTA}💥${NC} $1"; }
 
-TOTAL_STEPS=8
+TOTAL_STEPS=7
 CRASH_LOG="/var/lib/pg-limiter/logs/crash.log"
 RESTART_COUNT=0
 MAX_RESTARTS=2
@@ -93,7 +93,6 @@ log_info "Environment validated"
 log_debug "Panel: $PANEL_DOMAIN"
 log_debug "Bot Token: ${BOT_TOKEN:0:15}..."
 log_debug "Admin IDs: $ADMIN_IDS"
-log_debug "Redis URL: ${REDIS_URL:-not configured (using in-memory cache)}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 3: Initialize database
@@ -204,50 +203,9 @@ if [ -f "/app/.disable_users.json" ] || [ -f "/app/.violation_history.json" ]; t
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 5: Check Redis connectivity (optional)
+# STEP 5: Verify Telegram Bot Token
 # ═══════════════════════════════════════════════════════════════════════════════
-log_step 5 "Checking Redis connectivity..."
-REDIS_URL="${REDIS_URL:-}"
-
-if [ -z "$REDIS_URL" ]; then
-    log_debug "Redis not configured, using in-memory cache"
-    REDIS_STATUS="skipped"
-else
-    REDIS_OUTPUT=$(timeout 10 python -u -c "
-import asyncio
-import sys
-import os
-import logging
-
-logging.disable(logging.CRITICAL)
-
-async def check_redis():
-    try:
-        import redis.asyncio as redis
-        r = redis.from_url(os.environ.get('REDIS_URL', ''))
-        await r.ping()
-        await r.close()
-        print('CONNECTED')
-    except Exception as e:
-        print(f'FALLBACK: {e}')
-
-asyncio.run(check_redis())
-sys.exit(0)
-" 2>&1)
-    
-    if echo "$REDIS_OUTPUT" | grep -q "CONNECTED"; then
-        log_info "Redis connected"
-        REDIS_STATUS="connected"
-    else
-        log_warn "Redis not available, using in-memory cache fallback"
-        REDIS_STATUS="fallback"
-    fi
-fi
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 6: Verify Telegram Bot Token
-# ═══════════════════════════════════════════════════════════════════════════════
-log_step 6 "Verifying Telegram bot token..."
+log_step 5 "Verifying Telegram bot token..."
 BOT_OUTPUT=$(timeout 15 python -u -c "
 import asyncio
 import sys
@@ -285,9 +243,9 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 7: Verify Panel API connectivity
+# STEP 6: Verify Panel API connectivity
 # ═══════════════════════════════════════════════════════════════════════════════
-log_step 7 "Checking Panel API connectivity..."
+log_step 6 "Checking Panel API connectivity..."
 PANEL_OUTPUT=$(timeout 15 python -u -c "
 import asyncio
 import os
@@ -333,9 +291,9 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 8: Skip module verification (will fail at runtime if issues)
+# STEP 7: Skip module verification (will fail at runtime if issues)
 # ═══════════════════════════════════════════════════════════════════════════════
-log_step 8 "Checking core imports..."
+log_step 7 "Checking core imports..."
 
 # Quick syntax check only - full module loading happens in main app
 IMPORT_OUTPUT=$(timeout 10 python -u -c "
@@ -398,11 +356,6 @@ echo "Components Status:"
 echo "  • Database:     ✓ Ready"
 echo "  • Telegram Bot: ✓ $BOT_USERNAME"
 echo "  • Panel API:    ✓ $PANEL_DOMAIN"
-if [ "$REDIS_STATUS" = "connected" ]; then
-    echo "  • Redis Cache:  ✓ Connected"
-else
-    echo "  • Redis Cache:  ○ In-memory fallback"
-fi
 echo ""
 echo "Starting limiter..."
 echo ""

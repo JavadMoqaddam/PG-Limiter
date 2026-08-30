@@ -3,22 +3,14 @@ Configuration module for PG-Limiter.
 Reads settings from:
 - Environment variables (.env) for static settings
 - Database for dynamic settings that can be changed via Telegram
-- Redis cache for fast access (with fallback to in-memory)
+The merged result is held in a single process-wide dict and rebuilt only when a
+setting is written, so a read is a plain dictionary lookup.
 """
 
 import os
 from typing import Any, Dict, List, Optional
 
 from utils.logs import get_logger
-
-# Try to import Redis cache
-try:
-    from utils.redis_cache import (
-        get_cached_config, cache_config, invalidate_config as redis_invalidate_config
-    )
-    REDIS_CACHE_AVAILABLE = True
-except ImportError:
-    REDIS_CACHE_AVAILABLE = False
 
 # Module logger
 config_logger = get_logger("read_config")
@@ -30,26 +22,15 @@ try:
 except ImportError:
     DB_AVAILABLE = False
 
-# In-memory cache fallback
-_config_cache: Dict[str, Any] = {}
-_cache_loaded = False
+# Single in-process configuration cache. ``None`` means "not loaded yet".
+_config_cache: Optional[Dict[str, Any]] = None
 
 
 async def invalidate_config_cache():
-    """Invalidate configuration cache (Redis and in-memory)."""
-    global _config_cache, _cache_loaded, _config_fast_cache, _config_fast_time
-    
-    if REDIS_CACHE_AVAILABLE:
-        try:
-            await redis_invalidate_config()
-            config_logger.debug("🔧 Redis config cache invalidated")
-        except Exception as e:
-            config_logger.warning(f"Failed to invalidate Redis config cache: {e}")
-    
-    _config_cache = {}
-    _cache_loaded = False
-    _config_fast_cache = None
-    _config_fast_time = 0.0
+    """Drop the cached configuration so the next read rebuilds it from ENV + DB."""
+    global _config_cache
+
+    _config_cache = None
     config_logger.info("🔧 Configuration cache invalidated")
 
 
@@ -164,42 +145,18 @@ def get_config_sync() -> Dict[str, Any]:
     return load_env_config()
 
 
-import time
-
-_config_fast_cache = None
-_config_fast_time = 0.0
-
-
 async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     """
-    Read and return merged configuration from ENV and DB.
-    Uses Redis cache with short 2s in-memory window to prevent Redis network floods.
+    Read and return the merged configuration from ENV and the database.
+
+    The result is cached in-process until a write invalidates it, so this is
+    cheap enough to call from hot paths.
     """
-    global _config_cache, _cache_loaded, _config_fast_cache, _config_fast_time
-    
-    now = time.time()
-    if not check_required_elements and _config_fast_cache is not None and (now - _config_fast_time < 2.0):
-        return _config_fast_cache
-    
-    # Try Redis cache first
-    if REDIS_CACHE_AVAILABLE and not check_required_elements:
-        try:
-            cached = await get_cached_config()
-            if cached:
-                _config_fast_cache = cached
-                _config_fast_time = now
-                config_logger.debug("🔧 Using Redis cached config")
-                return cached
-        except Exception as e:
-            config_logger.warning(f"Redis config cache error: {e}")
-    
-    # Check in-memory cache
-    if _cache_loaded and _config_cache and not check_required_elements:
-        _config_fast_cache = _config_cache
-        _config_fast_time = now
-        config_logger.debug("🔧 Using in-memory cached config")
+    global _config_cache
+
+    if _config_cache is not None and not check_required_elements:
         return _config_cache
-    
+
     config_logger.debug("🔧 Loading fresh configuration...")
     
     # Load ENV config
@@ -508,19 +465,6 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
             raise ValueError("ADMIN_IDS is not set in environment")
     
     _config_cache = config
-    _cache_loaded = True
-    
-    # Store in Redis cache
-    if REDIS_CACHE_AVAILABLE:
-        try:
-            await cache_config(config)
-            config_logger.debug("🔧 Config stored in Redis cache")
-        except Exception as e:
-            config_logger.warning(f"Failed to cache config in Redis: {e}")
-    
-    _config_fast_cache = config
-    _config_fast_time = time.time()
-    
     return config
 
 

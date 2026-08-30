@@ -472,20 +472,6 @@ async def _publish_active_users(new_users: dict[str, UserType]) -> None:
         ACTIVE_USERS.clear()
         ACTIVE_USERS.update(new_users)
 
-    if not new_users:
-        return
-    try:
-        from utils.redis_cache import get_cache
-
-        cache = await get_cache()
-        if cache.is_connected:
-            now = time.time()
-            await cache.client.zadd(
-                "pg_limiter:active_users", {name: now for name in new_users}
-            )
-    except Exception as error:
-        api_ip_logger.debug(f"Could not sync active-user ZSET: {error}")
-
 
 def _resolve_online_window(config_data: dict) -> int:
     """

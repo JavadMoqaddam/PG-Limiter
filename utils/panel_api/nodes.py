@@ -9,19 +9,10 @@ from utils.types import PanelType, NodeType
 from utils.panel_api.auth import safe_send_logs_panel
 from utils.panel_api.request_helper import panel_get
 
-# Try to import Redis cache
-try:
-    from utils.redis_cache import (
-        get_cached_nodes, cache_nodes, invalidate_nodes as redis_invalidate_nodes
-    )
-    REDIS_CACHE_AVAILABLE = True
-except ImportError:
-    REDIS_CACHE_AVAILABLE = False
-
 # Module logger
 nodes_logger = get_logger("panel_api.nodes")
 
-# Fallback in-memory nodes cache (1 hour cache)
+# In-process nodes cache (1 hour)
 _nodes_cache = {
     "nodes": None,
     "expires_at": 0,
@@ -31,12 +22,6 @@ _nodes_cache = {
 
 async def invalidate_nodes_cache():
     """Invalidate the cached nodes list"""
-    if REDIS_CACHE_AVAILABLE:
-        try:
-            await redis_invalidate_nodes(_nodes_cache.get("panel_domain", "default"))
-        except Exception as e:
-            nodes_logger.warning(f"Failed to invalidate Redis nodes cache: {e}")
-    
     _nodes_cache["nodes"] = None
     _nodes_cache["expires_at"] = 0
     nodes_logger.info("🖥️ Nodes cache invalidated")
@@ -49,7 +34,7 @@ async def get_nodes(
 ) -> list[NodeType] | ValueError:
     """
     Get the IDs of all nodes from the panel API.
-    Results are cached for 1 hour in Redis (or in-memory fallback).
+    Results are cached in-process for 1 hour.
 
     Args:
         panel_data (PanelType): A PanelType object containing
@@ -64,28 +49,6 @@ async def get_nodes(
         ValueError: If the function fails to get the nodes from both the HTTP
         and HTTPS endpoints.
     """
-    # Try Redis cache first
-    if not force_refresh and REDIS_CACHE_AVAILABLE:
-        try:
-            cached_nodes = await get_cached_nodes(panel_data.panel_domain)
-            if cached_nodes:
-                # Convert cached dicts back to NodeType objects
-                nodes_list = [
-                    NodeType(
-                        node_id=n["node_id"],
-                        node_name=n["node_name"],
-                        node_ip=n["node_ip"],
-                        status=n["status"],
-                        message=n.get("message", ""),
-                    )
-                    for n in cached_nodes
-                ]
-                nodes_logger.debug(f"🖥️ Using Redis cached nodes list ({len(nodes_list)} nodes)")
-                return nodes_list
-        except Exception as e:
-            nodes_logger.warning(f"Redis cache error: {e}, falling back to in-memory")
-    
-    # Fallback: Check in-memory cache
     if not force_refresh and _nodes_cache["nodes"] is not None:
         current_time = time.time()
         # Check if cache is still valid and for same panel
@@ -157,26 +120,6 @@ async def get_nodes(
         )
     
     # Cache the nodes list for 1 hour (3600 seconds)
-    # Store in Redis if available
-    if REDIS_CACHE_AVAILABLE:
-        try:
-            # Convert NodeType objects to dicts for JSON serialization
-            nodes_dicts = [
-                {
-                    "node_id": n.node_id,
-                    "node_name": n.node_name,
-                    "node_ip": n.node_ip,
-                    "status": n.status,
-                    "message": n.message,
-                }
-                for n in all_nodes
-            ]
-            await cache_nodes(panel_data.panel_domain, nodes_dicts)
-            nodes_logger.debug("🖥️ Nodes cached in Redis")
-        except Exception as e:
-            nodes_logger.warning(f"Failed to cache nodes in Redis: {e}")
-    
-    # Always store in in-memory cache as fallback
     _nodes_cache["nodes"] = all_nodes
     _nodes_cache["expires_at"] = time.time() + 3600
     _nodes_cache["panel_domain"] = panel_data.panel_domain

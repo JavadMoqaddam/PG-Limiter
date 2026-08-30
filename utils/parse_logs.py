@@ -458,14 +458,6 @@ async def parse_logs(
                 await update_user_device_info_with_node(user, ip, inbound_protocol, current_node_id, current_node_name)
                 ACTIVE_USERS[email] = user
 
-        try:
-            from utils.redis_cache import get_cache
-            cache = await get_cache()
-            if cache.is_connected:
-                await cache.client.zadd("pg_limiter:active_users", {email: time.time()})
-        except Exception:
-            pass
-
     return ACTIVE_USERS
 
 

@@ -25,13 +25,6 @@ from utils.parse_logs import close_geo_client
 from utils.read_config import read_config
 from utils.types import PanelType
 
-# Import Redis cache utilities
-try:
-    from utils.redis_cache import get_cache, close_cache
-    REDIS_AVAILABLE = True
-except ImportError:
-    REDIS_AVAILABLE = False
-
 VERSION = "1.3.1"
 
 # Main logger
@@ -141,19 +134,6 @@ async def main():
         except Exception as db_err:
             main_logger.error(f"Database initialization error: {db_err}")
         
-        # Initialize Redis cache
-        if REDIS_AVAILABLE:
-            try:
-                cache = await get_cache()
-                if cache.is_connected:
-                    main_logger.info("✓ Redis cache connected")
-                else:
-                    main_logger.info("⚠ Redis not available, using in-memory cache fallback")
-            except Exception as e:
-                main_logger.warning(f"Redis initialization failed: {e}, using in-memory fallback")
-        else:
-            main_logger.info("ℹ Redis cache module not available, using in-memory cache")
-        
         # Start Telegram bot and message dispatcher in background tasks (keep strong references)
         main_logger.debug("Starting Telegram bot and dispatcher tasks...")
         from telegram_bot.dispatcher import get_dispatcher
@@ -211,12 +191,6 @@ async def main():
         main_logger.info("✓ Disabled users state preserved across restarts")
         
         async with asyncio.TaskGroup() as tg:
-            # Start Redis Pub/Sub listener for L1/L2 cache invalidations
-            if REDIS_AVAILABLE:
-                from utils.redis_cache import start_pubsub_listener
-                tg.create_task(start_pubsub_listener(), name="redis_pubsub")
-                main_logger.info("✓ Redis Pub/Sub listener registered in TaskGroup")
-
             # Start unknown user background worker
             from utils.user_sync import run_unknown_user_worker
             tg.create_task(run_unknown_user_worker(panel_data), name="unknown_user_worker")
@@ -268,7 +242,7 @@ async def main():
 
 
 async def cleanup_resources():
-    """Gracefully close all shared network clients, Redis, and database connections."""
+    """Gracefully close all shared network clients and database connections."""
     # 1. Close GeoIP client
     try:
         await close_geo_client()
@@ -276,22 +250,14 @@ async def cleanup_resources():
     except Exception as e:
         main_logger.debug(f"Error closing Geo client: {e}")
 
-    # 2. Close Redis connection
-    if REDIS_AVAILABLE:
-        try:
-            await close_cache()
-            main_logger.info("✓ Redis cache closed")
-        except Exception as e:
-            main_logger.debug(f"Error closing Redis cache: {e}")
-
-    # 3. Close database connections
+    # 2. Close database connections
     try:
         from db.database import close_db
         await close_db()
     except Exception as e:
         main_logger.debug(f"Error closing DB: {e}")
 
-    # 4. Close Panel API shared HTTP client
+    # 3. Close Panel API shared HTTP client
     try:
         from utils.panel_api.request_helper import close_panel_client
         await close_panel_client()
@@ -299,7 +265,7 @@ async def cleanup_resources():
     except Exception as e:
         main_logger.debug(f"Error closing Panel client: {e}")
 
-    # 5. Stop Telegram Dispatcher cleanly
+    # 4. Stop Telegram Dispatcher cleanly
     try:
         from telegram_bot.dispatcher import get_dispatcher
         dispatcher = get_dispatcher()
@@ -308,7 +274,7 @@ async def cleanup_resources():
     except Exception as e:
         main_logger.debug(f"Error stopping Dispatcher: {e}")
 
-    # 6. Stop the Telegram application so a restarted event loop does not find
+    # 5. Stop the Telegram application so a restarted event loop does not find
     #    an application that still reports itself as running (its polling tasks
     #    would belong to the dead loop and the bot would never answer again).
     try:

@@ -128,7 +128,7 @@ class DBSubnetISPCache:
 
     async def get_cached_isp(self, ip: str) -> Optional[Dict[str, str]]:
         """
-        Get cached ISP info for an IP's subnet across L0 (RAM), L1 (Redis), and L2 (SQLite).
+        Get cached ISP info for an IP's subnet from RAM, then SQLite.
 
         Args:
             ip: IP address
@@ -138,23 +138,11 @@ class DBSubnetISPCache:
         """
         subnet = self._get_subnet(ip)
 
-        # 1. Check L0 memory cache first
+        # 1. Check in-memory cache first
         if subnet in self._memory_cache:
             return self._memory_cache[subnet]
 
-        # 2. Check L1 Redis cache (by subnet or ip)
-        try:
-            from utils.redis_cache import get_cached_isp as redis_get_isp, cache_isp as redis_cache_isp
-            cached_redis = await redis_get_isp(subnet)
-            if not cached_redis and subnet != ip:
-                cached_redis = await redis_get_isp(ip)
-            if cached_redis:
-                self._memory_cache[subnet] = cached_redis
-                return cached_redis
-        except Exception as e:
-            logger.debug(f"Redis lookup error in get_cached_isp for {ip}: {e}")
-
-        # 3. Check L2 SQLite database with timeout
+        # 2. Check the SQLite subnet cache with a timeout
         import asyncio
         try:
             async with asyncio.timeout(3):  # 3 second timeout for DB query
@@ -170,12 +158,6 @@ class DBSubnetISPCache:
                             "region": cached.region or "Unknown",
                         }
                         self._memory_cache[subnet] = isp_info
-                        # Backpropagate to Redis
-                        try:
-                            from utils.redis_cache import cache_isp as redis_cache_isp
-                            await redis_cache_isp(subnet, isp_info)
-                        except Exception:
-                            pass
                         return isp_info
         except asyncio.TimeoutError:
             logger.debug(f"DB query timeout in get_cached_isp for {ip}")
@@ -193,7 +175,7 @@ class DBSubnetISPCache:
         region: Optional[str] = None,
     ):
         """
-        Cache ISP info for an IP's subnet across RAM (L0), Redis (L1), and SQLite (L2).
+        Cache ISP info for an IP's subnet in RAM and SQLite.
 
         Args:
             ip: IP address
@@ -211,17 +193,10 @@ class DBSubnetISPCache:
             "region": region or "Unknown",
         }
 
-        # 1. Update L0 memory cache
+        # 1. Update in-memory cache
         self._memory_cache[subnet] = isp_info
 
-        # 2. Update L1 Redis cache
-        try:
-            from utils.redis_cache import cache_isp as redis_cache_isp
-            await redis_cache_isp(subnet, isp_info)
-        except Exception as e:
-            logger.debug(f"Redis cache error in cache_isp for {subnet}: {e}")
-
-        # 3. Update L2 SQLite database with timeout
+        # 2. Update the SQLite subnet cache with a timeout
         import asyncio
         try:
             async with asyncio.timeout(3):  # 3 second timeout for DB save

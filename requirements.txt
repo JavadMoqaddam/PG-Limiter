@@ -9,5 +9,3 @@ uvicorn==0.52.3
 sqlalchemy[asyncio]==2.0.52
 aiosqlite==0.22.1
 alembic==1.19.1
-# Caching
-redis==8.1.0

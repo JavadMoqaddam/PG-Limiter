@@ -1,20 +1,14 @@
 """
 ISP Detection Module
-This module provides functionality to detect ISP information for IP addresses
-Uses Redis cache when available for fast lookups, with fallback to in-memory and database.
+This module provides functionality to detect ISP information for IP addresses.
+Lookups are served from a bounded in-process cache first, then from the
+database-backed subnet cache, and only then from the external APIs.
 """
 
 import asyncio
 from typing import Dict, Optional, Tuple
 import httpx
 from utils.logs import logger
-
-# Try to import Redis cache
-try:
-    from utils.redis_cache import get_cached_isp, cache_isp
-    REDIS_CACHE_AVAILABLE = True
-except ImportError:
-    REDIS_CACHE_AVAILABLE = False
 
 # Try to import database-backed subnet cache
 try:
@@ -120,19 +114,6 @@ class ISPDetector:
         if ip in self.cache:
             return self.cache[ip]
 
-        # Check Redis cache (fast)
-        if REDIS_CACHE_AVAILABLE:
-            try:
-                async with asyncio.timeout(2):  # 2 second Redis timeout
-                    cached = await get_cached_isp(ip)
-                    if cached:
-                        logger.debug(f"ISP Redis cache hit for {ip}")
-                        return cached
-            except asyncio.TimeoutError:
-                logger.warning(f"Redis cache timeout for {ip}")
-            except Exception as e:
-                logger.warning(f"Redis cache lookup failed for {ip}: {e}")
-        
         # Check database cache (by subnet) if enabled
         if self._db_cache:
             try:
@@ -253,22 +234,10 @@ class ISPDetector:
                 logger.warning(f"Failed to save ISP to database cache: {e}")
     
     async def _cache_isp_result(self, ip: str, isp_info: Dict[str, str]):
-        """Cache ISP result to Redis (primary) and database (backup) - non-blocking"""
+        """Persist an ISP result to the subnet cache in the database."""
         if isp_info.get("isp") == "Unknown ISP":
             return
-        
-        # Cache to Redis (7 day TTL) - with timeout
-        if REDIS_CACHE_AVAILABLE:
-            try:
-                async with asyncio.timeout(2):  # 2 second Redis timeout
-                    await cache_isp(ip, isp_info)
-                    logger.debug(f"Cached ISP for {ip} in Redis")
-            except asyncio.TimeoutError:
-                logger.debug(f"Redis cache timeout for {ip}")
-            except Exception as e:
-                logger.warning(f"Failed to cache ISP in Redis: {e}")
-        
-        # Also save to database as backup
+
         await self._save_to_db_cache(ip, isp_info)
     
     async def _get_isp_fallback(self, ip: str) -> Dict[str, str]:
