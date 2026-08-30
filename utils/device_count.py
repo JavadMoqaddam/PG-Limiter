@@ -16,8 +16,10 @@ otherwise be counted once per node.
                                        several people sharing one connection.
     "ip"      (ip-or-subnet)           one client IP is exactly one device.
 
-CDN traffic is collapsed before either rule applies: a whole CDN node, or a
-whole CDN inbound, is one device no matter how many addresses it presents.
+CDN traffic is collapsed before either rule applies, because a CDN presents many
+edge addresses for one client: every CDN node together counts as one device, and
+a CDN inbound counts as one device per inbound in "device" mode - all of them
+together in "ip" mode.
 """
 
 import ipaddress
@@ -128,11 +130,18 @@ def device_key(
     if conn.node_id in config.disabled_nodes:
         return None
 
-    # A CDN presents many addresses for one client, so the node (or the inbound
-    # when only the inbound is behind a CDN) counts as a single device.
+    # A CDN presents many addresses for one client, so its traffic collapses.
+    # The node id is deliberately NOT part of the key: several nodes serve one
+    # core config, so a single client is registered on all of them at once and
+    # would otherwise be counted once per node - which is how a user with one
+    # IP was reported as "7 devices".
     if conn.node_id in config.cdn_nodes:
-        return ("CDN_NODE", conn.node_id)
+        return ("CDN_NODE",)
     if conn.inbound_protocol in config.cdn_inbounds:
+        # The inbound only distinguishes devices in "device" mode; in "ip" mode
+        # every CDN inbound collapses together, like every other address does.
+        if config.count_mode == COUNT_MODE_IP:
+            return ("CDN_INBOUND",)
         return ("CDN_INBOUND", conn.inbound_protocol)
 
     if config.count_mode == COUNT_MODE_IP:

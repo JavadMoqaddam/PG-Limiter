@@ -140,6 +140,33 @@ class TestCdnCollapsing:
         assert count_devices(user, config) == 1
 
 
+    def test_one_ip_on_several_cdn_nodes_is_one_device(self):
+        # Regression: with one CDN key per node, a single-IP user connected to
+        # seven CDN nodes was reported as seven devices and banned.
+        config = DeviceCountingConfig(cdn_nodes=[5, 6, 7])
+        user = make_user(
+            [
+                ("5.6.7.8", "Vless", 5),
+                ("5.6.7.8", "Vless", 6),
+                ("5.6.7.8", "Vless", 7),
+            ]
+        )
+        assert count_devices(user, config) == 1
+
+    def test_device_mode_keeps_cdn_inbounds_apart(self):
+        config = DeviceCountingConfig(cdn_inbounds=["CDN_WS", "CDN_GRPC"])
+        user = make_user([("5.6.7.8", "CDN_WS", 1), ("5.6.7.8", "CDN_GRPC", 1)])
+        assert count_devices(user, config) == 2
+
+    def test_ip_mode_collapses_all_cdn_inbounds(self):
+        # In "ip" mode the inbound is part of no key, CDN inbounds included.
+        config = DeviceCountingConfig(
+            count_mode=COUNT_MODE_IP, cdn_inbounds=["CDN_WS", "CDN_GRPC"]
+        )
+        user = make_user([("5.6.7.8", "CDN_WS", 1), ("5.6.7.8", "CDN_GRPC", 1)])
+        assert count_devices(user, config) == 1
+
+
 class TestDisabledNodes:
     """Traffic from a disabled node is not evidence of anything."""
 
