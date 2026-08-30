@@ -284,6 +284,324 @@ async def help_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CALLBACK ROUTING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Every entry below is one callback -> one coroutine. Adding a button means
+# adding a single line here instead of another branch in a long if/elif chain.
+# Routes are called as ``route(update, query, context)``; the small lambdas adapt
+# the different handler signatures.
+
+MENU_TEXTS = {
+    "settings": "⚙️ <b>Settings Menu</b>\n\nConfigure your bot settings:",
+    "limits": "🎯 <b>Limits Menu</b>\n\nManage user connection limits:",
+    "users": "👥 <b>Users Menu</b>\n\nManage users and view disabled accounts:",
+    "monitoring": "📡 <b>Monitoring Menu</b>\n\nView user monitoring status:",
+    "reports": "📊 <b>Reports Menu</b>\n\nGenerate usage reports:",
+    "admin": "👑 <b>Admin Menu</b>\n\nManage bot administrators:",
+    "whitelist": (
+        "✅ <b>Whitelist Users</b>\n\n"
+        "Users in the whitelist are excluded from IP limits.\n"
+        "They can have unlimited connections."
+    ),
+    "special_limits": (
+        "🎯 <b>Special Limit Users</b>\n\n"
+        "Users with custom connection limits.\n"
+        "These limits override the general limit."
+    ),
+    "restore": (
+        "📥 <b>Restore from Backup</b>\n\n"
+        "Please send your backup file (zip or json format).\n\n"
+        "<b>⚠️ Warning:</b> This will replace your current data!\n\n"
+        "Use /restore command to upload your backup file."
+    ),
+    "create_config": (
+        "⚙️ <b>Create Config</b>\n\nUse the command:\n<code>/create_config</code>"
+    ),
+    "add_admin": (
+        "👤 <b>Add Admin</b>\n\nUse the command:\n<code>/add_admin</code>\n\n"
+        "Then send the chat ID of the user to add."
+    ),
+    "remove_admin": (
+        "🗑 <b>Remove Admin</b>\n\nUse the command:\n<code>/remove_admin</code>\n\n"
+        "Then send the chat ID of the admin to remove."
+    ),
+}
+
+
+async def _show_screen(query, text: str, keyboard) -> None:
+    """Render a static menu screen."""
+    await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+
+
+def _admin_screen_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard shared by the add/remove admin instruction screens."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("« Back to Admins", callback_data=CallbackData.LIST_ADMINS)],
+        [InlineKeyboardButton("« Back to Main Menu", callback_data=CallbackData.MAIN_MENU)],
+    ])
+
+
+def _lazy(module_name: str, func_name: str, *args, pass_update: bool = False):
+    """
+    Build a route whose handler module is imported on first use.
+
+    Keeps the heavier handler modules out of the startup import graph, exactly
+    as the previous inline ``from ... import ...`` statements did.
+    """
+    async def _route(update, query, context):
+        import importlib
+
+        handler = getattr(importlib.import_module(module_name), func_name)
+        if pass_update:
+            await handler(update, context, *args)
+        else:
+            await handler(query, context, *args)
+
+    return _route
+
+
+DISABLE_METHOD_BULLETS = (
+    "• <b>By Status</b>: Set user status to 'disabled'\n"
+    "• <b>By Group</b>: Move user to a disabled group\n"
+    "• <b>Fallback Group</b>: Default group for re-enabled users"
+)
+DISABLE_METHOD_TEXT_HEADER = "🚫 <b>Disable Method</b>\n\n"
+DISABLE_METHOD_TEXT = (
+    f"{DISABLE_METHOD_TEXT_HEADER}Choose how users should be disabled:\n\n{DISABLE_METHOD_BULLETS}"
+)
+
+
+async def _show_disable_method_menu(update, query, context) -> None:
+    """Render the disable-method screen with the resolved group names."""
+    config_data = await read_config()
+    current_method = config_data.get("disable_method", "status")
+    disabled_group_id = config_data.get("disabled_group_id")
+    fallback_group_id = config_data.get("fallback_group_id")
+    disabled_group_name = None
+    fallback_group_name = None
+
+    if (current_method == "group" and disabled_group_id) or fallback_group_id:
+        try:
+            from utils.user_group_filter import get_all_groups
+            from utils.types import PanelType
+
+            panel_config = config_data.get("panel", {})
+            panel_data = PanelType(
+                panel_config.get("username", ""),
+                panel_config.get("password", ""),
+                panel_config.get("domain", ""),
+            )
+            for group in await get_all_groups(panel_data):
+                if disabled_group_id and group.get("id") == int(disabled_group_id):
+                    disabled_group_name = group.get("name", "Unknown")
+                if fallback_group_id and group.get("id") == int(fallback_group_id):
+                    fallback_group_name = group.get("name", "Unknown")
+        except Exception:
+            pass
+
+    await _show_screen(
+        query,
+        DISABLE_METHOD_TEXT,
+        create_disable_method_keyboard(current_method, disabled_group_name, fallback_group_name),
+    )
+
+
+async def _set_disable_by_status(update, query, context) -> None:
+    """Switch the disable method to status and redraw the screen."""
+    await save_config_value("disable_method", "status")
+    await _show_screen(
+        query,
+        f"{DISABLE_METHOD_TEXT_HEADER}✅ Method set to <b>By Status</b>\n\n{DISABLE_METHOD_BULLETS}",
+        create_disable_method_keyboard("status", None),
+    )
+
+
+async def _send_backup_from_button(update, query, context) -> None:
+    """Backup expects an Update-like object carrying the message."""
+    class _FakeUpdate:
+        def __init__(self, message, effective_user, effective_chat):
+            self.message = message
+            self.effective_user = effective_user
+            self.effective_chat = effective_chat
+
+    fake_update = _FakeUpdate(query.message, update.effective_user, update.effective_chat)
+    await query.message.reply_text("📦 Creating backup... Please wait.")
+    await send_backup(fake_update, context)
+
+
+async def _cdn_mode_add(update, query, context) -> None:
+    """Adding a CDN inbound continues as a text prompt when the handler asks for it."""
+    from telegram_bot.handlers.settings import cdn_mode_add_callback
+
+    if await cdn_mode_add_callback(query, context) is not None:
+        context.user_data["waiting_for"] = "cdn_inbound"
+
+
+CALLBACK_ROUTES = {
+    # --- Main navigation ----------------------------------------------------
+    CallbackData.MAIN_MENU: lambda u, q, c: _show_screen(q, START_MESSAGE, create_main_menu_keyboard()),
+    CallbackData.BACK_MAIN: lambda u, q, c: _show_screen(q, START_MESSAGE, create_main_menu_keyboard()),
+    CallbackData.SETTINGS_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["settings"], create_settings_menu_keyboard()),
+    CallbackData.BACK_SETTINGS: lambda u, q, c: _show_screen(q, MENU_TEXTS["settings"], create_settings_menu_keyboard()),
+    CallbackData.LIMITS_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["limits"], create_limits_menu_keyboard()),
+    CallbackData.USERS_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["users"], create_users_menu_keyboard()),
+    CallbackData.BACK_USERS: lambda u, q, c: _show_screen(q, MENU_TEXTS["users"], create_users_menu_keyboard()),
+    CallbackData.MONITORING_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["monitoring"], create_monitoring_menu_keyboard()),
+    CallbackData.REPORTS_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["reports"], create_reports_menu_keyboard()),
+    CallbackData.ADMIN_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["admin"], create_admin_menu_keyboard()),
+    "noop": lambda u, q, c: q.answer(),
+
+    # --- Users --------------------------------------------------------------
+    CallbackData.WHITELIST_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["whitelist"], create_whitelist_menu_keyboard()),
+    CallbackData.SPECIAL_LIMITS_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["special_limits"], create_special_limits_menu_keyboard()),
+    CallbackData.FILTERED_USERS_MENU: lambda u, q, c: handle_filtered_users_menu(q, c),
+    CallbackData.SHOW_DISABLED_USERS: lambda u, q, c: show_disabled_users_menu(q),
+    CallbackData.ENABLE_ALL_DISABLED: lambda u, q, c: enable_all_disabled_users(q),
+    CallbackData.CLEANUP_DELETED_USERS: lambda u, q, c: cleanup_deleted_users_handler(q),
+    "view_users_in_disabled_group": _lazy("telegram_bot.handlers.users", "show_users_in_disabled_group"),
+    "fix_stuck_users": _lazy("telegram_bot.handlers.users", "fix_stuck_users_handler"),
+    CallbackData.SHOW_EXCEPT_USERS: lambda u, q, c: handle_show_except_users_callback(q, c),
+    CallbackData.SET_EXCEPT_USER: lambda u, q, c: handle_add_except_user_callback(q, c),
+    CallbackData.REMOVE_EXCEPT_USER: lambda u, q, c: handle_remove_except_user_callback(q, c),
+    CallbackData.SHOW_SPECIAL_LIMIT: lambda u, q, c: handle_show_special_limit_callback(q, c),
+    CallbackData.SET_SPECIAL_LIMIT: lambda u, q, c: handle_set_special_limit_callback(q, c),
+
+    # --- Admins & backup ----------------------------------------------------
+    CallbackData.LIST_ADMINS: lambda u, q, c: handle_admins_list_callback(q, c),
+    CallbackData.ADD_ADMIN: lambda u, q, c: _show_screen(q, MENU_TEXTS["add_admin"], _admin_screen_keyboard()),
+    CallbackData.REMOVE_ADMIN: lambda u, q, c: _show_screen(q, MENU_TEXTS["remove_admin"], _admin_screen_keyboard()),
+    CallbackData.BACKUP: _send_backup_from_button,
+    CallbackData.RESTORE: lambda u, q, c: _show_screen(q, MENU_TEXTS["restore"], create_back_to_main_keyboard()),
+    # --- Monitoring & reports ------------------------------------------------
+    CallbackData.MONITORING_STATUS: lambda u, q, c: monitoring_status(u, c),
+    CallbackData.MONITORING_DETAILS: lambda u, q, c: monitoring_details(u, c),
+    CallbackData.MONITORING_CLEAR: lambda u, q, c: clear_monitoring(u, c),
+    CallbackData.REPORT_CONNECTION: lambda u, q, c: connection_report_command(u, c),
+    CallbackData.REPORT_NODE_USAGE: lambda u, q, c: node_usage_report_command(u, c),
+    CallbackData.REPORT_MULTI_DEVICE: lambda u, q, c: multi_device_users_command(u, c),
+    CallbackData.REPORT_IP_12H: lambda u, q, c: ip_history_12h_command(u, c),
+    CallbackData.REPORT_IP_48H: lambda u, q, c: ip_history_48h_command(u, c),
+
+    # --- Limits -------------------------------------------------------------
+    CallbackData.GENERAL_LIMIT_2: lambda u, q, c: handle_general_limit_preset_callback(q, c, 2),
+    CallbackData.GENERAL_LIMIT_3: lambda u, q, c: handle_general_limit_preset_callback(q, c, 3),
+    CallbackData.GENERAL_LIMIT_4: lambda u, q, c: handle_general_limit_preset_callback(q, c, 4),
+    CallbackData.GENERAL_LIMIT_CUSTOM: lambda u, q, c: handle_general_limit_custom_callback(q, c),
+    CallbackData.SPECIAL_LIMIT_1: lambda u, q, c: handle_special_limit_1_callback(q, c),
+    CallbackData.SPECIAL_LIMIT_2: lambda u, q, c: handle_special_limit_2_callback(q, c),
+    CallbackData.SPECIAL_LIMIT_CUSTOM: _lazy("telegram_bot.handlers.limits", "handle_special_limit_custom_callback"),
+
+    # --- Core settings ------------------------------------------------------
+    CallbackData.CREATE_CONFIG: lambda u, q, c: _show_screen(q, MENU_TEXTS["create_config"], create_back_to_main_keyboard()),
+    CallbackData.SET_IPINFO: lambda u, q, c: handle_ipinfo_callback(q, c),
+    CallbackData.ENHANCED_ON: lambda u, q, c: handle_enhanced_toggle_callback(q, c, True),
+    CallbackData.ENHANCED_OFF: lambda u, q, c: handle_enhanced_toggle_callback(q, c, False),
+
+    # --- Disable method -----------------------------------------------------
+    CallbackData.DISABLE_METHOD_MENU: _show_disable_method_menu,
+    CallbackData.DISABLE_BY_STATUS: _set_disable_by_status,
+    CallbackData.DISABLE_BY_GROUP: lambda u, q, c: handle_disable_by_group_callback(q, c),
+    CallbackData.FALLBACK_GROUP_MENU: lambda u, q, c: handle_fallback_group_menu_callback(q, c),
+    CallbackData.CLEAR_FALLBACK_GROUP: lambda u, q, c: handle_clear_fallback_group_callback(q, c),
+
+    # --- User sync ----------------------------------------------------------
+    CallbackData.USER_SYNC_MENU: lambda u, q, c: handle_user_sync_menu_callback(q, c),
+    CallbackData.USER_SYNC_1: lambda u, q, c: handle_user_sync_interval_callback(q, c, 1),
+    CallbackData.USER_SYNC_5: lambda u, q, c: handle_user_sync_interval_callback(q, c, 5),
+    CallbackData.USER_SYNC_10: lambda u, q, c: handle_user_sync_interval_callback(q, c, 10),
+    CallbackData.USER_SYNC_15: lambda u, q, c: handle_user_sync_interval_callback(q, c, 15),
+    CallbackData.USER_SYNC_NOW: lambda u, q, c: handle_user_sync_now_callback(q, c),
+    CallbackData.USER_SYNC_PENDING: lambda u, q, c: handle_pending_deletions_callback(q, c),
+    CallbackData.USER_SYNC_FORCE_DELETE: lambda u, q, c: handle_force_delete_callback(q, c),
+    # --- Topics -------------------------------------------------------------
+    CallbackData.TOPICS_MENU: _lazy("telegram_bot.handlers.topics_settings", "handle_topics_menu_callback"),
+    CallbackData.TOPICS_TOGGLE: _lazy("telegram_bot.handlers.topics_settings", "handle_topics_toggle_callback"),
+    CallbackData.TOPICS_SETUP: _lazy("telegram_bot.handlers.topics_settings", "handle_topics_setup_callback"),
+    CallbackData.TOPICS_CLEAR: _lazy("telegram_bot.handlers.topics_settings", "handle_topics_clear_callback"),
+    CallbackData.TOPICS_SET_GROUP: _lazy("telegram_bot.handlers.topics_settings", "handle_topics_set_group_callback"),
+    CallbackData.TOPICS_CHECK_PERMISSIONS: _lazy("telegram_bot.handlers.topics_settings", "handle_topics_check_permissions_callback"),
+    CallbackData.TOPICS_CLEAR_CACHE: _lazy("telegram_bot.handlers.topics_settings", "handle_topics_clear_cache_callback"),
+
+    # --- Auto-backup (handlers take the Update) ------------------------------
+    CallbackData.AUTO_BACKUP_MENU: _lazy("telegram_bot.handlers.backup", "auto_backup_menu", pass_update=True),
+    CallbackData.AUTO_BACKUP_TOGGLE: _lazy("telegram_bot.handlers.backup", "auto_backup_toggle", pass_update=True),
+    CallbackData.AUTO_BACKUP_INTERVAL_1H: _lazy("telegram_bot.handlers.backup", "handle_auto_backup_interval_1h", pass_update=True),
+    CallbackData.AUTO_BACKUP_INTERVAL_3H: _lazy("telegram_bot.handlers.backup", "handle_auto_backup_interval_3h", pass_update=True),
+    CallbackData.AUTO_BACKUP_INTERVAL_6H: _lazy("telegram_bot.handlers.backup", "handle_auto_backup_interval_6h", pass_update=True),
+    CallbackData.AUTO_BACKUP_INTERVAL_12H: _lazy("telegram_bot.handlers.backup", "handle_auto_backup_interval_12h", pass_update=True),
+    CallbackData.AUTO_BACKUP_NOW: _lazy("telegram_bot.handlers.backup", "auto_backup_now", pass_update=True),
+
+    # --- Punishment (handlers take the Update) -------------------------------
+    CallbackData.PUNISHMENT_MENU: lambda u, q, c: punishment_status(u, c),
+    CallbackData.PUNISHMENT_TOGGLE: lambda u, q, c: punishment_toggle(u, c),
+    CallbackData.PUNISHMENT_WINDOW: lambda u, q, c: punishment_set_window(u, c),
+    CallbackData.PUNISHMENT_STEPS: lambda u, q, c: punishment_set_steps(u, c),
+    CallbackData.PUNISHMENT_WINDOW_24: _lazy("telegram_bot.handlers.punishment", "punishment_set_window_hours", 24, pass_update=True),
+    CallbackData.PUNISHMENT_WINDOW_48: _lazy("telegram_bot.handlers.punishment", "punishment_set_window_hours", 48, pass_update=True),
+    CallbackData.PUNISHMENT_WINDOW_72: _lazy("telegram_bot.handlers.punishment", "punishment_set_window_hours", 72, pass_update=True),
+    CallbackData.PUNISHMENT_WINDOW_168: _lazy("telegram_bot.handlers.punishment", "punishment_set_window_hours", 168, pass_update=True),
+    CallbackData.PUNISHMENT_ADD_STEP: _lazy("telegram_bot.handlers.punishment", "punishment_add_step_menu", pass_update=True),
+    CallbackData.PUNISHMENT_STEPS_RESET: _lazy("telegram_bot.handlers.punishment", "punishment_reset_steps", pass_update=True),
+    CallbackData.PUNISHMENT_STEP_WARNING: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "warning", 0, pass_update=True),
+    CallbackData.PUNISHMENT_STEP_DISABLE_10: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "disable", 10, pass_update=True),
+    CallbackData.PUNISHMENT_STEP_DISABLE_30: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "disable", 30, pass_update=True),
+    CallbackData.PUNISHMENT_STEP_DISABLE_60: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "disable", 60, pass_update=True),
+    CallbackData.PUNISHMENT_STEP_DISABLE_240: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "disable", 240, pass_update=True),
+    CallbackData.PUNISHMENT_STEP_DISABLE_UNLIMITED: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "disable", 0, pass_update=True),
+    CallbackData.PUNISHMENT_STEP_REVOKE: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "revoke", 0, pass_update=True),
+    # --- Group & admin filters ----------------------------------------------
+    CallbackData.GROUP_FILTER_MENU: lambda u, q, c: handle_group_filter_menu_callback(q, c),
+    CallbackData.GROUP_LIMIT_SET: lambda u, q, c: handle_group_limit_menu_callback(q, c),
+    CallbackData.GROUP_FILTER_TOGGLE: lambda u, q, c: handle_group_filter_toggle_callback(q, c),
+    CallbackData.GROUP_FILTER_MODE_INCLUDE: lambda u, q, c: handle_group_filter_mode_callback(q, c, "include"),
+    CallbackData.GROUP_FILTER_MODE_EXCLUDE: lambda u, q, c: handle_group_filter_mode_callback(q, c, "exclude"),
+    CallbackData.ADMIN_FILTER_MENU: lambda u, q, c: handle_admin_filter_menu_callback(q, c),
+    CallbackData.ADMIN_FILTER_TOGGLE: lambda u, q, c: handle_admin_filter_toggle_callback(q, c),
+    CallbackData.ADMIN_FILTER_MODE_INCLUDE: lambda u, q, c: handle_admin_filter_mode_callback(q, c, "include"),
+    CallbackData.ADMIN_FILTER_MODE_EXCLUDE: lambda u, q, c: handle_admin_filter_mode_callback(q, c, "exclude"),
+
+    # --- Device counting & grouping -----------------------------------------
+    CallbackData.SUBNET_IP_GROUPING_MENU: _lazy("telegram_bot.handlers.settings", "subnet_ip_grouping_menu_callback"),
+    CallbackData.SUBNET_IP_GROUPING_TOGGLE: _lazy("telegram_bot.handlers.settings", "subnet_ip_grouping_toggle_callback"),
+    CallbackData.SUBNET_IP_GROUPING_MODE_TOGGLE: _lazy("telegram_bot.handlers.settings", "subnet_ip_grouping_mode_toggle_callback"),
+    CallbackData.HIGH_TRUST_IP_GROUPING_MENU: _lazy("telegram_bot.handlers.settings", "high_trust_ip_grouping_menu_callback"),
+    CallbackData.HIGH_TRUST_IP_GROUPING_TOGGLE: _lazy("telegram_bot.handlers.settings", "high_trust_ip_grouping_toggle_callback"),
+    CallbackData.DEVICE_COUNT_MENU: _lazy("telegram_bot.handlers.settings", "handle_device_count_menu_callback"),
+    CallbackData.DEVICE_COUNT_SET_DEVICE: _lazy("telegram_bot.handlers.settings", "handle_device_count_set_device_callback"),
+    CallbackData.DEVICE_COUNT_SET_IP: _lazy("telegram_bot.handlers.settings", "handle_device_count_set_ip_callback"),
+
+    # --- Trust ---------------------------------------------------------------
+    CallbackData.TRUST_RESET_MENU: _lazy("telegram_bot.handlers.settings", "trust_reset_menu_callback"),
+    CallbackData.TRUST_RESET_ALL: _lazy("telegram_bot.handlers.settings", "trust_reset_all_callback"),
+
+    # --- CDN -----------------------------------------------------------------
+    CallbackData.CDN_MODE_MENU: _lazy("telegram_bot.handlers.settings", "cdn_mode_menu_callback"),
+    CallbackData.CDN_MODE_REMOVE: _lazy("telegram_bot.handlers.settings", "cdn_mode_remove_callback"),
+    CallbackData.CDN_MODE_CLEAR: _lazy("telegram_bot.handlers.settings", "cdn_mode_clear_callback"),
+    CallbackData.CDN_USE_XFF_TOGGLE: _lazy("telegram_bot.handlers.settings", "cdn_use_xff_toggle_callback"),
+    CallbackData.CDN_PROVIDER_MENU: _lazy("telegram_bot.handlers.settings", "cdn_provider_menu_callback"),
+    CallbackData.CDN_PROVIDER_CLOUDFLARE: _lazy("telegram_bot.handlers.settings", "cdn_provider_cloudflare_callback"),
+    CallbackData.CDN_MODE_ADD: _cdn_mode_add,
+
+    # --- Nodes ---------------------------------------------------------------
+    CallbackData.NODE_SETTINGS_MENU: _lazy("telegram_bot.handlers.settings", "node_settings_menu_callback"),
+    CallbackData.NODE_SETTINGS_REFRESH: _lazy("telegram_bot.handlers.settings", "node_settings_refresh_callback"),
+    CallbackData.NODE_CDN_MENU: _lazy("telegram_bot.handlers.settings", "node_cdn_menu_callback"),
+    CallbackData.NODE_DISABLED_MENU: _lazy("telegram_bot.handlers.settings", "node_disabled_menu_callback"),
+    CallbackData.NODE_CDN_CLEAR: _lazy("telegram_bot.handlers.settings", "node_cdn_clear_callback"),
+    CallbackData.NODE_DISABLED_CLEAR: _lazy("telegram_bot.handlers.settings", "node_disabled_clear_callback"),
+
+    # --- IP source -----------------------------------------------------------
+    CallbackData.IP_SOURCE_MENU: _lazy("telegram_bot.handlers.settings", "handle_ip_source_menu_callback"),
+    CallbackData.IP_SOURCE_SET_LOGS: _lazy("telegram_bot.handlers.settings", "handle_ip_source_set_logs_callback"),
+    CallbackData.IP_SOURCE_SET_API: _lazy("telegram_bot.handlers.settings", "handle_ip_source_set_api_callback"),
+    CallbackData.IP_SOURCE_SET_CONCURRENCY: _lazy("telegram_bot.handlers.settings", "handle_ip_source_concurrency_callback"),
+    CallbackData.IP_SOURCE_STATS: _lazy("telegram_bot.handlers.settings", "handle_ip_source_stats_callback"),
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # CALLBACK QUERY HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -302,551 +620,32 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             text="Sorry, you do not have permission to use this bot."
         )
         return
-    
-    # Main menu
-    if data in [CallbackData.MAIN_MENU, CallbackData.BACK_MAIN]:
-        await query.edit_message_text(
-            text=START_MESSAGE,
-            reply_markup=create_main_menu_keyboard(),
-            parse_mode="HTML"
-        )
+
+    # Exact-match callbacks come from the routing table; only callbacks that
+    # carry a payload (``prefix:value``) are matched below.
+    route = CALLBACK_ROUTES.get(data)
+    if route is not None:
+        await route(update, query, context)
         return
-    
-    # No-op callback (for buttons that just display info)
-    if data == "noop":
-        await query.answer()
-        return
-    
-    # Settings menu
-    if data == CallbackData.SETTINGS_MENU:
-        await query.edit_message_text(
-            text="⚙️ <b>Settings Menu</b>\n\nConfigure your bot settings:",
-            reply_markup=create_settings_menu_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-    
-    # Limits menu
-    if data == CallbackData.LIMITS_MENU:
-        await query.edit_message_text(
-            text="🎯 <b>Limits Menu</b>\n\nManage user connection limits:",
-            reply_markup=create_limits_menu_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-    
-    # Users menu
-    if data == CallbackData.USERS_MENU:
-        await query.edit_message_text(
-            text="👥 <b>Users Menu</b>\n\nManage users and view disabled accounts:",
-            reply_markup=create_users_menu_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-    
-    # Monitoring menu
-    if data == CallbackData.MONITORING_MENU:
-        await query.edit_message_text(
-            text="📡 <b>Monitoring Menu</b>\n\nView user monitoring status:",
-            reply_markup=create_monitoring_menu_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-    
-    # Reports menu
-    if data == CallbackData.REPORTS_MENU:
-        await query.edit_message_text(
-            text="📊 <b>Reports Menu</b>\n\nGenerate usage reports:",
-            reply_markup=create_reports_menu_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-    
-    # Admin menu
-    if data == CallbackData.ADMIN_MENU:
-        await query.edit_message_text(
-            text="👑 <b>Admin Menu</b>\n\nManage bot administrators:",
-            reply_markup=create_admin_menu_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-    
-    # Disabled users
-    if data == CallbackData.SHOW_DISABLED_USERS:
-        await show_disabled_users_menu(query)
-        return
-    
-    if data == CallbackData.ENABLE_ALL_DISABLED:
-        await enable_all_disabled_users(query)
-        return
-    
-    if data == "view_users_in_disabled_group":
-        from telegram_bot.handlers.users import show_users_in_disabled_group
-        await show_users_in_disabled_group(query)
-        return
-    
+
     if data.startswith("disabled_group_page:"):
         from telegram_bot.handlers.users import show_users_in_disabled_group
         page = int(data.split(":")[1])
         await show_users_in_disabled_group(query, page)
         return
-    
-    if data == "fix_stuck_users":
-        from telegram_bot.handlers.users import fix_stuck_users_handler
-        await fix_stuck_users_handler(query)
-        return
-    
-    if data == CallbackData.CLEANUP_DELETED_USERS:
-        await cleanup_deleted_users_handler(query)
-        return
-    
-    # Backup/Restore callbacks
-    if data == CallbackData.BACKUP:
-        # Create a fake update with the query.message to use send_backup
-        class FakeUpdate:
-            def __init__(self, message, effective_user, effective_chat):
-                self.message = message
-                self.effective_user = effective_user
-                self.effective_chat = effective_chat
-        
-        fake_update = FakeUpdate(query.message, update.effective_user, update.effective_chat)
-        await query.message.reply_text("📦 Creating backup... Please wait.")
-        await send_backup(fake_update, context)
-        return
-    
-    if data == CallbackData.RESTORE:
-        await query.edit_message_text(
-            text="📥 <b>Restore from Backup</b>\n\n"
-                 "Please send your backup file (zip or json format).\n\n"
-                 "<b>⚠️ Warning:</b> This will replace your current data!\n\n"
-                 "Use /restore command to upload your backup file.",
-            reply_markup=create_back_to_main_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-    
-    # Admin management callbacks
-    if data == CallbackData.LIST_ADMINS:
-        await handle_admins_list_callback(query, context)
-        return
-    
-    if data == CallbackData.ADD_ADMIN:
-        await query.edit_message_text(
-            text="👤 <b>Add Admin</b>\n\n"
-                 "Use the command:\n"
-                 "<code>/add_admin</code>\n\n"
-                 "Then send the chat ID of the user to add.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("« Back to Admins", callback_data=CallbackData.LIST_ADMINS)],
-                [InlineKeyboardButton("« Back to Main Menu", callback_data=CallbackData.MAIN_MENU)],
-            ]),
-            parse_mode="HTML"
-        )
-        return
-    
-    if data == CallbackData.REMOVE_ADMIN:
-        await query.edit_message_text(
-            text="🗑 <b>Remove Admin</b>\n\n"
-                 "Use the command:\n"
-                 "<code>/remove_admin</code>\n\n"
-                 "Then send the chat ID of the admin to remove.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("« Back to Admins", callback_data=CallbackData.LIST_ADMINS)],
-                [InlineKeyboardButton("« Back to Main Menu", callback_data=CallbackData.MAIN_MENU)],
-            ]),
-            parse_mode="HTML"
-        )
-        return
-    
-    # User management callbacks
-    if data == CallbackData.WHITELIST_MENU:
-        await query.edit_message_text(
-            text="✅ <b>Whitelist Users</b>\n\n"
-                 "Users in the whitelist are excluded from IP limits.\n"
-                 "They can have unlimited connections.",
-            reply_markup=create_whitelist_menu_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-    
-    if data == CallbackData.SPECIAL_LIMITS_MENU:
-        await query.edit_message_text(
-            text="🎯 <b>Special Limit Users</b>\n\n"
-                 "Users with custom connection limits.\n"
-                 "These limits override the general limit.",
-            reply_markup=create_special_limits_menu_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-    
-    if data == CallbackData.FILTERED_USERS_MENU:
-        await handle_filtered_users_menu(query, context)
-        return
-    
-    if data == CallbackData.BACK_USERS:
-        await query.edit_message_text(
-            text="👥 <b>Users Menu</b>\n\nManage users and view disabled accounts:",
-            reply_markup=create_users_menu_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-    
-    if data == CallbackData.SHOW_EXCEPT_USERS:
-        await handle_show_except_users_callback(query, context)
-        return
-    
-    if data == CallbackData.SET_EXCEPT_USER:
-        await handle_add_except_user_callback(query, context)
-        return
-    
-    if data == CallbackData.REMOVE_EXCEPT_USER:
-        await handle_remove_except_user_callback(query, context)
-        return
-    
-    if data == CallbackData.SHOW_SPECIAL_LIMIT:
-        await handle_show_special_limit_callback(query, context)
-        return
-    
-    if data == CallbackData.SET_SPECIAL_LIMIT:
-        await handle_set_special_limit_callback(query, context)
-        return
-    
-    # Monitoring callbacks
-    if data == CallbackData.MONITORING_STATUS:
-        await monitoring_status(update, context)
-        return
-    
-    if data == CallbackData.MONITORING_DETAILS:
-        await monitoring_details(update, context)
-        return
-    
-    if data == CallbackData.MONITORING_CLEAR:
-        await clear_monitoring(update, context)
-        return
-    
-    # Reports callbacks
-    if data == CallbackData.REPORT_CONNECTION:
-        await connection_report_command(update, context)
-        return
-    
-    if data == CallbackData.REPORT_NODE_USAGE:
-        await node_usage_report_command(update, context)
-        return
-    
-    if data == CallbackData.REPORT_MULTI_DEVICE:
-        await multi_device_users_command(update, context)
-        return
-    
-    if data == CallbackData.REPORT_IP_12H:
-        await ip_history_12h_command(update, context)
-        return
-    
-    if data == CallbackData.REPORT_IP_48H:
-        await ip_history_48h_command(update, context)
-        return
-    
-    # Settings callbacks
-    if data == CallbackData.CREATE_CONFIG:
-        await query.edit_message_text(
-            text="⚙️ <b>Create Config</b>\n\n"
-                 "Use the command:\n"
-                 "<code>/create_config</code>",
-            reply_markup=create_back_to_main_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-    
-    if data == CallbackData.SET_IPINFO:
-        await handle_ipinfo_callback(query, context)
-        return
-    
-    # Enhanced details callbacks
-    if data == CallbackData.ENHANCED_ON:
-        await handle_enhanced_toggle_callback(query, context, True)
-        return
-    
-    if data == CallbackData.ENHANCED_OFF:
-        await handle_enhanced_toggle_callback(query, context, False)
-        return
-    
-    # Disable method callbacks
-    if data == CallbackData.DISABLE_METHOD_MENU:
-        config_data = await read_config()
-        current_method = config_data.get("disable_method", "status")
-        disabled_group_id = config_data.get("disabled_group_id")
-        fallback_group_id = config_data.get("fallback_group_id")
-        disabled_group_name = None
-        fallback_group_name = None
-        
-        # Get group names if set
-        if (current_method == "group" and disabled_group_id) or fallback_group_id:
-            try:
-                from utils.user_group_filter import get_all_groups
-                from utils.types import PanelType
-                panel_config = config_data.get("panel", {})
-                panel_data = PanelType(
-                    panel_config.get("username", ""),
-                    panel_config.get("password", ""),
-                    panel_config.get("domain", "")
-                )
-                groups = await get_all_groups(panel_data)
-                for group in groups:
-                    if disabled_group_id and group.get("id") == int(disabled_group_id):
-                        disabled_group_name = group.get("name", "Unknown")
-                    if fallback_group_id and group.get("id") == int(fallback_group_id):
-                        fallback_group_name = group.get("name", "Unknown")
-            except Exception:
-                pass
-        
-        await query.edit_message_text(
-            text="🚫 <b>Disable Method</b>\n\n"
-                 "Choose how users should be disabled:\n\n"
-                 "• <b>By Status</b>: Set user status to 'disabled'\n"
-                 "• <b>By Group</b>: Move user to a disabled group\n"
-                 "• <b>Fallback Group</b>: Default group for re-enabled users",
-            reply_markup=create_disable_method_keyboard(current_method, disabled_group_name, fallback_group_name),
-            parse_mode="HTML"
-        )
-        return
-    
-    if data == CallbackData.DISABLE_BY_STATUS:
-        await save_config_value("disable_method", "status")
-        await query.edit_message_text(
-            text="🚫 <b>Disable Method</b>\n\n"
-                 "✅ Method set to <b>By Status</b>\n\n"
-                 "• <b>By Status</b>: Set user status to 'disabled'\n"
-                 "• <b>By Group</b>: Move user to a disabled group\n"
-                 "• <b>Fallback Group</b>: Default group for re-enabled users",
-            reply_markup=create_disable_method_keyboard("status", None),
-            parse_mode="HTML"
-        )
-        return
-    
-    if data == CallbackData.DISABLE_BY_GROUP:
-        await handle_disable_by_group_callback(query, context)
-        return
-    
+
     # Handle select disabled group callbacks
     if data.startswith("select_disabled_group:"):
         group_id = int(data.split(":")[1])
         await handle_select_disabled_group_callback(query, context, group_id)
         return
-    
-    # Fallback group callbacks
-    if data == CallbackData.FALLBACK_GROUP_MENU:
-        await handle_fallback_group_menu_callback(query, context)
-        return
-    
+
     if data.startswith("select_fallback_group:"):
         group_id = int(data.split(":")[1])
         await handle_select_fallback_group_callback(query, context, group_id)
         return
-    
-    if data == CallbackData.CLEAR_FALLBACK_GROUP:
-        await handle_clear_fallback_group_callback(query, context)
-        return
-    
-    # User sync callbacks
-    if data == CallbackData.USER_SYNC_MENU:
-        await handle_user_sync_menu_callback(query, context)
-        return
-    
-    if data == CallbackData.USER_SYNC_1:
-        await handle_user_sync_interval_callback(query, context, 1)
-        return
-    
-    if data == CallbackData.USER_SYNC_5:
-        await handle_user_sync_interval_callback(query, context, 5)
-        return
-    
-    if data == CallbackData.USER_SYNC_10:
-        await handle_user_sync_interval_callback(query, context, 10)
-        return
-    
-    if data == CallbackData.USER_SYNC_15:
-        await handle_user_sync_interval_callback(query, context, 15)
-        return
-    
-    if data == CallbackData.USER_SYNC_NOW:
-        await handle_user_sync_now_callback(query, context)
-        return
-    
-    if data == CallbackData.USER_SYNC_PENDING:
-        await handle_pending_deletions_callback(query, context)
-        return
-    
-    if data == CallbackData.USER_SYNC_FORCE_DELETE:
-        await handle_force_delete_callback(query, context)
-        return
-    
-    # Topics callbacks
-    if data == CallbackData.TOPICS_MENU:
-        from telegram_bot.handlers.topics_settings import handle_topics_menu_callback
-        await handle_topics_menu_callback(query, context)
-        return
-    
-    if data == CallbackData.TOPICS_TOGGLE:
-        from telegram_bot.handlers.topics_settings import handle_topics_toggle_callback
-        await handle_topics_toggle_callback(query, context)
-        return
-    
-    if data == CallbackData.TOPICS_SETUP:
-        from telegram_bot.handlers.topics_settings import handle_topics_setup_callback
-        await handle_topics_setup_callback(query, context)
-        return
-    
-    if data == CallbackData.TOPICS_CLEAR:
-        from telegram_bot.handlers.topics_settings import handle_topics_clear_callback
-        await handle_topics_clear_callback(query, context)
-        return
-    
-    if data == CallbackData.TOPICS_SET_GROUP:
-        from telegram_bot.handlers.topics_settings import handle_topics_set_group_callback
-        result = await handle_topics_set_group_callback(query, context)
-        # This returns a conversation state, but we handle it in the callback handler
-        return
-    
-    if data == CallbackData.TOPICS_CHECK_PERMISSIONS:
-        from telegram_bot.handlers.topics_settings import handle_topics_check_permissions_callback
-        await handle_topics_check_permissions_callback(query, context)
-        return
-    
-    if data == CallbackData.TOPICS_CLEAR_CACHE:
-        from telegram_bot.handlers.topics_settings import handle_topics_clear_cache_callback
-        await handle_topics_clear_cache_callback(query, context)
-        return
-    
-    # Auto-backup settings callbacks
-    if data == CallbackData.AUTO_BACKUP_MENU or data == "auto_backup_menu":
-        from telegram_bot.handlers.backup import auto_backup_menu
-        await auto_backup_menu(update, context)
-        return
-    
-    if data == CallbackData.AUTO_BACKUP_TOGGLE or data == "auto_backup_toggle":
-        from telegram_bot.handlers.backup import auto_backup_toggle
-        await auto_backup_toggle(update, context)
-        return
-    
-    if data == CallbackData.AUTO_BACKUP_INTERVAL_1H or data == "auto_backup_interval_1h":
-        from telegram_bot.handlers.backup import handle_auto_backup_interval_1h
-        await handle_auto_backup_interval_1h(update, context)
-        return
-    
-    if data == CallbackData.AUTO_BACKUP_INTERVAL_3H or data == "auto_backup_interval_3h":
-        from telegram_bot.handlers.backup import handle_auto_backup_interval_3h
-        await handle_auto_backup_interval_3h(update, context)
-        return
-    
-    if data == CallbackData.AUTO_BACKUP_INTERVAL_6H or data == "auto_backup_interval_6h":
-        from telegram_bot.handlers.backup import handle_auto_backup_interval_6h
-        await handle_auto_backup_interval_6h(update, context)
-        return
-    
-    if data == CallbackData.AUTO_BACKUP_INTERVAL_12H or data == "auto_backup_interval_12h":
-        from telegram_bot.handlers.backup import handle_auto_backup_interval_12h
-        await handle_auto_backup_interval_12h(update, context)
-        return
-    
-    if data == CallbackData.AUTO_BACKUP_NOW or data == "auto_backup_now":
-        from telegram_bot.handlers.backup import auto_backup_now
-        await auto_backup_now(update, context)
-        return
-    
-    # Back to settings callback
-    if data == CallbackData.BACK_SETTINGS:
-        await query.edit_message_text(
-            text="⚙️ <b>Settings Menu</b>\n\nConfigure your bot settings:",
-            reply_markup=create_settings_menu_keyboard(),
-            parse_mode="HTML"
-        )
-        return
-    
-    # Punishment callbacks
-    if data == CallbackData.PUNISHMENT_MENU:
-        await punishment_status(update, context)
-        return
-    
-    if data == CallbackData.PUNISHMENT_TOGGLE:
-        await punishment_toggle(update, context)
-        return
-    
-    if data == CallbackData.PUNISHMENT_WINDOW:
-        await punishment_set_window(update, context)
-        return
-    
-    if data == CallbackData.PUNISHMENT_STEPS:
-        await punishment_set_steps(update, context)
-        return
-    
-    # Punishment window hour selection callbacks
-    if data == CallbackData.PUNISHMENT_WINDOW_24:
-        from telegram_bot.handlers.punishment import punishment_set_window_hours
-        await punishment_set_window_hours(update, context, 24)
-        return
-    
-    if data == CallbackData.PUNISHMENT_WINDOW_48:
-        from telegram_bot.handlers.punishment import punishment_set_window_hours
-        await punishment_set_window_hours(update, context, 48)
-        return
-    
-    if data == CallbackData.PUNISHMENT_WINDOW_72:
-        from telegram_bot.handlers.punishment import punishment_set_window_hours
-        await punishment_set_window_hours(update, context, 72)
-        return
-    
-    if data == CallbackData.PUNISHMENT_WINDOW_168:
-        from telegram_bot.handlers.punishment import punishment_set_window_hours
-        await punishment_set_window_hours(update, context, 168)
-        return
-    
-    # Punishment steps callbacks
-    if data == CallbackData.PUNISHMENT_ADD_STEP:
-        from telegram_bot.handlers.punishment import punishment_add_step_menu
-        await punishment_add_step_menu(update, context)
-        return
-    
-    if data == CallbackData.PUNISHMENT_STEPS_RESET:
-        from telegram_bot.handlers.punishment import punishment_reset_steps
-        await punishment_reset_steps(update, context)
-        return
-    
-    # Punishment step type callbacks
-    if data == CallbackData.PUNISHMENT_STEP_WARNING:
-        from telegram_bot.handlers.punishment import punishment_add_step
-        await punishment_add_step(update, context, "warning", 0)
-        return
-    
-    if data == CallbackData.PUNISHMENT_STEP_DISABLE_10:
-        from telegram_bot.handlers.punishment import punishment_add_step
-        await punishment_add_step(update, context, "disable", 10)
-        return
-    
-    if data == CallbackData.PUNISHMENT_STEP_DISABLE_30:
-        from telegram_bot.handlers.punishment import punishment_add_step
-        await punishment_add_step(update, context, "disable", 30)
-        return
-    
-    if data == CallbackData.PUNISHMENT_STEP_DISABLE_60:
-        from telegram_bot.handlers.punishment import punishment_add_step
-        await punishment_add_step(update, context, "disable", 60)
-        return
-    
-    if data == CallbackData.PUNISHMENT_STEP_DISABLE_240:
-        from telegram_bot.handlers.punishment import punishment_add_step
-        await punishment_add_step(update, context, "disable", 240)
-        return
-    
-    if data == CallbackData.PUNISHMENT_STEP_DISABLE_UNLIMITED:
-        from telegram_bot.handlers.punishment import punishment_add_step
-        await punishment_add_step(update, context, "disable", 0)
-        return
-    
-    if data == CallbackData.PUNISHMENT_STEP_REVOKE:
-        from telegram_bot.handlers.punishment import punishment_add_step
-        await punishment_add_step(update, context, "revoke", 0)
-        return
-    
-    # Handle remove step callbacks
+
+    # Punishment step callbacks that carry an index
     if data.startswith("punishment_remove_step:"):
         step_index = int(data.split(":")[1])
         from telegram_bot.handlers.punishment import punishment_remove_step
@@ -870,136 +669,23 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         await punishment_update_step(update, context, step_index, step_type, duration)
         return
     
-    # Group filter callbacks
-    if data == CallbackData.GROUP_FILTER_MENU:
-        await handle_group_filter_menu_callback(query, context)
-        return
-    
-    if data == CallbackData.GROUP_LIMIT_SET:
-        await handle_group_limit_menu_callback(query, context)
-        return
-    if data == CallbackData.GROUP_FILTER_TOGGLE:
-        await handle_group_filter_toggle_callback(query, context)
-        return
-    
-    if data == CallbackData.GROUP_FILTER_MODE_INCLUDE:
-        await handle_group_filter_mode_callback(query, context, "include")
-        return
-    
-    if data == CallbackData.GROUP_FILTER_MODE_EXCLUDE:
-        await handle_group_filter_mode_callback(query, context, "exclude")
-        return
-    
     # Handle group filter toggle group callbacks
     if data.startswith("gf_toggle_group:"):
         group_id = int(data.split(":")[1])
         await handle_group_filter_toggle_group_callback(query, context, group_id)
         return
-    
+
     # Handle set group limit callbacks
     if data.startswith("set_glimit:"):
         group_id = int(data.split(":")[1])
         await handle_set_group_limit_callback(query, context, group_id)
         context.user_data["waiting_for"] = "group_limit"
         return
-    # Admin filter callbacks
-    if data == CallbackData.ADMIN_FILTER_MENU:
-        await handle_admin_filter_menu_callback(query, context)
-        return
-    
-    if data == CallbackData.ADMIN_FILTER_TOGGLE:
-        await handle_admin_filter_toggle_callback(query, context)
-        return
-    
-    if data == CallbackData.ADMIN_FILTER_MODE_INCLUDE:
-        await handle_admin_filter_mode_callback(query, context, "include")
-        return
-    
-    if data == CallbackData.ADMIN_FILTER_MODE_EXCLUDE:
-        await handle_admin_filter_mode_callback(query, context, "exclude")
-        return
-    
+
     # Handle admin filter toggle admin callbacks
     if data.startswith("af_toggle_admin:"):
         username = data.split(":")[1]
         await handle_admin_filter_toggle_admin_callback(query, context, username)
-        return
-    
-    # Subnet IP Grouping callback
-    if data == CallbackData.SUBNET_IP_GROUPING_MENU:
-        from telegram_bot.handlers.settings import subnet_ip_grouping_menu_callback
-        await subnet_ip_grouping_menu_callback(query, context)
-        return
-        
-    if data == CallbackData.SUBNET_IP_GROUPING_TOGGLE:
-        from telegram_bot.handlers.settings import subnet_ip_grouping_toggle_callback
-        await subnet_ip_grouping_toggle_callback(query, context)
-        return
-        
-    if data == CallbackData.SUBNET_IP_GROUPING_MODE_TOGGLE:
-        from telegram_bot.handlers.settings import subnet_ip_grouping_mode_toggle_callback
-        await subnet_ip_grouping_mode_toggle_callback(query, context)
-        return
-    
-    # High Trust IP Grouping callback
-    if data == CallbackData.HIGH_TRUST_IP_GROUPING_MENU:
-        from telegram_bot.handlers.settings import high_trust_ip_grouping_menu_callback
-        await high_trust_ip_grouping_menu_callback(query, context)
-        return
-        
-    if data == CallbackData.HIGH_TRUST_IP_GROUPING_TOGGLE:
-        from telegram_bot.handlers.settings import high_trust_ip_grouping_toggle_callback
-        await high_trust_ip_grouping_toggle_callback(query, context)
-        return
-    
-    # Trust Reset callbacks
-    if data == CallbackData.TRUST_RESET_MENU:
-        from telegram_bot.handlers.settings import trust_reset_menu_callback
-        await trust_reset_menu_callback(query, context)
-        return
-    
-    if data == CallbackData.TRUST_RESET_ALL:
-        from telegram_bot.handlers.settings import trust_reset_all_callback
-        await trust_reset_all_callback(query, context)
-        return
-    
-    # CDN mode callbacks
-    if data == CallbackData.CDN_MODE_MENU:
-        from telegram_bot.handlers.settings import cdn_mode_menu_callback
-        await cdn_mode_menu_callback(query, context)
-        return
-    
-    if data == CallbackData.CDN_MODE_ADD:
-        from telegram_bot.handlers.settings import cdn_mode_add_callback
-        result = await cdn_mode_add_callback(query, context)
-        # If it returns a state, we're waiting for text input
-        if result is not None:
-            context.user_data["waiting_for"] = "cdn_inbound"
-        return
-    
-    if data == CallbackData.CDN_MODE_REMOVE:
-        from telegram_bot.handlers.settings import cdn_mode_remove_callback
-        await cdn_mode_remove_callback(query, context)
-        return
-    
-    if data == CallbackData.CDN_MODE_CLEAR:
-        from telegram_bot.handlers.settings import cdn_mode_clear_callback
-        await cdn_mode_clear_callback(query, context)
-        return
-    
-    if data == CallbackData.CDN_USE_XFF_TOGGLE:
-        from telegram_bot.handlers.settings import cdn_use_xff_toggle_callback
-        await cdn_use_xff_toggle_callback(query, context)
-        return
-    
-    if data == CallbackData.CDN_PROVIDER_MENU:
-        from telegram_bot.handlers.settings import cdn_provider_menu_callback
-        await cdn_provider_menu_callback(query, context)
-        return
-    
-    if data == CallbackData.CDN_PROVIDER_CLOUDFLARE:
-        from telegram_bot.handlers.settings import cdn_provider_cloudflare_callback
-        await cdn_provider_cloudflare_callback(query, context)
         return
     
     # Handle CDN remove inbound callbacks
@@ -1008,90 +694,17 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         await cdn_mode_remove_inbound_callback(query, context)
         return
     
-    # Node settings callbacks
-    if data == CallbackData.NODE_SETTINGS_MENU:
-        from telegram_bot.handlers.settings import node_settings_menu_callback
-        await node_settings_menu_callback(query, context)
-        return
-    
-    if data == CallbackData.NODE_SETTINGS_REFRESH:
-        from telegram_bot.handlers.settings import node_settings_refresh_callback
-        await node_settings_refresh_callback(query, context)
-        return
-    
-    if data == CallbackData.NODE_CDN_MENU:
-        from telegram_bot.handlers.settings import node_cdn_menu_callback
-        await node_cdn_menu_callback(query, context)
-        return
-    
-    if data == CallbackData.NODE_DISABLED_MENU:
-        from telegram_bot.handlers.settings import node_disabled_menu_callback
-        await node_disabled_menu_callback(query, context)
-        return
-    
-    if data == CallbackData.NODE_CDN_CLEAR:
-        from telegram_bot.handlers.settings import node_cdn_clear_callback
-        await node_cdn_clear_callback(query, context)
-        return
-    
-    if data == CallbackData.NODE_DISABLED_CLEAR:
-        from telegram_bot.handlers.settings import node_disabled_clear_callback
-        await node_disabled_clear_callback(query, context)
-        return
-    
     # Handle node toggle callbacks
     if data.startswith("node_cdn_toggle:"):
         node_id = int(data.split(":")[1])
         from telegram_bot.handlers.settings import node_cdn_toggle_callback
         await node_cdn_toggle_callback(query, context, node_id)
         return
-    
+
     if data.startswith("node_disabled_toggle:"):
         node_id = int(data.split(":")[1])
         from telegram_bot.handlers.settings import node_disabled_toggle_callback
         await node_disabled_toggle_callback(query, context, node_id)
-        return
-    
-    # IP source callbacks (SSE logs vs panel API)
-    if data == CallbackData.IP_SOURCE_MENU:
-        from telegram_bot.handlers.settings import handle_ip_source_menu_callback
-        await handle_ip_source_menu_callback(query, context)
-        return
-
-    if data == CallbackData.IP_SOURCE_SET_LOGS:
-        from telegram_bot.handlers.settings import handle_ip_source_set_logs_callback
-        await handle_ip_source_set_logs_callback(query, context)
-        return
-
-    if data == CallbackData.IP_SOURCE_SET_API:
-        from telegram_bot.handlers.settings import handle_ip_source_set_api_callback
-        await handle_ip_source_set_api_callback(query, context)
-        return
-
-    if data == CallbackData.IP_SOURCE_SET_CONCURRENCY:
-        from telegram_bot.handlers.settings import handle_ip_source_concurrency_callback
-        await handle_ip_source_concurrency_callback(query, context)
-        return
-
-    if data == CallbackData.IP_SOURCE_STATS:
-        from telegram_bot.handlers.settings import handle_ip_source_stats_callback
-        await handle_ip_source_stats_callback(query, context)
-        return
-
-    # Device counting mode callbacks (node-aware devices vs node-agnostic IPs)
-    if data == CallbackData.DEVICE_COUNT_MENU:
-        from telegram_bot.handlers.settings import handle_device_count_menu_callback
-        await handle_device_count_menu_callback(query, context)
-        return
-
-    if data == CallbackData.DEVICE_COUNT_SET_DEVICE:
-        from telegram_bot.handlers.settings import handle_device_count_set_device_callback
-        await handle_device_count_set_device_callback(query, context)
-        return
-
-    if data == CallbackData.DEVICE_COUNT_SET_IP:
-        from telegram_bot.handlers.settings import handle_device_count_set_ip_callback
-        await handle_device_count_set_ip_callback(query, context)
         return
 
     # Handle dynamic callbacks
@@ -1224,44 +837,14 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
     
-    # General limit preset callbacks
-    if data == CallbackData.GENERAL_LIMIT_2:
-        await handle_general_limit_preset_callback(query, context, 2)
-        return
-    
-    if data == CallbackData.GENERAL_LIMIT_3:
-        await handle_general_limit_preset_callback(query, context, 3)
-        return
-    
-    if data == CallbackData.GENERAL_LIMIT_4:
-        await handle_general_limit_preset_callback(query, context, 4)
-        return
-    
-    if data == CallbackData.GENERAL_LIMIT_CUSTOM:
-        await handle_general_limit_custom_callback(query, context)
-        return
-    
-    # Special limit preset callbacks (when setting limit for selected user)
-    if data == CallbackData.SPECIAL_LIMIT_1:
-        await handle_special_limit_1_callback(query, context)
-        return
-    
-    if data == CallbackData.SPECIAL_LIMIT_2:
-        await handle_special_limit_2_callback(query, context)
-        return
-    
-    if data == CallbackData.SPECIAL_LIMIT_CUSTOM:
-        from telegram_bot.handlers.limits import handle_special_limit_custom_callback
-        await handle_special_limit_custom_callback(query, context)
-        return
-    
     # Handle user_info: callback (informational only, from disabled users list)
     if data.startswith("user_info:"):
         username = data.split(":", 1)[1]
         await query.answer(f"User: {username}", show_alert=False)
         return
-    
+
     # Fallback for unhandled callbacks
+    bot_logger.warning(f"Unhandled callback data: {data}")
     await query.edit_message_text(
         text=f"⚠️ Unhandled callback: {data}",
         reply_markup=create_back_to_main_keyboard(),
