@@ -1008,7 +1008,24 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     )
 
     # Check for users whose usage normalized (active devices <= limit or disconnected)
+    #
+    # An empty sample while users are under monitoring is not 2,350 people
+    # disconnecting at once - it is the log pipeline having stopped. shared_state
+    # publishes no per-node heartbeat, so from here a dead SSE stream and a genuinely
+    # idle panel look identical, and a stream can go half-open without ever raising
+    # (utils/get_logs.py opens its client with timeout=None and the node status stays
+    # "Connected"). Clearing on that evidence hands every real offender a fresh start
+    # each cycle, which is how a flaky stream stops bans altogether.
+    counters_are_trustworthy = bool(all_users_actual_ips) or not warning_system.warnings
+    if not counters_are_trustworthy:
+        logger.error(
+            f"⛔ No active users this cycle while {len(warning_system.warnings)} are under "
+            f"monitoring - treating the sample as unusable and leaving every counter alone"
+        )
+
     for monitored_user in list(warning_system.warnings.keys()):
+        if not counters_are_trustworthy:
+            break
         if monitored_user not in all_users_actual_ips:
             await warning_system.clear_user_trust_data(monitored_user)
             logger.info(f"✅ User {monitored_user} inactive, monitoring cleared")
