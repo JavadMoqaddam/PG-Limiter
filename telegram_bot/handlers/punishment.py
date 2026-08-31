@@ -526,7 +526,10 @@ async def user_violations(update: Update, context: ContextTypes.DEFAULT_TYPE):
         system = get_punishment_system()
         system.load_config(config_data)
 
-        status = system.get_user_status(username)
+        # SQLite, not the JSON copy: get_punishment_for_user decides the real step
+        # from the database, so showing the admin a JSON-derived count meant the
+        # "Next Punishment" line could disagree with what was applied next.
+        status = await system.get_user_status_async(username)
 
         if status["violation_count"] == 0:
             await _send_response(

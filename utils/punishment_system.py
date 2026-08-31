@@ -111,7 +111,30 @@ class PunishmentSystem:
         self.enabled: bool = True
         self._write_lock = asyncio.Lock()
         self._last_cleanup: float = 0.0
+        # Rate limit for the "reading the JSON copy instead of SQLite" warning: the
+        # enforcement loop asks about thousands of users per cycle, so warning per
+        # user would bury the log it is meant to make legible.
+        self._last_fallback_warning: float = 0.0
         self.load_violations()
+
+    def _warn_json_fallback(self, reason: str) -> None:
+        """
+        Say out loud that a punishment decision is about to use the JSON copy.
+
+        This used to be a ``debug`` line, which at normal log level meant no line
+        at all: escalation could silently restart at step 1 while SQLite held the
+        real history. Whether that is lenient or harsh depends on how stale the
+        file is, and either way the operator needs to know it happened.
+        """
+        now = time.time()
+        if now - self._last_fallback_warning < 60:
+            return
+        self._last_fallback_warning = now
+        punishment_logger.warning(
+            f"⚠️ Punishment history is coming from {self.filename} instead of SQLite: "
+            f"{reason}. That copy can be stale, so the escalation step may be wrong. "
+            f"Further occurrences are suppressed for 60s."
+        )
     
     def load_violations(self):
         """Load violation history from file"""
@@ -217,8 +240,11 @@ class PunishmentSystem:
 
     async def get_violation_count_async(self, username: str) -> int:
         """
-        Get the number of violations for a user within the time window from SQLite.
-        Falls back to in-memory/json cache if DB is unavailable.
+        Violation count inside the window, read from SQLite.
+
+        SQLite is the store the escalation decision is actually made on, so this
+        is the number that matters. The JSON copy is a fallback of last resort and
+        is now announced when it is used - see ``_warn_json_fallback``.
         """
         try:
             from db.database import get_db, DB_AVAILABLE
@@ -226,9 +252,10 @@ class PunishmentSystem:
             if DB_AVAILABLE:
                 async with get_db() as db:
                     return await ViolationHistoryCRUD.get_violation_count(db, username, window_hours=self.window_hours)
+            self._warn_json_fallback("db.database reports DB_AVAILABLE is False")
         except Exception as e:
-            punishment_logger.debug(f"DB get_violation_count fallback for {username}: {e}")
-            
+            self._warn_json_fallback(f"the query failed ({e})")
+
         self._ensure_cleanup()
         return len(self.violations.get(username, []))
     
@@ -345,25 +372,23 @@ class PunishmentSystem:
         await self.save_violations()
         punishment_logger.info("🗑️ Cleared all violation history")
     
-    def get_user_status(self, username: str) -> dict:
+    def _build_status(self, username: str, entries: list[tuple[int, int, float]]) -> dict:
         """
-        Get detailed status for a user.
-        
-        Args:
-            username: The username to check
-            
-        Returns:
-            Dict with violation_count, next_step, history details
+        Shape the status dict from (step_applied, disable_duration, timestamp) rows.
+
+        ``time_ago`` is part of the contract: telegram_bot/handlers/punishment.py
+        reads ``v['time_ago']`` for every row, and it was never in the dict, so the
+        /user_violations command raised KeyError and the admin saw
+        "❌ Error: 'time_ago'" for any user who had a violation. ``_format_time_ago``
+        existed the whole time and was called from nowhere.
         """
-        self.cleanup_old_violations()
-        
-        violations = self.violations.get(username, [])
-        next_step_idx = self.get_next_step_index(username)
+        violation_count = len(entries)
+        next_step_idx = min(violation_count, len(self.steps) - 1)
         next_step = self.steps[next_step_idx]
-        
+
         return {
             "username": username,
-            "violation_count": len(violations),
+            "violation_count": violation_count,
             "window_hours": self.window_hours,
             "next_step_index": next_step_idx,
             "next_punishment": next_step.get_display_text(),
@@ -371,13 +396,57 @@ class PunishmentSystem:
             "is_unlimited_next": next_step.is_unlimited_disable(),
             "recent_violations": [
                 {
-                    "step": v.step_applied,
-                    "duration": v.disable_duration,
-                    "timestamp": v.timestamp
+                    "step": step_applied,
+                    "duration": disable_duration,
+                    "timestamp": timestamp,
+                    "time_ago": self._format_time_ago(timestamp),
                 }
-                for v in violations
-            ]
+                for step_applied, disable_duration, timestamp in entries
+            ],
         }
+
+    async def get_user_status_async(self, username: str) -> dict:
+        """
+        Status for a user, read from SQLite - the same store the punishment uses.
+
+        The sync ``get_user_status`` reads the JSON copy, so the "Next Punishment"
+        it reported could differ from the one actually applied a moment later by
+        ``get_punishment_for_user``, which goes to SQLite. Anything shown to an
+        admin should come through here.
+        """
+        try:
+            from db.database import get_db, DB_AVAILABLE
+            from db.crud.violations import ViolationHistoryCRUD
+            if DB_AVAILABLE:
+                async with get_db() as db:
+                    rows = await ViolationHistoryCRUD.get_user_violations(
+                        db, username, window_hours=self.window_hours
+                    )
+                return self._build_status(
+                    username,
+                    [(row.step_applied, row.disable_duration, row.timestamp) for row in rows],
+                )
+            self._warn_json_fallback("db.database reports DB_AVAILABLE is False")
+        except Exception as e:
+            self._warn_json_fallback(f"the query failed ({e})")
+
+        return self.get_user_status(username)
+
+    def get_user_status(self, username: str) -> dict:
+        """
+        Status for a user from the JSON copy.
+
+        Kept for callers that cannot await, and it is the fallback for
+        ``get_user_status_async``. Prefer the async one: this number can disagree
+        with the punishment that will really be applied.
+        """
+        self.cleanup_old_violations()
+
+        violations = self.violations.get(username, [])
+        return self._build_status(
+            username,
+            [(v.step_applied, v.disable_duration, v.timestamp) for v in violations],
+        )
     
     def _format_time_ago(self, timestamp: float) -> str:
         """Format timestamp as 'X ago' string"""
