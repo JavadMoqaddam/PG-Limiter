@@ -779,6 +779,10 @@ async def collect_active_users_from_api(
     # which is the part that was missing.
     min_node_coverage = float(config_data.get("api_ip_min_node_coverage") or 0.0)
     if min_node_coverage and node_coverage < min_node_coverage:
+        # The build already ran, so report what it found. Without this the
+        # diagnostics show a cycle that collected nothing, which reads like a dead
+        # panel rather than a partial fleet - the opposite of the diagnosis needed.
+        LAST_CYCLE_STATS.update(build_stats)
         LAST_CYCLE_STATS["skipped_reason"] = (
             f"node coverage {node_coverage:.0%} below {min_node_coverage:.0%}"
         )

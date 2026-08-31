@@ -650,6 +650,77 @@ class TestCollectFailSafe:
         assert get_last_cycle_stats()["coverage"] == 1.0
 
     @pytest.mark.asyncio
+    async def test_node_coverage_is_reported_even_with_the_gate_off(
+        self, panel, api_config, monkeypatch
+    ):
+        from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
+
+        fresh = int(time.time())
+        _patch_collector(
+            monkeypatch,
+            candidates=[{"username": "alice", "id": 1}],
+            payloads={"alice": {1: {"5.6.7.8": fresh}}},
+            node_name_map={1: "de", 2: "nl", 3: "fr"},
+        )
+
+        # Per-user coverage is a perfect 1.0 while two of three nodes said nothing.
+        # That is exactly the blind spot the node ratio exists to expose, so the
+        # cycle still runs but the numbers are now on the record.
+        assert await collect_active_users_from_api(panel, api_config) is True
+        stats = get_last_cycle_stats()
+        assert stats["coverage"] == 1.0
+        assert stats["nodes_seen"] == 1
+        assert stats["nodes_expected"] == 3
+        assert stats["node_coverage"] == 0.3333
+
+    @pytest.mark.asyncio
+    async def test_low_node_coverage_skips_the_cycle_when_configured(
+        self, panel, api_config, monkeypatch
+    ):
+        from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
+        from utils.shared_state import ACTIVE_USERS
+        from utils.types import UserType
+
+        ACTIVE_USERS["carol"] = UserType(name="carol", ip=["1.2.3.4"])
+        api_config["api_ip_min_node_coverage"] = 0.8
+        fresh = int(time.time())
+        _patch_collector(
+            monkeypatch,
+            candidates=[{"username": "alice", "id": 1}],
+            payloads={"alice": {1: {"5.6.7.8": fresh}}},
+            node_name_map={1: "de", 2: "nl", 3: "fr"},
+        )
+
+        assert await collect_active_users_from_api(panel, api_config) is False
+        assert list(ACTIVE_USERS) == ["carol"]
+        stats = get_last_cycle_stats()
+        assert "node coverage" in stats["skipped_reason"]
+        # What the build actually found still has to be reported, or the
+        # diagnostics read like a dead panel instead of a partial fleet.
+        assert stats["users_with_ips"] == 1
+        assert stats["total_ips"] == 1
+
+    @pytest.mark.asyncio
+    async def test_full_node_coverage_passes_the_gate(self, panel, api_config, monkeypatch):
+        from utils.ip_source_api import collect_active_users_from_api
+        from utils.shared_state import ACTIVE_USERS
+
+        api_config["api_ip_min_node_coverage"] = 0.8
+        fresh = int(time.time())
+        _patch_collector(
+            monkeypatch,
+            candidates=[{"username": "alice", "id": 1}],
+            payloads={"alice": {1: {"5.6.7.8": fresh}}},
+            node_name_map={1: "de", 2: "nl"},
+            expected_node_ids={1},
+        )
+
+        # Node 2 is deliberately absent from expected_node_ids - a node the operator
+        # disabled, or one the panel no longer lists, must not drag the ratio down.
+        assert await collect_active_users_from_api(panel, api_config) is True
+        assert list(ACTIVE_USERS) == ["alice"]
+
+    @pytest.mark.asyncio
     async def test_all_stale_ips_skip_the_cycle(self, panel, api_config, monkeypatch):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
         from utils.shared_state import ACTIVE_USERS
