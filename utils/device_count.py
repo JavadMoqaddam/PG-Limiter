@@ -169,6 +169,50 @@ def _connections_of(user: UserType | None) -> list[ConnectionInfo]:
     return user.device_info.connections
 
 
+def count_devices_from_ips(
+    ips: set[str] | list[str] | None,
+    config: DeviceCountingConfig | None = None,
+    isp_info: dict | None = None,
+) -> int:
+    """
+    Count devices from bare addresses, with no per-connection detail.
+
+    This is the fallback for a user the collector gave IPs but no inbound or node
+    information. It exists because the two callers used to disagree on what the
+    number even meant: enforcement counted raw unique IPs, so a whole /24 counted
+    as N devices - the measure that produced the ~450 false positives subnet
+    grouping was introduced to stop - while the report counted display strings,
+    where "1.2.3.x (5)" counted as 1. Neither matched what a real connection list
+    would have produced through ``device_key``.
+
+    The same subnet rule ``device_key`` applies is reused here, so the fallback
+    and the full path agree. Inbound is unknown, so "device" mode cannot tell two
+    devices behind one address apart; the count is identical in both modes and is
+    therefore a lower bound - the safe direction, since it can never invent a
+    violation that the full path would not have found.
+
+    Args:
+        ips: The user's unique addresses.
+        config: Counting and grouping rules; defaults are used when omitted.
+        isp_info: ``{ip: isp_info}`` used by "/16" subnet grouping.
+
+    Returns:
+        int: Number of distinct devices these addresses represent.
+    """
+    if config is None:
+        config = DeviceCountingConfig()
+
+    keys = set()
+    for ip in ips or ():
+        if not ip:
+            continue
+        if config.subnet_ip_grouping:
+            keys.add(_subnet_parts(ip, config, isp_info))
+        else:
+            keys.add(("IP_ONLY", ip))
+    return len(keys)
+
+
 def count_devices(
     user: UserType | None,
     config: DeviceCountingConfig | None = None,
@@ -272,13 +316,21 @@ def count_devices_and_details(
     Returns:
         tuple[list[str], int]: (display lines, device count). The lines are empty
         when ``show_enhanced_details`` is False. With no connection information
-        the count falls back to the number of formatted IPs.
+        the count comes from ``count_devices_from_ips``, which applies the same
+        subnet rule the full path uses - it used to be the number of formatted
+        display strings, which collapsed "1.2.3.x (5)" to 1 and so disagreed with
+        the number enforcement acted on for the very same user.
     """
     if device_config is None:
         device_config = DeviceCountingConfig()
 
     if not _connections_of(original_user):
-        return [], len(user_info.formatted_ips)
+        raw_ips = getattr(original_user, "ip", None)
+        if not raw_ips:
+            # Nothing but display strings to go on; keep the old behaviour rather
+            # than report a zero that would read as "no devices".
+            return [], len(user_info.formatted_ips)
+        return [], count_devices_from_ips(raw_ips, device_config, isp_info)
 
     device_count = count_devices(
         original_user,

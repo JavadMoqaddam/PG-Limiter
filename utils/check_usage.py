@@ -18,6 +18,7 @@ from utils.device_count import (
     DeviceCountingConfig,
     count_devices,
     count_devices_and_details,
+    count_devices_from_ips,
     group_ips_by_subnet,
 )
 from utils.warning_system import warning_system  # global shared instance
@@ -828,14 +829,17 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     for _u_name, _u_ips in all_users_actual_ips.items():
         _u_data = all_users_data.get(_u_name)
         _w_curr = warning_system.warnings.get(_u_name)
+        _u_isp = {ip: isp_info_batch.get(ip, {}) for ip in _u_ips if ip in isp_info_batch}
         all_users_device_counts[_u_name] = count_devices(
             _u_data,
             device_config,
             trust_score=_w_curr.trust_score if _w_curr else 0.0,
-            isp_info={ip: isp_info_batch.get(ip, {}) for ip in _u_ips if ip in isp_info_batch},
-            # No connection detail collected for this user: the unique-IP count
-            # is the only measure available.
-            fallback_count=len(_u_ips),
+            isp_info=_u_isp,
+            # No connection detail for this user, so the addresses are all there
+            # is. This used to pass len(_u_ips) - the raw IP count - which ignores
+            # subnet grouping and would read a single /24 as N separate devices,
+            # exactly the measure that caused the earlier wave of false bans.
+            fallback_count=count_devices_from_ips(_u_ips, device_config, _u_isp),
         )
 
     total_devices_cycle = sum(all_users_device_counts.values())

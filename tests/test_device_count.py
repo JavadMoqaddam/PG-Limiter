@@ -16,6 +16,7 @@ from utils.device_count import (
     build_ip_details,
     count_devices,
     count_devices_and_details,
+    count_devices_from_ips,
     group_ips_by_subnet,
     subnet_key,
     wide_subnet_key,
@@ -308,6 +309,76 @@ class TestNoConnectionInfo:
         user = make_user([("5.6.7.8", "Vless", 1), ("5.6.7.8", "Vmess", 2)])
         # Defaults are device mode with no grouping.
         assert count_devices(user) == 2
+
+
+class TestCountDevicesFromIps:
+    """
+    The fallback for a user with addresses but no connection detail.
+
+    Enforcement and the report used to compute this differently - raw unique-IP
+    count versus number of display strings - so the same user could be judged on
+    one number and reported with another. Both now come through here.
+    """
+
+    def test_without_grouping_each_address_is_a_device(self):
+        assert count_devices_from_ips(["5.6.7.8", "9.9.9.9"], DeviceCountingConfig()) == 2
+
+    def test_a_whole_24_collapses_when_grouping_is_on(self):
+        # The raw count this replaces would have said 3, which bans a user whose
+        # limit is 2 for one client hopping addresses inside its own subnet.
+        config = DeviceCountingConfig(subnet_ip_grouping=True)
+        assert count_devices_from_ips(["5.6.7.10", "5.6.7.99", "5.6.7.200"], config) == 1
+
+    def test_distinct_subnets_still_count_separately(self):
+        config = DeviceCountingConfig(subnet_ip_grouping=True)
+        assert count_devices_from_ips(["5.6.7.10", "5.6.9.10"], config) == 2
+
+    def test_wide_mode_uses_the_isp(self):
+        config = DeviceCountingConfig(subnet_ip_grouping=True, subnet_grouping_mode="/16")
+        isp_info = {"5.6.7.10": {"isp": "Irancell"}, "5.6.200.4": {"isp": "Irancell"}}
+        assert count_devices_from_ips(["5.6.7.10", "5.6.200.4"], config, isp_info) == 1
+
+    def test_count_mode_makes_no_difference(self):
+        # The inbound is unknown here, so "device" mode has nothing extra to split
+        # on and both modes must agree.
+        ips = ["5.6.7.10", "5.6.7.99"]
+        device = DeviceCountingConfig(count_mode=COUNT_MODE_DEVICE, subnet_ip_grouping=True)
+        ip_only = DeviceCountingConfig(count_mode=COUNT_MODE_IP, subnet_ip_grouping=True)
+        assert count_devices_from_ips(ips, device) == 1
+        assert count_devices_from_ips(ips, ip_only) == 1
+
+    def test_empty_and_blank_inputs(self):
+        config = DeviceCountingConfig()
+        assert count_devices_from_ips(None, config) == 0
+        assert count_devices_from_ips([], config) == 0
+        assert count_devices_from_ips(["", "5.6.7.8"], config) == 1
+
+    def test_config_is_optional(self):
+        assert count_devices_from_ips(["5.6.7.8", "9.9.9.9"]) == 2
+
+
+class TestCountDevicesAndDetailsFallback:
+    """The report path must reach the same number enforcement acts on."""
+
+    def test_connectionless_user_uses_the_grouped_count(self):
+        config = DeviceCountingConfig(subnet_ip_grouping=True)
+        ips = ["5.6.7.10", "5.6.7.99", "5.6.7.200"]
+        user = UserType(name="user1", ip=ips)
+        info = EnhancedUserInfo(user=user, formatted_ips=["5.6.7.x (3)"])
+
+        lines, count = count_devices_and_details(info, user, device_config=config)
+        assert lines == []
+        # One device: not 3 from the raw address count, and not 1 by the accident
+        # of the display collapsing three addresses into one string.
+        assert count == 1
+        assert count == count_devices_from_ips(ips, config)
+
+    def test_display_strings_are_the_last_resort(self):
+        # No raw addresses at all: reporting the formatted count beats reporting 0,
+        # which would read as "this user has no devices".
+        user = UserType(name="user1", ip=[])
+        info = EnhancedUserInfo(user=user, formatted_ips=["5.6.7.x (3)", "9.9.9.9"])
+        assert count_devices_and_details(info, user) == ([], 2)
 
 
 class TestFromConfig:
