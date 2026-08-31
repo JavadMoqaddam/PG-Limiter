@@ -131,7 +131,17 @@ async def main():
             await init_db()
             main_logger.info("✓ Database initialized")
         except Exception as db_err:
-            main_logger.error(f"Database initialization error: {db_err}")
+            # Fatal on purpose. SQLite is the only store for bans, limits and
+            # warnings since Redis was removed, so carrying on here produces the
+            # worst possible state: enforcement keeps disabling users on the panel
+            # while nothing can record the ban or ever lift it. Exiting non-zero
+            # hands the problem to the supervisor, which is the honest outcome.
+            main_logger.critical(
+                f"❌ FATAL: database initialization failed: {db_err}. Refusing to start - "
+                f"users would be banned with no way to record or lift it.",
+                exc_info=True,
+            )
+            raise SystemExit(1) from db_err
         
         # Start Telegram bot and message dispatcher in background tasks (keep strong references)
         main_logger.debug("Starting Telegram bot and dispatcher tasks...")

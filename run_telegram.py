@@ -24,21 +24,26 @@ async def run_telegram_bot():
     
     telegram_runner_logger.info("🤖 Initializing Telegram bot...")
     
-    # Debug: Print token state
-    telegram_runner_logger.debug(f"Bot token type: {type(bot_main.bot_token)}")
-    telegram_runner_logger.debug(f"Bot token value: {repr(bot_main.bot_token[:20] if bot_main.bot_token else 'None')}")
-    telegram_runner_logger.debug(f"Bot token truthy: {bool(bot_main.bot_token)}")
-    
+    # Never log any part of the token itself: the id half is public but the 35-char
+    # secret half is not, and `token[:15]` at INFO leaked four characters of it into
+    # every normal log the operator shares.
+    telegram_runner_logger.debug(f"Bot token configured: {bool(bot_main.bot_token)}")
+
     # Check if application was already created with valid token at module import
     if bot_main.bot_token and bot_main.bot_token != "0000000000:XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX":
         # Token was loaded successfully at import time
         application = bot_main.application
-        telegram_runner_logger.info(f"✓ Bot token loaded: {bot_main.bot_token[:15]}...")
+        telegram_runner_logger.info(
+            f"✓ Bot token loaded (id={bot_main.bot_token.split(':', 1)[0]}, secret redacted)"
+        )
     else:
-        # This shouldn't happen if config file exists, but handle it anyway
+        # Raise rather than return: this used to end the coroutine normally, so the
+        # task completed "successfully" and the limiter ran on with a mute bot while
+        # it kept banning users. The task lives outside the TaskGroup, so raising
+        # here cannot stop enforcement - it only makes the failure visible.
         telegram_runner_logger.error("✗ Bot token not found!")
         telegram_runner_logger.error("Please set BOT_TOKEN in your environment or config")
-        return
+        raise RuntimeError("BOT_TOKEN is missing or still the placeholder value")
     
     # Initialize the application
     try:
@@ -47,11 +52,18 @@ async def run_telegram_bot():
             telegram_runner_logger.info("✓ Telegram bot is already running!")
             return
         
+        # Both start calls are bounded on purpose. _telegram_watchdog in limiter.py
+        # wakes 60s after registration and, finding updater.running still False,
+        # would issue a second start_polling on the same updater - two getUpdates
+        # loops, which Telegram answers with HTTP 409. A hang here can no longer
+        # outlive the watchdog's first check.
         telegram_runner_logger.debug("Initializing application...")
-        await application.initialize()
-        
+        async with asyncio.timeout(30):
+            await application.initialize()
+
         telegram_runner_logger.debug("Starting application...")
-        await application.start()
+        async with asyncio.timeout(30):
+            await application.start()
 
         # Register initialized bot instance with Dispatcher
         try:
@@ -63,10 +75,11 @@ async def run_telegram_bot():
         
         # Start polling for updates
         telegram_runner_logger.info("🔄 Starting polling for updates...")
-        await application.updater.start_polling(
-            allowed_updates=["message", "callback_query"],
-            drop_pending_updates=True,  # Ignore old updates
-        )
+        async with asyncio.timeout(30):
+            await application.updater.start_polling(
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True,  # Ignore old updates
+            )
         
         telegram_runner_logger.info("✓ Telegram bot started successfully!")
         telegram_runner_logger.info("✓ Bot is now polling for updates")
@@ -110,12 +123,19 @@ async def run_telegram_bot():
     except RuntimeError as e:
         if "already running" in str(e).lower():
             telegram_runner_logger.info("✓ Telegram bot is already running!")
-        else:
-            telegram_runner_logger.error(f"✗ Failed to start Telegram bot: {e}")
-            import traceback
-            telegram_runner_logger.debug(f"Traceback:\n{traceback.format_exc()}")
+            return
+        telegram_runner_logger.error(f"✗ Failed to start Telegram bot: {e}")
+        import traceback
+        telegram_runner_logger.debug(f"Traceback:\n{traceback.format_exc()}")
+        raise
     except Exception as e:
+        # Re-raised so the failure is real. Swallowing it here ended the coroutine
+        # normally, so limiter.py's done-callback saw no exception and the operator
+        # got a healthy-looking log while the bot was unreachable and enforcement
+        # kept disabling users. The task sits outside the TaskGroup, so raising
+        # cannot stop enforcement; the watchdog retries every 60s.
         telegram_runner_logger.error(f"✗ Failed to start Telegram bot: {e}")
         telegram_runner_logger.error("Please verify your BOT_TOKEN is correct")
         import traceback
         telegram_runner_logger.debug(f"Traceback:\n{traceback.format_exc()}")
+        raise
