@@ -91,7 +91,10 @@ fi
 
 log_info "Environment validated"
 log_debug "Panel: $PANEL_DOMAIN"
-log_debug "Bot Token: ${BOT_TOKEN:0:15}..."
+# Only the id half. A bot token is <10-digit id>:<35-char secret>, so the old
+# ${BOT_TOKEN:0:15} printed four characters of the secret into the boot log -
+# the same leak that was fixed in run_telegram.py and missed here.
+log_debug "Bot Token: id=${BOT_TOKEN%%:*}, secret redacted"
 log_debug "Admin IDs: $ADMIN_IDS"
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -248,10 +251,31 @@ else
     exit 1
 fi
 
-# Migrate from JSON to database if old JSON files exist
-if [ -f "/app/.disable_users.json" ] || [ -f "/app/.violation_history.json" ]; then
-    log_debug "Migrating data from JSON files to database..."
-    timeout 30 python -m db.migrate_from_json 2>&1 && log_info "JSON migration complete" || log_warn "JSON migration skipped"
+# Import the retired JSON files if any are still on the volume.
+#
+# This gate used to test /app/.disable_users.json and /app/.violation_history.json:
+# dot-prefixed names in the working directory, while the real files live on the
+# persisted volume under /var/lib/pg-limiter. It therefore never fired, and that
+# was quietly a good thing, because the importer stamped every old violation with
+# the current time and would have jumped users to the harshest punishment step.
+# Both halves are fixed now - timestamps are preserved and the violation import is
+# a no-op when SQLite already holds rows - so the gate can look at the real paths.
+# --legacy-only is important: the module's full main() also feeds config.json into
+# the Config table, which would overwrite live settings on every container start.
+LEGACY_DIR="${PG_LIMITER_DATA_DIR:-/var/lib/pg-limiter}"
+if [ -f "$LEGACY_DIR/disable_users.json" ] || [ -f "$LEGACY_DIR/violation_history.json" ]; then
+    log_debug "Found retired JSON files in $LEGACY_DIR, importing..."
+    JSON_OUTPUT=$(timeout 60 python -m db.migrate_from_json --legacy-only 2>&1)
+    JSON_EXIT=$?
+    if [ $JSON_EXIT -eq 0 ]; then
+        log_info "JSON import complete"
+    else
+        # Not fatal: the database is already migrated and usable at this point, and
+        # these files are historical. But it must not be silent either - a failed
+        # import means somebody is still disabled only in a file nobody reads.
+        log_warn "JSON import failed (exit $JSON_EXIT) - the limiter will start anyway:"
+        echo "$JSON_OUTPUT" | tail -n 20 | while read -r line; do log_warn "$line"; done
+    fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
