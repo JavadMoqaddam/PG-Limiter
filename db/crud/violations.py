@@ -25,12 +25,22 @@ class ViolationHistoryCRUD:
         disable_duration: int,
         ip_count: Optional[int] = None,
         ips: Optional[List[str]] = None,
+        timestamp: Optional[float] = None,
     ) -> ViolationHistory:
-        """Add a violation record."""
+        """
+        Add a violation record.
+
+        ``timestamp`` exists for the JSON importer. It used to be hardcoded to
+        ``time.time()``, which meant importing an old history stamped every record
+        as happening *now* - and since the escalation step is the count of
+        violations inside the window, that jumped every affected user straight to
+        the harshest punishment. Live callers leave it None and get now, as before.
+        """
+        recorded_at = time.time() if timestamp is None else float(timestamp)
         db_violations_logger.debug(f"📝 Adding violation for {username}: step={step_applied}, duration={disable_duration}min")
         violation = ViolationHistory(
             username=username,
-            timestamp=time.time(),
+            timestamp=recorded_at,
             step_applied=step_applied,
             disable_duration=disable_duration,
             ip_count=ip_count,
@@ -40,6 +50,14 @@ class ViolationHistoryCRUD:
         await db.flush()
         db_violations_logger.info(f"✅ Violation recorded for {username}: step={step_applied}")
         return violation
+
+    @staticmethod
+    async def count_all(db: AsyncSession) -> int:
+        """Total rows in the table, regardless of window. Used by the importer."""
+        result = await db.execute(
+            select(func.count(ViolationHistory.id))  # pylint: disable=not-callable
+        )
+        return result.scalar() or 0
     
     @staticmethod
     async def get_user_violations(

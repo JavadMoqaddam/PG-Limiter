@@ -25,8 +25,19 @@ from db.crud import (
 )
 from utils.logs import logger
 
+# Where the retired files actually live. These defaults used to be bare relative
+# dot-names (".disable_users.json"), which resolve against the working directory -
+# /app in the container - while the real files are on the persisted volume. Every
+# importer therefore reported "file not found" and did nothing, and start.sh's gate
+# tested the same wrong paths, so the whole module was unreachable.
+LEGACY_DIR = os.environ.get("PG_LIMITER_DATA_DIR", "/var/lib/pg-limiter")
+LEGACY_DISABLED_USERS = os.path.join(LEGACY_DIR, "disable_users.json")
+LEGACY_VIOLATION_HISTORY = os.path.join(LEGACY_DIR, "violation_history.json")
+LEGACY_USER_GROUPS = os.path.join(LEGACY_DIR, "user_groups_backup.json")
+LEGACY_CONFIG = os.path.join(LEGACY_DIR, "config.json")
 
-async def migrate_config(config_file: str = "config.json"):
+
+async def migrate_config(config_file: str = LEGACY_CONFIG):
     """Migrate config.json to database Config table."""
     if not os.path.exists(config_file):
         logger.warning(f"Config file not found: {config_file}")
@@ -128,55 +139,27 @@ async def migrate_config(config_file: str = "config.json"):
     return count
 
 
-async def migrate_disabled_users(disabled_file: str = ".disable_users.json"):
-    """Migrate disabled users from JSON to database."""
-    if not os.path.exists(disabled_file):
-        logger.warning(f"Disabled users file not found: {disabled_file}")
-        return 0
-    
-    try:
-        with open(disabled_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        logger.error(f"Failed to read disabled users file: {e}")
-        return 0
-    
-    count = 0
-    async with get_db() as db:
-        # Handle different formats
-        disabled_users = data.get("disabled_users", data.get("disable_user", {}))
-        enable_at = data.get("enable_at", {})
-        
-        if isinstance(disabled_users, list):
-            # Old format: list of usernames
-            import time
-            current_time = time.time()
-            for username in disabled_users:
-                await DisabledUserCRUD.add(
-                    db,
-                    username=username,
-                    disabled_at=current_time,
-                    reason="Migrated from JSON",
-                )
-                count += 1
-        elif isinstance(disabled_users, dict):
-            # New format: {username: timestamp}
-            for username, disabled_at in disabled_users.items():
-                user_enable_at = enable_at.get(username)
-                await DisabledUserCRUD.add(
-                    db,
-                    username=username,
-                    disabled_at=disabled_at,
-                    enable_at=user_enable_at,
-                    reason="Migrated from JSON",
-                )
-                count += 1
-    
-    logger.info(f"Migrated {count} disabled users from {disabled_file}")
+async def migrate_disabled_users(disabled_file: str = LEGACY_DISABLED_USERS):
+    """
+    Import the retired disabled-users file.
+
+    Delegates to ``utils.handel_dis_users.import_legacy_json``, which is the
+    canonical importer: it writes to the ``users`` table (the single store since
+    Redis was removed), reads all three historical key shapes, never resurrects a
+    ban an operator has already lifted, and renames the file when it is done.
+
+    This function used to write to ``DisabledUserCRUD`` - the legacy
+    ``disabled_users`` table that nothing reads any more - so its work was
+    invisible to enforcement.
+    """
+    from utils.handel_dis_users import import_legacy_json
+
+    count = await import_legacy_json(disabled_file)
+    logger.info(f"Imported {count} disabled users from {disabled_file}")
     return count
 
 
-async def migrate_user_groups(groups_file: str = ".user_groups_backup.json"):
+async def migrate_user_groups(groups_file: str = LEGACY_USER_GROUPS):
     """Migrate user groups backup from JSON to database."""
     if not os.path.exists(groups_file):
         logger.warning(f"User groups file not found: {groups_file}")
@@ -206,59 +189,124 @@ async def migrate_user_groups(groups_file: str = ".user_groups_backup.json"):
     return count
 
 
-async def migrate_violation_history(violations_file: str = ".violation_history.json"):
-    """Migrate violation history from JSON to database."""
+async def migrate_violation_history(violations_file: str = LEGACY_VIOLATION_HISTORY):
+    """
+    Import the retired violation-history file, timestamps intact.
+
+    Two things used to make this dangerous to run:
+
+    * every record was written with ``timestamp=time.time()``, so an imported
+      history looked like it all happened this second. The escalation step is the
+      number of violations inside the window, so that sent every affected user
+      straight to the harshest punishment.
+    * it was not idempotent, so a second run doubled everyone's count.
+
+    Now the original timestamp is preserved, records without a usable one are
+    skipped rather than invented, and the whole import is a no-op when the table
+    already holds rows - which is the normal state on any installation that has
+    been recording violations in SQLite.
+    """
     if not os.path.exists(violations_file):
         logger.warning(f"Violation history file not found: {violations_file}")
         return 0
-    
+
     try:
         with open(violations_file, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
         logger.error(f"Failed to read violation history file: {e}")
         return 0
-    
+
     count = 0
+    skipped = 0
     async with get_db() as db:
+        existing = await ViolationHistoryCRUD.count_all(db)
+        if existing:
+            logger.info(
+                f"Skipping violation import: {existing} rows are already in SQLite, "
+                f"and importing on top of them would double every user's count"
+            )
+            return 0
+
         violations = data.get("violations", {})
-        
+
         for username, records in violations.items():
             for record in records:
+                original = record.get("timestamp")
+                try:
+                    original = float(original)
+                except (TypeError, ValueError):
+                    skipped += 1
+                    continue
+                if original <= 0:
+                    skipped += 1
+                    continue
+
                 await ViolationHistoryCRUD.add(
                     db,
                     username=username,
                     step_applied=record.get("step_applied", 0),
                     disable_duration=record.get("disable_duration", 0),
+                    timestamp=original,
                 )
                 count += 1
-    
+        await db.commit()
+
+    if skipped:
+        logger.warning(f"Skipped {skipped} violation records with no usable timestamp")
     logger.info(f"Migrated {count} violation records from {violations_file}")
     return count
 
 
 async def backup_json_files():
-    """Backup JSON files before migration."""
-    backup_dir = "backup_json"
+    """
+    Copy the retired files aside before importing them.
+
+    The backup directory used to be a bare relative ``backup_json/``, which in the
+    container is /app - not on a volume, so the copies vanished with the next
+    image. It now sits next to the files it is protecting.
+    """
+    backup_dir = os.path.join(LEGACY_DIR, "backup_json")
     os.makedirs(backup_dir, exist_ok=True)
-    
+
     files_to_backup = [
-        "config.json",
-        ".disable_users.json",
-        ".user_groups_backup.json",
-        ".violation_history.json",
+        LEGACY_CONFIG,
+        LEGACY_DISABLED_USERS,
+        LEGACY_USER_GROUPS,
+        LEGACY_VIOLATION_HISTORY,
     ]
-    
+
     import shutil
-    from datetime import datetime
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    for filename in files_to_backup:
-        if os.path.exists(filename):
-            backup_path = os.path.join(backup_dir, f"{filename}.{timestamp}.bak")
-            shutil.copy2(filename, backup_path)
-            logger.info(f"Backed up {filename} to {backup_path}")
+
+    for path in files_to_backup:
+        if os.path.exists(path):
+            backup_path = os.path.join(
+                backup_dir, f"{os.path.basename(path)}.{timestamp}.bak"
+            )
+            shutil.copy2(path, backup_path)
+            logger.info(f"Backed up {path} to {backup_path}")
+
+
+async def import_legacy_stores() -> int:
+    """
+    Import only the two retired per-user stores: disabled users and violation
+    history.
+
+    Deliberately does not touch config. ``main()`` also feeds config.json into the
+    Config table, which on a live installation would overwrite the current settings
+    - panel credentials, limits, group filter, punishment steps - with whatever an
+    old file happens to contain. That is a reasonable one-shot upgrade step to run
+    by hand. It is not something to do on every container start, and start.sh calls
+    this function, not ``main()``, for exactly that reason.
+    """
+    await init_db()
+
+    total = 0
+    total += await migrate_disabled_users()
+    total += await migrate_violation_history()
+    return total
 
 
 async def main():
@@ -297,11 +345,15 @@ async def main():
     print("\n" + "=" * 60)
     print(f"Migration complete! Total items migrated: {total}")
     print("=" * 60)
-    print("\nYour JSON files have been backed up to backup_json/")
+    print("\nYour JSON files have been backed up next to them, under backup_json/")
     print("You can safely delete them after verifying the migration.")
     print("\nNote: Panel credentials and bot token are now in .env file.")
     print("Dynamic settings are stored in the database.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if "--legacy-only" in sys.argv:
+        imported = asyncio.run(import_legacy_stores())
+        print(f"Legacy store import finished: {imported} records")
+    else:
+        asyncio.run(main())
