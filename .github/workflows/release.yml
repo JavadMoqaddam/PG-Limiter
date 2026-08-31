@@ -66,20 +66,24 @@ jobs:
         generate_release_notes: true
         body: |
           ## 🛡️ PG-Limiter ${{ steps.get_version.outputs.version }}
-          
-          High-performance IP Connection Limiter for PasarGuard Panel with real-time SSE streaming, Telegram Forum Topics, Subnet Grouping, High Trust Mode, and Redis caching.
-          
+
+          High-performance IP connection limiter for PasarGuard Panel: real-time SSE
+          log streaming or panel-API polling as the IP source, subnet grouping, High
+          Trust mode, escalating punishment, Telegram forum topics, and SQLite under
+          Alembic migrations as the single store.
+
           ### 🚀 Quick Install (Docker - Recommended)
-          
+
           ```bash
           sudo bash <(curl -sSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/main/pg-limiter.sh) install
           ```
-          
+
           ### 🐳 Docker Image
-          
+
           The Multi-Arch Docker image is available at:
           ```
           ghcr.io/javadmoqaddam/pg-limiter:latest
+          ghcr.io/javadmoqaddam/pg-limiter:${{ steps.get_version.outputs.version }}
           ```
         files: |
           release/pg-limiter-${{ steps.get_version.outputs.version }}.tar.gz

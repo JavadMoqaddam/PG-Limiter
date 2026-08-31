@@ -331,6 +331,7 @@ Settings → Device Counting - Count per device (by inbound) or per IP
 /punishment_status - Show punishment settings
 /punishment_toggle - Enable/disable smart punishment
 /punishment_set_window - Set violation window
+/punishment_set_steps - Set the escalation steps
 /user_violations - Check user violations
 /clear_user_violations - Clear user violations
 
@@ -339,15 +340,21 @@ Settings → Device Counting - Count per device (by inbound) or per IP
 /group_filter_toggle - Enable/disable filter
 /group_filter_mode - Set include/exclude mode
 /group_filter_set - Set group IDs
+/group_filter_add - Add one group ID
+/group_filter_remove - Remove one group ID
 
 <b>👤 Admin Filter:</b>
 /admin_filter_status - Show admin filter status
 /admin_filter_toggle - Enable/disable filter
 /admin_filter_set - Set admin usernames
+/admin_filter_add - Add one admin username
+/admin_filter_remove - Remove one admin username
 
 <b>📊 Reports:</b>
 /connection_report - Connection analysis
 /node_usage - Node usage report
+/users_by_node - Active users grouped by node
+/users_by_protocol - Active users grouped by inbound
 /multi_device_users - Multi-device detection
 /ip_history_12h - 12-hour IP history
 /ip_history_48h - 48-hour IP history
