@@ -112,17 +112,36 @@ async def load_disabled_users() -> dict:
 
 
 def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
-    """Verify API credentials with ENV override support"""
+    """
+    HTTP Basic check that fails closed.
+
+    An unset password used to authenticate *everyone*. The "no password configured"
+    branch only logged a warning and carried on, so ``compare_digest(b"", b"")``
+    returned True and the default username ``admin`` with an empty password opened
+    every route - including the ones that enable users and rewrite config - on a
+    server whose default bind address is 0.0.0.0 with no rate limiting. Note that
+    ``os.getenv(...) or ...`` also treats an empty environment variable as unset,
+    so exporting ``API_PASSWORD=`` reached the same place.
+
+    A missing password now disables the API instead of opening it.
+    """
     config = load_config()
     api_config = config.get("api", {})
-    
+
     correct_username = os.getenv("API_USERNAME") or api_config.get("username", "admin")
     correct_password = os.getenv("API_PASSWORD") or api_config.get("password", "")
-    
-    # If no password configured, require setting one
+
     if not correct_password:
-        logger.warning("⚠️ API password not configured! Please set API_PASSWORD in .env")
-    
+        logger.error(
+            "⛔ API request refused: no API password is configured. Set API_PASSWORD in "
+            "the environment or api.password in the config. Refusing is deliberate - an "
+            "empty password authenticates every caller."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="API password is not configured; the API is disabled",
+        )
+
     is_correct_username = secrets.compare_digest(
         credentials.username.encode("utf8"),
         correct_username.encode("utf8")
@@ -131,7 +150,7 @@ def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
         credentials.password.encode("utf8"),
         correct_password.encode("utf8")
     )
-    
+
     if not (is_correct_username and is_correct_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -152,20 +171,52 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("🛑 Limiter API Server shutting down...")
 
 
+def _docs_enabled() -> bool:
+    """
+    Whether to publish /docs, /redoc and /openapi.json.
+
+    FastAPI serves all three without authentication, so on a 0.0.0.0 bind they
+    handed an unauthenticated caller the full route list and every request schema.
+    Off unless the operator asks for them.
+    """
+    return os.getenv("API_DOCS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _cors_origins() -> list[str]:
+    """
+    Explicit cross-origin allow-list, empty by default.
+
+    This was ``allow_origins=["*"]`` together with ``allow_credentials=True``.
+    Starlette cannot answer a credentialed request with a literal ``*``, so it
+    echoes back whichever Origin asked - which is every origin, with credentials.
+    Same-origin callers and non-browser clients (curl, scripts, the CLI) are
+    unaffected by an empty list.
+    """
+    raw = os.getenv("API_CORS_ORIGINS", "")
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+_DOCS_ON = _docs_enabled()
+
 app = FastAPI(
     title="Limiter API",
     description="REST API for IP Connection Limiter Management",
     version="1.4.0",
     lifespan=lifespan,
+    docs_url="/docs" if _DOCS_ON else None,
+    redoc_url="/redoc" if _DOCS_ON else None,
+    openapi_url="/openapi.json" if _DOCS_ON else None,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+_CORS_ORIGINS = _cors_origins()
+if _CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -607,13 +658,20 @@ if __name__ == "__main__":
         host = "0.0.0.0"
         port = 8080
     
+    docs_line = f"  Docs: http://{host}:{port}/docs" if _DOCS_ON else "  Docs: disabled (API_DOCS=true)"
     print(f"""
 ╔═══════════════════════════════════════════╗
 ║         🛡️  LIMITER API  🛡️               ║
 ║     REST API for IP Connection Limiter    ║
 ╠═══════════════════════════════════════════╣
-║  Docs: http://{host}:{port}/docs          ║
+║{docs_line:<43}║
 ╚═══════════════════════════════════════════╝
     """)
-    
+
+    if host == "0.0.0.0":  # nosec B104 - operator's choice, but say so out loud
+        logger.warning(
+            "⚠️ The API is listening on 0.0.0.0, so it is reachable from outside this "
+            "host. There is no rate limiting; put it behind a firewall or set API_HOST."
+        )
+
     uvicorn.run(app, host=host, port=port)
