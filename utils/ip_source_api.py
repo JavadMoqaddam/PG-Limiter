@@ -42,6 +42,12 @@ LAST_CYCLE_STATS: dict = {
     "users_with_ips": 0,
     "total_ips": 0,
     "nodes_seen": 0,
+    # How many nodes the panel says should be reporting, and the resulting ratio.
+    # `coverage` above is the per-USER answer rate and says nothing about nodes: a
+    # cycle where every user call returned 200 reads 1.0 even if two thirds of the
+    # nodes contributed no IPs at all, which under-counts devices silently.
+    "nodes_expected": 0,
+    "node_coverage": 0.0,
     "duration_ms": 0,
     "geo_lookups": 0,
     "stale_ips": 0,
@@ -72,7 +78,7 @@ async def _notify(message: str) -> None:
         api_ip_logger.debug(f"Could not deliver notification: {error}")
 
 
-async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tuple[dict, set]:
+async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tuple[dict, set, set]:
     """
     Build the node lookup table and refresh the node-IP blocklist.
 
@@ -81,12 +87,18 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
     does not go through that path, so the same seeding happens here.
 
     Returns:
-        ``(node_name_map, disabled_node_ids)``
+        ``(node_name_map, disabled_node_ids, expected_node_ids)``
+
+    ``expected_node_ids`` are the connected nodes the operator has not disabled -
+    the set that ought to show up in a healthy cycle. Without it there is no way
+    to tell "users are concentrated on 16 nodes" from "33 nodes stopped
+    reporting", and the two have opposite meanings for the device counts.
     """
     from utils.ip_facts import register_node_ips
     from utils.panel_api.nodes import get_nodes
 
     node_name_map: dict[int, str] = {}
+    connected_node_ids: set = set()
     try:
         nodes = await get_nodes(panel_data)
     except Exception as error:
@@ -97,9 +109,11 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
         register_node_ips(node.node_ip for node in nodes)
         for node in nodes:
             node_name_map[node.node_id] = node.node_name
+            if getattr(node, "status", None) == "connected":
+                connected_node_ids.add(node.node_id)
 
     disabled_nodes = set(config_data.get("disabled_nodes") or [])
-    return node_name_map, disabled_nodes
+    return node_name_map, disabled_nodes, connected_node_ids - disabled_nodes
 
 
 def resolve_monitored_group_ids(config_data: dict) -> Optional[list[int]]:
@@ -571,7 +585,9 @@ async def collect_active_users_from_api(
         api_ip_logger.warning("🛰️ Skipping API IP collection: panel marked unavailable")
         return False
 
-    node_name_map, disabled_nodes = await _resolve_node_context(panel_data, config_data)
+    node_name_map, disabled_nodes, expected_node_ids = await _resolve_node_context(
+        panel_data, config_data
+    )
 
     candidate_mode = str(config_data.get("api_ip_candidate_mode") or "online")
     online_window = (
@@ -639,7 +655,16 @@ async def collect_active_users_from_api(
         await _handle_dead_cycle(config_data, "no successful lookups")
         return False
 
-    min_coverage = float(config_data.get("api_ip_min_coverage") or 0.0)
+    # An absent key means "use the documented default", not "no floor at all".
+    # `or 0.0` silently disabled the guard for any caller that assembled
+    # config_data without going through read_config, which is where the 0.8
+    # default actually lives.
+    raw_min_coverage = config_data.get("api_ip_min_coverage")
+    if raw_min_coverage is None or raw_min_coverage == "":
+        min_coverage = 0.8
+    else:
+        min_coverage = float(raw_min_coverage)
+
     if coverage < min_coverage:
         LAST_CYCLE_STATS["skipped_reason"] = (
             f"coverage {coverage:.0%} below {min_coverage:.0%}"
@@ -649,7 +674,11 @@ async def collect_active_users_from_api(
             f"🛰️ Skipping enforcement: coverage {coverage:.1%} < {min_coverage:.0%} "
             f"({counters['ok']} ok, {counters['failed']} failed of {len(targets)})"
         )
-        _consecutive_dead_cycles = 0
+        # This is a dead cycle and now counts as one. Zeroing the counter here meant
+        # API mode could skip enforcement on every cycle indefinitely while the
+        # automatic revert to log mode never fired: nobody was ever banned and
+        # nothing said the pipeline had stopped.
+        await _handle_dead_cycle(config_data, "coverage below threshold")
         return False
 
     _consecutive_dead_cycles = 0
@@ -676,6 +705,36 @@ async def collect_active_users_from_api(
         )
         return False
 
+    # Node coverage: how many of the nodes that ought to be reporting actually
+    # contributed an IP. The `coverage` gate above is a per-user answer rate and
+    # reads 1.0 even when a third of the fleet is silent, so this is the only
+    # signal that separates "users happen to be concentrated on a few nodes" from
+    # "these nodes stopped reporting" - and the second under-counts devices, which
+    # is what lets a real offender's consecutive-violation counter be cleared.
+    nodes_expected = len(expected_node_ids)
+    node_coverage = (build_stats["nodes_seen"] / nodes_expected) if nodes_expected else 1.0
+    LAST_CYCLE_STATS["nodes_seen"] = build_stats["nodes_seen"]
+    LAST_CYCLE_STATS["nodes_expected"] = nodes_expected
+    LAST_CYCLE_STATS["node_coverage"] = round(node_coverage, 4)
+
+    # Off unless configured. A genuinely quiet node reports nothing, so the right
+    # floor depends on the fleet and has to be observed before it is enforced -
+    # guessing one here would skip healthy cycles. The ratio is logged either way,
+    # which is the part that was missing.
+    min_node_coverage = float(config_data.get("api_ip_min_node_coverage") or 0.0)
+    if min_node_coverage and node_coverage < min_node_coverage:
+        LAST_CYCLE_STATS["skipped_reason"] = (
+            f"node coverage {node_coverage:.0%} below {min_node_coverage:.0%}"
+        )
+        LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
+        api_ip_logger.error(
+            f"🛰️ Skipping enforcement: only {build_stats['nodes_seen']} of "
+            f"{nodes_expected} connected nodes reported an IP "
+            f"({node_coverage:.1%} < {min_node_coverage:.0%})"
+        )
+        await _handle_dead_cycle(config_data, "node coverage below threshold")
+        return False
+
     await _publish_active_users(new_users)
 
     LAST_CYCLE_STATS.update(build_stats)
@@ -685,7 +744,9 @@ async def collect_active_users_from_api(
         f"🛰️ API IP collection: {len(new_users)} users / "
         f"{build_stats['total_ips']} IPs across {build_stats['nodes_seen']} nodes "
         f"(candidates {len(candidates)} → targets {len(targets)}, "
-        f"coverage {coverage:.1%}, {build_stats['stale_ips']} stale IPs dropped, "
+        f"user coverage {coverage:.1%}, node coverage {node_coverage:.1%} "
+        f"({build_stats['nodes_seen']}/{nodes_expected}), "
+        f"{build_stats['stale_ips']} stale IPs dropped, "
         f"{LAST_CYCLE_STATS['duration_ms']}ms)"
     )
     return True
