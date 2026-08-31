@@ -24,7 +24,7 @@ from utils.parse_logs import close_geo_client
 from utils.read_config import read_config
 from utils.types import PanelType
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 # Main logger
 main_logger = get_logger("limiter.main")
@@ -178,12 +178,19 @@ async def main():
             except ValueError as error:
                 main_logger.error(f"Configuration error: {error}")
                 await send_logs(f"<code>{error}</code>")
+                # Only advertise commands that are actually registered. This message
+                # used to offer /set_check_interval and /set_time_to_active_users,
+                # neither of which is a CommandHandler anywhere in telegram_bot, so
+                # an operator following the instructions got silence from the bot
+                # while the limiter sat in this retry loop.
                 await send_logs(
                     "Please configure the required settings:\n"
                     "/create_config - Panel credentials\n"
-                    "/set_general_limit_number - Default IP limit\n"
-                    "/set_check_interval - Check interval\n"
-                    "/set_time_to_active_users - Re-enable timeout\n\n"
+                    "/set_general_limit_number - Default IP limit\n\n"
+                    "The check interval and the re-enable timeout are set in the "
+                    "environment file, not from the bot:\n"
+                    "<code>CHECK_INTERVAL</code> - seconds between scans (180-300)\n"
+                    "<code>TIME_TO_ACTIVE_USERS</code> - re-enable timeout in seconds\n\n"
                     "Retrying in <b>60 seconds</b>..."
                 )
                 await asyncio.sleep(60)

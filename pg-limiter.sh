@@ -4,7 +4,7 @@ set -e
 # PG-Limiter Management Script
 # https://github.com/JavadMoqaddam/PG-Limiter
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 # Configuration
 REPO_OWNER="JavadMoqaddam"
@@ -235,7 +235,11 @@ ADMIN_IDS=
 # ═══════════════════════════════════════════════════════════════
 
 GENERAL_LIMIT=2
-CHECK_INTERVAL=60
+# 180-300 is the practical range on a busy panel. Below that the monitoring window
+# (CHECK_INTERVAL x MAX_WARNING_COUNT) is too short for a user to correct
+# themselves, and a cycle that over-runs the interval degrades the
+# consecutive-scan timing the disable decision rests on.
+CHECK_INTERVAL=180
 # MAX_WARNING_COUNT=3
 TIME_TO_ACTIVE_USERS=900
 COUNTRY_CODE=
@@ -244,10 +248,16 @@ COUNTRY_CODE=
 # API Server (Optional)
 # ═══════════════════════════════════════════════════════════════
 # API_ENABLED=false
-# API_HOST=0.0.0.0
+# 0.0.0.0 is reachable from outside this host and the API has no rate limiting.
+# API_HOST=127.0.0.1
 # API_PORT=8080
 # API_USERNAME=admin
+# Required. With no password set every API request is refused rather than allowed.
 # API_PASSWORD=secure_password
+# /docs, /redoc and /openapi.json are unauthenticated in FastAPI, so they are off.
+# API_DOCS=false
+# Comma-separated browser origins allowed cross-origin. Empty means none.
+# API_CORS_ORIGINS=
 
 # ═══════════════════════════════════════════════════════════════
 # Advanced Settings
@@ -567,31 +577,184 @@ cmd_logs() {
 cmd_update() {
     check_running_as_root
     check_docker
-    
+
     print_banner
-    
+
     if ! is_installed; then
         colorized_echo red "PG-Limiter is not installed. Run 'pg-limiter install' first."
         exit 1
     fi
-    
-    colorized_echo blue "Updating PG-Limiter..."
-    
-    # Update script
-    colorized_echo blue "Updating pg-limiter script..."
-    curl -sSL "$SCRIPT_URL" -o /usr/local/bin/pg-limiter
-    chmod +x /usr/local/bin/pg-limiter
-    
-    # Pull latest image
-    colorized_echo blue "Pulling latest Docker image..."
-    docker pull "$DOCKER_IMAGE"
-    
-    # Restart with new image (removes old container to clear logs)
-    colorized_echo blue "Restarting service..."
+
+    # Two stages, on purpose.
+    #
+    # Stage 1 (this script) only replaces the CLI, then re-execs. Stage 2 runs from
+    # the NEW script and does the actual update, so compose changes shipped in a
+    # release are applied by the code that shipped them.
+    #
+    # The old version did `curl -sSL "$SCRIPT_URL" -o /usr/local/bin/pg-limiter`
+    # over the file it was executing. Bash reads a script lazily, so truncating and
+    # rewriting it in place can make the rest of the run continue from a byte offset
+    # in the new file. There was no -f either, so an HTML error page was installed
+    # as the CLI. Downloading to a temp file, checking it, `mv`-ing it (which swaps
+    # the directory entry and leaves this process's open inode intact) and then
+    # exec'ing a fresh interpreter removes both problems.
+    if [[ -z "${PG_LIMITER_UPDATE_STAGE2:-}" ]]; then
+        local stamp
+        stamp=$(date +%Y%m%d-%H%M%S)
+        local backup_dir="$DATA_DIR/update-backups/$stamp"
+        mkdir -p "$backup_dir"
+
+        local new_script
+        new_script=$(mktemp)
+
+        colorized_echo blue "Downloading the new pg-limiter script..."
+        if ! curl -fsSL "$SCRIPT_URL" -o "$new_script"; then
+            rm -f "$new_script"
+            colorized_echo red "Could not download $SCRIPT_URL. Nothing was changed."
+            exit 1
+        fi
+        if ! head -n 1 "$new_script" | grep -q '^#!'; then
+            rm -f "$new_script"
+            colorized_echo red "The download is not a shell script. Nothing was changed."
+            exit 1
+        fi
+        if ! grep -q 'cmd_update()' "$new_script"; then
+            rm -f "$new_script"
+            colorized_echo red "The download looks truncated. Nothing was changed."
+            exit 1
+        fi
+
+        cp -a /usr/local/bin/pg-limiter "$backup_dir/pg-limiter.old" 2>/dev/null || true
+        mv "$new_script" /usr/local/bin/pg-limiter
+        chmod +x /usr/local/bin/pg-limiter
+        colorized_echo green "✓ CLI updated (previous copy: $backup_dir/pg-limiter.old)"
+
+        export PG_LIMITER_UPDATE_STAGE2=1
+        export PG_LIMITER_UPDATE_DIR="$backup_dir"
+        exec /usr/local/bin/pg-limiter update
+    fi
+
+    cmd_update_stage2
+}
+
+cmd_update_stage2() {
+    local backup_dir="${PG_LIMITER_UPDATE_DIR:-$DATA_DIR/update-backups/$(date +%Y%m%d-%H%M%S)}"
+    local db_path="$DATA_DIR/data/pg_limiter.db"
+    local rollback_tag="pg-limiter:rollback-$(basename "$backup_dir")"
+
+    mkdir -p "$backup_dir"
+    colorized_echo blue "Updating PG-Limiter (v$VERSION)..."
+
+    # Tag the image being replaced. `docker pull` on a :latest tag leaves the old
+    # image untagged, so without this there is no simple way back.
+    if docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
+        if docker tag "$DOCKER_IMAGE" "$rollback_tag" 2>/dev/null; then
+            colorized_echo green "✓ Current image tagged $rollback_tag"
+        fi
+    fi
+
+    # Stop first, then copy. Copying a live SQLite file can capture a half-written
+    # page, and this database is the only record of who is banned and until when.
+    colorized_echo blue "Stopping the service..."
+    $COMPOSE -f "$COMPOSE_FILE" stop >/dev/null 2>&1 || true
+
+    if [[ -f "$db_path" ]]; then
+        cp -a "$db_path" "$backup_dir/"
+        colorized_echo green "✓ Database copied to $backup_dir"
+    else
+        colorized_echo yellow "No database at $db_path yet - nothing to back up"
+    fi
+    for extra in user_warnings.json violation_history.json disable_users.json; do
+        if [[ -f "$DATA_DIR/$extra" ]]; then
+            cp -a "$DATA_DIR/$extra" "$backup_dir/"
+        fi
+    done
+    cp -a "$COMPOSE_FILE" "$backup_dir/docker-compose.yml.old" 2>/dev/null || true
+    cp -a "$ENV_FILE" "$backup_dir/env.old" 2>/dev/null || true
+
+    colorized_echo blue "Pulling the latest Docker image..."
+    if ! docker pull "$DOCKER_IMAGE"; then
+        colorized_echo red "docker pull failed - restarting the version you had."
+        $COMPOSE -f "$COMPOSE_FILE" up -d
+        exit 1
+    fi
+
+    # Only `install` ever wrote this file, so compose changes shipped in a release
+    # never reached an existing installation - and a service the new code no longer
+    # uses stays declared, which means --remove-orphans does not consider it an
+    # orphan and `up -d` starts it again. The previous file is in $backup_dir.
+    colorized_echo blue "Regenerating the compose file..."
+    create_compose_file
+
+    colorized_echo blue "Starting the service..."
     $COMPOSE -f "$COMPOSE_FILE" down --remove-orphans
     $COMPOSE -f "$COMPOSE_FILE" up -d
-    
-    colorized_echo green "✓ PG-Limiter updated successfully!"
+
+    cmd_update_verify "$backup_dir" "$rollback_tag"
+}
+
+cmd_update_verify() {
+    local backup_dir="$1"
+    local rollback_tag="$2"
+
+    # The old version printed "updated successfully" unconditionally, without
+    # looking at the container or its log. Combined with a startup that used to
+    # swallow migration failures, that gave the operator a green tick over a broken
+    # boot - which is exactly how the Alembic chain stayed broken unnoticed.
+    colorized_echo blue "Verifying startup (this takes ~20s)..."
+    sleep 20
+
+    local state
+    state=$(docker inspect -f '{{.State.Status}}' "$SERVICE_NAME" 2>/dev/null || echo "missing")
+
+    if [[ "$state" != "running" ]]; then
+        colorized_echo red "✗ Container state is '$state', not 'running'."
+        colorized_echo yellow "Last 40 log lines:"
+        docker logs "$SERVICE_NAME" --tail 40 2>&1 || true
+        cmd_update_rollback_hint "$backup_dir" "$rollback_tag"
+        exit 1
+    fi
+
+    # start.sh exits non-zero on a migration failure and limiter.py refuses to run
+    # without a usable database; both say so in these words.
+    local fatal
+    fatal=$(docker logs "$SERVICE_NAME" --tail 300 2>&1 \
+        | grep -iE "FATAL|Migration failed|Migrations failed|Refusing to start|Unknown database state" \
+        | tail -n 10 || true)
+
+    if [[ -n "$fatal" ]]; then
+        colorized_echo red "✗ The container is up but its log reports a fatal startup error:"
+        echo "$fatal"
+        cmd_update_rollback_hint "$backup_dir" "$rollback_tag"
+        exit 1
+    fi
+
+    colorized_echo green "✓ PG-Limiter v$VERSION updated and running"
+    echo ""
+    echo "  Backup:   $backup_dir"
+    echo "  Rollback: docker tag $rollback_tag $DOCKER_IMAGE && pg-limiter restart"
+    echo ""
+    colorized_echo blue "Worth a look after any update:"
+    echo "  pg-limiter logs | grep -iE 'migration|alembic|Counting mode'"
+}
+
+cmd_update_rollback_hint() {
+    local backup_dir="$1"
+    local rollback_tag="$2"
+
+    echo ""
+    colorized_echo yellow "To go back:"
+    if docker image inspect "$rollback_tag" >/dev/null 2>&1; then
+        echo "  docker tag $rollback_tag $DOCKER_IMAGE"
+        echo "  cp -a $backup_dir/pg-limiter.old /usr/local/bin/pg-limiter"
+        echo "  pg-limiter restart"
+    else
+        colorized_echo yellow "  No rollback image was tagged; pull the previous release manually."
+    fi
+    echo ""
+    colorized_echo yellow "Your data before this update is in: $backup_dir"
+    echo "  Restore the database with the container stopped:"
+    echo "  cp -a $backup_dir/pg_limiter.db $DATA_DIR/data/pg_limiter.db"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════

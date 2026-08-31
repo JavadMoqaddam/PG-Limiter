@@ -146,6 +146,30 @@ jobs:
           python tools/ci_migration_checks.py assert-upsert ./data/prealembic.db
           python tools/ci_migration_checks.py parity ./data/prealembic.db
 
+      # The damage the released 1.4.0 actually did in the field: alembic_version
+      # says 008 while the index 007 should have created is absent, so a plain
+      # `upgrade head` is a no-op and the upsert stays broken forever. start.sh
+      # detects this by inspecting the schema instead of trusting the recorded
+      # version, then re-stamps 006 so the corrective revisions run again.
+      - name: Scenario 7 - a database mis-stamped at head is repaired anyway
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///./data/misstamped.db
+        run: |
+          python tools/ci_migration_checks.py create-all ./data/misstamped.db
+          python tools/ci_migration_checks.py drop-ip-history-unique ./data/misstamped.db
+          python -m alembic stamp head
+          # Proves the trap: alembic reports head, and upgrading changes nothing.
+          python -m alembic upgrade head
+          if python tools/ci_migration_checks.py assert-upsert ./data/misstamped.db; then
+            echo "::error::upgrade head should not have repaired this - scenario is not reproducing the bug"
+            exit 1
+          fi
+          # The repair start.sh now performs.
+          python -m alembic stamp 006_drop_patterns
+          python -m alembic upgrade head
+          python tools/ci_migration_checks.py assert-upsert ./data/misstamped.db
+          python tools/ci_migration_checks.py parity ./data/misstamped.db
+
       - name: Scenario 4 - a populated 001..006 database survives the upgrade
         env:
           DATABASE_URL: sqlite+aiosqlite:///./data/populated.db

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 # Colors for output
 RED='\033[0;31m'
@@ -207,8 +207,28 @@ if not os.path.exists(path):
 
 con = sqlite3.connect(path)
 tables = {r[0] for r in con.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")}
+
+def unique_username_ip_present():
+    # A database damaged by the old 'stamp head' has ip_history but no unique
+    # index over (username, ip): alembic_version says 008 while the index 007
+    # should have created was never made, so 'upgrade head' is a no-op and every
+    # cycle fails on ON CONFLICT. Detect it by looking at the schema itself
+    # rather than trusting the recorded version.
+    if 'ip_history' not in tables:
+        return True
+    for row in con.execute(\"PRAGMA index_list('ip_history')\"):
+        name, is_unique = row[1], row[2]
+        if not is_unique:
+            continue
+        cols = {r[2] for r in con.execute(f\"PRAGMA index_info('{name}')\")}
+        if cols == {'username', 'ip'}:
+            return True
+    return False
+
 if 'users' not in tables:
     print('FRESH', flush=True)
+elif not unique_username_ip_present():
+    print('NEEDS_REPAIR', flush=True)
 elif 'alembic_version' in tables and con.execute('SELECT COUNT(*) FROM alembic_version').fetchone()[0] > 0:
     print('VERSIONED', flush=True)
 else:
@@ -217,7 +237,7 @@ con.close()
 " 2>&1)
 
 case "$STATE_OUTPUT" in
-    *NEEDS_STAMP*)
+    *NEEDS_STAMP*|*NEEDS_REPAIR*)
         # Stamp at 006, NOT at head.
         #
         # `stamp head` was wrong and it hid a live bug: it declares every revision
@@ -231,12 +251,24 @@ case "$STATE_OUTPUT" in
         # done, so claiming those is correct. Everything from 007 onward repairs a
         # defect that a create_all database can carry, so it has to run.
         #
+        # NEEDS_REPAIR is the same treatment for a database that a previous version
+        # of this script already mis-stamped: re-stamping 006 overwrites the recorded
+        # version, so the corrective revisions run on the next line. That is what
+        # makes this self-healing instead of needing a manual alembic command.
+        #
         # THEREFORE: every revision after 006 must be idempotent - it has to check
         # the schema and return quietly when its change is already present. 007 and
         # 008 both do. A new revision that assumes it runs exactly once will break
         # this path.
         STAMP_TARGET="006_drop_patterns"
-        log_info "Existing schema with no migration version - stamping at $STAMP_TARGET, then upgrading"
+        case "$STATE_OUTPUT" in
+            *NEEDS_REPAIR*)
+                log_warn "Schema is missing the ip_history unique index despite a recorded migration version - repairing"
+                ;;
+            *)
+                log_info "Existing schema with no migration version - stamping at $STAMP_TARGET, then upgrading"
+                ;;
+        esac
         if ! STAMP_OUTPUT=$(timeout 30 python -m alembic stamp "$STAMP_TARGET" 2>&1); then
             log_error "Could not stamp the database at $STAMP_TARGET:"
             echo "$STAMP_OUTPUT" | while read -r line; do log_error "$line"; done
