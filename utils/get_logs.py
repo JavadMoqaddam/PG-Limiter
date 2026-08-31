@@ -17,6 +17,7 @@ from telegram_bot.send_message import send_logs, edit_message
 from utils.logs import logger  # pylint: disable=ungrouped-imports
 from utils.panel_api import get_nodes, get_token
 from utils.parse_logs import parse_logs, set_current_node_info
+from utils.shared_state import clear_node_events, forget_node_event, note_node_event
 from utils.types import NodeType, PanelType
 
 TASKS = []
@@ -272,18 +273,31 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
                     
                     # Update status to connected
                     await _update_node_status(node.node_id, node.node_name, "✅ Connected")
-                    
+
+                    # Seed the heartbeat so a node that has just connected is not
+                    # immediately judged stale by the enforcement cycle. Every line
+                    # below refreshes it; nothing else in this module proves the
+                    # stream is still delivering, because timeout=None means a
+                    # half-open connection never raises.
+                    note_node_event(node.node_id)
+
                     # Clear stale/ghost connections for this specific node BEFORE reading fresh stream
                     from utils.parse_logs import clear_node_active_connections
                     cleared_count = await clear_node_active_connections(node.node_id)
                     if cleared_count > 0:
                         logger.info(f"🧹 Cleared {cleared_count} stale connections for node {node.node_id} ({node.node_name}) before reading SSE stream")
-                    
+
                     next_mode_check = time.time() + _IP_SOURCE_RECHECK_SECONDS
                     async for line in response.aiter_lines():
                         # Honour a runtime switch to API mode: the stream is
                         # abandoned so the outer loop can park the task.
                         now = time.time()
+                        # Any line at all counts, including the keep-alives that
+                        # carry no "data:" payload: this answers "is the stream
+                        # alive", not "did a user connect". Counting only parsed
+                        # events would read a busy node whose lines are all
+                        # filtered out as dead.
+                        note_node_event(node.node_id, now)
                         if now >= next_mode_check:
                             next_mode_check = now + _IP_SOURCE_RECHECK_SECONDS
                             if await _ip_source_is_api():
@@ -292,6 +306,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
                                     f"for node {node.node_id} ({node.node_name})"
                                 )
                                 await clear_node_active_connections(node.node_id)
+                                forget_node_event(node.node_id)
                                 break
 
                         if line.startswith("data: "):
@@ -359,7 +374,13 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
                 # Clear active connections for this deactivated node
                 from utils.parse_logs import clear_node_active_connections
                 await clear_node_active_connections(node_id)
-                
+
+                # The panel says this node is gone, so drop its heartbeat rather
+                # than leaving a stale timestamp behind. A stale entry is the
+                # signal for a node that should be streaming and is not; a node
+                # that is deliberately down must not drag that ratio down.
+                forget_node_event(node_id)
+
                 del deactivate_nodes[task_name]
                 task.cancel()
                 tasks.remove(task)
@@ -423,6 +444,11 @@ async def handle_cancel_all(tasks: list[Task], panel_data: PanelType, tg: asynci
         # Reset status tracking
         _node_status_message_id = None
         _node_connection_status = {}
+
+        # Every stream is about to be rebuilt, so the old heartbeats describe
+        # tasks that no longer exist. Leaving them would make the next cycle read
+        # the whole fleet as stale during the rebuild and skip enforcement.
+        clear_node_events()
         
         # Small delay to let tasks clean up
         await asyncio.sleep(2)

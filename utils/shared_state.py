@@ -4,6 +4,8 @@ Decouples state ownership to eliminate circular dependencies between check_usage
 """
 
 import asyncio
+import time
+
 from utils.types import UserType
 
 # Global state of currently active connected users
@@ -11,6 +13,57 @@ ACTIVE_USERS: dict[str, UserType] = {}
 
 # Module-level lock protecting concurrent access to ACTIVE_USERS
 ACTIVE_USERS_LOCK = asyncio.Lock()
+
+# Per-node "last event seen" wall clock, {node_id: timestamp}.
+#
+# ACTIVE_USERS on its own cannot tell a dead pipeline from a quiet one: an empty
+# map reads identically for "nobody is connected" and "every SSE stream is
+# half-open". get_logs connects with ``timeout=None``, so a stalled stream never
+# raises - the node keeps reporting "✅ Connected" while delivering nothing, and
+# the cycle that follows clears the consecutive-violation counter of every absent
+# user, so a genuine offender never reaches the third scan.
+#
+# No lock. This is written once per log line, and assigning a float into a dict is
+# atomic under the GIL; taking a lock per line would cost more than it protects,
+# and making writers wait on ACTIVE_USERS_LOCK would serialise ingestion behind
+# snapshotting. Readers copy with list() so they never iterate a mutating dict.
+NODE_LAST_EVENT: dict[int, float] = {}
+
+
+def note_node_event(node_id: int | None, when: float | None = None) -> None:
+    """Record that ``node_id`` produced a log event."""
+    if node_id is None:
+        return
+    NODE_LAST_EVENT[node_id] = time.time() if when is None else when
+
+
+def forget_node_event(node_id: int | None) -> None:
+    """Drop a node's heartbeat when its task is cancelled or the node disappears."""
+    if node_id is None:
+        return
+    NODE_LAST_EVENT.pop(node_id, None)
+
+
+def clear_node_events() -> None:
+    """Forget every heartbeat, for the periodic full rebuild of the node tasks."""
+    NODE_LAST_EVENT.clear()
+
+
+def nodes_seen_within(max_age: float) -> int:
+    """How many nodes produced an event within the last ``max_age`` seconds."""
+    cutoff = time.time() - max_age
+    return sum(1 for seen in list(NODE_LAST_EVENT.values()) if seen >= cutoff)
+
+
+def tracked_node_count() -> int:
+    """How many nodes are currently being tracked at all."""
+    return len(NODE_LAST_EVENT)
+
+
+def get_node_event_ages() -> dict[int, float]:
+    """``{node_id: seconds since its last event}``, for diagnostics and reports."""
+    now = time.time()
+    return {node_id: now - seen for node_id, seen in list(NODE_LAST_EVENT.items())}
 
 
 def _clone_user_map(users: dict[str, UserType]) -> dict[str, UserType]:

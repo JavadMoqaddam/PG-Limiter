@@ -27,7 +27,15 @@ from utils.ip_history_tracker import ip_history_tracker
 from utils.user_group_filter import should_limit_user, get_filter_status_text
 from utils.admin_filter import should_limit_user_by_admin
 
-from utils.shared_state import ACTIVE_USERS, ACTIVE_USERS_LOCK, get_active_users_snapshot, pop_active_users_snapshot
+from utils.shared_state import (
+    ACTIVE_USERS,
+    ACTIVE_USERS_LOCK,
+    get_active_users_snapshot,
+    get_node_event_ages,
+    nodes_seen_within,
+    pop_active_users_snapshot,
+    tracked_node_count,
+)
 
 # Re-export internal alias for backward compatibility
 _active_users_lock = ACTIVE_USERS_LOCK
@@ -1051,18 +1059,49 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # Check for users whose usage normalized (active devices <= limit or disconnected)
     #
     # An empty sample while users are under monitoring is not 2,350 people
-    # disconnecting at once - it is the log pipeline having stopped. shared_state
-    # publishes no per-node heartbeat, so from here a dead SSE stream and a genuinely
-    # idle panel look identical, and a stream can go half-open without ever raising
-    # (utils/get_logs.py opens its client with timeout=None and the node status stays
-    # "Connected"). Clearing on that evidence hands every real offender a fresh start
-    # each cycle, which is how a flaky stream stops bans altogether.
+    # disconnecting at once - it is the log pipeline having stopped. Clearing on that
+    # evidence hands every real offender a fresh start each cycle, which is how a
+    # flaky stream stops bans altogether.
+    #
+    # Two separate signals, because they catch different failures:
+    #
+    #  * an empty sample catches "everything is down";
+    #  * the per-node heartbeat catches *partial* failure, which an empty sample
+    #    cannot see. get_logs opens its client with timeout=None, so a half-open
+    #    stream never raises and the node keeps reporting "✅ Connected" while
+    #    delivering nothing. One dead node out of forty-nine still leaves plenty of
+    #    active users in the sample - and every user who was on that node looks
+    #    like they disconnected.
+    #
+    # The staleness window is generous on purpose. A node with no traffic at all in
+    # two whole check intervals is not merely quiet on this installation, and
+    # erring long means a genuinely idle node never blocks enforcement.
     counters_are_trustworthy = bool(all_users_actual_ips) or not warning_system.warnings
     if not counters_are_trustworthy:
         logger.error(
             f"⛔ No active users this cycle while {len(warning_system.warnings)} are under "
             f"monitoring - treating the sample as unusable and leaving every counter alone"
         )
+
+    tracked_nodes = tracked_node_count()
+    if counters_are_trustworthy and tracked_nodes and warning_system.warnings:
+        stale_window = max(120.0, float(check_interval) * 2)
+        live_nodes = nodes_seen_within(stale_window)
+        if live_nodes < tracked_nodes:
+            silent_nodes = sorted(
+                node_id
+                for node_id, age in get_node_event_ages().items()
+                if age > stale_window
+            )
+            # Under-counting is the failure direction here, so the safe response is
+            # to leave every counter alone rather than to clear on a partial view.
+            counters_are_trustworthy = False
+            logger.error(
+                f"⛔ {len(silent_nodes)} of {tracked_nodes} log streams produced nothing in "
+                f"the last {int(stale_window)}s (node ids {silent_nodes}) while "
+                f"{len(warning_system.warnings)} users are under monitoring - the sample is "
+                f"incomplete, so no counter is cleared this cycle"
+            )
 
     for monitored_user in list(warning_system.warnings.keys()):
         if not counters_are_trustworthy:
