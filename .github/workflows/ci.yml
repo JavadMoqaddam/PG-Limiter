@@ -115,10 +115,36 @@ jobs:
           DATABASE_URL: sqlite+aiosqlite:///./data/legacy.db
         run: |
           python tools/ci_migration_checks.py create-all ./data/legacy.db
-          python -m alembic stamp head
+          python -m alembic stamp 006_drop_patterns
           python -m alembic upgrade head
           python tools/ci_migration_checks.py parity ./data/legacy.db
           python tools/ci_migration_checks.py assert-upsert ./data/legacy.db
+
+      # The exact shape of every pre-Alembic installation, and the scenario the
+      # first version of this job missed. The live database had ip_history without
+      # UNIQUE(username, ip) - an old create_all built it before the model declared
+      # the constraint - and no alembic_version at all. start.sh used to answer that
+      # with `alembic stamp head`, which claims every revision is applied without
+      # running one, so 007 never created the index and production failed once per
+      # cycle with "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+      # constraint". start.sh now stamps 006 and upgrades; this proves it.
+      - name: Scenario 6 - a pre-Alembic database missing the unique index is repaired
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///./data/prealembic.db
+        run: |
+          python tools/ci_migration_checks.py create-all ./data/prealembic.db
+          python tools/ci_migration_checks.py drop-ip-history-unique ./data/prealembic.db
+          python tools/ci_migration_checks.py unversion ./data/prealembic.db
+          # Fails loudly if the upsert is broken before the repair, which is the
+          # bug being reproduced.
+          if python tools/ci_migration_checks.py assert-upsert ./data/prealembic.db; then
+            echo "::error::the upsert should NOT work before the repair - this scenario is not reproducing the bug"
+            exit 1
+          fi
+          python -m alembic stamp 006_drop_patterns
+          python -m alembic upgrade head
+          python tools/ci_migration_checks.py assert-upsert ./data/prealembic.db
+          python tools/ci_migration_checks.py parity ./data/prealembic.db
 
       - name: Scenario 4 - a populated 001..006 database survives the upgrade
         env:

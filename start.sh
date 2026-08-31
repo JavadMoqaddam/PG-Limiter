@@ -218,9 +218,27 @@ con.close()
 
 case "$STATE_OUTPUT" in
     *NEEDS_STAMP*)
-        log_info "Existing schema with no migration version - stamping it as current"
-        if ! STAMP_OUTPUT=$(timeout 30 python -m alembic stamp head 2>&1); then
-            log_error "Could not stamp the database as current:"
+        # Stamp at 006, NOT at head.
+        #
+        # `stamp head` was wrong and it hid a live bug: it declares every revision
+        # applied without running any of them, so the corrective migrations never
+        # executed on the one kind of database that needs them. Production proved it -
+        # the boot log said "stamping it as current", then every cycle failed with
+        # "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
+        # because 007 never created the unique index on ip_history.
+        #
+        # 001..006 only create and drop whole tables, which create_all has already
+        # done, so claiming those is correct. Everything from 007 onward repairs a
+        # defect that a create_all database can carry, so it has to run.
+        #
+        # THEREFORE: every revision after 006 must be idempotent - it has to check
+        # the schema and return quietly when its change is already present. 007 and
+        # 008 both do. A new revision that assumes it runs exactly once will break
+        # this path.
+        STAMP_TARGET="006_drop_patterns"
+        log_info "Existing schema with no migration version - stamping at $STAMP_TARGET, then upgrading"
+        if ! STAMP_OUTPUT=$(timeout 30 python -m alembic stamp "$STAMP_TARGET" 2>&1); then
+            log_error "Could not stamp the database at $STAMP_TARGET:"
             echo "$STAMP_OUTPUT" | while read -r line; do log_error "$line"; done
             exit 1
         fi

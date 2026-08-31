@@ -233,12 +233,85 @@ def cmd_assert_upsert(path: str) -> int:
     return 0
 
 
+def cmd_unversion(path: str) -> int:
+    """
+    Drop alembic_version, leaving the schema but no migration history.
+
+    This is the shape every pre-Alembic installation has: tables built by
+    ``create_all``, nothing in ``alembic_version``. start.sh calls it NEEDS_STAMP.
+    Reproducing it matters because the first fix for that path stamped *head*,
+    which declared all revisions applied without running any - so the corrective
+    migrations silently never executed, and the only symptom was a failing upsert
+    once per cycle in production.
+    """
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("DROP TABLE IF EXISTS alembic_version")
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"dropped alembic_version from {path} (now looks pre-Alembic)")
+    return 0
+
+
+def cmd_drop_ip_history_unique(path: str) -> int:
+    """
+    Remove whatever enforces UNIQUE(username, ip) on ip_history.
+
+    An old ``create_all`` built this table before the model declared the
+    constraint, so the live database has the table and not the constraint. A
+    named index can simply be dropped; an inline table constraint cannot, so the
+    table is rebuilt without it.
+    """
+    conn = sqlite3.connect(path)
+    try:
+        names = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='ip_history'"
+            )
+            if row[0] and not row[0].startswith("sqlite_autoindex")
+        ]
+        for name in names:
+            if "username" in name and "ip" in name:
+                conn.execute(f'DROP INDEX IF EXISTS "{name}"')
+
+        conn.executescript(
+            """
+            CREATE TABLE ip_history_old AS SELECT * FROM ip_history;
+            DROP TABLE ip_history;
+            CREATE TABLE ip_history (
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                username VARCHAR(255) NOT NULL,
+                ip VARCHAR(45) NOT NULL,
+                node_name VARCHAR(255),
+                inbound_protocol VARCHAR(100),
+                first_seen DATETIME,
+                last_seen DATETIME,
+                connection_count INTEGER
+            );
+            INSERT INTO ip_history (id, username, ip, node_name, inbound_protocol,
+                                    first_seen, last_seen, connection_count)
+                SELECT id, username, ip, node_name, inbound_protocol,
+                       first_seen, last_seen, connection_count FROM ip_history_old;
+            DROP TABLE ip_history_old;
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"rebuilt ip_history in {path} without any UNIQUE(username, ip)")
+    return 0
+
+
 COMMANDS = {
     "create-all": cmd_create_all,
     "seed-ip-history": cmd_seed_ip_history,
     "parity": cmd_parity,
     "assert-dedup": cmd_assert_dedup,
     "assert-upsert": cmd_assert_upsert,
+    "unversion": cmd_unversion,
+    "drop-ip-history-unique": cmd_drop_ip_history_unique,
 }
 
 
