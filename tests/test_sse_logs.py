@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
 Test script to verify SSE logs functionality
+
+This one talks to a real panel with real credentials, so it is marked
+`integration`: conftest.py skips it unless pytest is given --run-integration.
+It used to be hidden from CI with --ignore instead, which made the suite look
+smaller than it is and left nothing explaining why.
 """
 
 import asyncio
 import sys
 
+import pytest
+
+pytestmark = pytest.mark.integration
+
 try:
     import httpx
 except ImportError:
-    print("❌ httpx is not installed!")
-    sys.exit(1)
+    pytest.skip("httpx is not installed", allow_module_level=True)
 
 from utils.panel_api import get_token, get_nodes
 from utils.types import PanelType

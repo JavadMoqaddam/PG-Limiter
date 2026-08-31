@@ -17,12 +17,12 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create an instance of the default event loop for the test session."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
+# There is deliberately no `event_loop` fixture here. Overriding it was the old way
+# to widen the loop's scope; pytest-asyncio deprecated that in 0.23 and removed the
+# fixture in 1.0, and a session-scoped override alongside pytest.ini's
+# asyncio_default_fixture_loop_scope = function is exactly the combination that
+# either errors at collection or silently leaves async tests on a closed loop.
+# pytest.ini owns the loop scope now.
 
 
 @pytest.fixture

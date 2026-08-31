@@ -1,32 +1,30 @@
 #!/usr/bin/env python3
 """
 Test script to verify that the new API endpoints work correctly
+
+This one talks to a real panel with real credentials, so it is marked
+`integration`: conftest.py skips it unless pytest is given --run-integration.
+It used to be hidden from CI with --ignore instead, which made the suite look
+smaller than it is and left nothing explaining why.
 """
 
 import asyncio
 import sys
 
-# Check if httpx is available
+import pytest
+
+pytestmark = pytest.mark.integration
+
 try:
-    import httpx
-    print("✅ httpx dependency is available")
+    import httpx  # noqa: F401
 except ImportError:
-    print("❌ httpx is not installed!")
-    print("Please install it using one of these methods:")
-    print("1. pip3 install httpx --break-system-packages")
-    print("2. pip3 install httpx --user")
-    print("3. sudo apt install python3-httpx (Ubuntu/Debian)")
-    print("4. Run: bash install_httpx.sh")
-    print("\nSee PEP668_INSTALLATION_GUIDE.md for detailed instructions.")
-    sys.exit(1)
+    pytest.skip("httpx is not installed", allow_module_level=True)
 
 try:
     from utils.panel_api import get_token, get_nodes, all_user
     from utils.types import PanelType
 except ImportError as e:
-    print(f"❌ Import error: {e}")
-    print("Make sure you're running this script from the limiter directory.")
-    sys.exit(1)
+    pytest.skip(f"panel_api is not importable: {e}", allow_module_level=True)
 
 
 async def test_new_api():

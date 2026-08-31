@@ -42,12 +42,25 @@ jobs:
       - name: Python Syntax & Bytecode Compilation Check
         run: |
           python -m compileall .
-      
+
+      # compileall only proves each file parses. It says nothing about a name that
+      # does not exist, which is what a large refactor actually breaks - a renamed
+      # helper still parses fine at every call site. These four rule groups are the
+      # ones that cannot be a matter of taste, so this step blocks instead of
+      # warning. --select on the command line replaces ruff.toml's own select while
+      # still honouring its exclude list.
+      - name: Ruff - Release Blockers (undefined names, broken syntax)
+        run: |
+          ruff check . --config ruff.toml --select E9,F63,F7,F82 --output-format=github
+
+      # Advisory on purpose: style and formatting findings should not stand between
+      # a verified fix and production. The blocking checks are the step above, the
+      # import sweep in the test job, and the migration job.
       - name: Run Ruff Linter
         run: |
           ruff check . --output-format=github --config ruff.toml
         continue-on-error: true
-      
+
       - name: Run Ruff Formatter Check
         run: |
           ruff format --check . --config ruff.toml
@@ -74,25 +87,58 @@ jobs:
         run: |
           mkdir -p data /tmp/pg-limiter/data
 
-      - name: Test Fresh SQLite Database Creation
-        run: |
-          python -c "
-          import asyncio
-          from db.models import Base
-          from sqlalchemy.ext.asyncio import create_async_engine
-          async def test_init():
-              engine = create_async_engine('sqlite+aiosqlite:///./data/test_ci.db')
-              async with engine.begin() as conn:
-                  await conn.run_sync(Base.metadata.create_all)
-              await engine.dispose()
-              print('Fresh DB models created successfully!')
-          asyncio.run(test_init())
-          "
+      # Every step below names its own database through DATABASE_URL, which
+      # db/migrations/env.py honours. The previous version of this job did not:
+      # it built ./data/test_ci.db with create_all and then ran `alembic upgrade
+      # head`, which fell back to alembic.ini's ./data/pg_limiter.db - a different,
+      # empty file. So the two halves never met and no scenario here ever ran a
+      # migration against a database that already had tables, which is the only
+      # kind of database that exists in production.
 
-      - name: Test Alembic Migrations Upgrade (head)
+      - name: Scenario 1 - migrations apply to an empty database and reach head
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///./data/fresh.db
         run: |
           python -m alembic upgrade head
-          echo "Alembic migrations applied cleanly to head!"
+          python -m alembic current 2>&1 | tee current.txt
+          grep -q "(head)" current.txt
+
+      - name: Scenario 2 - the migrated schema matches db/models.py
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///./data/fresh.db
+        run: |
+          python tools/ci_migration_checks.py parity ./data/fresh.db
+          python tools/ci_migration_checks.py assert-upsert ./data/fresh.db
+
+      - name: Scenario 3 - a create_all database is stampable and reaches head
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///./data/legacy.db
+        run: |
+          python tools/ci_migration_checks.py create-all ./data/legacy.db
+          python -m alembic stamp head
+          python -m alembic upgrade head
+          python tools/ci_migration_checks.py parity ./data/legacy.db
+          python tools/ci_migration_checks.py assert-upsert ./data/legacy.db
+
+      - name: Scenario 4 - a populated 001..006 database survives the upgrade
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///./data/populated.db
+        run: |
+          python -m alembic upgrade 006_drop_patterns
+          python tools/ci_migration_checks.py seed-ip-history ./data/populated.db
+          python -m alembic upgrade head
+          python tools/ci_migration_checks.py assert-dedup ./data/populated.db
+          python tools/ci_migration_checks.py parity ./data/populated.db
+          python tools/ci_migration_checks.py assert-upsert ./data/populated.db
+
+      - name: Scenario 5 - the chain is linear and downgrades cleanly
+        env:
+          DATABASE_URL: sqlite+aiosqlite:///./data/fresh.db
+        run: |
+          python -m alembic heads 2>&1 | tee heads.txt
+          test "$(grep -c '(head)' heads.txt)" -eq 1
+          python -m alembic downgrade -1
+          python -m alembic upgrade head
 
   tests:
     name: Unit & Async Integration Tests
@@ -119,18 +165,28 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-${{ matrix.python-version }}-
       
+      # Pinned to major ranges on purpose. pytest.ini relies on
+      # asyncio_default_fixture_loop_scope (pytest-asyncio >= 0.24) and on
+      # asyncio_mode = auto; an unpinned install can pick up a major release that
+      # changes how async tests are collected, and the failure mode is silent -
+      # every async test simply stops running and the job still reports success.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio pytest-cov
+          pip install "pytest>=8.0,<9" "pytest-asyncio>=0.24,<2" "pytest-cov>=5,<8"
           pip install -r requirements.txt
-      
+
+      # core_test.py does not match python_files = test_*.py, so pytest never
+      # collected it in the first place; naming it here only made the list look
+      # more thorough than it was. test_minimal.py exercises mock classes defined
+      # inside itself and asserts nothing, so it cannot fail and cannot help.
+      # test_new_api.py and test_sse_logs.py need real panel credentials and are
+      # now marked `integration`, which conftest.py skips without --run-integration
+      # - collected and honestly skipped rather than hidden.
       - name: Run Pytest Suite
         run: |
           pytest tests/ -v --tb=short \
             --ignore=tests/core_test.py \
-            --ignore=tests/test_new_api.py \
-            --ignore=tests/test_sse_logs.py \
             --ignore=tests/test_minimal.py
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -149,11 +205,25 @@ jobs:
       
       - name: Install Bandit
         run: pip install bandit
-      
+
+      # Advisory, but no longer invisible: the findings go into the run's summary
+      # page instead of scrolling past inside a step that is allowed to fail, which
+      # is how an advisory scan turns into an ignored one. Left non-blocking because
+      # a false positive here should not stand between a verified fix and a deploy.
       - name: Run Bandit Security Scan
         run: |
+          set +e
           bandit -r . \
             -x ./tests,./node_modules,./.git \
             -ll \
-            --format txt
-        continue-on-error: true
+            --format txt | tee bandit.txt
+          status=${PIPESTATUS[0]}
+          {
+            echo "## Bandit (advisory)"
+            echo ""
+            echo '```'
+            tail -n 60 bandit.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "bandit exit status: $status"
+          exit 0
