@@ -56,6 +56,8 @@ def clean_collector_state():
     COUNTRY_CACHE.clear()
     api_mod._consecutive_dead_cycles = 0
     api_mod._forbidden_alert_sent = False
+    api_mod._consecutive_coverage_skips = 0
+    api_mod._coverage_alert_sent = False
     yield
     ACTIVE_USERS.clear()
     USER_METADATA_CACHE.clear()
@@ -67,6 +69,8 @@ def clean_collector_state():
     BLOCKED_IPS.update(blocklist_seed)
     api_mod._consecutive_dead_cycles = 0
     api_mod._forbidden_alert_sent = False
+    api_mod._consecutive_coverage_skips = 0
+    api_mod._coverage_alert_sent = False
 
 
 def _patch_collector(
@@ -76,6 +80,7 @@ def _patch_collector(
     counters=None,
     node_name_map=None,
     disabled_nodes=None,
+    expected_node_ids=None,
     panel_available=True,
 ):
     """
@@ -94,7 +99,19 @@ def _patch_collector(
         return candidates
 
     async def fake_node_context(*_args, **_kwargs):
-        return dict(node_name_map or {}), set(disabled_nodes or [])
+        names = dict(node_name_map or {})
+        disabled = set(disabled_nodes or [])
+        # Third element: the connected nodes the operator has not disabled, i.e.
+        # the set that ought to appear in a healthy cycle. Defaults to every node
+        # in node_name_map minus the disabled ones, which is what a healthy panel
+        # looks like; pass expected_node_ids explicitly to simulate a fleet where
+        # some nodes have gone quiet.
+        expected = (
+            set(expected_node_ids)
+            if expected_node_ids is not None
+            else set(names) - disabled
+        )
+        return names, disabled, expected
 
     async def fake_fetch(_panel, targets, **_kwargs):
         default = {"ok": len(targets), "failed": 0, "not_found": 0,
@@ -669,6 +686,36 @@ class TestCollectFailSafe:
         assert await api_mod.collect_active_users_from_api(panel, api_config) is False
         # The panel answered, so the auto-fallback streak resets.
         assert api_mod._consecutive_dead_cycles == 0
+
+    @pytest.mark.asyncio
+    async def test_repeated_coverage_skips_raise_one_alert(
+        self, panel, api_config, monkeypatch
+    ):
+        """
+        A run of coverage skips means enforcement has stopped entirely.
+
+        One skip is the correct, safe outcome. Three in a row means nobody is being
+        warned or banned at all, and the only trace used to be one WARNING per cycle
+        that reads exactly like the previous one. Reverting to log mode is not the
+        remedy here - the panel is answering, just incompletely - so this is an
+        alarm, not a mode change.
+        """
+        import utils.ip_source_api as api_mod
+
+        notifications = _patch_collector(
+            monkeypatch,
+            candidates=[{"username": f"u{i}", "id": i} for i in range(1, 5)],
+            counters={"ok": 1, "failed": 3, "not_found": 0,
+                      "forbidden": 0, "unauthorized": 0},
+        )
+
+        for _ in range(api_mod.COVERAGE_SKIP_ALERT_THRESHOLD + 2):
+            assert await api_mod.collect_active_users_from_api(panel, api_config) is False
+
+        assert api_mod._consecutive_coverage_skips == api_mod.COVERAGE_SKIP_ALERT_THRESHOLD + 2
+        # Alarmed once, not once per cycle.
+        assert len(notifications) == 1
+        assert "enforcement has stopped" in notifications[0]
 
     @pytest.mark.asyncio
     async def test_forbidden_raises_one_alert_only(self, panel, api_config, monkeypatch):

@@ -59,8 +59,18 @@ LAST_CYCLE_STATS: dict = {
 _consecutive_dead_cycles = 0
 _forbidden_alert_sent = False
 
+# Consecutive cycles skipped because the sample was too incomplete to act on. Kept
+# apart from the dead-cycle streak: a dead cycle means the panel gave us nothing and
+# log mode is the remedy, while these mean the panel answered incompletely and the
+# remedy is for the operator to look at why.
+_consecutive_coverage_skips = 0
+_coverage_alert_sent = False
+
 # Consecutive dead cycles tolerated before reverting to log mode
 DEAD_CYCLE_FALLBACK_THRESHOLD = 3
+
+# Consecutive coverage skips tolerated before saying enforcement has stopped
+COVERAGE_SKIP_ALERT_THRESHOLD = 3
 
 
 def get_last_cycle_stats() -> dict:
@@ -537,6 +547,41 @@ async def _handle_dead_cycle(config_data: dict, reason: str) -> None:
         )
 
 
+async def _handle_coverage_skip(reason: str) -> None:
+    """
+    Track consecutive cycles skipped for insufficient coverage, and say so.
+
+    A coverage skip is the safe outcome for one cycle - a partial sample would
+    clear real offenders' counters. A *run* of them is a different thing: nobody is
+    being escalated or banned at all, and the only trace used to be one WARNING per
+    cycle that looks identical to the previous one. Reverting to log mode is not the
+    remedy (the panel is answering, it is just answering incompletely), so this
+    raises an alarm instead of changing the IP source.
+    """
+    global _consecutive_coverage_skips, _coverage_alert_sent
+
+    _consecutive_coverage_skips += 1
+    if _consecutive_coverage_skips < COVERAGE_SKIP_ALERT_THRESHOLD:
+        return
+
+    api_ip_logger.error(
+        f"⛔ Enforcement has been skipped for {_consecutive_coverage_skips} consecutive "
+        f"cycles ({reason}). Nobody is being warned or banned. Check the panel's "
+        f"online-stats endpoint, api_ip_timeout and api_ip_concurrency."
+    )
+    if _coverage_alert_sent:
+        return
+    _coverage_alert_sent = True
+    await _notify(
+        "🛰️ <b>API IP mode: enforcement has stopped</b>\n\n"
+        f"{_consecutive_coverage_skips} cycles in a row were skipped because the "
+        f"sample was incomplete (<code>{reason}</code>).\n"
+        "Nobody is being warned or banned while this lasts. Raise "
+        "<code>api_ip_timeout</code>, lower <code>api_ip_concurrency</code>, or "
+        "switch the IP source back to Logs."
+    )
+
+
 async def _alert_forbidden_once() -> None:
     """Warn the operator the first time the panel rejects online-stats calls."""
     global _forbidden_alert_sent
@@ -572,6 +617,7 @@ async def collect_active_users_from_api(
         escalate an innocent user into a ban.
     """
     global _consecutive_dead_cycles, _forbidden_alert_sent
+    global _consecutive_coverage_skips, _coverage_alert_sent
 
     from utils.panel_api.online_ips import fetch_online_candidates
     from utils.panel_api.request_helper import is_panel_available
@@ -621,6 +667,8 @@ async def collect_active_users_from_api(
         LAST_CYCLE_STATS["coverage"] = 1.0
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         _consecutive_dead_cycles = 0
+        _consecutive_coverage_skips = 0
+        _coverage_alert_sent = False
         api_ip_logger.info("🛰️ No online candidates this cycle")
         return True
 
@@ -674,15 +722,23 @@ async def collect_active_users_from_api(
             f"🛰️ Skipping enforcement: coverage {coverage:.1%} < {min_coverage:.0%} "
             f"({counters['ok']} ok, {counters['failed']} failed of {len(targets)})"
         )
-        # This is a dead cycle and now counts as one. Zeroing the counter here meant
-        # API mode could skip enforcement on every cycle indefinitely while the
-        # automatic revert to log mode never fired: nobody was ever banned and
-        # nothing said the pipeline had stopped.
-        await _handle_dead_cycle(config_data, "coverage below threshold")
+        # The dead-cycle streak is deliberately NOT advanced here: the panel did
+        # answer, so reverting to log mode is not the right remedy and would thrash
+        # the IP source over a slow panel.
+        #
+        # But a run of these means enforcement has silently stopped - nobody is
+        # escalated, nobody is banned - so it gets its own counter and its own
+        # alarm rather than being invisible.
+        _consecutive_dead_cycles = 0
+        await _handle_coverage_skip(LAST_CYCLE_STATS["skipped_reason"])
         return False
 
     _consecutive_dead_cycles = 0
     _forbidden_alert_sent = False
+    # A usable sample: clear the "enforcement has stopped" state so the alarm can
+    # fire again if it happens a second time.
+    _consecutive_coverage_skips = 0
+    _coverage_alert_sent = False
 
     raw_by_name = {name: raw for name, _, raw in targets}
     new_users, build_stats = await _build_users_from_payloads(
@@ -732,7 +788,7 @@ async def collect_active_users_from_api(
             f"{nodes_expected} connected nodes reported an IP "
             f"({node_coverage:.1%} < {min_node_coverage:.0%})"
         )
-        await _handle_dead_cycle(config_data, "node coverage below threshold")
+        await _handle_coverage_skip(LAST_CYCLE_STATS["skipped_reason"])
         return False
 
     await _publish_active_users(new_users)
