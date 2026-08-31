@@ -537,7 +537,17 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
         all_user_ip_details[email] = ip_details
         total_devices += device_count
 
-    logger.info("Number of all active ips: %s, devices: %s", str(total_ips), str(total_devices))
+    # Two different populations and two different measures used to share one log
+    # line, which is why the report number and the enforcement number below never
+    # matched. Said plainly here: `total_ips` is a global set over every active
+    # user, while `total_devices` sums only the users that survived the group and
+    # admin filters (see the `email in filtered_users` skip above).
+    logger.info("📊 Snapshot: %s unique IPs across all active users", str(total_ips))
+    logger.info(
+        "📊 Report scope (group/admin filters applied): %s users, %s devices",
+        str(len(enhanced_users_info)),
+        str(total_devices),
+    )
 
     # Sort users by device count (descending)
     sorted_users = sorted(
@@ -830,9 +840,15 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
 
     total_devices_cycle = sum(all_users_device_counts.values())
     total_ips_cycle = sum(len(v) for v in all_users_actual_ips.values())
+    # Deliberately spelled out, because this number is larger than the report's and
+    # that used to look like a bug: this covers EVERY active user (filters are
+    # applied per user further down, not here), and the IP figure is the sum of
+    # per-user counts, so an IP shared by two users is counted twice - unlike the
+    # report's global set.
     logger.info(
-        f"📊 Counting mode '{device_config.count_mode}': {total_devices_cycle} devices "
-        f"from {total_ips_cycle} per-user IPs"
+        f"📊 Enforcement scope (all active users), counting mode "
+        f"'{device_config.count_mode}': {total_devices_cycle} devices from "
+        f"{total_ips_cycle} per-user IPs (summed per user, not de-duplicated)"
     )
 
     # Check for users who still violate limits after warning period
@@ -860,10 +876,19 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     group_filtered_users = set()
     admin_filtered_users = set()
     unknown_metadata_users = set()
+    failed_users = set()
     cycle_new_warnings = []
 
     for user_name, unique_ips in all_users_actual_ips.items():
-        if user_name not in except_users and user_name not in processed_users:
+        # Inverted from `if not except and not processed:` to an early continue so
+        # that the `try` below sits at the indentation the old `if` had. The body is
+        # unchanged and un-reindented on purpose: a single exception in here used to
+        # abandon the whole cycle for every remaining user, and hand-reindenting 130
+        # lines to fix that is how silent bugs get made.
+        if user_name in except_users or user_name in processed_users:
+            continue
+
+        try:
             if user_name not in users_metadata_usage:
                 # No local row for this user, so neither their monitoring flag nor
                 # their limit is known. Enforcing on defaults would judge somebody
@@ -1006,6 +1031,18 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         f"Unhandled warning result '{result}' for user {user_name} "
                         f"({effective_device_count} devices, limit={user_limit_number})"
                     )
+        except Exception as user_error:  # pylint: disable=broad-except
+            # One malformed user must not cost every user after them in the dict
+            # their evaluation. The counter is deliberately left untouched: it is
+            # the record of how many consecutive scans they have violated, and
+            # resetting it here would restart their escalation from zero.
+            failed_users.add(user_name)
+            logger.error(
+                f"❌ Enforcement failed for {user_name}: {user_error}. Their counter is "
+                f"left as it was and the cycle continues with the next user.",
+                exc_info=True,
+            )
+            continue
 
     # Check for users whose usage normalized (active devices <= limit or disconnected)
     #
@@ -1026,6 +1063,10 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     for monitored_user in list(warning_system.warnings.keys()):
         if not counters_are_trustworthy:
             break
+        if monitored_user in failed_users:
+            # Their evaluation raised an exception this cycle, so nothing about
+            # them is known well enough to justify clearing their record.
+            continue
         if monitored_user not in all_users_actual_ips:
             await warning_system.clear_user_trust_data(monitored_user)
             logger.info(f"✅ User {monitored_user} inactive, monitoring cleared")
@@ -1069,6 +1110,15 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         logger.warning(
             f"⏭️ {len(unknown_metadata_users)} active users skipped - not synced to the "
             f"local database yet, so their limit is unknown"
+        )
+
+    # Kept at ERROR: a non-zero count here means some users were not enforced this
+    # cycle for a reason that is a defect, not a policy.
+    if failed_users:
+        logger.error(
+            f"❌ {len(failed_users)} users could not be evaluated this cycle "
+            f"({', '.join(sorted(failed_users)[:10])}"
+            f"{'...' if len(failed_users) > 10 else ''}) - see the tracebacks above"
         )
 
     # Dispatch chunked warning reports in batches of 10
