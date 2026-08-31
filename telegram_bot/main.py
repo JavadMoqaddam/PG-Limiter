@@ -495,6 +495,7 @@ CALLBACK_ROUTES = {
     # --- Core settings ------------------------------------------------------
     CallbackData.CREATE_CONFIG: lambda u, q, c: _show_screen(q, MENU_TEXTS["create_config"], create_back_to_main_keyboard()),
     CallbackData.SET_IPINFO: lambda u, q, c: handle_ipinfo_callback(q, c),
+    CallbackData.ENHANCED_MENU: lambda u, q, c: handle_enhanced_menu_callback(q, c),
     CallbackData.ENHANCED_ON: lambda u, q, c: handle_enhanced_toggle_callback(q, c, True),
     CallbackData.ENHANCED_OFF: lambda u, q, c: handle_enhanced_toggle_callback(q, c, False),
 

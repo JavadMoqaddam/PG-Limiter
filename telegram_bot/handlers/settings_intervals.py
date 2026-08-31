@@ -3,6 +3,22 @@ Timing settings: how often users are checked and how long they stay active.
 
 Each value has three entry points that must stay in sync: the ``/set_*``
 conversation, the preset buttons, and the free-text input after "Custom".
+
+UNREACHABLE AS SHIPPED - nothing in this module runs. Verified against
+telegram_bot/main.py: no ``CommandHandler`` is registered for
+``set_check_interval`` or ``set_time_to_active``, the ``GET_CHECK_INTERVAL`` and
+``GET_TIME_TO_ACTIVE_USERS`` states belong to no ``ConversationHandler``, none of
+the ``INTERVAL_*``/``TIME_*`` callbacks appear in ``CALLBACK_ROUTES``, no
+settings keyboard offers a button that reaches these screens, and
+``text_message_handler`` has no branch for the ``waiting_for`` values
+``"check_interval"`` / ``"time_to_active"``.
+
+Both values are read from the environment instead - ``CHECK_INTERVAL`` and
+``TIME_TO_ACTIVE_USERS``, see .env.example. This file is kept because the code is
+complete and correct and wiring it up is a small change; it is documented as dead
+so that nobody edits it expecting a live screen, and so the next person does not
+have to rediscover it. Anything that told the operator these commands existed has
+been corrected (limiter.py's config-error message, and HELP_TEXT).
 """
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup

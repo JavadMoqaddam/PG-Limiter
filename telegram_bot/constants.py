@@ -108,6 +108,12 @@ class CallbackData:
     TIME_CUSTOM = "time_custom"
     
     # Enhanced details toggle
+    # ENHANCED_MENU shows the current state with the ON/OFF keyboard. The settings
+    # button used to send ENHANCED_ON directly, so pressing "Enhanced Details" set
+    # the option instead of opening its screen, and handle_enhanced_menu_callback -
+    # which exists and does exactly the right thing - was imported by main.py and
+    # never routed.
+    ENHANCED_MENU = "enhanced_menu"
     ENHANCED_ON = "enhanced_on"
     ENHANCED_OFF = "enhanced_off"
     
@@ -307,7 +313,7 @@ HELP_TEXT = """
 /show_except_users - Show except users
 
 <b>⚙️ Settings:</b>
-/show_enhanced_details - Toggle enhanced info
+Settings → Enhanced Details - Toggle node names, IDs and protocols in reports
 /set_ipinfo_token - Set IPInfo API token
 
 <b>🛰️ IP Source:</b>

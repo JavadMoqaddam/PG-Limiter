@@ -22,7 +22,14 @@ def create_back_to_settings_keyboard():
 
 
 async def handle_settings_menu_callback(query, _context: ContextTypes.DEFAULT_TYPE):
-    """Handle callback for settings menu display."""
+    """
+    Handle callback for settings menu display.
+
+    NOT ROUTED. ``SETTINGS_MENU`` and ``BACK_SETTINGS`` are both handled by inline
+    lambdas in main.py's ``CALLBACK_ROUTES``, so this copy never runs. It is left
+    here because it is the readable version of what those lambdas do - but it is a
+    divergence trap: editing this function changes nothing at runtime.
+    """
     await query.edit_message_text(
         text="⚙️ <b>Settings Menu</b>\n\nConfigure your bot settings:",
         reply_markup=create_settings_menu_keyboard(),

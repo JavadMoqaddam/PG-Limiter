@@ -4,6 +4,20 @@ Display and lookup settings: country filter, ipinfo token, report detail level.
 These are the toggles that change what the reports show and which IPs are
 counted at all - the country filter is the one with teeth, since an IP outside
 the configured country is never counted as a device.
+
+Live here: ``set_ipinfo_token`` / ``ipinfo_token_handler`` (registered as a
+conversation in main.py), ``handle_ipinfo_callback``,
+``handle_enhanced_menu_callback`` and ``handle_enhanced_toggle_callback``.
+
+Unreachable here, verified against main.py's ``CALLBACK_ROUTES`` and handler
+registrations: ``set_country_code`` / ``country_code_handler`` (no
+``CommandHandler``, ``SET_COUNTRY_CODE`` belongs to no ``ConversationHandler``),
+``handle_country_menu_callback`` / ``handle_country_selection_callback`` (the
+``COUNTRY_*`` callbacks are routed nowhere and no keyboard emits them), and
+``handle_single_ip_menu_callback`` / ``handle_single_ip_toggle_callback`` (same
+for ``SINGLE_IP_*``). The country filter is set through ``COUNTRY_CODE`` in the
+environment instead. Documented rather than deleted so the next reader does not
+have to re-derive it, and so nobody edits a screen that cannot be opened.
 """
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup

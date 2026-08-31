@@ -37,7 +37,7 @@ def create_settings_menu_keyboard():
             InlineKeyboardButton("🚫 Disable Method", callback_data=CallbackData.DISABLE_METHOD_MENU),
         ],
         [
-            InlineKeyboardButton("📋 Enhanced Details", callback_data=CallbackData.ENHANCED_ON),
+            InlineKeyboardButton("📋 Enhanced Details", callback_data=CallbackData.ENHANCED_MENU),
             InlineKeyboardButton("⚖️ Punishment", callback_data=CallbackData.PUNISHMENT_MENU),
         ],
         [
