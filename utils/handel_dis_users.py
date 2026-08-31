@@ -79,23 +79,43 @@ class DisabledUserEntry:
 
 _migration_lock = asyncio.Lock()
 _migrated = False
+_last_migration_attempt = 0.0
+
+# A permanently unreadable file must not turn a retry into a hot loop.
+MIGRATION_RETRY_SECONDS = 300.0
 
 
 async def _ensure_migrated() -> None:
-    """Import the retired JSON registry once per process, then never again."""
-    global _migrated
+    """
+    Import the retired JSON registry once per process, then never again.
+
+    The flag used to be set *before* the import ran, so one transient database
+    error made the file look imported for the whole lifetime of the process and
+    every user listed in it stayed disabled invisibly until somebody restarted the
+    container. It is now set only after the import actually succeeds, with a
+    back-off so a file that can never be read does not get retried on every call.
+    """
+    global _migrated, _last_migration_attempt
     if _migrated:
         return
     async with _migration_lock:
         if _migrated:
             return
-        _migrated = True
+        now = time.monotonic()
+        if _last_migration_attempt and now - _last_migration_attempt < MIGRATION_RETRY_SECONDS:
+            return
+        _last_migration_attempt = now
         try:
             imported = await import_legacy_json()
             if imported:
                 logger.info(f"Imported {imported} disabled users from the retired JSON registry")
+            _migrated = True
         except Exception as error:  # pylint: disable=broad-except
-            logger.error(f"Could not import the legacy disabled-users file: {error}")
+            logger.error(
+                f"Could not import the legacy disabled-users file: {error}. Retrying in "
+                f"{int(MIGRATION_RETRY_SECONDS)}s - until it succeeds this process does not know "
+                f"about users who were disabled before the move to SQLite."
+            )
 
 
 async def import_legacy_json(path: str = LEGACY_JSON_PATH) -> int:

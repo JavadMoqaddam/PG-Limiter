@@ -12,7 +12,11 @@ from typing import Dict, List, Optional
 from cachetools import LRUCache
 from utils.logs import logger
 
-# Try to import database module, fall back to JSON if not available
+# SQLite is the only store since Redis was removed, so a failure to import it is
+# fatal rather than something to degrade around. This block used to set
+# DB_AVAILABLE = False and log "falling back to JSON storage" - but no JSON
+# fallback exists in this module any more, and `init_db` / `get_db` were never
+# bound, so the promise turned into a NameError at the first call instead.
 try:
     from db import (
         init_db,
@@ -23,9 +27,14 @@ try:
     )
     DB_AVAILABLE = True
     logger.info("Database module loaded successfully")
-except ImportError as e:
+except ImportError as import_error:
     DB_AVAILABLE = False
-    logger.warning(f"Database module not available ({e}), falling back to JSON storage")
+    logger.critical(
+        f"❌ FATAL: the database module could not be imported ({import_error}). "
+        f"There is no JSON fallback: the ISP cache, violation history and config "
+        f"store all require SQLite."
+    )
+    raise
 
 
 class DBSubnetISPCache:
@@ -167,6 +176,13 @@ class DBSubnetISPCache:
 class DBViolationHistory:
     """
     Database-backed violation history for punishment system.
+
+    DEPRECATED and unused. utils/punishment_system.py talks to
+    ViolationHistoryCRUD directly, so this is a third wrapper over the same table
+    that no code path reaches. It is left in place rather than deleted because
+    nothing here is broken and a release is not the moment to remove a public
+    name; do not build on it, and do not add a caller. The one store of record is
+    the ``violation_history`` table via ViolationHistoryCRUD.
     """
 
     def __init__(self):
