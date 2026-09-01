@@ -7,11 +7,9 @@ Enhanced with warning system and ISP detection.
 import asyncio
 import re
 import time
-from collections import Counter
 
 from telegram_bot.send_message import send_logs, send_user_message
 from utils.logs import logger
-from utils.panel_api import disable_user
 from utils.read_config import read_config, get_config_value
 from utils.types import PanelType, UserType, EnhancedUserInfo
 from utils.device_count import (
@@ -25,7 +23,6 @@ from utils.warning_system import warning_system  # global shared instance
 from utils.isp_detector import ISPDetector
 from utils.ip_history_tracker import ip_history_tracker
 from utils.user_group_filter import should_limit_user, get_filter_status_text
-from utils.admin_filter import should_limit_user_by_admin
 
 from utils.shared_state import (
     ACTIVE_USERS,
@@ -244,8 +241,12 @@ async def get_group_limits_batch(
         # If user not found in RAM or local DB, fallback to panel API
         if gids is None:
             try:
-                from utils.panel_api import get_user
-                user_info = await get_user(panel_data, username)
+                # get_user_details, not get_user: panel_api has never exported a
+                # `get_user`, so this import raised ImportError every time, the bare
+                # `except Exception` below turned it into `gids = []`, and the panel
+                # fallback advertised here has in fact never run once.
+                from utils.panel_api import get_user_details
+                user_info = await get_user_details(panel_data, username)
                 if user_info and isinstance(user_info, dict):
                     gids = user_info.get("group_ids", [])
                     if not gids and "group_id" in user_info and user_info["group_id"] is not None:
@@ -256,7 +257,14 @@ async def get_group_limits_batch(
                     if username not in USER_METADATA_CACHE:
                         USER_METADATA_CACHE[username] = {"_partial": True}
                     USER_METADATA_CACHE[username]["group_ids"] = gids
-            except Exception:
+            except Exception as lookup_error:
+                # Say so rather than swallowing it. An empty list here means the
+                # user gets no group limit, and check_users_usage then skips them
+                # entirely - safe, but invisible unless it is logged.
+                logger.warning(
+                    f"Group lookup from the panel failed for {username}: {lookup_error}. "
+                    f"They will be skipped this cycle rather than judged on a default."
+                )
                 gids = []
 
         # Calculate the max limit if user is in multiple groups

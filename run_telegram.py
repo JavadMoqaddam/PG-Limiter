@@ -5,9 +5,6 @@ This module provides the function to run the Telegram bot in the background.
 
 import asyncio
 from datetime import timedelta
-import os
-import json
-from telegram.ext import ApplicationBuilder
 from utils.logs import get_logger
 
 # Module logger

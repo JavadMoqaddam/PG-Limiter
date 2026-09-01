@@ -4,7 +4,7 @@ set -e
 # PG-Limiter Management Script
 # https://github.com/JavadMoqaddam/PG-Limiter
 
-VERSION="1.4.1"
+VERSION="1.4.2"
 
 # Configuration
 REPO_OWNER="JavadMoqaddam"
@@ -12,7 +12,16 @@ REPO_NAME="PG-Limiter"
 SERVICE_NAME="pg-limiter"
 CONFIG_DIR="/etc/opt/pg-limiter"
 DATA_DIR="/var/lib/pg-limiter"
-DOCKER_IMAGE="ghcr.io/javadmoqaddam/pg-limiter:latest"
+DOCKER_REPO="ghcr.io/javadmoqaddam/pg-limiter"
+# Pinned to $VERSION, so this line has to stay below VERSION.
+#
+# :latest is mutable - every push to main overwrites it. `docker pull` therefore
+# fetched whatever was built last rather than the release this script belongs to,
+# and the pull moved the tag off the image already on disk, leaving the previous
+# version untagged with no obvious way back. Two servers could also be running
+# different code while both reporting :latest. A version tag is immutable, so the
+# script, the compose file and the running image always agree.
+DOCKER_IMAGE="$DOCKER_REPO:$VERSION"
 COMPOSE_FILE="$CONFIG_DIR/docker-compose.yml"
 ENV_FILE="$CONFIG_DIR/.env"
 SCRIPT_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/pg-limiter.sh"
@@ -192,22 +201,47 @@ is_running() {
 # ═══════════════════════════════════════════════════════════════════════════════
 
 create_compose_file() {
-    cat > "$COMPOSE_FILE" <<'EOF'
+    # Unquoted heredoc, so $DOCKER_IMAGE expands to the pinned version. TZ is
+    # escaped as \${TZ:-UTC} because Docker Compose - not bash - expands it, from
+    # .env, at `up` time; it must reach the file literally. Anything added here
+    # that Compose should expand needs the same backslash.
+    #
+    # Kept deliberately close to the docker-compose.yml checked into the repo, which
+    # had drifted from it. The file this function writes is the only one production
+    # has ever used, and it was missing the log rotation, so a chatty run with 49
+    # log streams could fill the disk with container logs nothing ever truncated.
+    #
+    # One difference is on purpose: the repo template sets `mem_limit: 512m` and this
+    # does not. Production has never run under that cap, and this process holds every
+    # user's metadata and pre-computed limit in RAM - nearly 29,000 of them on the
+    # installation this was written for. Imposing an untested hard limit turns a
+    # memory spike into an OOM kill of the process that is supposed to be lifting
+    # bans. Measure with `docker stats pg-limiter` over a busy period first, then add
+    # a cap with headroom above the peak.
+    cat > "$COMPOSE_FILE" <<EOF
 services:
   pg-limiter:
-    image: ghcr.io/javadmoqaddam/pg-limiter:latest
+    image: $DOCKER_IMAGE
     container_name: pg-limiter
     restart: always
     env_file: .env
     networks:
       - pg-limiter-network
     ports:
-      - "8080:8080"
+      - "8080:8080"  # API port (if enabled)
     volumes:
+      # Persistent storage for the database, warnings and logs
       - /var/lib/pg-limiter:/var/lib/pg-limiter
+      # Config directory, read-only, for the backup command
       - /etc/opt/pg-limiter:/etc/opt/pg-limiter:ro
     environment:
-      - TZ=${TZ:-UTC}
+      - TZ=\${TZ:-UTC}
+      - PYTHONUNBUFFERED=1
+    logging:
+      driver: "local"
+      options:
+        max-size: "100m"
+        max-file: "5"
 
 networks:
   pg-limiter-network:
@@ -402,8 +436,8 @@ cmd_install() {
     # Interactive configuration
     configure_interactive
     
-    # Pull latest image
-    colorized_echo blue "Pulling latest Docker image..."
+    # Pull the pinned image
+    colorized_echo blue "Pulling Docker image $DOCKER_IMAGE..."
     docker pull "$DOCKER_IMAGE"
     
     # Install CLI command globally
@@ -645,8 +679,10 @@ cmd_update_stage2() {
     mkdir -p "$backup_dir"
     colorized_echo blue "Updating PG-Limiter (v$VERSION)..."
 
-    # Tag the image being replaced. `docker pull` on a :latest tag leaves the old
-    # image untagged, so without this there is no simple way back.
+    # Tag the image being replaced. Now that the tag carries the version an
+    # upgrade no longer untags the old image, but an install that has been
+    # updated in place more than once, or a pre-pinning install still sitting on
+    # :latest, can still leave nothing to go back to. This is cheap insurance.
     if docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
         if docker tag "$DOCKER_IMAGE" "$rollback_tag" 2>/dev/null; then
             colorized_echo green "✓ Current image tagged $rollback_tag"
@@ -672,10 +708,20 @@ cmd_update_stage2() {
     cp -a "$COMPOSE_FILE" "$backup_dir/docker-compose.yml.old" 2>/dev/null || true
     cp -a "$ENV_FILE" "$backup_dir/env.old" 2>/dev/null || true
 
-    colorized_echo blue "Pulling the latest Docker image..."
+    colorized_echo blue "Pulling $DOCKER_IMAGE..."
     if ! docker pull "$DOCKER_IMAGE"; then
-        colorized_echo red "docker pull failed - restarting the version you had."
+        colorized_echo red "✗ docker pull failed for $DOCKER_IMAGE"
+        colorized_echo yellow "The image is pinned to this script's version, so the usual cause is that the"
+        colorized_echo yellow "release tag v$VERSION has not been pushed yet: the registry only builds a"
+        colorized_echo yellow "versioned image when a v* git tag lands. Tags that do exist are listed at"
+        echo "  https://github.com/$REPO_OWNER/$REPO_NAME/pkgs/container/${DOCKER_REPO##*/}"
+        colorized_echo yellow "It does not fall back to :latest on purpose - :latest is mutable, so that"
+        colorized_echo yellow "would leave you unsure which build is actually running."
+        colorized_echo blue "Restarting the version you had (the compose file was not touched)."
         $COMPOSE -f "$COMPOSE_FILE" up -d
+        echo ""
+        colorized_echo yellow "Stage 1 already replaced the CLI. To put the previous one back:"
+        echo "  cp -a $backup_dir/pg-limiter.old /usr/local/bin/pg-limiter"
         exit 1
     fi
 

@@ -4,7 +4,6 @@ SQLAlchemy models for all database tables.
 """
 
 from datetime import datetime, timezone
-from typing import Optional
 from sqlalchemy import (
     Column,
     Integer,

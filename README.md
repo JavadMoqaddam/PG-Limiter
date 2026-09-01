@@ -3,7 +3,7 @@
   <img src="https://img.shields.io/badge/License-AGPL--3.0-green" alt="License">
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white" alt="Docker">
-  <img src="https://img.shields.io/badge/Version-1.4.1-orange" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.4.2-orange" alt="Version">
 </p>
 
 <h1 align="center">🛡️ PG-Limiter</h1>
@@ -12,7 +12,7 @@
   <b>High-Performance IP Connection Limiter for <a href="https://github.com/PasarGuard/panel">PasarGuard</a> Panel</b>
   <br><br>
   Real-time SSE multi-node connection monitor, Telegram Forum Topics integration,<br>
-  Subnet grouping, High Trust scoring, fast Redis/RAM caching, and zero-false-positive punishment system.
+  Subnet grouping, High Trust scoring, in-process caching, and zero-false-positive punishment system.
 </p>
 
 ---
@@ -35,7 +35,7 @@
 - [CLI Interface](#-cli-interface)
 - [REST API](#-rest-api)
 - [Disable Methods](#-disable-methods)
-- [Redis Caching](#-redis-caching)
+- [Caching](#-caching)
 - [Project Architecture](#-project-architecture)
 - [FAQ](#-faq)
 - [License & Credits](#-license--credits)
@@ -71,7 +71,7 @@
 |---------|-------------|
 | 🚀 **Fast Parallel Sync** | Fetches 20,000+ users across pages in parallel with native SQLite bulk upsert |
 | 🧠 **0ms In-RAM Lookups** | Zero-latency pre-computed RAM cache for instantaneous user limit evaluation |
-| 🏎️ **Redis Caching** | High-performance distributed caching with automatic in-memory fallback |
+| 🏎️ **In-Process Caching** | One bounded cache per data type, with no external cache service to run |
 | 💿 **Async SQLite Engine** | Modern WAL-mode async database with automated Alembic migrations |
 | 🐳 **Multi-Arch Docker** | Automated CI/CD builds for `linux/amd64` and `linux/arm64` |
 
@@ -82,7 +82,6 @@
 - **Docker** and **Docker Compose** (installed automatically by the installer)
 - **PasarGuard Panel** (latest version with SSE logs enabled, or an account with `nodes:stats` for API mode)
 - **Telegram Bot Token** (from [@BotFather](https://t.me/BotFather))
-- **Redis** (included in the default Docker Compose stack)
 
 ---
 
@@ -110,7 +109,7 @@ The installer will:
 1. Check and install Docker & Docker Compose if missing.
 2. Setup directories at `/etc/opt/pg-limiter/` and `/var/lib/pg-limiter/`.
 3. Interactively prompt for panel credentials and Telegram bot tokens.
-4. Pull the latest multi-arch Docker image (`ghcr.io/javadmoqaddam/pg-limiter:latest`).
+4. Pull the multi-arch Docker image for the release the installer belongs to (`ghcr.io/javadmoqaddam/pg-limiter:<version>`).
 5. Install the global `pg-limiter` command line tool and start the stack.
 
 ---
@@ -225,9 +224,6 @@ CHECK_INTERVAL=60
 TIME_TO_ACTIVE_USERS=1800
 COUNTRY_CODE=IR
 
-# Redis Cache (Included in default stack)
-REDIS_URL=redis://redis:6379
-
 # Timezone
 TZ=Asia/Tehran
 ```
@@ -276,7 +272,7 @@ Runs on port `8080` by default. Swagger documentation available at `http://local
 
 ---
 
-## 🚀 Redis Caching
+## 🚀 Caching
 
 | Cache Item | TTL | Purpose |
 |------------|-----|---------|
@@ -284,7 +280,7 @@ Runs on port `8080` by default. Swagger documentation available at `http://local
 | **Node List** | 1 hour | Active PasarGuard SSE nodes |
 | **Configuration** | 5 min | Dynamic runtime parameters |
 | **Subnet & ISP Info** | 7 days | IP-to-carrier resolution cache |
-| **User Metadata** | 1 min | RAM/Redis synchronization |
+| **User Metadata** | 1 min | Pre-computed limits held in RAM |
 
 ---
 
@@ -317,7 +313,6 @@ PG-Limiter/
 │   ├── ip_source_api.py        # API-mode IP collector (panel online-stats)
 │   ├── user_sync.py            # Fast parallel panel user synchronization
 │   ├── isp_detector.py         # Subnet & ISP detection engine
-│   ├── redis_cache.py          # Redis async client & Pub/Sub invalidation
 │   ├── punishment_system.py    # Tiered punishment duration manager
 │   └── warning_system/         # 3-cycle consecutive tracking & trust scoring
 │

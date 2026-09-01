@@ -53,6 +53,18 @@ jobs:
         run: |
           ruff check . --config ruff.toml --select E9,F63,F7,F82 --output-format=github
 
+      # Catches what neither compileall nor ruff does: a `from utils.x import y`
+      # where y no longer exists. That parses fine and F821 does not see across
+      # modules, so it only fails when the import is executed - which for a Telegram
+      # handler means at bot startup. It found a real one: check_usage imported
+      # `get_user` from utils.panel_api, which has only ever exported
+      # `get_user_details`, so the panel fallback for unsynced users had never run.
+      # Needs no third-party packages, so it also runs on a laptop with nothing
+      # installed: `python3 tools/check_local_imports.py`.
+      - name: Local import consistency
+        run: |
+          python tools/check_local_imports.py
+
       # Advisory on purpose: style and formatting findings should not stand between
       # a verified fix and production. The blocking checks are the step above, the
       # import sweep in the test job, and the migration job.

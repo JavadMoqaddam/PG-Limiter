@@ -131,17 +131,6 @@ def _patch_collector(
     return notifications
 
 
-def _no_redis(monkeypatch):
-    """
-    Kept as a no-op shim.
-
-    The collector used to mirror the active-user set into Redis; nothing in the
-    pipeline talks to an external cache any more, so the tests have nothing to
-    stub out here.
-    """
-    return None
-
-
 class TestResolveMonitoredGroupIds:
     """Group narrowing decides how small the candidate query stays."""
 
@@ -634,8 +623,6 @@ class TestCollectFailSafe:
     @pytest.mark.asyncio
     async def test_not_found_counts_as_covered(self, panel, api_config, monkeypatch):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
-
-        _no_redis(monkeypatch)
         _patch_collector(
             monkeypatch,
             candidates=[{"username": f"u{i}", "id": i} for i in range(1, 5)],
@@ -859,8 +846,6 @@ class TestCollectHappyPath:
         # A stale entry from the previous cycle must not survive: merging would
         # accumulate IPs across cycles and inflate device counts.
         ACTIVE_USERS["gone"] = UserType(name="gone", ip=["1.2.3.4"])
-
-        _no_redis(monkeypatch)
         _patch_collector(
             monkeypatch,
             candidates=[
@@ -896,7 +881,6 @@ class TestCollectHappyPath:
         from utils.types import UserType
 
         ACTIVE_USERS["gone"] = UserType(name="gone", ip=["1.2.3.4"])
-        _no_redis(monkeypatch)
         _patch_collector(monkeypatch, candidates=[])
 
         # Nobody online is a valid answer, not a failure: enforcement has to run
@@ -913,8 +897,6 @@ class TestCollectHappyPath:
 
         USER_METADATA_CACHE["white"] = {"is_excepted": True, "is_monitored": True}
         seen: list[list[str]] = []
-
-        _no_redis(monkeypatch)
         _patch_collector(
             monkeypatch,
             candidates=[
@@ -950,8 +932,6 @@ class TestCollectHappyPath:
         async def capture(_panel, **kwargs):
             captured.update(kwargs)
             return []
-
-        _no_redis(monkeypatch)
         _patch_collector(monkeypatch, candidates=[])
         monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", capture)
 
@@ -975,8 +955,6 @@ class TestCollectHappyPath:
         async def capture(_panel, **kwargs):
             captured.update(kwargs)
             return []
-
-        _no_redis(monkeypatch)
         _patch_collector(monkeypatch, candidates=[])
         monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", capture)
 

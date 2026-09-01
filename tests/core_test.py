@@ -13,7 +13,6 @@ from utils.get_logs import (
     TASKS,
     check_and_add_new_nodes,
     create_node_task,
-    create_panel_task,
     handle_cancel,
     handle_cancel_one,
 )
@@ -153,12 +152,6 @@ async def main():  # pylint: disable=too-many-statements
         await enable_selected_users(panel_data, set([users[0].name, users[1].name])),
     )
     print("Get Nodes Test: ", await get_nodes(panel_data))
-    async with asyncio.TaskGroup() as tg:
-        print("Start Create Panel Task Test: ")
-        await create_panel_task(panel_data, tg)
-        await asyncio.sleep(5)
-        print("Cancel Panel Task Test: ")
-        await handle_cancel_one(TASKS)
     nodes_list = await get_nodes(panel_data)
     async with asyncio.TaskGroup() as tg:
         if nodes_list and not isinstance(nodes_list, ValueError):

@@ -9,7 +9,6 @@ unchanged.
 
     settings_common.py        root menu + shared keyboard
     settings_panel.py         panel domain / username / password
-    settings_intervals.py     check interval, time to active
     settings_display.py       country filter, ipinfo token, report detail
     settings_groups.py        disabled group, fallback group
     settings_sync.py          user sync interval, pending deletions
@@ -31,37 +30,13 @@ from telegram_bot.handlers.settings_panel import (
     get_username,
     get_password,
 )
-from telegram_bot.handlers.settings_intervals import (
-    create_interval_keyboard,
-    create_time_to_active_keyboard,
-    set_check_interval,
-    check_interval_handler,
-    set_time_to_active,
-    time_to_active_handler,
-    handle_interval_menu_callback,
-    handle_interval_preset_callback,
-    handle_interval_custom_callback,
-    handle_time_menu_callback,
-    handle_time_preset_callback,
-    handle_time_custom_callback,
-    handle_check_interval_input,
-    handle_time_to_active_input,
-)
 from telegram_bot.handlers.settings_display import (
-    create_country_keyboard,
     create_enhanced_details_keyboard,
-    create_single_ip_keyboard,
-    set_country_code,
-    country_code_handler,
     set_ipinfo_token,
     ipinfo_token_handler,
     save_ipinfo_token,
-    handle_country_menu_callback,
-    handle_country_selection_callback,
     handle_enhanced_menu_callback,
     handle_enhanced_toggle_callback,
-    handle_single_ip_menu_callback,
-    handle_single_ip_toggle_callback,
     handle_ipinfo_callback,
     handle_ipinfo_token_input,
 )
