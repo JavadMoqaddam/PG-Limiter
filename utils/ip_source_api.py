@@ -129,34 +129,37 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
 
 def resolve_monitored_group_ids(config_data: dict) -> Optional[list[int]]:
     """
-    Determine which group IDs the candidate query should be restricted to.
+    Determine which group IDs the candidate query may be restricted to.
 
-    Priority:
-      1. Group Filter in ``include`` mode — authoritative, since every user
-         outside those groups already has ``is_monitored=False``.
-      2. Group Limits keys — the groups that carry an explicit device limit.
-      3. ``None`` — no group narrowing (every user is a candidate).
+    Narrowing is only allowed when it provably cannot drop a user enforcement would
+    judge, and exactly one setting gives that guarantee: the Group Filter in
+    ``include`` mode. There, ``calculate_user_effective_limit_and_monitoring``
+    (``utils/user_sync.py``) sets ``is_monitored=False`` for every user outside the
+    listed groups, and the enforcement gate in ``check_usage`` skips on that flag, so
+    the users the panel omits are the same ones enforcement would ignore.
 
-    Group Filter in ``exclude`` mode cannot be expressed as a panel-side
-    filter, so it is left to the existing client-side filtering in
-    ``check_usage`` and no narrowing is applied here.
+    Everything else returns ``None`` - no group narrowing at all. The candidate query
+    is still bounded by ``status=active`` and the online-freshness window, which is
+    what keeps it cheap.
+
+    Group Limits deliberately do **not** narrow. That mapping only supplies an
+    *effective limit* per group; a user in no limited group is still monitored and is
+    judged against the general limit (``resolve_effective_limit`` step 5). Restricting
+    the query to the ``group_limits`` keys therefore left every general-limit user
+    uncollected, and because coverage is measured over the narrowed target set the
+    cycle still reported 100% and enforced - silently shrinking enforcement to the
+    limited groups while looking healthy.
+
+    Note the degenerate case: filter enabled in ``include`` mode with an empty group
+    list makes *nobody* monitored, but an empty return value means "no filter" to the
+    panel, so this returns ``None`` and lets ``_prefilter_candidates`` drop them all.
+    One wasted query, correct outcome.
     """
     group_filter = config_data.get("group_filter") or {}
     if group_filter.get("enabled") and group_filter.get("mode", "include") == "include":
         filter_ids = [int(g) for g in (group_filter.get("group_ids") or [])]
         if filter_ids:
             return filter_ids
-
-    group_limits = config_data.get("group_limits") or {}
-    if group_limits:
-        limit_ids = []
-        for key in group_limits:
-            try:
-                limit_ids.append(int(key))
-            except (ValueError, TypeError):
-                continue
-        if limit_ids:
-            return sorted(set(limit_ids))
 
     return None
 

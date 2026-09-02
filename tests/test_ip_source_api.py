@@ -132,7 +132,13 @@ def _patch_collector(
 
 
 class TestResolveMonitoredGroupIds:
-    """Group narrowing decides how small the candidate query stays."""
+    """
+    Group narrowing decides how small the candidate query stays.
+
+    The rule it has to obey: never drop a user enforcement would judge. Only the
+    Group Filter in ``include`` mode gives that guarantee, because it is the one
+    setting that also makes those users ``is_monitored=False``.
+    """
 
     def test_group_filter_include_wins(self):
         from utils.ip_source_api import resolve_monitored_group_ids
@@ -143,38 +149,56 @@ class TestResolveMonitoredGroupIds:
         }
         assert resolve_monitored_group_ids(config) == [12, 15]
 
-    def test_group_limits_used_when_no_include_filter(self):
+    def test_group_limits_alone_do_not_narrow(self):
+        """
+        A group limit is a limit, not a monitoring scope.
+
+        Users in no limited group are still monitored and judged against the general
+        limit, so narrowing to the group_limits keys used to leave them uncollected
+        while coverage - measured over the narrowed set - still read 100%.
+        """
         from utils.ip_source_api import resolve_monitored_group_ids
 
         config = {"group_limits": {"15": 2, "12": 1}}
-        assert resolve_monitored_group_ids(config) == [12, 15]
+        assert resolve_monitored_group_ids(config) is None
 
     def test_exclude_mode_does_not_narrow(self):
+        """Exclude mode cannot be expressed panel-side, and group_limits must not stand in."""
         from utils.ip_source_api import resolve_monitored_group_ids
 
         config = {
             "group_filter": {"enabled": True, "mode": "exclude", "group_ids": [12]},
+            "group_limits": {"12": 4},
         }
         assert resolve_monitored_group_ids(config) is None
 
-    def test_disabled_filter_falls_through_to_group_limits(self):
+    def test_disabled_filter_does_not_narrow(self):
+        """A disabled filter means every active user is monitored."""
         from utils.ip_source_api import resolve_monitored_group_ids
 
         config = {
             "group_filter": {"enabled": False, "mode": "include", "group_ids": [7]},
             "group_limits": {"3": 1},
         }
-        assert resolve_monitored_group_ids(config) == [3]
+        assert resolve_monitored_group_ids(config) is None
+
+    def test_include_mode_with_no_group_ids_does_not_narrow(self):
+        """
+        Degenerate config: nobody is monitored, but an empty list means "no filter" to
+        the panel, so this asks wide and lets the client-side prefilter drop them.
+        """
+        from utils.ip_source_api import resolve_monitored_group_ids
+
+        config = {
+            "group_filter": {"enabled": True, "mode": "include", "group_ids": []},
+            "group_limits": {"3": 1},
+        }
+        assert resolve_monitored_group_ids(config) is None
 
     def test_no_configuration_returns_none(self):
         from utils.ip_source_api import resolve_monitored_group_ids
 
         assert resolve_monitored_group_ids({}) is None
-
-    def test_non_numeric_group_keys_are_skipped(self):
-        from utils.ip_source_api import resolve_monitored_group_ids
-
-        assert resolve_monitored_group_ids({"group_limits": {"abc": 2}}) is None
 
 
 class TestResolveMonitoredAdmins:
@@ -921,7 +945,7 @@ class TestCollectHappyPath:
         assert api_mod.get_last_cycle_stats()["prefiltered"] == 1
 
     @pytest.mark.asyncio
-    async def test_candidate_query_is_narrowed_by_configured_groups(
+    async def test_candidate_query_is_narrowed_by_the_include_filter(
         self, panel, api_config, monkeypatch
     ):
         import utils.panel_api.online_ips as online_ips_mod
@@ -935,13 +959,72 @@ class TestCollectHappyPath:
         _patch_collector(monkeypatch, candidates=[])
         monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", capture)
 
-        api_config["group_limits"] = {"12": 1, "15": 2}
+        api_config["group_filter"] = {
+            "enabled": True, "mode": "include", "group_ids": [12, 15]
+        }
         api_config["check_interval"] = 240
 
         assert await collect_active_users_from_api(panel, api_config) is True
         assert captured["group_ids"] == [12, 15]
         assert captured["status"] == "active"
         assert captured["online_window"] == 270
+
+    @pytest.mark.asyncio
+    async def test_group_limits_do_not_narrow_the_candidate_query(
+        self, panel, api_config, monkeypatch
+    ):
+        """
+        The regression that matters: group limits are limits, not a monitoring scope.
+
+        Users outside the limited groups are still judged against the general limit, so
+        asking the panel only about the limited groups left them uncollected - and the
+        coverage gate could not see it, because coverage is the answer rate over
+        whatever was asked for.
+        """
+        import utils.panel_api.online_ips as online_ips_mod
+        from utils.ip_source_api import collect_active_users_from_api
+
+        captured: dict = {}
+
+        async def capture(_panel, **kwargs):
+            captured.update(kwargs)
+            return []
+        _patch_collector(monkeypatch, candidates=[])
+        monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", capture)
+
+        api_config["group_limits"] = {"12": 1, "15": 2}
+
+        assert await collect_active_users_from_api(panel, api_config) is True
+        assert captured["group_ids"] is None
+        assert captured["status"] == "active"
+
+    @pytest.mark.asyncio
+    async def test_exclude_filter_does_not_narrow_to_the_excluded_group(
+        self, panel, api_config, monkeypatch
+    ):
+        """
+        The worst shape of the old bug: exclude mode fell through to group_limits, so a
+        limit on the very group being excluded made the query ask for exactly the users
+        enforcement must ignore - and enforcement then ran against nobody.
+        """
+        import utils.panel_api.online_ips as online_ips_mod
+        from utils.ip_source_api import collect_active_users_from_api
+
+        captured: dict = {}
+
+        async def capture(_panel, **kwargs):
+            captured.update(kwargs)
+            return []
+        _patch_collector(monkeypatch, candidates=[])
+        monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", capture)
+
+        api_config["group_filter"] = {
+            "enabled": True, "mode": "exclude", "group_ids": [7]
+        }
+        api_config["group_limits"] = {"7": 4}
+
+        assert await collect_active_users_from_api(panel, api_config) is True
+        assert captured["group_ids"] is None
 
     @pytest.mark.asyncio
     async def test_all_monitored_mode_drops_the_online_window(
