@@ -136,8 +136,21 @@ async def load_db_config() -> Dict[str, Any]:
             "special_limits": special_limits,
             "except_users": except_users,
         }
-    except Exception:
-        return {}
+    except Exception as error:  # pylint: disable=broad-except
+        # Silence here was dangerous. An empty dict makes read_config build a config
+        # with no whitelist, no special limits, no group limits and group_filter
+        # disabled - and a disabled group filter means "limit every user"
+        # (user_group_filter.should_limit_user returns True when it is off). One
+        # transient SQLite error could therefore put every monitored user under the
+        # general limit with no exceptions, and the result was cached for the life of
+        # the process with nothing in the log to show it.
+        config_logger.error(
+            f"❌ Could not load dynamic configuration from the database: {error}. "
+            f"Whitelist, special limits and group limits are unknown, so this "
+            f"configuration must not be used for enforcement.",
+            exc_info=True,
+        )
+        return {"_load_failed": True}
 
 
 def get_config_sync() -> Dict[str, Any]:
@@ -167,6 +180,10 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     
     # Merge configurations
     config = env_config.copy()
+
+    # Propagate a failed database read (see load_db_config) so the enforcement loop can
+    # refuse to act on a configuration that has no whitelist and no group limits.
+    config["config_degraded"] = bool(db_data.get("_load_failed"))
     
     # Add special limits from DB
     if "special_limits" in db_data:
@@ -447,6 +464,20 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
         config["api_ip_min_coverage"] = 0.8
     config["api_ip_min_coverage"] = max(0.0, min(1.0, config["api_ip_min_coverage"]))
 
+    # Fraction of the expected node fleet that must appear in the API payloads.
+    # ip_source_api reads this key, but nothing ever populated it, so the gate was
+    # permanently off: the "only 16 of 49 nodes reported" cycles passed as healthy.
+    # Default stays 0.0 (off) so wiring it up cannot change behaviour on its own.
+    try:
+        config["api_ip_min_node_coverage"] = float(
+            db_config.get("api_ip_min_node_coverage", "0.0")
+        )
+    except (ValueError, TypeError):
+        config["api_ip_min_node_coverage"] = 0.0
+    config["api_ip_min_node_coverage"] = max(
+        0.0, min(1.0, config["api_ip_min_node_coverage"])
+    )
+
     # Automatically fall back to log mode after repeated total failures
     # (e.g. the panel account is missing the nodes:stats permission).
     config["api_ip_auto_fallback"] = db_config.get(
@@ -464,6 +495,18 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
         if not config["telegram"]["admins"]:
             raise ValueError("ADMIN_IDS is not set in environment")
     
+    # A configuration whose database half could not be read is missing the whitelist,
+    # the special limits and the group limits. It is served (so the bot and the CLI
+    # keep working) but flagged and never cached, so the next call retries instead of
+    # freezing the degraded view in for the life of the process. check_usage refuses to
+    # enforce while the flag is set.
+    if config.get("config_degraded"):
+        config_logger.critical(
+            "⛔ Serving a configuration with no database settings - enforcement will be "
+            "skipped until a database read succeeds"
+        )
+        return config
+
     _config_cache = config
     return config
 
