@@ -379,7 +379,12 @@ async def add_except_user(except_user: str) -> str | None:
         async with get_db() as db:
             await UserCRUD.set_excepted(db, except_user, True)
             await db.commit()
-            return except_user
+        # The enforcement loop's only whitelist gate in the warn/ban path reads
+        # config["except_users"] out of the process-wide config cache. Without this
+        # invalidation the freshly excepted user keeps accruing violation scans and is
+        # banned anyway, until some other setting is written or the process restarts.
+        await invalidate_config_cache()
+        return except_user
     
     # Fallback to config.json
     if os.path.exists("config.json"):
@@ -458,7 +463,10 @@ async def remove_except_user_from_config(user: str) -> str | None:
         async with get_db() as db:
             result = await UserCRUD.set_excepted(db, user, False)
             await db.commit()
-            return user if result is not None else None
+        # Same reason as add_except_user: without this the cached except_users list
+        # keeps shielding a user the operator just removed from the whitelist.
+        await invalidate_config_cache()
+        return user if result is not None else None
     
     # Fallback to config.json
     if not os.path.exists("config.json"):
