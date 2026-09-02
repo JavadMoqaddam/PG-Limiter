@@ -29,15 +29,6 @@ backup_logger = get_logger("backup")
 MIGRATE_WAITING_FILE = 100
 
 
-def create_migrate_keyboard():
-    """Create keyboard for migration options."""
-    keyboard = [
-        [InlineKeyboardButton("📥 Send JSON File", callback_data="migrate_send_file")],
-        [InlineKeyboardButton("« Back", callback_data="settings_menu")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
 def _sync_create_backup_zip() -> tuple[str, str, str]:
     """Create backup zip file synchronously. Returns (zip_path, zip_name, temp_dir)."""
     temp_dir = tempfile.mkdtemp()
