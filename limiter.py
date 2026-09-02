@@ -216,9 +216,21 @@ async def main():
             main_logger.info("✓ Telegram polling watchdog registered in TaskGroup")
 
             main_logger.debug("Fetching available nodes...")
-            nodes_list = await get_nodes(panel_data)
-            
-            if nodes_list and not isinstance(nodes_list, ValueError):
+            # get_nodes raises when the panel cannot be reached; the `else` branch below
+            # was written for a returned error that never happens, so a panel that is
+            # briefly down during boot used to abort the TaskGroup instead of starting
+            # with no streams and letting check_and_add_new_nodes pick them up later.
+            try:
+                nodes_list = await get_nodes(panel_data)
+            except Exception as nodes_error:  # pylint: disable=broad-except
+                main_logger.error(
+                    f"Could not fetch the node list at startup: {nodes_error}. "
+                    f"Starting without SSE streams; the node watcher will add them "
+                    f"as soon as the panel answers."
+                )
+                nodes_list = None
+
+            if nodes_list:
                 await init_node_status_message(nodes_list)
                 connected_nodes = [n for n in nodes_list if n.status == "connected"]
                 main_logger.info(f"🖥️ Found {len(nodes_list)} nodes ({len(connected_nodes)} connected)")
