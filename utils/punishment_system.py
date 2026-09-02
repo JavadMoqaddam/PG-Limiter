@@ -183,7 +183,9 @@ def _parse_step(position: int, step) -> Optional[PunishmentStep]:
         step_type = "warning"
 
     if "duration" in step:
-        return PunishmentStep(step_type, _coerce_duration_minutes(step["duration"], step_type))
+        # Passed raw on purpose: PunishmentStep.__post_init__ coerces it, and doing it
+        # here as well logged the same complaint about the same value twice.
+        return PunishmentStep(step_type, step["duration"])
 
     if step_type == "disable":
         # The old code read this with .get("duration", 0), and 0 on a disable step

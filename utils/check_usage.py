@@ -361,7 +361,12 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
         config_data = await read_config()
     general_limit = config_data.get("limits", {}).get("general", 2)
     except_users = config_data.get("except_users", [])  # except_users is at root level
-    show_enhanced_details = config_data.get("display", {}).get("show_enhanced_details", True)
+    # read_config exposes this as a root-level bool named "enhanced_details" (the key the
+    # Telegram toggle writes). This used to read config["display"]["show_enhanced_details"],
+    # a path read_config never creates, so it always fell back to True and the toggle did
+    # nothing. It only decides whether the per-IP detail lines are rendered - the device
+    # count itself is computed before the flag is consulted - so no ban outcome changes.
+    show_enhanced_details = bool(config_data.get("enhanced_details", True))
     device_config = DeviceCountingConfig.from_config(config_data)
 
     # Read special limits from database instead of config
@@ -709,7 +714,7 @@ async def dispatch_chunked_warnings(
 
         header = (
             f"⚠️ <b>WARNINGS REPORT</b> ({batch_num}/{total_chunks}) - <code>{now_str}</code>\n"
-            f"📡 Monitoring Window: <code>{max_warnings} cycles (~{period_min} min)</code>\n"
+            f"📡 Monitoring Window (current setting): <code>{max_warnings} cycles (~{period_min} min)</code>\n"
             f"📊 Violators in cycle: <code>{total_violators}</code> | In batch: <code>{len(chunk)}</code>"
         )
 
