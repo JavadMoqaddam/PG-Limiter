@@ -195,7 +195,7 @@ Both modes write into the same `ACTIVE_USERS` structure, so device counting, sub
 
 **How API mode keeps a cycle safe:**
 * **Candidate narrowing.** `GET /api/users` is filtered panel-side by the group IDs from Group Limits / Group Filter, by `status=active`, and by an online-freshness window equal to `CHECK_INTERVAL + 30s`, so only the handful of currently-online monitored users is queried.
-* **Coverage gate.** If fewer than `api_ip_min_coverage` (default **80%**) of the candidates answered, the whole cycle is skipped rather than enforced on partial data — an under-covered snapshot could otherwise clear the counters of real offenders.
+* **Coverage gate.** If fewer than `API_IP_MIN_COVERAGE` (default **80%**, set as a percentage in `.env`) of the candidates answered, the whole cycle is skipped rather than enforced on partial data — an under-covered snapshot could otherwise clear the counters of real offenders.
 * **Never a false positive.** A snapshot can only report *fewer* IPs than continuous log streaming, never more, and a failed candidate query leaves the previous state untouched instead of wiping pending warnings.
 * **Auto-fallback.** After 3 consecutive cycles with no usable data (for example a missing `nodes:stats` permission) the IP source reverts to logs automatically and a Telegram alert is sent.
 * **Per-inbound CDN grouping is inactive** in API mode because the panel reports no inbound names — use **CDN Nodes** (per-node) instead of CDN Inbounds.

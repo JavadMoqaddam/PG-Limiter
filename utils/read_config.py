@@ -7,6 +7,7 @@ The merged result is held in a single process-wide dict and rebuilt only when a
 setting is written, so a read is a plain dictionary lookup.
 """
 
+import math
 import os
 from typing import Any, Dict, List, Optional
 
@@ -66,6 +67,53 @@ def _get_env(key: str, default: Any = None, cast_type: type = str) -> Any:
     return value
 
 
+# The coverage floor for API mode, as a fraction. This is the one place the default
+# lives; ip_source_api and the settings screen import it rather than repeating 0.8.
+DEFAULT_API_IP_MIN_COVERAGE = 0.8
+
+
+def normalize_min_coverage(raw: Any, default: float = DEFAULT_API_IP_MIN_COVERAGE) -> float:
+    """
+    Turn a configured coverage floor into a fraction between 0 and 1.
+
+    Accepts both spellings, because the operator sets this as a percentage in the
+    environment (``API_IP_MIN_COVERAGE=80``) while the database row and every
+    comparison use a fraction (``0.8``):
+
+        80   -> 0.8      100 -> 1.0      150 -> 1.0 (clamped)
+        0.8  -> 0.8      1   -> 1.0      -5  -> 0.0 (clamped)
+        0    -> 0.0, which switches the gate off entirely
+
+    Anything above 1 is read as a percentage, anything at or below 1 as a fraction.
+    The ambiguous value 1 is taken as 100%, the stricter of the two readings: getting
+    this wrong in the other direction would silently disable the guard that stops a
+    thin sample from clearing real offenders' violation counters. A value that is not
+    a number at all falls back to the default rather than to zero, for the same reason.
+    """
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except (ValueError, TypeError):
+        config_logger.error(
+            f"⚠️ Ignoring API_IP_MIN_COVERAGE / api_ip_min_coverage value {raw!r}: not a "
+            f"number - falling back to {default:.0%}"
+        )
+        return default
+    if not math.isfinite(value):
+        # "nan" and "inf" survive float(), and nan in particular defeats the clamp
+        # below because every comparison against it is False. Both would land on a
+        # floor of 1.0, which stalls enforcement silently rather than obviously.
+        config_logger.error(
+            f"⚠️ Ignoring API_IP_MIN_COVERAGE / api_ip_min_coverage value {raw!r}: not a "
+            f"finite number - falling back to {default:.0%}"
+        )
+        return default
+    if value > 1:
+        value = value / 100.0
+    return max(0.0, min(1.0, value))
+
+
 def load_env_config() -> Dict[str, Any]:
     """Load configuration from environment variables."""
     return {
@@ -99,6 +147,11 @@ def load_env_config() -> Dict[str, Any]:
         "country_code": _get_env("COUNTRY_CODE", ""),
         # User sync settings
         "user_sync_interval": _get_env("USER_SYNC_INTERVAL", 5, int),  # Minutes
+        # Minimum share of candidates that must answer before an API-mode cycle is
+        # allowed to enforce. Set as a percentage; see normalize_min_coverage.
+        "api_ip_min_coverage": normalize_min_coverage(
+            os.environ.get("API_IP_MIN_COVERAGE")
+        ),
         # API settings (from ENV)
         "api": {
             "enabled": _get_env("API_ENABLED", False, bool),
@@ -457,11 +510,14 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     # Minimum successful-fetch ratio required to run enforcement for a cycle.
     # Below this the cycle is skipped entirely so that a flaky panel cannot
     # mass-reset the consecutive-violation counters of real offenders.
-    try:
-        config["api_ip_min_coverage"] = float(db_config.get("api_ip_min_coverage", "0.8"))
-    except (ValueError, TypeError):
-        config["api_ip_min_coverage"] = 0.8
-    config["api_ip_min_coverage"] = max(0.0, min(1.0, config["api_ip_min_coverage"]))
+    #
+    # The environment value already went through normalize_min_coverage in
+    # load_env_config, so it is the fallback here and a database row still wins - the
+    # same precedence GENERAL_LIMIT and CHECK_INTERVAL use.
+    config["api_ip_min_coverage"] = normalize_min_coverage(
+        db_config.get("api_ip_min_coverage"),
+        default=config.get("api_ip_min_coverage", DEFAULT_API_IP_MIN_COVERAGE),
+    )
 
     # Fraction of the expected node fleet that must appear in the API payloads.
     # ip_source_api reads this key, but nothing ever populated it, so the gate was

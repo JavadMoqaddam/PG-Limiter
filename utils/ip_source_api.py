@@ -24,6 +24,7 @@ import time
 from typing import Optional
 
 from utils.logs import get_logger
+from utils.read_config import normalize_min_coverage
 from utils.shared_state import ACTIVE_USERS, ACTIVE_USERS_LOCK
 from utils.types import PanelType, UserType
 
@@ -728,13 +729,10 @@ async def collect_active_users_from_api(
 
     # An absent key means "use the documented default", not "no floor at all".
     # `or 0.0` silently disabled the guard for any caller that assembled
-    # config_data without going through read_config, which is where the 0.8
-    # default actually lives.
-    raw_min_coverage = config_data.get("api_ip_min_coverage")
-    if raw_min_coverage is None or raw_min_coverage == "":
-        min_coverage = 0.8
-    else:
-        min_coverage = float(raw_min_coverage)
+    # config_data without going through read_config. normalize_min_coverage owns
+    # both the default and the percent-versus-fraction rule, so this file no longer
+    # keeps its own copy of 0.8 to drift from read_config's.
+    min_coverage = normalize_min_coverage(config_data.get("api_ip_min_coverage"))
 
     if coverage < min_coverage:
         LAST_CYCLE_STATS["skipped_reason"] = (

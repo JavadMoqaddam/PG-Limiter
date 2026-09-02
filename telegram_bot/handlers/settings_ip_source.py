@@ -14,7 +14,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from telegram_bot.constants import CallbackData
-from utils.read_config import read_config, save_config_value
+from utils.read_config import normalize_min_coverage, read_config, save_config_value
 
 
 def _build_panel_data(config_data: dict):
@@ -74,7 +74,10 @@ def _build_ip_source_text(config_data: dict) -> str:
     freshness_label = (
         f"auto ({max(60, interval)}s = check interval)" if freshness == 0 else f"{freshness}s"
     )
-    coverage = float(config_data.get("api_ip_min_coverage") or 0.0)
+    # normalize_min_coverage rather than "or 0.0": an absent key means the documented
+    # default, and the old fallback would have shown 0% on this screen while the
+    # collector was actually enforcing 80%.
+    coverage = normalize_min_coverage(config_data.get("api_ip_min_coverage"))
     auto_fallback = "✅ on" if config_data.get("api_ip_auto_fallback", True) else "❌ off"
 
     if current_source == "api":
