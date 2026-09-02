@@ -435,10 +435,12 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                 if "panel" in data or "limits" in data or "timing" in data:
                     backup_logger.info("Detected config.json format")
                     
-                    # Migrate panel settings (for reference only - actual auth is from .env)
-                    if "panel" in data:
-                        await ConfigCRUD.set(db, "panel_backup", data["panel"])
-                        stats["config_items"] += 1
+                    # Panel settings are deliberately NOT stored. Authentication comes
+                    # from .env, nothing ever read the "panel_backup" row this used to
+                    # write, and data["panel"] carries the panel password - so the only
+                    # thing that row achieved was keeping a plaintext copy of the
+                    # password in the database. The reply below already tells the
+                    # operator to put panel credentials in .env.
                     
                     # Migrate limits
                     if "limits" in data:
@@ -476,25 +478,31 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                         except Exception:
                             pass  # May already exist
                 
-                # Timing settings
-                if "timing" in data:
-                    await ConfigCRUD.set(db, "timing", data["timing"])
-                    stats["config_items"] += 1
-                elif "check_interval" in data or "time_to_active_users" in data:
-                    timing = {
-                        "check_interval": data.get("check_interval", 60),
-                        "time_to_active_users": data.get("time_to_active_users", 900),
-                    }
-                    await ConfigCRUD.set(db, "timing", timing)
-                    stats["config_items"] += 1
+                # Timing settings. read_config reads the flat check_interval and
+                # time_to_active_users keys, never a "timing" blob, so writing the blob
+                # restored nothing - the running process kept its old values while the
+                # import reported success.
+                timing = data.get("timing") if isinstance(data.get("timing"), dict) else None
+                if timing is None and ("check_interval" in data or "time_to_active_users" in data):
+                    timing = data
+                if timing:
+                    if "check_interval" in timing:
+                        await ConfigCRUD.set(db, "check_interval", str(int(timing["check_interval"])))
+                        stats["config_items"] += 1
+                    if "time_to_active_users" in timing:
+                        await ConfigCRUD.set(
+                            db, "time_to_active_users", str(int(timing["time_to_active_users"]))
+                        )
+                        stats["config_items"] += 1
                 
-                # Display settings
-                if "display" in data:
-                    await ConfigCRUD.set(db, "display", data["display"])
-                    stats["config_items"] += 1
-                
-                if "enhanced_details" in data:
-                    await ConfigCRUD.set(db, "enhanced_details", str(data["enhanced_details"]).lower())
+                # Display settings. Same story as "timing": read_config reads the flat
+                # enhanced_details key, never a "display" blob.
+                display = data.get("display") if isinstance(data.get("display"), dict) else {}
+                enhanced = data.get("enhanced_details", display.get("enhanced_details"))
+                if enhanced is None:
+                    enhanced = display.get("show_enhanced_details")
+                if enhanced is not None:
+                    await ConfigCRUD.set(db, "enhanced_details", str(enhanced).lower())
                     stats["config_items"] += 1
                 
                 # Disable method
@@ -511,15 +519,45 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                     await ConfigCRUD.set(db, "country_code", data["country_code"])
                     stats["config_items"] += 1
                 
-                # Punishment settings
-                if "punishment" in data:
-                    await ConfigCRUD.set(db, "punishment", data["punishment"])
-                    stats["config_items"] += 1
-                
-                # Group filter
-                if "group_filter" in data:
-                    await ConfigCRUD.set(db, "group_filter", data["group_filter"])
-                    stats["config_items"] += 1
+                # Punishment settings. read_config reads punishment_enabled,
+                # punishment_steps and punishment_window_hours - never a "punishment"
+                # blob - so restoring the blob silently left the escalation ladder at
+                # whatever it already was.
+                punishment = data.get("punishment")
+                if isinstance(punishment, dict):
+                    if "enabled" in punishment:
+                        await ConfigCRUD.set(
+                            db, "punishment_enabled", "true" if punishment["enabled"] else "false"
+                        )
+                        stats["config_items"] += 1
+                    if "window_hours" in punishment:
+                        await ConfigCRUD.set(
+                            db, "punishment_window_hours", str(int(punishment["window_hours"]))
+                        )
+                        stats["config_items"] += 1
+                    if isinstance(punishment.get("steps"), list):
+                        await ConfigCRUD.set(db, "punishment_steps", json.dumps(punishment["steps"]))
+                        stats["config_items"] += 1
+
+                # Group filter. Same again: the flat keys are group_filter_enabled,
+                # group_filter_mode and group_filter_ids.
+                group_filter = data.get("group_filter")
+                if isinstance(group_filter, dict):
+                    if "enabled" in group_filter:
+                        await ConfigCRUD.set(
+                            db, "group_filter_enabled", "true" if group_filter["enabled"] else "false"
+                        )
+                        stats["config_items"] += 1
+                    if group_filter.get("mode") in ("include", "exclude"):
+                        await ConfigCRUD.set(db, "group_filter_mode", str(group_filter["mode"]))
+                        stats["config_items"] += 1
+                    if isinstance(group_filter.get("group_ids"), list):
+                        await ConfigCRUD.set(
+                            db,
+                            "group_filter_ids",
+                            ",".join(str(int(gid)) for gid in group_filter["group_ids"]),
+                        )
+                        stats["config_items"] += 1
             
             # Check if it's a .disable_users.json file
             if "disabled_users" in data or "disable_user" in data or "enable_at" in data:
