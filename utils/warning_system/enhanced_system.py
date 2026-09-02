@@ -219,7 +219,7 @@ class EnhancedWarningSystem:
                             warning = self._deserialize_warning(warning_data)
                         except Exception as record_error:  # pylint: disable=broad-except
                             damaged += 1
-                            warning_logger.error(
+                            warning_logger.exception(
                                 f"Skipping unreadable warning record for {username}: {record_error}"
                             )
                             continue

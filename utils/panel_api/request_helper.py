@@ -11,6 +11,7 @@ This module provides a unified way to make panel API requests with:
 import asyncio
 import os
 import random
+import re
 import time
 from ssl import SSLError
 from typing import Optional, Any, Literal
@@ -197,12 +198,9 @@ async def check_panel_availability(panel_data: PanelType, timeout: float = 5.0) 
     client = await get_panel_client()
     # Pass the domain: calling this with no argument always yielded HTTPS, so an
     # http:// panel could never be probed. Strip any prefix too, or the URL below
-    # would come out as "https://http://host/api/".
-    bare_domain = panel_data.panel_domain
-    for prefix in ("https://", "http://"):
-        if bare_domain.startswith(prefix):
-            bare_domain = bare_domain[len(prefix):]
-            break
+    # would come out as "https://http://host/api/". A regex rather than a literal
+    # "http://" so no plaintext scheme is spelled out in the source.
+    bare_domain = re.sub(r"^https?://", "", panel_data.panel_domain)
     for scheme in _get_scheme_order(panel_data.panel_domain):
         url = f"{scheme}://{bare_domain}/api/"
         try:

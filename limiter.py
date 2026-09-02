@@ -223,7 +223,7 @@ async def main():
             try:
                 nodes_list = await get_nodes(panel_data)
             except Exception as nodes_error:  # pylint: disable=broad-except
-                main_logger.error(
+                main_logger.exception(
                     f"Could not fetch the node list at startup: {nodes_error}. "
                     f"Starting without SSE streams; the node watcher will add them "
                     f"as soon as the panel answers."

@@ -144,11 +144,10 @@ async def load_db_config() -> Dict[str, Any]:
         # transient SQLite error could therefore put every monitored user under the
         # general limit with no exceptions, and the result was cached for the life of
         # the process with nothing in the log to show it.
-        config_logger.error(
+        config_logger.exception(
             f"❌ Could not load dynamic configuration from the database: {error}. "
             f"Whitelist, special limits and group limits are unknown, so this "
-            f"configuration must not be used for enforcement.",
-            exc_info=True,
+            f"configuration must not be used for enforcement."
         )
         return {"_load_failed": True}
 
