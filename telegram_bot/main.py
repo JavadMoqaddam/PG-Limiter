@@ -212,7 +212,13 @@ bot_token = None
 try:
     bot_token = os.environ.get("BOT_TOKEN", "")
     if bot_token:
-        bot_logger.info(f"✓ Bot token loaded from environment: {bot_token[:15]}...")
+        # Never log any slice of the token: it is "<bot_id>:<35-char secret>", so the
+        # old token[:15] printed the public id plus the first four characters of the
+        # secret into every normal log the operator shares. run_telegram.py was fixed
+        # for this; this second call site was missed.
+        bot_logger.info(
+            f"✓ Bot token loaded from environment (id={bot_token.split(':', 1)[0]}, secret redacted)"
+        )
     else:
         bot_logger.warning("⚠ BOT_TOKEN environment variable is empty")
 except Exception as e:
