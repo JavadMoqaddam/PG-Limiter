@@ -598,7 +598,16 @@ class EnhancedWarningSystem:
         excepted = set(except_users or ())
         
         limits_config = config_data.get("limits", {})
-        special_limit = limits_config.get("special", {})
+        # A copy, not the cached dict itself. The DB refresh below calls .update() on
+        # this name, which used to mutate config_data["limits"]["special"] in place -
+        # so every cycle quietly rewrote the process-wide config cache, and because
+        # update() only ever adds keys, a special limit the operator REMOVED stayed
+        # visible until the cache happened to be rebuilt. The enforcement path does not
+        # read this dict (limits come from the per-cycle metadata batch); its readers
+        # are the Telegram display, the backup export and
+        # get_config_value("SPECIAL_LIMIT"), all of which should see what read_config
+        # loaded from the database rather than what this function last fetched.
+        special_limit = dict(limits_config.get("special", {}))
         limit_number = limits_config.get("general", 2)
         
         # Read special limits from DB if available
