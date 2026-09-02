@@ -749,6 +749,60 @@ async def dispatch_chunked_warnings(
         await send_warning_log(batch_msg, ttl=warning_ttl)
 
 
+def _sample_is_trustworthy(all_users_actual_ips: dict, check_interval: int) -> bool:
+    """
+    Whether this cycle's sample is complete enough to act on monitoring records.
+
+    An empty sample while users are under monitoring is not 2,350 people
+    disconnecting at once - it is the log pipeline having stopped. Acting on that
+    evidence hands every real offender a fresh start each cycle, which is how a
+    flaky stream stops bans altogether.
+
+    Two separate signals, because they catch different failures:
+
+      * an empty sample catches "everything is down";
+      * the per-node heartbeat catches *partial* failure, which an empty sample
+        cannot see. get_logs opens its client with timeout=None, so a half-open
+        stream never raises and the node keeps reporting "✅ Connected" while
+        delivering nothing. One dead node out of forty-nine still leaves plenty of
+        active users in the sample - and every user who was on that node looks like
+        they disconnected.
+
+    The staleness window is generous on purpose. A node with no traffic at all in
+    two whole check intervals is not merely quiet on this installation, and erring
+    long means a genuinely idle node never blocks enforcement.
+
+    Under-counting is the failure direction here, so the safe answer when in doubt
+    is False: leave every counter and every record exactly as it is.
+    """
+    if not all_users_actual_ips and warning_system.warnings:
+        logger.error(
+            f"⛔ No active users this cycle while {len(warning_system.warnings)} are under "
+            f"monitoring - treating the sample as unusable and leaving every counter alone"
+        )
+        return False
+
+    tracked_nodes = tracked_node_count()
+    if tracked_nodes and warning_system.warnings:
+        stale_window = max(120.0, float(check_interval) * 2)
+        live_nodes = nodes_seen_within(stale_window)
+        if live_nodes < tracked_nodes:
+            silent_nodes = sorted(
+                node_id
+                for node_id, age in get_node_event_ages().items()
+                if age > stale_window
+            )
+            logger.error(
+                f"⛔ {len(silent_nodes)} of {tracked_nodes} log streams produced nothing in "
+                f"the last {int(stale_window)}s (node ids {silent_nodes}) while "
+                f"{len(warning_system.warnings)} users are under monitoring - the sample is "
+                f"incomplete, so no counter is cleared and no record is judged this cycle"
+            )
+            return False
+
+    return True
+
+
 async def check_users_usage(panel_data: PanelType, config_data: dict | None = None):
     """
     Enhanced function to check usage with warning system and ISP detection
@@ -871,11 +925,22 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         f"{total_ips_cycle} per-user IPs (summed per user, not de-duplicated)"
     )
 
-    # Check for users who still violate limits after warning period
-    # Pass actual IPs, group limits and the cycle's unified device counts
+    # Judge the sample BEFORE the second ban path runs. This used to be computed
+    # ~200 lines below, after check_persistent_violations had already deleted every
+    # expired record - so the guard meant to stop a partial view from wiping counters
+    # ran too late to protect the records that path touches.
+    counters_are_trustworthy = _sample_is_trustworthy(all_users_actual_ips, check_interval)
+
+    # Check for users who still violate limits after warning period.
+    # Pass the actual IPs, group limits and the cycle's unified device counts, plus
+    # the three facts this path was missing: whether the sample can be trusted, who
+    # is whitelisted, and whose limit is actually known this cycle.
     disabled_users, warned_users = await warning_system.check_persistent_violations(
         panel_data, all_users_actual_ips, config_data, batched_group_limits,
-        device_counts=all_users_device_counts
+        device_counts=all_users_device_counts,
+        sample_is_trustworthy=counters_are_trustworthy,
+        except_users=except_users,
+        known_users=set(users_metadata_usage),
     )
 
     # Combine disabled and warned users to skip them in the loop
@@ -1107,53 +1172,10 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
             )
             continue
 
-    # Check for users whose usage normalized (active devices <= limit or disconnected)
-    #
-    # An empty sample while users are under monitoring is not 2,350 people
-    # disconnecting at once - it is the log pipeline having stopped. Clearing on that
-    # evidence hands every real offender a fresh start each cycle, which is how a
-    # flaky stream stops bans altogether.
-    #
-    # Two separate signals, because they catch different failures:
-    #
-    #  * an empty sample catches "everything is down";
-    #  * the per-node heartbeat catches *partial* failure, which an empty sample
-    #    cannot see. get_logs opens its client with timeout=None, so a half-open
-    #    stream never raises and the node keeps reporting "✅ Connected" while
-    #    delivering nothing. One dead node out of forty-nine still leaves plenty of
-    #    active users in the sample - and every user who was on that node looks
-    #    like they disconnected.
-    #
-    # The staleness window is generous on purpose. A node with no traffic at all in
-    # two whole check intervals is not merely quiet on this installation, and
-    # erring long means a genuinely idle node never blocks enforcement.
-    counters_are_trustworthy = bool(all_users_actual_ips) or not warning_system.warnings
-    if not counters_are_trustworthy:
-        logger.error(
-            f"⛔ No active users this cycle while {len(warning_system.warnings)} are under "
-            f"monitoring - treating the sample as unusable and leaving every counter alone"
-        )
-
-    tracked_nodes = tracked_node_count()
-    if counters_are_trustworthy and tracked_nodes and warning_system.warnings:
-        stale_window = max(120.0, float(check_interval) * 2)
-        live_nodes = nodes_seen_within(stale_window)
-        if live_nodes < tracked_nodes:
-            silent_nodes = sorted(
-                node_id
-                for node_id, age in get_node_event_ages().items()
-                if age > stale_window
-            )
-            # Under-counting is the failure direction here, so the safe response is
-            # to leave every counter alone rather than to clear on a partial view.
-            counters_are_trustworthy = False
-            logger.error(
-                f"⛔ {len(silent_nodes)} of {tracked_nodes} log streams produced nothing in "
-                f"the last {int(stale_window)}s (node ids {silent_nodes}) while "
-                f"{len(warning_system.warnings)} users are under monitoring - the sample is "
-                f"incomplete, so no counter is cleared this cycle"
-            )
-
+    # Clear the records of users who came back inside their limit or went away.
+    # counters_are_trustworthy was decided before check_persistent_violations ran
+    # (see _sample_is_trustworthy); reusing it here keeps both paths on one verdict
+    # and stops the log from reporting the same partial sample twice.
     for monitored_user in list(warning_system.warnings.keys()):
         if not counters_are_trustworthy:
             break

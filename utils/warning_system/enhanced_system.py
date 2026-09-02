@@ -546,7 +546,17 @@ class EnhancedWarningSystem:
                 subnets.add(ip)
         return subnets
     
-    async def check_persistent_violations(self, panel_data: PanelType, all_users_actual_ips: Dict[str, Set[str]], config_data: dict, batched_group_limits: dict = None, device_counts: Dict[str, int] = None) -> tuple[Set[str], Set[str]]:
+    async def check_persistent_violations(
+        self,
+        panel_data: PanelType,
+        all_users_actual_ips: Dict[str, Set[str]],
+        config_data: dict,
+        batched_group_limits: dict = None,
+        device_counts: Dict[str, int] = None,
+        sample_is_trustworthy: bool = True,
+        except_users=None,
+        known_users: Optional[Set[str]] = None,
+    ) -> tuple[Set[str], Set[str]]:
         """
         Check for users who still violate limits after the monitoring window ended.
 
@@ -554,6 +564,16 @@ class EnhancedWarningSystem:
             device_counts: Optional cycle-wide {username: device_count} map. When
                 given, the ban decision uses exactly the same number the warning
                 path used, instead of the raw unique-IP count.
+            sample_is_trustworthy: False when the caller judged this cycle's sample
+                incomplete. Nothing is banned and no record is deleted, because a
+                partial view cannot tell "this user disconnected" from "the node
+                carrying this user went silent".
+            except_users: Whitelisted usernames. The caller's main loop skips these;
+                without them here the second ban path could disable a user the
+                operator had explicitly excepted.
+            known_users: Usernames whose limit is actually known this cycle. A user
+                missing from it is left untouched: resolve_effective_limit would fall
+                back to the general limit, which is stricter than most group limits.
 
         Returns:
             Tuple[Set[str], Set[str]]: (disabled_users, warned_users) - sets of users who were disabled or warned
@@ -561,6 +581,21 @@ class EnhancedWarningSystem:
         disabled_users = set()
         warned_users = set()  # Track users who received warnings to prevent double processing
         users_to_remove = []
+
+        if not sample_is_trustworthy:
+            # Deliberately before any other work. This function used to run before the
+            # caller had even computed the trustworthiness of the sample, and its
+            # "user not found in current logs" branch deleted the record - so a few
+            # cycles with one silent node wiped the counters of every offender whose
+            # window had closed, and the guard that was supposed to prevent exactly
+            # that ran 200 lines later.
+            warning_logger.error(
+                f"⛔ Sample is not trustworthy this cycle - {len(self.warnings)} monitored "
+                f"record(s) are left exactly as they are: nothing banned, nothing deleted"
+            )
+            return disabled_users, warned_users
+
+        excepted = set(except_users or ())
         
         limits_config = config_data.get("limits", {})
         special_limit = limits_config.get("special", {})
@@ -587,6 +622,31 @@ class EnhancedWarningSystem:
         for username, warning in list(self.warnings.items()):
             if not warning.is_monitoring_active():
                 warning_logger.debug(f"⚠️ Monitoring ended for {username}")
+
+                if username in excepted:
+                    # The caller's main loop skips whitelisted users before they can
+                    # ever be warned. This path had no equivalent check, so a user the
+                    # operator excepted while they were already under monitoring could
+                    # still be disabled here.
+                    warning_logger.info(
+                        f"✅ {username} is whitelisted - dropping the monitoring record "
+                        f"instead of judging it"
+                    )
+                    users_to_remove.append(username)
+                    continue
+
+                if known_users is not None and username not in known_users:
+                    # Their limit is unknown this cycle, and resolve_effective_limit
+                    # would quietly fall back to the general limit - stricter than most
+                    # group limits, so it disables users who are inside their real one.
+                    # Leave the record untouched and judge it when the data is back.
+                    warning_logger.warning(
+                        f"⚠️ Limit unknown for {username} this cycle - the monitoring "
+                        f"record is left as it is rather than judged against the general "
+                        f"fallback limit"
+                    )
+                    continue
+
                 if warning.active_monitoring_task and not warning.active_monitoring_task.done():
                     warning.active_monitoring_task.cancel()
                 
