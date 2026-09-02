@@ -3,10 +3,14 @@ Configuration module for PG-Limiter.
 Reads settings from:
 - Environment variables (.env) for static settings
 - Database for dynamic settings that can be changed via Telegram
+
 The merged result is held in a single process-wide dict and rebuilt only when a
-setting is written, so a read is a plain dictionary lookup.
+setting is written. ``read_config`` hands out a deep copy of it, so a caller that
+edits what it got cannot reach the shared configuration every other task is
+reading - see the note on the cache below.
 """
 
+import copy
 import math
 import os
 from typing import Any, Dict, List, Optional
@@ -24,6 +28,14 @@ except ImportError:
     DB_AVAILABLE = False
 
 # Single in-process configuration cache. ``None`` means "not loaded yet".
+#
+# Never hand this object out. It used to be returned directly, and every caller in
+# the process therefore shared one mutable dict with no TTL: a Telegram handler doing
+# ``config_data["disabled_nodes"].append(id)`` changed what the enforcement loop saw,
+# permanently, with nothing in the log. Two such bugs were fixed one caller at a time
+# before the pattern recurred in eight more places, so the guarantee now lives here
+# instead: ``read_config`` deep-copies on the way out. Read
+# ``read_config_scalar`` for the one case that does not need a copy.
 _config_cache: Optional[Dict[str, Any]] = None
 
 
@@ -216,11 +228,16 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
 
     The result is cached in-process until a write invalidates it, so this is
     cheap enough to call from hot paths.
+
+    The returned dict is a **deep copy**: editing it, or any list or dict inside it,
+    affects nobody else. Writes still have to go through ``save_config_value`` to
+    become durable, exactly as before - the copy only stops an edit from leaking
+    into the shared cache on its way there.
     """
     global _config_cache
 
     if _config_cache is not None and not check_required_elements:
-        return _config_cache
+        return copy.deepcopy(_config_cache)
 
     config_logger.debug("🔧 Loading fresh configuration...")
     
@@ -560,10 +577,47 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
             "⛔ Serving a configuration with no database settings - enforcement will be "
             "skipped until a database read succeeds"
         )
+        # No copy needed: this one is deliberately never cached, so it is already
+        # private to this caller and nobody else holds a reference to it.
         return config
 
     _config_cache = config
-    return config
+    # The dict just built becomes the cache, so this exit has to copy as well. Missing
+    # it would leave the shared object exposed to the first caller after every
+    # invalidation - which is routinely the Telegram handler that just wrote a setting
+    # and is now re-rendering its menu.
+    return copy.deepcopy(config)
+
+
+async def read_config_scalar(key: str, default: Any = None) -> Any:
+    """
+    Read one immutable top-level setting without copying the whole configuration.
+
+    ``read_config`` deep-copies on every call, which is the right default but is
+    wasted work for a caller that wants a single string or number. The SSE log loop
+    is the case that matters: it asks whether the IP source was switched to API mode
+    once every 15 seconds per node, so on a 49-node fleet with a 180s check interval
+    that is ~588 reads per cycle for one string.
+
+    Only immutable values may be read this way. Handing out a list or a dict from the
+    cache is exactly the sharing bug the deep copy exists to prevent, so that raises
+    instead of quietly returning a shared reference.
+    """
+    cache = _config_cache
+    if cache is None:
+        # Cold cache: first call, or the first call after an invalidation. Build it and
+        # read from what came back, because a degraded configuration is deliberately
+        # not cached and would leave the global at None on the next line.
+        cache = await read_config()
+
+    value = cache.get(key, default)
+    if isinstance(value, (dict, list, set)):
+        raise TypeError(
+            f"read_config_scalar({key!r}) may only be used for immutable values, but "
+            f"{key!r} holds a {type(value).__name__}. Use read_config() instead - "
+            f"returning the container itself would share the process-wide cache."
+        )
+    return value
 
 
 async def save_config_value(key: str, value: Any) -> bool:

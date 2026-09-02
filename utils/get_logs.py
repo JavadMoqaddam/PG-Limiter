@@ -90,25 +90,26 @@ async def _ip_source_is_api() -> bool:
     """
     Report whether the limiter is currently configured to pull IPs from the API.
 
-    ``read_config()`` returns a process-wide cached dict that is rebuilt only when a
-    settings write invalidates it, so this stays cheap enough to poll from inside the
-    streaming loop.
+    Uses the scalar reader rather than ``read_config()``: this is polled from inside
+    every node's streaming loop, and a full ``read_config()`` would deep-copy the
+    whole configuration ~588 times per cycle on a 49-node fleet to look at one string.
     """
-    from utils.read_config import read_config
+    from utils.read_config import read_config_scalar
 
     try:
-        config_data = await read_config()
+        source = await read_config_scalar("ip_source", "logs")
     except Exception:  # pylint: disable=broad-except
         return False
-    return str(config_data.get("ip_source") or "logs") == "api"
+    return str(source or "logs") == "api"
 
 
 async def _get_status_throttle_interval() -> float:
     """Get node status edit throttle interval (synced with check_interval, default 60s)."""
     try:
-        from utils.read_config import read_config
-        config = await read_config()
-        return float(config.get("check_interval") or config.get("monitoring", {}).get("check_interval", 60))
+        from utils.read_config import read_config_scalar
+        # read_config always sets this at the root and derives monitoring.check_interval
+        # from it, so the old nested fallback could never fire.
+        return float(await read_config_scalar("check_interval", 60) or 60)
     except Exception:
         return 60.0
 
