@@ -1138,6 +1138,12 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     behavior = w_obj.get_behavior_summary() if w_obj else ""
                     default_consecutive = 2 if result == "updated" else 1
                     consecutive = getattr(w_obj, "consecutive_violations", default_consecutive) if w_obj else default_consecutive
+                    # The record's own threshold, not the live setting: lowering
+                    # max_warning_count does not apply to a streak already in progress,
+                    # so "Scan 2 of 3" has to quote the rule this user is judged by.
+                    item_max_warnings = (
+                        warning_system.effective_max_warnings(w_obj) if w_obj else int(max_warning_count)
+                    )
                     cycle_new_warnings.append({
                         "username": user_name,
                         "ip_count": effective_device_count,
@@ -1146,7 +1152,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         "trust_level": trust_level,
                         "behavior": behavior,
                         "consecutive_violations": consecutive,
-                        "max_warnings": max_warning_count,
+                        "max_warnings": item_max_warnings,
                     })
                     if result == "new":
                         logger.warning(

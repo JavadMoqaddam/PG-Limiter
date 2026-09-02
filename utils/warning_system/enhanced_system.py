@@ -57,6 +57,35 @@ class EnhancedWarningSystem:
         self.check_interval = max(5, int(check_interval))
         self.max_warnings = max(1, int(max_warnings))
         self.monitoring_period = self.check_interval * self.max_warnings
+
+    def effective_max_warnings(self, warning: UserLimitWarning) -> int:
+        """
+        How many consecutive violating scans this specific record needs before a ban.
+
+        check_usage calls update_settings() on every cycle, so self.max_warnings is a
+        live value. Comparing a counter that has been accumulating for two scans
+        against a threshold the operator just lowered would ban on the old count under
+        a new, stricter rule - a user mid-streak would be disabled without ever
+        completing the number of scans they were being monitored for.
+
+        Taking the maximum of the record's own threshold and the current one means a
+        settings change can only ever make a ban harder, never easier:
+
+          lowered  (3 -> 2): max(3, 2) = 3, the record keeps the rule it started under
+          raised   (3 -> 5): max(3, 5) = 5, the stricter-for-the-limiter value wins
+          new records:       stored == current, so the new setting applies in full
+
+        A record with no stored threshold predates this field and falls back to the
+        live value; those records expire within one monitoring window.
+        """
+        stored = getattr(warning, "max_warnings_at_creation", 0) or 0
+        try:
+            stored = int(stored)
+        except (TypeError, ValueError):
+            stored = 0
+        if stored < 1:
+            return self.max_warnings
+        return max(stored, self.max_warnings)
     
     def load_warning_history(self):
         """Load warning history from file"""
@@ -198,6 +227,7 @@ class EnhancedWarningSystem:
             user_limit=warning_data.get("user_limit", 1),
             consecutive_violations=warning_data.get("consecutive_violations", 1),
             last_scan_time=warning_data.get("last_scan_time", 0.0),
+            max_warnings_at_creation=warning_data.get("max_warnings_at_creation", 0),
         )
         warning.monitoring_history = monitoring_history
         return warning
@@ -281,7 +311,8 @@ class EnhancedWarningSystem:
                 "isp_change_pattern": warning.isp_change_pattern,
                 "connection_details": warning.connection_details,
                 "user_limit": getattr(warning, "user_limit", 1),
-                "consecutive_violations": getattr(warning, "consecutive_violations", 1)
+                "consecutive_violations": getattr(warning, "consecutive_violations", 1),
+                "max_warnings_at_creation": getattr(warning, "max_warnings_at_creation", 0)
             }
         
         atomic_write_json(self.filename, data)
@@ -369,11 +400,13 @@ class EnhancedWarningSystem:
                         f"(minimum {min_scan_gap:.0f}s)"
                     )
 
+            required_violations = self.effective_max_warnings(warning)
+
             if not counted:
                 warning_logger.warning(
                     f"⏱️ User {username} violated again but the violation was not counted: "
                     f"{not_counted_reason} - the record is refreshed, so no fast loop and no "
-                    f"restart can shortcut the {self.max_warnings}-scan rule"
+                    f"restart can shortcut the {required_violations}-scan rule"
                 )
 
             warning.ip_count = ip_count
@@ -402,7 +435,7 @@ class EnhancedWarningSystem:
             warning_logger.info(f"⚠️ User {username} consecutive violation scan #{warning.consecutive_violations} (trust={warning.trust_score:.0f})")
             log_monitoring_event("warning_updated", username, {"ip_count": ip_count, "trust_score": warning.trust_score, "consecutive": warning.consecutive_violations})
             
-            if warning.consecutive_violations >= self.max_warnings:
+            if warning.consecutive_violations >= required_violations:
                 return "violation_limit_reached"
             return "updated"
         
@@ -450,7 +483,8 @@ class EnhancedWarningSystem:
             connection_details=connection_details,
             user_limit=user_limit if user_limit and user_limit >= 1 else 1,
             consecutive_violations=1,
-            last_scan_time=current_time
+            last_scan_time=current_time,
+            max_warnings_at_creation=self.max_warnings
         )
         
         warning.trust_score = warning.calculate_trust_score()
@@ -682,12 +716,13 @@ class EnhancedWarningSystem:
                     else:
                         device_count = len(current_ips)
                     activity_summary = warning.get_ip_activity_summary()
+                    required_violations = self.effective_max_warnings(warning)
 
-                    warning_logger.info(f"⚠️ User {username}: {device_count} devices / {len(current_ips)} IPs (limit: {user_limit_number}, violations: {warning.consecutive_violations}/{self.max_warnings}), trust={trust_score:.0f}")
-                    
+                    warning_logger.info(f"⚠️ User {username}: {device_count} devices / {len(current_ips)} IPs (limit: {user_limit_number}, violations: {warning.consecutive_violations}/{required_violations}), trust={trust_score:.0f}")
+
                     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    if device_count > user_limit_number and warning.consecutive_violations >= self.max_warnings:
+
+                    if device_count > user_limit_number and warning.consecutive_violations >= required_violations:
                         # ===== DOUBLE-CHECK BEFORE BAN (O(1) FAST RAM CHECK) =====
                         try:
                             if username in USER_METADATA_CACHE:

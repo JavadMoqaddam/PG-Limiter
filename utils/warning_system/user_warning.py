@@ -50,6 +50,15 @@ class UserLimitWarning:
     # period that wrote the deadline is no longer the period used to read it back.
     # 0.0 means "unknown" (a record written before this field existed).
     last_scan_time: float = 0.0
+    # The max_warnings setting that was in force when this record was created. The ban
+    # threshold is max(this, the current setting), so lowering max_warning_count can
+    # never retro-apply to a record that is already being monitored: a user who was
+    # told "3 consecutive scans" is still judged on 3 even if the operator drops the
+    # setting to 2 mid-streak. Raising it applies immediately, because that direction
+    # only makes a ban harder. 0 means "unknown" - a record written before this field
+    # existed - and falls back to the current setting, which is the old behaviour;
+    # such records expire within one monitoring window.
+    max_warnings_at_creation: int = 0
     
     def __post_init__(self):
         if self.monitoring_history is None:
