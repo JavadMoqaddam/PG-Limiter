@@ -331,15 +331,19 @@ async def handle_remove_special_limit_callback(query, _context: ContextTypes.DEF
     """Handle callback for removing a special limit."""
     from db.database import get_db, DB_AVAILABLE
     from db.crud import UserCRUD
-    
+    from utils.read_config import invalidate_config_cache
+
     if DB_AVAILABLE:
         async with get_db() as db:
             result = await UserCRUD.set_special_limit(db, username, None)
             await db.commit()
-            if result is not None:
-                text = f"✅ Special limit for <b>{username}</b> removed!\n\nThis user will now use the general limit."
-            else:
-                text = f"❌ No special limit found for <b>{username}</b>."
+        # Same reason as handle_special_limit: the cache has no expiry, so the backup
+        # and the status screens would keep showing the limit that was just removed.
+        await invalidate_config_cache()
+        if result is not None:
+            text = f"✅ Special limit for <b>{username}</b> removed!\n\nThis user will now use the general limit."
+        else:
+            text = f"❌ No special limit found for <b>{username}</b>."
     else:
         text = "❌ Database not available."
     

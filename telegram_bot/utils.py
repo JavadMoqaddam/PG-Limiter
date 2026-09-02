@@ -209,11 +209,16 @@ async def handle_special_limit(username: str, limit: int) -> list:
             # Check if limit was set before
             existing_limit = await UserCRUD.get_special_limit(db, username)
             set_before = 1 if existing_limit is not None else 0
-            
+
             # Set the new limit
             await UserCRUD.set_special_limit(db, username, limit)
             await db.commit()
-            return [set_before, limit]
+        # The enforcement loop re-reads special limits straight from the database, so it
+        # sees this immediately - but every other reader goes through the config cache,
+        # which has no expiry. Without this, /backup captures the previous limit and the
+        # status screens keep reporting it until some unrelated setting is written.
+        await invalidate_config_cache()
+        return [set_before, limit]
     
     # Fallback to config.json
     set_before = 0
