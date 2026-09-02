@@ -18,6 +18,7 @@ from telegram.ext import (
     ConversationHandler,
 )
 from utils.atomic_io import atomic_write_json
+from utils.read_config import invalidate_config_cache
 
 from telegram_bot.constants import RESTORE_CONFIG
 from telegram_bot.handlers.admin import check_admin_privilege
@@ -273,11 +274,16 @@ async def restore_config_handler(update: Update, context: ContextTypes.DEFAULT_T
                     except_users = config_data.get("except_users", [])
                     for username in except_users:
                         await UserCRUD.set_excepted(db, username, True, reason="Restored from backup")
-                
+
+                # Nothing re-reads the configuration on a timer, so the imported
+                # whitelist and limits would sit unused until the next settings write.
+                await invalidate_config_cache()
+
                 await update.message.reply_html(
                     "✅ <b>Legacy config imported to database!</b>\n\n"
                     "📝 Panel credentials should be set in .env file.\n"
-                    "⚠️ Restart the service for changes to take effect."
+                    "ℹ️ The imported settings are already live; only .env changes "
+                    "need a service restart."
                 )
                 
             except json.JSONDecodeError as e:
@@ -565,7 +571,12 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                 f"❌ Database error:\n<code>{str(db_err)}</code>"
             )
             return ConversationHandler.END
-        
+
+        # The configuration cache has no expiry: it is rebuilt only when a write
+        # invalidates it. Without this call the migrated settings stay invisible to the
+        # running limiter, which would make the "no restart needed" line below false.
+        await invalidate_config_cache()
+
         # Build result message
         total = (
             stats["config_items"] + 

@@ -485,13 +485,21 @@ async def save_general_limit(limit: int) -> int:
     """
     Save the general limit to the database.
     Falls back to config.json if database is not available.
+
+    Every path invalidates the configuration cache. That cache has no expiry - it is
+    dropped only by an explicit invalidation - and read_config() overlays the stored
+    general_limit onto config["limits"]["general"], which is what the enforcement loop
+    compares device counts against. Without the invalidation the new limit was written
+    to the database and then ignored for the life of the process, so raising the limit
+    from the bot did not stop the old one from banning people.
     """
     if DB_AVAILABLE:
         async with get_db() as db:
             await ConfigCRUD.set(db, "general_limit", limit)
             await db.commit()
-            return limit
-    
+        await invalidate_config_cache()
+        return limit
+
     # Fallback to config.json
     if os.path.exists("config.json"):
         data = await read_json_file()
@@ -499,9 +507,11 @@ async def save_general_limit(limit: int) -> int:
             data["limits"] = {}
         data["limits"]["general"] = limit
         await write_json_file(data)
+        await invalidate_config_cache()
         return limit
     data = {"limits": {"general": limit}}
     await write_json_file(data)
+    await invalidate_config_cache()
     return limit
 
 

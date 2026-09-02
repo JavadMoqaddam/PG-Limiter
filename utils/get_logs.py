@@ -84,8 +84,9 @@ async def _ip_source_is_api() -> bool:
     """
     Report whether the limiter is currently configured to pull IPs from the API.
 
-    ``read_config()`` is backed by a 2-second in-memory cache, so this stays
-    cheap enough to poll from inside the streaming loop.
+    ``read_config()`` returns a process-wide cached dict that is rebuilt only when a
+    settings write invalidates it, so this stays cheap enough to poll from inside the
+    streaming loop.
     """
     from utils.read_config import read_config
 

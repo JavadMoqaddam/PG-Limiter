@@ -282,6 +282,15 @@ class DBViolationHistory:
 class DBConfig:
     """
     Database-backed configuration storage.
+
+    DEPRECATED and unused, like DBViolationHistory above: nothing imports
+    ``get_db_config``. Do not add a caller. ``set()`` writes the row and updates this
+    object's private ``_cache``, but it does not touch the process-wide cache in
+    utils/read_config.py - which has no expiry - so a write through here would be
+    invisible to the limiter, the bot and the API until something else invalidated
+    that cache. The one supported way to change a setting is
+    ``ConfigCRUD.set`` (or ``save_config_value``) followed by
+    ``invalidate_config_cache()``.
     """
 
     def __init__(self):
