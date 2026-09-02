@@ -160,6 +160,45 @@ class PunishmentStep:
         return f"🔒 {hours}h {remaining_mins}m disable"
 
 
+def _parse_step(position: int, step) -> Optional[PunishmentStep]:
+    """
+    Build one PunishmentStep from its configured dict, or None if it is unusable.
+
+    ``position`` is 1-based and only used in the log lines, so an operator can tell
+    which entry of their steps list is wrong.
+    """
+    if not isinstance(step, dict):
+        punishment_logger.error(
+            f"⚠️ Punishment step {position} is {type(step).__name__}, not an object - "
+            f"skipping it"
+        )
+        return None
+
+    step_type = str(step.get("type") or "disable").strip().lower()
+    if step_type not in _VALID_STEP_TYPES:
+        punishment_logger.error(
+            f"⚠️ Punishment step {position} has unknown type {step.get('type')!r} - "
+            f"treating it as a warning, so a step nobody can read cannot disable anyone"
+        )
+        step_type = "warning"
+
+    if "duration" in step:
+        return PunishmentStep(step_type, _coerce_duration_minutes(step["duration"], step_type))
+
+    if step_type == "disable":
+        # The old code read this with .get("duration", 0), and 0 on a disable step
+        # means unlimited - so a step that simply forgot the key was a permanent,
+        # manual-enable-only ban, logged nowhere.
+        punishment_logger.error(
+            f"⚠️ Punishment step {position} is a disable with no duration key - using "
+            f"{FALLBACK_DISABLE_MINUTES} minutes. An unlimited ban has to say so "
+            f'explicitly with "duration": 0.'
+        )
+        return PunishmentStep(step_type, FALLBACK_DISABLE_MINUTES)
+
+    return PunishmentStep(step_type, 0)
+
+
 @dataclass
 class ViolationRecord:
     """Represents a single violation record"""
@@ -290,40 +329,11 @@ class PunishmentSystem:
         # Load steps from config
         steps_config = punishment_config.get("steps", None)
         if steps_config and isinstance(steps_config, list) and len(steps_config) > 0:
-            self.steps = []
-            for position, step in enumerate(steps_config, start=1):
-                if not isinstance(step, dict):
-                    punishment_logger.error(
-                        f"⚠️ Punishment step {position} is {type(step).__name__}, not an "
-                        f"object - skipping it"
-                    )
-                    continue
-
-                step_type = str(step.get("type") or "disable").strip().lower()
-                if step_type not in _VALID_STEP_TYPES:
-                    punishment_logger.error(
-                        f"⚠️ Punishment step {position} has unknown type "
-                        f"{step.get('type')!r} - treating it as a warning, so a step "
-                        f"nobody can read cannot disable anyone"
-                    )
-                    step_type = "warning"
-
-                if "duration" in step:
-                    duration = _coerce_duration_minutes(step["duration"], step_type)
-                elif step_type == "disable":
-                    # The old code read this with .get("duration", 0), and 0 on a
-                    # disable step means unlimited - so a step that simply forgot the
-                    # key was a permanent, manual-enable-only ban, logged nowhere.
-                    punishment_logger.error(
-                        f"⚠️ Punishment step {position} is a disable with no duration "
-                        f"key - using {FALLBACK_DISABLE_MINUTES} minutes. An unlimited "
-                        f'ban has to say so explicitly with "duration": 0.'
-                    )
-                    duration = FALLBACK_DISABLE_MINUTES
-                else:
-                    duration = 0
-
-                self.steps.append(PunishmentStep(step_type, duration))
+            self.steps = [
+                parsed
+                for position, step in enumerate(steps_config, start=1)
+                if (parsed := _parse_step(position, step)) is not None
+            ]
 
             if not self.steps:
                 self.steps = self.DEFAULT_STEPS.copy()
