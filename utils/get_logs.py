@@ -3,6 +3,7 @@ This module contains functions to get logs from the nodes using SSE (Server-Sent
 """
 
 import asyncio
+import os
 import time
 from asyncio import Task
 from datetime import datetime
@@ -267,7 +268,23 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
                 "Cache-Control": "no-cache",
             }
             
-            async with httpx.AsyncClient(verify=False, timeout=None) as client:
+            # timeout=None capped nothing at all: a panel that accepted the TCP
+            # connection but never completed the TLS handshake held this node's task
+            # forever. connect/write/pool are bounded here because none of them can
+            # touch an established stream.
+            #
+            # read is deliberately left unbounded. In httpx one read timeout covers
+            # every chunk of the response body, so any value shorter than a node's
+            # quietest period would tear down healthy streams - and picking that number
+            # needs real traffic, not a guess. A stream that goes silent while still
+            # looking connected is caught by the per-node heartbeat gate in
+            # check_usage, which blocks counter changes rather than trusting the sample.
+            sse_timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+            # Match the API client instead of hardcoding False, so PANEL_VERIFY_SSL
+            # covers the log streams too. Same host as the API calls, so a setting that
+            # works there works here; the default stays off.
+            verify_ssl = os.getenv("PANEL_VERIFY_SSL", "false").lower() in ("true", "1", "yes")
+            async with httpx.AsyncClient(verify=verify_ssl, timeout=sse_timeout) as client:
                 logger.info(f"Establishing SSE connection for node {node.node_id}: {node.node_name}")
                 
                 async with client.stream("GET", url, headers=headers) as response:
