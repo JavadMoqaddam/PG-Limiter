@@ -12,6 +12,11 @@ class ConversationState(IntEnum):
     Using IntEnum instead of range() unpacking ensures that
     adding or removing a state does not silently shift all
     subsequent values and break existing conversations.
+
+    The gaps at 9, 13 and 14 are removed states: the country-code, check-interval
+    and re-enable-timeout conversations were never wired to a button or a command,
+    so their states, callback data and writer functions were deleted. Those three
+    settings come from the environment file (and the CLI / API), not from the bot.
     """
     GET_DOMAIN = 0
     GET_PORT = 1
@@ -22,12 +27,9 @@ class ConversationState(IntEnum):
     GET_SPECIAL_LIMIT = 6
     GET_LIMIT_NUMBER = 7
     GET_CHAT_ID_TO_REMOVE = 8
-    SET_COUNTRY_CODE = 9
     SET_EXCEPT_USERS = 10
     REMOVE_EXCEPT_USER = 11
     GET_GENERAL_LIMIT_NUMBER = 12
-    GET_CHECK_INTERVAL = 13
-    GET_TIME_TO_ACTIVE_USERS = 14
     SET_IPINFO_TOKEN = 15
     SET_ENHANCED_DETAILS = 16
     RESTORE_CONFIG = 17
@@ -48,12 +50,9 @@ GET_CHAT_ID = ConversationState.GET_CHAT_ID
 GET_SPECIAL_LIMIT = ConversationState.GET_SPECIAL_LIMIT
 GET_LIMIT_NUMBER = ConversationState.GET_LIMIT_NUMBER
 GET_CHAT_ID_TO_REMOVE = ConversationState.GET_CHAT_ID_TO_REMOVE
-SET_COUNTRY_CODE = ConversationState.SET_COUNTRY_CODE
 SET_EXCEPT_USERS = ConversationState.SET_EXCEPT_USERS
 REMOVE_EXCEPT_USER = ConversationState.REMOVE_EXCEPT_USER
 GET_GENERAL_LIMIT_NUMBER = ConversationState.GET_GENERAL_LIMIT_NUMBER
-GET_CHECK_INTERVAL = ConversationState.GET_CHECK_INTERVAL
-GET_TIME_TO_ACTIVE_USERS = ConversationState.GET_TIME_TO_ACTIVE_USERS
 SET_IPINFO_TOKEN = ConversationState.SET_IPINFO_TOKEN
 SET_ENHANCED_DETAILS = ConversationState.SET_ENHANCED_DETAILS
 RESTORE_CONFIG = ConversationState.RESTORE_CONFIG
@@ -88,25 +87,7 @@ class CallbackData:
     GENERAL_LIMIT_3 = "general_limit_3"
     GENERAL_LIMIT_4 = "general_limit_4"
     GENERAL_LIMIT_CUSTOM = "general_limit_custom"
-    
-    # Country code options
-    COUNTRY_IR = "country_ir"
-    COUNTRY_RU = "country_ru"
-    COUNTRY_CN = "country_cn"
-    COUNTRY_NONE = "country_none"
-    
-    # Check interval options
-    INTERVAL_120 = "interval_120"
-    INTERVAL_180 = "interval_180"
-    INTERVAL_240 = "interval_240"
-    INTERVAL_CUSTOM = "interval_custom"
-    
-    # Time to active options
-    TIME_300 = "time_300"
-    TIME_600 = "time_600"
-    TIME_900 = "time_900"
-    TIME_CUSTOM = "time_custom"
-    
+
     # Enhanced details toggle
     # ENHANCED_MENU shows the current state with the ON/OFF keyboard. The settings
     # button used to send ENHANCED_ON directly, so pressing "Enhanced Details" set

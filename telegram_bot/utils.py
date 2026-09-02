@@ -343,33 +343,6 @@ async def get_special_limit_list() -> list | None:
     return None
 
 
-async def write_country_code_json(country_code: str) -> None:
-    """
-    Saves the country code to the database.
-    Falls back to config.json if database is not available.
-
-    Args:
-        country_code: The country code to write.
-    """
-    if DB_AVAILABLE:
-        async with get_db() as db:
-            await ConfigCRUD.set(db, "country_code", country_code)
-            await db.commit()
-            await invalidate_config_cache()
-            return
-    
-    # Fallback to config.json
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-    else:
-        data = {}
-    if "monitoring" not in data:
-        data["monitoring"] = {}
-    data["monitoring"]["ip_location"] = country_code
-    await write_json_file(data)
-    await invalidate_config_cache()
-
-
 async def add_except_user(except_user: str) -> str | None:
     """
     Add a user to the exception list using database.
@@ -513,57 +486,3 @@ async def save_general_limit(limit: int) -> int:
     await write_json_file(data)
     await invalidate_config_cache()
     return limit
-
-
-async def save_check_interval(interval: int) -> int:
-    """
-    Save the check interval to the database.
-    Falls back to config.json if database is not available.
-    """
-    if DB_AVAILABLE:
-        async with get_db() as db:
-            await ConfigCRUD.set(db, "check_interval", interval)
-            await db.commit()
-            await invalidate_config_cache()
-            return interval
-    
-    # Fallback to config.json
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-        if "monitoring" not in data:
-            data["monitoring"] = {}
-        data["monitoring"]["check_interval"] = interval
-        await write_json_file(data)
-        await invalidate_config_cache()
-        return interval
-    data = {"monitoring": {"check_interval": interval}}
-    await write_json_file(data)
-    await invalidate_config_cache()
-    return interval
-
-
-async def save_time_to_active_users(time_val: int) -> int:
-    """
-    Save the time to active users to the database.
-    Falls back to config.json if database is not available.
-    """
-    if DB_AVAILABLE:
-        async with get_db() as db:
-            await ConfigCRUD.set(db, "time_to_active_users", time_val)
-            await db.commit()
-            await invalidate_config_cache()
-            return time_val
-    
-    # Fallback to config.json
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-        if "monitoring" not in data:
-            data["monitoring"] = {}
-        data["monitoring"]["time_to_active_users"] = time_val
-        await write_json_file(data)
-        await invalidate_config_cache()
-        return time_val
-    data = {"monitoring": {"time_to_active_users": time_val}}
-    await write_json_file(data)
-    await invalidate_config_cache()
-    return time_val
