@@ -18,7 +18,13 @@ from telegram_bot.send_message import send_logs, edit_message
 from utils.logs import logger  # pylint: disable=ungrouped-imports
 from utils.panel_api import get_nodes, get_token
 from utils.parse_logs import parse_logs, set_current_node_info
-from utils.shared_state import clear_node_events, forget_node_event, note_node_event
+from utils.shared_state import (
+    clear_node_events,
+    forget_node_event,
+    get_node_event_ages,
+    node_silence_window,
+    note_node_event,
+)
 from utils.types import NodeType, PanelType
 
 TASKS = []
@@ -105,6 +111,17 @@ async def _get_status_throttle_interval() -> float:
         return float(config.get("check_interval") or config.get("monitoring", {}).get("check_interval", 60))
     except Exception:
         return 60.0
+
+
+async def _get_node_poll_interval() -> float:
+    """
+    How long to wait between two passes over the panel's node list.
+
+    Three check intervals, the same window `_sample_is_trustworthy` uses to call a
+    stream silent, so the poller that reconnects a node and the gate that distrusts
+    its absence cannot disagree about how long silence is allowed to last.
+    """
+    return node_silence_window(await _get_status_throttle_interval())
 
 
 async def _delayed_status_update(delay: float) -> None:
@@ -380,26 +397,53 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
         tasks (list[Task]): The list of tasks to be cancelled.
     """
     global _node_connection_status
-    
+
     deactivate_nodes = {}  # task_name -> node_id
     while True:
+        poll_interval = await _get_node_poll_interval()
         # get_nodes RAISES ValueError when the panel is unreachable or the circuit
         # breaker is open - it never returns one, despite the isinstance() guards
         # scattered around the codebase. This coroutine is a TaskGroup child, so an
         # unguarded raise here cancelled every SSE stream and took the whole process
         # down on a transient panel hiccup. One failed poll must only cost one poll.
+        #
+        # force_refresh matters: get_nodes caches for an hour, so without it this poll
+        # was reading node status up to an hour old and a node that dropped stayed
+        # "connected" in our view for the rest of that hour. enabled_only=False matters
+        # for the same reason in the other direction - with the default filter a node
+        # disabled in the panel vanishes from the list entirely instead of arriving with
+        # status "disabled", and the loop below only looks at nodes it can see, so that
+        # node's stream was never cancelled at all.
         try:
-            nodes_list = await get_nodes(panel_data)
+            nodes_list = await get_nodes(panel_data, force_refresh=True, enabled_only=False)
         except Exception as error:  # pylint: disable=broad-except
             logger.warning(
                 f"Could not fetch the node list to look for disconnected nodes: {error}. "
                 f"Retrying on the next pass; existing streams are left alone."
             )
-            await asyncio.sleep(60)
+            await asyncio.sleep(poll_interval)
             continue
+        silence_window = poll_interval
+        event_ages = get_node_event_ages()
         for node in nodes_list or []:
+            task_name = f"Task-{node.node_id}-{node.node_name}"
             if node.status != "connected":
-                task_name = f"Task-{node.node_id}-{node.node_name}"
+                deactivate_nodes[task_name] = node.node_id
+                continue
+            # The panel says this node is fine, so panel-to-node is healthy - but the
+            # panel-to-us hop is a different connection, and that is the one that goes
+            # half-open. Every line counts as a heartbeat, keep-alives included, so a
+            # node with no users still reports in: silence this long means our stream
+            # is dead, not that the node is quiet. Cancel it and let
+            # check_and_add_new_nodes rebuild it, which is cheaper and more certain
+            # than guessing a read timeout that would also tear down healthy streams.
+            age = event_ages.get(node.node_id)
+            if age is not None and age > silence_window:
+                logger.error(
+                    f"🔌 Node {node.node_id} ({node.node_name}) is 'connected' on the panel "
+                    f"but its log stream has produced nothing for {int(age)}s "
+                    f"(limit {int(silence_window)}s) - reconnecting it"
+                )
                 deactivate_nodes[task_name] = node.node_id
 
         for task in list(tasks):
@@ -427,8 +471,7 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
                 tasks.remove(task)
                 if task in task_node_mapping:
                     task_node_mapping.pop(task)
-        # Check for disconnected nodes every minute
-        await asyncio.sleep(60)
+        await asyncio.sleep(poll_interval)
 
 
 async def handle_cancel_one(tasks: list[Task]) -> None:
@@ -538,7 +581,12 @@ async def check_and_add_new_nodes(panel_data: PanelType, tg: asyncio.TaskGroup) 
 
             active_node_ids = {n.node_id for t, n in task_node_mapping.items() if not t.done()}
 
-            all_nodes = await get_nodes(panel_data)
+            # force_refresh for the same reason as in handle_cancel: get_nodes caches
+            # for an hour, so without it a node that came back stayed invisible here
+            # until the cache expired. enabled_only=False keeps the status field
+            # authoritative for every node instead of silently omitting disabled ones -
+            # the "connected" test below is what decides whether to reconnect.
+            all_nodes = await get_nodes(panel_data, force_refresh=True, enabled_only=False)
             if all_nodes and not isinstance(all_nodes, ValueError):
                 for node in all_nodes:
                     if (
@@ -561,8 +609,8 @@ async def check_and_add_new_nodes(panel_data: PanelType, tg: asyncio.TaskGroup) 
             break
         except Exception as e:
             logger.error(f"Error in check_and_add_new_nodes: {e}")
-            
-        await asyncio.sleep(120)
+
+        await asyncio.sleep(await _get_node_poll_interval())
 
 
 async def create_node_task(

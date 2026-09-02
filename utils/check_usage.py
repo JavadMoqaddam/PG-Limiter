@@ -29,6 +29,7 @@ from utils.shared_state import (
     ACTIVE_USERS_LOCK,
     get_active_users_snapshot,
     get_node_event_ages,
+    node_silence_window,
     nodes_seen_within,
     pop_active_users_snapshot,
     tracked_node_count,
@@ -782,15 +783,17 @@ def _sample_is_trustworthy(all_users_actual_ips: dict, check_interval: int) -> b
 
       * an empty sample catches "everything is down";
       * the per-node heartbeat catches *partial* failure, which an empty sample
-        cannot see. get_logs opens its client with timeout=None, so a half-open
+        cannot see. get_logs opens its client with read timeout None, so a half-open
         stream never raises and the node keeps reporting "✅ Connected" while
         delivering nothing. One dead node out of forty-nine still leaves plenty of
         active users in the sample - and every user who was on that node looks like
         they disconnected.
 
-    The staleness window is generous on purpose. A node with no traffic at all in
-    two whole check intervals is not merely quiet on this installation, and erring
-    long means a genuinely idle node never blocks enforcement.
+    The staleness window is three check intervals (see node_silence_window). Every
+    line the panel sends counts as a heartbeat, keep-alives included, so a node with
+    no user traffic at all still reports in and a genuinely idle node never blocks
+    enforcement. Silence for three whole intervals is a broken stream, and the node
+    poller in get_logs reconnects on the same window.
 
     Under-counting is the failure direction here, so the safe answer when in doubt
     is False: leave every counter and every record exactly as it is.
@@ -804,7 +807,7 @@ def _sample_is_trustworthy(all_users_actual_ips: dict, check_interval: int) -> b
 
     tracked_nodes = tracked_node_count()
     if tracked_nodes and warning_system.warnings:
-        stale_window = max(120.0, float(check_interval) * 2)
+        stale_window = node_silence_window(check_interval)
         live_nodes = nodes_seen_within(stale_window)
         if live_nodes < tracked_nodes:
             silent_nodes = sorted(
