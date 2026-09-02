@@ -92,8 +92,24 @@ async def get_token(panel_data: PanelType, force_refresh: bool = False) -> Panel
             return panel_data
 
         auth_logger.info(f"🔑 Fetching new token for {panel_data.panel_domain} (force_refresh={force_refresh})")
+        # Fetch while still holding the lock. The lock used to be released right here,
+        # so every task that had missed the cache went on to issue its own
+        # POST /api/admin/token (up to max_attempts x schemes each) - precisely the
+        # thundering herd the lock was added to prevent, with ~50 SSE tasks plus the
+        # API collector all authenticating against one panel at the same moment.
+        return await _fetch_new_token(panel_data)
     
-    # Need to fetch a new token
+async def _fetch_new_token(panel_data: PanelType) -> PanelType:
+    """
+    Authenticate against the panel and cache the resulting token.
+
+    The caller must hold ``_auth_token_lock``: this is the serialized half of
+    ``get_token``, split out so the lock can cover the HTTP call itself without
+    re-indenting the retry loop.
+
+    Raises:
+        ValueError: if no attempt against any scheme produced a token.
+    """
     payload = {
         "username": f"{panel_data.panel_username}",
         "password": f"{panel_data.panel_password}",
@@ -141,9 +157,11 @@ async def get_token(panel_data: PanelType, force_refresh: bool = False) -> Panel
                     
                 token = json_obj["access_token"]
 
-                # Cache the token for 30 minutes (1800 seconds)
+                # Cache the token for 30 minutes (1800 seconds). Read the clock here
+                # rather than reusing the caller's timestamp: the retry loop can sleep
+                # for over a minute, which would shorten the cached lifetime.
                 _token_cache["token"] = token
-                _token_cache["expires_at"] = current_time + 1800
+                _token_cache["expires_at"] = time.time() + 1800
                 _token_cache["panel_domain"] = panel_data.panel_domain
                 
                 panel_data.panel_token = token

@@ -27,7 +27,9 @@ warning_logger = get_logger("warning_system")
 
 
 class EnhancedWarningSystem:
-    # Class-level constants for compatibility and test suite
+    # Class-level constants kept for the test suite. Note that no code path returns
+    # "instant_disabled", so INSTANT_DISABLE_THRESHOLD is not consulted anywhere:
+    # every ban goes through the max_warnings consecutive-scan rule.
     INSTANT_DISABLE_THRESHOLD = -60
     MIN_DEVICE_DURATION = 120  # 2 minutes
 
@@ -158,56 +160,83 @@ class EnhancedWarningSystem:
         
         return had_data
     
+    @staticmethod
+    def _deserialize_warning(warning_data: dict) -> UserLimitWarning:
+        """Rebuild one UserLimitWarning from its persisted dict. Raises on bad input."""
+        monitoring_history = []
+        for snapshot in warning_data.get('monitoring_history') or []:
+            monitoring_history.append({
+                'timestamp': snapshot['timestamp'],
+                'ips': set(snapshot['ips']),
+                'ip_count': snapshot['ip_count'],
+            })
+
+        ip_to_inbounds = {}
+        for ip, inbounds in (warning_data.get('ip_to_inbounds') or {}).items():
+            ip_to_inbounds[ip] = set(inbounds)
+
+        warning = UserLimitWarning(
+            username=warning_data["username"],
+            ip_count=warning_data["ip_count"],
+            ips=set(warning_data["ips"]),
+            warning_time=warning_data["warning_time"],
+            monitoring_end_time=warning_data["monitoring_end_time"],
+            warned=warning_data.get("warned", False),
+            ip_first_seen=warning_data.get("ip_first_seen", {}),
+            ip_last_seen=warning_data.get("ip_last_seen", {}),
+            ip_seen_count=warning_data.get("ip_seen_count", {}),
+            trust_score=warning_data.get("trust_score", 0.0),
+            inbound_protocols=set(warning_data.get("inbound_protocols", [])),
+            isp_names=set(warning_data.get("isp_names", [])),
+            ip_subnets=set(warning_data.get("ip_subnets", [])),
+            previous_warnings_12h=warning_data.get("previous_warnings_12h", 0),
+            previous_warnings_24h=warning_data.get("previous_warnings_24h", 0),
+            ip_to_inbounds=ip_to_inbounds,
+            same_ip_multiple_inbounds=warning_data.get("same_ip_multiple_inbounds", False),
+            isp_change_pattern=warning_data.get("isp_change_pattern"),
+            connection_details=warning_data.get("connection_details", []),
+            user_limit=warning_data.get("user_limit", 1),
+            consecutive_violations=warning_data.get("consecutive_violations", 1),
+            last_scan_time=warning_data.get("last_scan_time", 0.0),
+        )
+        warning.monitoring_history = monitoring_history
+        return warning
+
     def load_warnings(self):
         """Load warnings from file"""
         try:
             if os.path.exists(self.filename) and os.path.getsize(self.filename) > 0:
                 with open(self.filename, "r", encoding="utf-8") as file:
                     data = json.load(file)
+                    now = time.time()
+                    expired = 0
+                    damaged = 0
                     for username, warning_data in data.items():
-                        monitoring_history = []
-                        if 'monitoring_history' in warning_data:
-                            for snapshot in warning_data['monitoring_history']:
-                                monitoring_history.append({
-                                    'timestamp': snapshot['timestamp'],
-                                    'ips': set(snapshot['ips']),
-                                    'ip_count': snapshot['ip_count']
-                                })
-                        
-                        ip_to_inbounds = {}
-                        if 'ip_to_inbounds' in warning_data:
-                            for ip, inbounds in warning_data['ip_to_inbounds'].items():
-                                ip_to_inbounds[ip] = set(inbounds)
-                        
-                        ip_first_seen = warning_data.get("ip_first_seen", {})
-                        ip_last_seen = warning_data.get("ip_last_seen", {})
-                        ip_seen_count = warning_data.get("ip_seen_count", {})
-                        
-                        warning = UserLimitWarning(
-                            username=warning_data["username"],
-                            ip_count=warning_data["ip_count"],
-                            ips=set(warning_data["ips"]),
-                            warning_time=warning_data["warning_time"],
-                            monitoring_end_time=warning_data["monitoring_end_time"],
-                            warned=warning_data.get("warned", False),
-                            ip_first_seen=ip_first_seen,
-                            ip_last_seen=ip_last_seen,
-                            ip_seen_count=ip_seen_count,
-                            trust_score=warning_data.get("trust_score", 0.0),
-                            inbound_protocols=set(warning_data.get("inbound_protocols", [])),
-                            isp_names=set(warning_data.get("isp_names", [])),
-                            ip_subnets=set(warning_data.get("ip_subnets", [])),
-                            previous_warnings_12h=warning_data.get("previous_warnings_12h", 0),
-                            previous_warnings_24h=warning_data.get("previous_warnings_24h", 0),
-                            ip_to_inbounds=ip_to_inbounds,
-                            same_ip_multiple_inbounds=warning_data.get("same_ip_multiple_inbounds", False),
-                            isp_change_pattern=warning_data.get("isp_change_pattern"),
-                            connection_details=warning_data.get("connection_details", []),
-                            user_limit=warning_data.get("user_limit", 1),
-                            consecutive_violations=warning_data.get("consecutive_violations", 1)
-                        )
-                        warning.monitoring_history = monitoring_history
+                        # Per-record, not per-file: one record with a missing key used
+                        # to abort the loop, silently discarding every record after it
+                        # and leaving the system half-loaded.
+                        try:
+                            warning = self._deserialize_warning(warning_data)
+                        except Exception as record_error:  # pylint: disable=broad-except
+                            damaged += 1
+                            warning_logger.exception(
+                                f"Skipping unreadable warning record for {username}: {record_error}"
+                            )
+                            continue
+                        if warning.monitoring_end_time <= now:
+                            # The monitoring window closed while the process was down.
+                            # Restoring the counter would treat scans from before the
+                            # downtime as consecutive with the next one, so a user could
+                            # be banned on a single fresh observation. Dropping the
+                            # record costs a delayed ban, which is the safe direction.
+                            expired += 1
+                            continue
                         self.warnings[username] = warning
+                    if expired or damaged:
+                        warning_logger.warning(
+                            f"⚠️ Dropped {expired} expired and {damaged} unreadable warning "
+                            f"record(s) while loading; counters restart for those users"
+                        )
                     warning_logger.debug(f"⚠️ Loaded {len(self.warnings)} active warnings from file")
         except Exception as e:
             warning_logger.error(f"Error loading warnings: {e}")
@@ -235,6 +264,7 @@ class EnhancedWarningSystem:
                 "ips": list(warning.ips),
                 "warning_time": warning.warning_time,
                 "monitoring_end_time": warning.monitoring_end_time,
+                "last_scan_time": warning.last_scan_time,
                 "warned": warning.warned,
                 "monitoring_history": monitoring_history_serializable,
                 "ip_first_seen": warning.ip_first_seen,
@@ -271,11 +301,12 @@ class EnhancedWarningSystem:
                          user_data: 'UserType' = None, isp_info: dict = None,
                          panel_data: 'PanelType' = None, send_telegram_notification: bool = True) -> str:
         """
-        Add a warning for a user with trust score calculation.
-        May instantly disable user if trust score is very low.
-        
+        Add a warning for a user, updating the consecutive-scan counter.
+
         Returns:
-            str: "new" if new warning, "updated" if existing, "instant_disabled" if instantly disabled
+            str: "new" for a first warning, "updated" while the user is under
+            monitoring, "violation_limit_reached" once max_warnings consecutive
+            violating scans have been counted.
         """
         current_time = time.time()
         warning_logger.info(f"⚠️ Processing warning for user: {username} (ip_count={ip_count}, limit={user_limit})")
@@ -291,21 +322,58 @@ class EnhancedWarningSystem:
             # reached max_warnings and banned a user who should have had
             # check_interval * max_warnings to correct themselves.
             #
-            # monitoring_end_time was set to "that scan's time + monitoring_period" on
-            # the previous scan, so it recovers the previous scan time exactly, with no
-            # extra field to persist.
-            previous_scan_time = warning.monitoring_end_time - self.monitoring_period
-            elapsed_since_scan = current_time - previous_scan_time
+            # The previous scan time is read from the record itself. It used to be
+            # derived as ``monitoring_end_time - monitoring_period``, which only holds
+            # while the period never changes - but update_settings() rewrites
+            # monitoring_period from live config on every cycle, so raising
+            # check_interval put the derived time in the past (every gap accepted, the
+            # guard disabled) and lowering it put the derived time in the future (every
+            # gap negative, no violation ever counted).
+            previous_scan_time = warning.last_scan_time
             min_scan_gap = max(1.0, self.check_interval * 0.5)
+            max_scan_gap = float(self.monitoring_period)
+            counted = False
+            not_counted_reason = ""
 
-            if elapsed_since_scan >= min_scan_gap:
-                warning.consecutive_violations = getattr(warning, "consecutive_violations", 1) + 1
+            if previous_scan_time <= 0:
+                # Record written before last_scan_time existed. Refusing to count is
+                # the fail-safe reading: a missed increment only delays a ban, while a
+                # guessed one bans a user who never had max_warnings scans.
+                warning.last_scan_time = current_time
+                not_counted_reason = "the previous scan time is unknown (record predates this field)"
+            elif current_time < previous_scan_time:
+                # Clock stepped backwards (NTP correction). The streak cannot be
+                # verified, so it restarts instead of stalling forever on a negative gap.
+                warning.consecutive_violations = 1
+                warning.last_scan_time = current_time
+                not_counted_reason = "the clock moved backwards, so the streak restarted at 1"
             else:
+                elapsed_since_scan = current_time - previous_scan_time
+                if elapsed_since_scan > max_scan_gap:
+                    # Too long ago to be the previous scan of the same streak: downtime,
+                    # or a record resurrected from disk after a restart. Scans that far
+                    # apart are not consecutive, whatever the counter says.
+                    warning.consecutive_violations = 1
+                    warning.last_scan_time = current_time
+                    not_counted_reason = (
+                        f"the previous scan was {elapsed_since_scan:.0f}s ago "
+                        f"(more than {max_scan_gap:.0f}s), so the streak restarted at 1"
+                    )
+                elif elapsed_since_scan >= min_scan_gap:
+                    warning.consecutive_violations = getattr(warning, "consecutive_violations", 1) + 1
+                    warning.last_scan_time = current_time
+                    counted = True
+                else:
+                    not_counted_reason = (
+                        f"it came only {elapsed_since_scan:.0f}s after the previous scan "
+                        f"(minimum {min_scan_gap:.0f}s)"
+                    )
+
+            if not counted:
                 warning_logger.warning(
-                    f"⏱️ User {username} violated again only {elapsed_since_scan:.0f}s after the "
-                    f"previous scan (minimum {min_scan_gap:.0f}s) - the record is refreshed but "
-                    f"the violation is not counted, so a fast loop cannot shortcut the "
-                    f"{self.max_warnings}-scan rule"
+                    f"⏱️ User {username} violated again but the violation was not counted: "
+                    f"{not_counted_reason} - the record is refreshed, so no fast loop and no "
+                    f"restart can shortcut the {self.max_warnings}-scan rule"
                 )
 
             warning.ip_count = ip_count
@@ -381,7 +449,8 @@ class EnhancedWarningSystem:
             same_ip_multiple_inbounds=same_ip_multiple_inbounds,
             connection_details=connection_details,
             user_limit=user_limit if user_limit and user_limit >= 1 else 1,
-            consecutive_violations=1
+            consecutive_violations=1,
+            last_scan_time=current_time
         )
         
         warning.trust_score = warning.calculate_trust_score()
@@ -509,8 +578,13 @@ class EnhancedWarningSystem:
             pass
         
         warning_logger.debug(f"⚠️ Checking {len(self.warnings)} active warnings for persistent violations")
-        
-        for username, warning in self.warnings.items():
+
+        # Snapshot the items: the body below awaits (limit resolution, panel disable,
+        # Telegram sends) and self.warnings can be mutated at any of those points - by
+        # the operator's clear-trust-data command or by the next cycle - which used to
+        # raise "dictionary changed size during iteration" and abandon every remaining
+        # offender for that cycle.
+        for username, warning in list(self.warnings.items()):
             if not warning.is_monitoring_active():
                 warning_logger.debug(f"⚠️ Monitoring ended for {username}")
                 if warning.active_monitoring_task and not warning.active_monitoring_task.done():
@@ -660,7 +734,9 @@ class EnhancedWarningSystem:
                 users_to_remove.append(username)
         
         for username in users_to_remove:
-            del self.warnings[username]
+            # pop, not del: clear_user_trust_data may already have removed the key
+            # while this function was awaiting a panel call or a Telegram send.
+            self.warnings.pop(username, None)
         
         if users_to_remove:
             await self.save_warnings()
@@ -715,38 +791,6 @@ class EnhancedWarningSystem:
         warning_logger.debug(f"📍 Monitoring for {username} handled through periodic checks")
         return
 
-    async def generate_monitoring_summary(self) -> Optional[str]:
-        """
-        Generate a concise monitoring summary for users being monitored.
-        Returns a formatted message or None if no monitoring is active.
-        """
-        if not self.warnings:
-            return None
-        
-        active_warnings = {
-            user: warning for user, warning in self.warnings.items() 
-            if warning.is_monitoring_active()
-        }
-        
-        if not active_warnings:
-            return None
-        
-        period_min = max(1, round(self.monitoring_period / 60))
-        summary_lines = [f"📊 <b>Active Monitoring (~{period_min} min)</b>", "─" * 25]
-        
-        for user, warning in active_warnings.items():
-            time_left = warning.time_remaining()
-            minutes = time_left // 60
-            seconds = time_left % 60
-            trust_level = warning.get_trust_level()
-            
-            summary_lines.append(
-                f"👤 <code>{user}</code>\n"
-                f"   ⏱ {minutes}m{seconds}s | 📍 {warning.ip_count} IPs | Violations: {warning.consecutive_violations}/{self.max_warnings}\n"
-                f"   {trust_level}"
-            )
-        
-        summary_lines.append(f"\n📈 Total: {len(active_warnings)} users monitored")
         
 # Global singleton instance and accessor function
 _warning_system: Optional[EnhancedWarningSystem] = None

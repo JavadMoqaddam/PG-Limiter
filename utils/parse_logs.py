@@ -417,19 +417,23 @@ async def parse_logs(
         
         # Extract email
         if email_match:
-            email = email_match.group(1)
-            email = await remove_id_from_username(email)
+            raw_email = email_match.group(1)
+            # Decide "panel id" vs "username" on the RAW field, before the "<id>."
+            # prefix is stripped. Stripping first turned "9999.1234" into "1234", which
+            # was then re-interpreted as a panel id: a user whose panel username is
+            # numeric had every log line dropped, and if that number happened to match
+            # another user's panel id their IPs were credited to that other user.
+            if raw_email.isdigit():
+                resolved = LOCAL_ID_CACHE.get(raw_email)
+                if not resolved:
+                    # ID was not found in batch pre-resolution, skip it
+                    continue
+                email = resolved
+            else:
+                email = await remove_id_from_username(raw_email)
             # Skip empty usernames or invalid emails
             if not email or not email.strip() or email in INVALID_EMAILS:
                 continue
-                
-            # Translate numeric ID to username (pre-resolved in batch above)
-            if email.isdigit():
-                if email in LOCAL_ID_CACHE:
-                    email = LOCAL_ID_CACHE[email]
-                else:
-                    # ID was not found in batch pre-resolution, skip it
-                    continue
         else:
             continue
 

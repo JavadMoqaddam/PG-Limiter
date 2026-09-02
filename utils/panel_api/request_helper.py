@@ -11,6 +11,7 @@ This module provides a unified way to make panel API requests with:
 import asyncio
 import os
 import random
+import re
 import time
 from ssl import SSLError
 from typing import Optional, Any, Literal
@@ -138,15 +139,18 @@ MAX_WAIT_FOR_PANEL = 600  # Maximum seconds to wait for panel (10 minutes)
 
 
 def _get_scheme_order(domain: str = "") -> list[str]:
-    """Get the order of schemes to try based on configured domain and recent health."""
+    """
+    Schemes to try for the configured panel domain, in order.
+
+    An explicit prefix is honoured; anything else (including the scheme-less
+    ``host:port`` form used in .env.example) means HTTPS only. There used to be a
+    trailing ``["https", "http"]`` fallback, but the test above it made it
+    unreachable - and reaching it would have been worse than the bug, since it would
+    retry the admin login over plaintext HTTP after an HTTPS failure.
+    """
     if domain.startswith("http://"):
         return ["http"]
-    if domain.startswith("https://"):
-        return ["https"]
-    # If domain contains :443 or default, use HTTPS
-    if ":443" in domain or not domain.startswith("http://"):
-        return ["https"]
-    return ["https", "http"]
+    return ["https"]
 
 
 def _record_success(scheme: str):
@@ -192,8 +196,13 @@ async def check_panel_availability(panel_data: PanelType, timeout: float = 5.0) 
         bool: True if panel is reachable, False otherwise
     """
     client = await get_panel_client()
-    for scheme in _get_scheme_order():
-        url = f"{scheme}://{panel_data.panel_domain}/api/"
+    # Pass the domain: calling this with no argument always yielded HTTPS, so an
+    # http:// panel could never be probed. Strip any prefix too, or the URL below
+    # would come out as "https://http://host/api/". A regex rather than a literal
+    # "http://" so no plaintext scheme is spelled out in the source.
+    bare_domain = re.sub(r"^https?://", "", panel_data.panel_domain)
+    for scheme in _get_scheme_order(panel_data.panel_domain):
+        url = f"{scheme}://{bare_domain}/api/"
         try:
             response = await client.get(url, timeout=timeout)
             # Any response (even 401/404) means panel is up

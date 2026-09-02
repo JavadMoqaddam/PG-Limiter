@@ -971,8 +971,10 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     )
 
                 if result == "violation_limit_reached":
-                    from utils.warning_system import safe_disable_user_with_punishment
-                    from telegram_bot.send_message import send_disable_notification
+                    from utils.warning_system import (
+                        safe_disable_user_with_punishment,
+                        safe_send_disable_notification,
+                    )
                     from datetime import datetime
 
                     punishment_result = await safe_disable_user_with_punishment(
@@ -992,7 +994,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     trust_level = w_obj.get_trust_level() if w_obj else "🟡 MEDIUM"
                     activity_summary = w_obj.get_ip_activity_summary() if w_obj else ""
 
-                    if punishment_result.get("action") == "revoked":
+                    ban_action = str(punishment_result.get("action") or "")
+                    if ban_action == "revoked":
                         revoke_note = "✅ Sub revoked" if punishment_result.get("revoke_success", False) else "⚠️ Revoke failed"
                         uuid_note = "✅ UUID reset" if punishment_result.get("uuid_reset_success", False) else "⚠️ UUID failed"
                         msg = (
@@ -1006,6 +1009,33 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                             f"Duration: <code>Until manual enable</code>\n"
                             f"📊 IP Activity:\n<code>{activity_summary}</code>"
                         )
+                    elif ban_action in ("error", "skipped"):
+                        # No punishment was applied. This used to fall into the
+                        # "USER DISABLED ... Until manual enable" text below, because
+                        # that wording is chosen by duration_minutes == 0 - which is
+                        # exactly what a failure returns. The operator was told a user
+                        # had been banned forever while nothing had happened at all.
+                        from html import escape as _esc
+                        reason = _esc(str(punishment_result.get("message") or ban_action))
+                        msg = (
+                            f"❗️ <b>BAN FAILED</b> - {time_str}\n\n"
+                            f"User: <code>{user_name}</code>\n"
+                            f"Active Devices: <code>{effective_device_count}</code> ({len(unique_ips)} IPs)\n"
+                            f"User limit: <code>{user_limit_number}</code>\n"
+                            f"Outcome: <code>{ban_action}</code>\n"
+                            f"Reason: <code>{reason}</code>\n\n"
+                            f"⚠️ The user was NOT disabled. Their counter was reset, so "
+                            f"{max_warning_count} fresh consecutive scans are needed again."
+                        )
+                    elif ban_action == "warning":
+                        msg = (
+                            f"⚠️ <b>WARNING STEP APPLIED</b> - {time_str}\n\n"
+                            f"User: <code>{user_name}</code>\n"
+                            f"Active Devices: <code>{effective_device_count}</code> ({len(unique_ips)} IPs)\n"
+                            f"User limit: <code>{user_limit_number}</code>\n\n"
+                            f"📊 Violation #{punishment_result.get('violation_count', 1)} (Step {punishment_result.get('step_index', 0) + 1})\n"
+                            f"This escalation step only warns - the user was not disabled."
+                        )
                     else:
                         msg = (
                             f"🚫 <b>USER DISABLED</b> - {time_str}\n\n"
@@ -1017,12 +1047,25 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                             f"{duration_text}"
                             f"📊 IP Activity:\n<code>{activity_summary}</code>"
                         )
-                    await send_disable_notification(msg, user_name)
+                    # Clear the record BEFORE notifying, and never let a Telegram
+                    # failure propagate. The old order was notify-then-clear with the
+                    # raw sender, so an unreachable chat left consecutive_violations at
+                    # the threshold: the next cycle returned "violation_limit_reached"
+                    # again and record_violation advanced the escalation a second time,
+                    # jumping the user a punishment step for a single offence.
                     await warning_system.clear_user_trust_data(user_name)
-                    logger.warning(f"🚫 Disabled user {user_name} after {max_warning_count} consecutive violation scans (limit: {user_limit_number})")
-                elif result == "instant_disabled":
-                    disabled_users.add(user_name)
-                    logger.warning(f"User {user_name} instantly disabled due to low trust score")
+                    await safe_send_disable_notification(msg, user_name)
+                    if ban_action in ("error", "skipped"):
+                        logger.error(
+                            f"❗️ Ban FAILED for {user_name} (action={ban_action}): "
+                            f"{punishment_result.get('message')}. The user is still enabled."
+                        )
+                    else:
+                        logger.warning(
+                            f"🚫 Disabled user {user_name} after {max_warning_count} "
+                            f"consecutive violation scans (limit: {user_limit_number}, "
+                            f"action={ban_action or 'disabled'})"
+                        )
                 elif result in ("new", "updated"):
                     w_obj = warning_system.warnings.get(user_name)
                     trust_score = w_obj.trust_score if w_obj else 0.0
@@ -1196,7 +1239,17 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
         # cycle is skipped entirely: feeding partial data to check_users_usage
         # would clear the consecutive-violation counters of real offenders.
         run_enforcement = True
-        if str(config_data.get("ip_source") or "logs") == "api":
+        if config_data.get("config_degraded"):
+            # read_config could not reach the database, so the whitelist, the special
+            # limits and the group limits are all unknown - and a group_filter that
+            # reads as disabled means "limit every user". Enforcing on that would ban
+            # excepted users and users whose real limit is higher than the general one.
+            logger.critical(
+                "⛔ Configuration is degraded (database settings unavailable) - skipping "
+                "enforcement this cycle. Counters keep their values."
+            )
+            run_enforcement = False
+        elif str(config_data.get("ip_source") or "logs") == "api":
             from utils.ip_source_api import collect_active_users_from_api
 
             try:

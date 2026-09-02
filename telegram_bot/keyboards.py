@@ -200,60 +200,6 @@ def create_admin_menu_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-def create_country_keyboard():
-    """Create country code selection keyboard."""
-    keyboard = [
-        [
-            InlineKeyboardButton("🇮🇷 Iran (IR)", callback_data=CallbackData.COUNTRY_IR),
-            InlineKeyboardButton("🇷🇺 Russia (RU)", callback_data=CallbackData.COUNTRY_RU),
-        ],
-        [
-            InlineKeyboardButton("🇨🇳 China (CN)", callback_data=CallbackData.COUNTRY_CN),
-            InlineKeyboardButton("🌍 All Countries", callback_data=CallbackData.COUNTRY_NONE),
-        ],
-        [
-            InlineKeyboardButton("🔙 Back", callback_data=CallbackData.BACK_SETTINGS),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def create_interval_keyboard():
-    """Create check interval selection keyboard."""
-    keyboard = [
-        [
-            InlineKeyboardButton("2 min", callback_data=CallbackData.INTERVAL_120),
-            InlineKeyboardButton("3 min", callback_data=CallbackData.INTERVAL_180),
-        ],
-        [
-            InlineKeyboardButton("4 min", callback_data=CallbackData.INTERVAL_240),
-            InlineKeyboardButton("✏️ Custom", callback_data=CallbackData.INTERVAL_CUSTOM),
-        ],
-        [
-            InlineKeyboardButton("🔙 Back", callback_data=CallbackData.BACK_SETTINGS),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def create_time_to_active_keyboard():
-    """Create time to active selection keyboard."""
-    keyboard = [
-        [
-            InlineKeyboardButton("5 min", callback_data=CallbackData.TIME_300),
-            InlineKeyboardButton("10 min", callback_data=CallbackData.TIME_600),
-        ],
-        [
-            InlineKeyboardButton("15 min", callback_data=CallbackData.TIME_900),
-            InlineKeyboardButton("✏️ Custom", callback_data=CallbackData.TIME_CUSTOM),
-        ],
-        [
-            InlineKeyboardButton("🔙 Back", callback_data=CallbackData.BACK_SETTINGS),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
 def create_enhanced_details_keyboard():
     """Create enhanced details toggle keyboard."""
     keyboard = [
@@ -311,7 +257,11 @@ def create_punishment_menu_keyboard(enabled: bool = False):
         ],
         [
             InlineKeyboardButton("72h Window", callback_data=CallbackData.PUNISHMENT_WINDOW_72),
-            InlineKeyboardButton("✏️ Custom", callback_data=CallbackData.PUNISHMENT_WINDOW_CUSTOM),
+            # Was "✏️ Custom" (PUNISHMENT_WINDOW_CUSTOM), which has no route in
+            # CALLBACK_ROUTES and no prefix handler, so pressing it only produced
+            # "⚠️ Unhandled callback". PUNISHMENT_WINDOW_168 is already routed and 168h
+            # is the configured default, so it had a route but no button.
+            InlineKeyboardButton("7d Window", callback_data=CallbackData.PUNISHMENT_WINDOW_168),
         ],
         [
             InlineKeyboardButton("🔙 Back", callback_data=CallbackData.BACK_SETTINGS),

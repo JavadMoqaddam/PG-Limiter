@@ -363,7 +363,7 @@ class TestBuildUsersFromPayloads:
         assert {c.inbound_protocol for c in user.device_info.connections} == {"API"}
         assert stats == {
             "geo_lookups": 0, "nodes_seen": 1, "total_ips": 2, "users_with_ips": 1,
-            "stale_ips": 0,
+            "stale_ips": 0, "future_ips": 0,
         }
 
     @pytest.mark.asyncio

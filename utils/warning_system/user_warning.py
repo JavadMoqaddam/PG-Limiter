@@ -43,6 +43,13 @@ class UserLimitWarning:
     connection_details: list = None  # List of connection info for analysis
     user_limit: int = 1  # The user's effective limit
     consecutive_violations: int = 1  # Number of consecutive scan cycles user has violated
+    # Wall-clock time of the scan that last incremented consecutive_violations.
+    # Stored explicitly because the alternative - deriving it from
+    # monitoring_end_time minus the current monitoring_period - silently breaks the
+    # moment the operator edits check_interval or max_warning_count, since the
+    # period that wrote the deadline is no longer the period used to read it back.
+    # 0.0 means "unknown" (a record written before this field existed).
+    last_scan_time: float = 0.0
     
     def __post_init__(self):
         if self.monitoring_history is None:

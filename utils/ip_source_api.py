@@ -386,6 +386,9 @@ async def _build_users_from_payloads(
     raw_ips: set[str] = set()
     nodes_seen: set[int] = set()
     stale_dropped = 0
+    future_dropped = 0
+    # Tolerance for ordinary clock skew between panel and limiter.
+    future_cutoff = now + max(60.0, float(freshness or 0))
 
     for username, node_map in payloads.items():
         pairs: list[tuple[int, str]] = []
@@ -397,9 +400,20 @@ async def _build_users_from_payloads(
             for ip, value in ip_values.items():
                 # Values below the floor are legacy connection counts, not
                 # timestamps, and carry no freshness information.
-                if value >= STALE_EPOCH_FLOOR and value < stale_cutoff:
-                    stale_dropped += 1
-                    continue
+                if value >= STALE_EPOCH_FLOOR:
+                    if value > future_cutoff:
+                        # A last-seen stamp cannot be in the future. The panel clock is
+                        # ahead (or the value is garbage), which silently turned the
+                        # whole freshness filter into a no-op and let the panel's
+                        # never-expiring IP list inflate device counts again. Treat it
+                        # as unusable: if every value looks like this, the existing
+                        # "all IPs stale" gate skips the cycle instead of enforcing.
+                        future_dropped += 1
+                        stale_dropped += 1
+                        continue
+                    if value < stale_cutoff:
+                        stale_dropped += 1
+                        continue
                 pairs.append((node_id, ip))
                 raw_ips.add(ip)
         if pairs:
@@ -439,12 +453,21 @@ async def _build_users_from_payloads(
         new_users[username] = user
         total_ips += len(user.ip)
 
+    if future_dropped:
+        api_ip_logger.warning(
+            f"🛰️ {future_dropped} reported IP timestamps were in the future (more than "
+            f"{future_cutoff - now:.0f}s ahead) and were discarded - check the clock skew "
+            f"between the panel and this host, the freshness filter cannot work while "
+            f"the panel clock runs ahead"
+        )
+
     stats = {
         "geo_lookups": geo_lookups,
         "nodes_seen": len(nodes_seen),
         "total_ips": total_ips,
         "users_with_ips": len(new_users),
         "stale_ips": stale_dropped,
+        "future_ips": future_dropped,
     }
     return new_users, stats
 

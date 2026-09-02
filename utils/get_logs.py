@@ -240,9 +240,19 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
                 await asyncio.sleep(30)
                 continue
         
-        get_panel_token = await get_token(panel_data)
-        if isinstance(get_panel_token, ValueError):
-            raise get_panel_token
+        # get_token raises on failure. This call sat outside the try below, so a panel
+        # that refused to authenticate killed this node's task - and with it, being a
+        # TaskGroup child, the whole process. Retry in place instead: the loop already
+        # handles panel unavailability a few lines up.
+        try:
+            get_panel_token = await get_token(panel_data)
+        except Exception as token_error:  # pylint: disable=broad-except
+            logger.error(
+                f"Could not obtain a panel token for node {node.node_id}: {token_error}. "
+                f"Retrying in 30s."
+            )
+            await asyncio.sleep(30)
+            continue
         token = get_panel_token.panel_token
         
         # Determine the scheme based on the domain
@@ -355,8 +365,21 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
     
     deactivate_nodes = {}  # task_name -> node_id
     while True:
-        nodes_list = await get_nodes(panel_data)
-        for node in nodes_list:
+        # get_nodes RAISES ValueError when the panel is unreachable or the circuit
+        # breaker is open - it never returns one, despite the isinstance() guards
+        # scattered around the codebase. This coroutine is a TaskGroup child, so an
+        # unguarded raise here cancelled every SSE stream and took the whole process
+        # down on a transient panel hiccup. One failed poll must only cost one poll.
+        try:
+            nodes_list = await get_nodes(panel_data)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                f"Could not fetch the node list to look for disconnected nodes: {error}. "
+                f"Retrying on the next pass; existing streams are left alone."
+            )
+            await asyncio.sleep(60)
+            continue
+        for node in nodes_list or []:
             if node.status != "connected":
                 task_name = f"Task-{node.node_id}-{node.node_name}"
                 deactivate_nodes[task_name] = node.node_id
@@ -453,9 +476,18 @@ async def handle_cancel_all(tasks: list[Task], panel_data: PanelType, tg: asynci
         # Small delay to let tasks clean up
         await asyncio.sleep(2)
         
-        # Fetch fresh node list
-        nodes_list = await get_nodes(panel_data)
-        if nodes_list and not isinstance(nodes_list, ValueError):
+        # Fetch fresh node list. get_nodes raises on failure rather than returning a
+        # ValueError, so an unguarded call here could take the whole TaskGroup - and
+        # therefore the process - down while rebuilding the streams.
+        try:
+            nodes_list = await get_nodes(panel_data)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.error(
+                f"Could not fetch the node list while rebuilding SSE streams: {error}. "
+                f"No streams were recreated on this pass."
+            )
+            nodes_list = None
+        if nodes_list:
             # Initialize status message for all nodes
             await init_node_status_message(nodes_list)
             
