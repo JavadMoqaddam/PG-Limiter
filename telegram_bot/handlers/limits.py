@@ -22,6 +22,7 @@ from telegram_bot.utils import (
     get_special_limits_dict,
     handel_special_limit,
     save_general_limit,
+    special_limit_rejection,
 )
 from telegram_bot.keyboards import (
     create_back_to_main_keyboard,
@@ -74,6 +75,10 @@ async def get_limit_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=f"Wrong input: <code>{update.message.text.strip()}"
             + "</code>\ntry again <b>/set_special_limit</b>"
         )
+        return ConversationHandler.END
+    rejection = special_limit_rejection(context.user_data["limit_number"])
+    if rejection:
+        await update.message.reply_html(text=rejection)
         return ConversationHandler.END
     out_put = await handel_special_limit(
         context.user_data["selected_user"], context.user_data["limit_number"]
@@ -416,6 +421,27 @@ async def handle_special_limit_number_input(update: Update, context: ContextType
     text = update.message.text.strip()
     try:
         limit = int(text)
+    except ValueError:
+        await update.message.reply_html(
+            text="❌ Invalid number. Please send a valid number.",
+            reply_markup=create_back_to_main_keyboard()
+        )
+        context.user_data["waiting_for"] = None
+        return
+
+    # 0 and negatives used to be accepted here, and a stored limit of 0 made a single
+    # device a violation - so an admin reaching for "no limit" got the user banned
+    # instead. Unlimited has its own mechanism.
+    rejection = special_limit_rejection(limit)
+    if rejection:
+        await update.message.reply_html(
+            text=rejection,
+            reply_markup=create_back_to_main_keyboard()
+        )
+        context.user_data["waiting_for"] = None
+        return
+
+    try:
         username = context.user_data.get("selected_user", "user")
         out_put = await handel_special_limit(username, limit)
         msg = f"✅ Special limit for <b>{username}</b> set to <b>{limit}</b>"

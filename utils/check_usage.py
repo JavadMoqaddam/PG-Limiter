@@ -104,9 +104,24 @@ async def resolve_effective_limit(
     # 1. Check direct special limit override
     if special_limit and username in special_limit:
         try:
-            return int(special_limit[username])
+            raw_special = int(special_limit[username])
         except (ValueError, TypeError):
             pass
+        else:
+            if raw_special >= 1:
+                return raw_special
+            # A stored limit of 0 or less is not a limit of zero - it would make one
+            # device a violation and ban the user after the usual consecutive scans.
+            # Zero is rejected at input now, so a row like this is legacy or hand-edited
+            # data. Treat it the way the sync half already does (user_sync.py checks
+            # "> 0") and fall through to the group or general limit, which is both the
+            # safe direction and the only reading that keeps this function's promise of
+            # returning >= 1. "Unlimited" is the whitelist, not a special limit of 0.
+            logger.warning(
+                f"Ignoring special limit {raw_special!r} for {username}: a special limit "
+                f"must be 1 or greater. Falling back to the group or general limit - to "
+                f"exempt this user entirely, add them to the whitelist instead."
+            )
 
     # 2. Check pre-computed metadata limit (if provided)
     if metadata and isinstance(metadata, dict):

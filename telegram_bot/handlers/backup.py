@@ -4,6 +4,7 @@ Includes functions for creating and restoring backups.
 """
 
 import asyncio
+import html
 import json
 import os
 import shutil
@@ -265,10 +266,16 @@ async def restore_config_handler(update: Update, context: ContextTypes.DEFAULT_T
                     if config_data.get("enhanced_details") is not None:
                         await ConfigCRUD.set(db, "enhanced_details", str(config_data["enhanced_details"]).lower())
                     
-                    # Import special limits
+                    # Import special limits. A limit below 1 is refused by the CRUD (it
+                    # would ban the user rather than exempt them), so skip that entry and
+                    # report it instead of letting one bad row abort the whole import.
                     special_limits = config_data.get("limits", {}).get("special", {})
+                    skipped_limits = []
                     for username, limit in special_limits.items():
-                        await UserCRUD.set_special_limit(db, username, limit)
+                        try:
+                            await UserCRUD.set_special_limit(db, username, limit)
+                        except ValueError as error:
+                            skipped_limits.append(f"{username} ({error})")
                     
                     # Import except users
                     except_users = config_data.get("except_users", [])
@@ -284,6 +291,13 @@ async def restore_config_handler(update: Update, context: ContextTypes.DEFAULT_T
                     "📝 Panel credentials should be set in .env file.\n"
                     "ℹ️ The imported settings are already live; only .env changes "
                     "need a service restart."
+                    + (
+                        "\n\n⚠️ Skipped these special limits because a limit must be 1 "
+                        "or greater — put the user in the whitelist for no limit:\n"
+                        + "\n".join(f"• <code>{html.escape(entry)}</code>" for entry in skipped_limits)
+                        if skipped_limits
+                        else ""
+                    )
                 )
                 
             except json.JSONDecodeError as e:

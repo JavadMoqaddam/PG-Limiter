@@ -192,6 +192,29 @@ async def check_admin() -> list[int] | None:
     return []
 
 
+SPECIAL_LIMIT_MIN = 1
+
+
+def special_limit_rejection(limit: int) -> str | None:
+    """
+    Return an admin-facing rejection message for a bad special limit, or None if usable.
+
+    0 and negatives used to be stored as-is, and a stored limit of 0 makes a single
+    device a violation - so an admin reaching for "no limit" got the user banned on
+    their first connection. Unlimited has its own mechanism in this project: the
+    whitelist. A special limit is always a real device count of 1 or more.
+    """
+    if limit < SPECIAL_LIMIT_MIN:
+        return (
+            f"❌ A special limit must be <b>{SPECIAL_LIMIT_MIN}</b> or greater "
+            f"(you sent <code>{limit}</code>).\n\n"
+            "If you want this user to have <b>no limit at all</b>, add them to the "
+            "whitelist instead — a special limit of 0 would ban them on their first "
+            "device, not exempt them."
+        )
+    return None
+
+
 async def handle_special_limit(username: str, limit: int) -> list:
     """
     Handles the special limit for a given username using database.
