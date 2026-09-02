@@ -622,51 +622,81 @@ async def read_config_scalar(key: str, default: Any = None) -> Any:
 
 async def save_config_value(key: str, value: Any) -> bool:
     """
-    Save a dynamic configuration value to database.
-    
-    Args:
-        key: Configuration key
-        value: Value to save
-        
+    Save a dynamic configuration value to the database.
+
     Returns:
-        True if successful
+        True if the write committed.
+
+    A failure used to return ``False`` with nothing in the log, and almost every
+    caller is a Telegram handler that reports success without reading the result - so
+    the operator saw a green tick, the setting was not stored, and there was no trace
+    to find later. The write is still best-effort, but it is no longer silent.
     """
     if not DB_AVAILABLE:
+        config_logger.error(
+            f"❌ Cannot save configuration {key!r}: the database module is unavailable"
+        )
         return False
-    
+
     try:
         async with get_db() as session:
             await ConfigCRUD.set(session, key, str(value))
-        await invalidate_config_cache()
         return True
-    except Exception:
+    except Exception as error:  # pylint: disable=broad-except
+        config_logger.exception(
+            f"❌ Failed to save configuration {key!r}: {error}. The previous value is "
+            f"still in effect."
+        )
         return False
+    finally:
+        # Unconditionally, including on failure. If the write really did not land, the
+        # cache already matches the database and the rebuild is a no-op; if it landed
+        # and something after it raised, dropping the cache is the only thing that
+        # stops the process from serving the old value for the rest of its life.
+        await invalidate_config_cache()
 
 
 async def delete_config_value(key: str) -> bool:
-    """Delete a configuration value from database."""
+    """Delete a configuration value from the database."""
     if not DB_AVAILABLE:
+        config_logger.error(
+            f"❌ Cannot delete configuration {key!r}: the database module is unavailable"
+        )
         return False
-    
+
     try:
         async with get_db() as session:
             await ConfigCRUD.delete(session, key)
-        await invalidate_config_cache()
         return True
-    except Exception:
+    except Exception as error:  # pylint: disable=broad-except
+        config_logger.exception(
+            f"❌ Failed to delete configuration {key!r}: {error}. The previous value is "
+            f"still in effect."
+        )
         return False
+    finally:
+        await invalidate_config_cache()
 
 
 async def get_config_value_from_db(key: str, default: Any = None) -> Any:
-    """Get a single config value from database."""
+    """
+    Get a single config value straight from the database.
+
+    A read failure returns ``default``, which is indistinguishable from "not set" -
+    so it is logged rather than swallowed.
+    """
     if not DB_AVAILABLE:
         return default
-    
+
     try:
         async with get_db() as session:
             value = await ConfigCRUD.get(session, key, default)
             return value
-    except Exception:
+    except Exception as error:  # pylint: disable=broad-except
+        config_logger.error(
+            f"⚠️ Could not read configuration {key!r} from the database: {error}. "
+            f"Falling back to {default!r}, which reads the same as 'not set'."
+        )
         return default
 
 
