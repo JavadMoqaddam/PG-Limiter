@@ -34,11 +34,96 @@ from utils.atomic_io import atomic_write_json
 punishment_logger = get_logger("punishment")
 
 
+# Used when a configured disable step has a duration that cannot be read. It is
+# deliberately not 0: on a disable step 0 means "unlimited, manual enable only", so a
+# malformed or missing value must never be able to produce the harshest punishment in
+# the list. 10 minutes matches the shortest step in DEFAULT_STEPS.
+FALLBACK_DISABLE_MINUTES = 10
+
+_VALID_STEP_TYPES = ("warning", "disable", "revoke")
+
+
+def _coerce_duration_minutes(raw, step_type: str) -> int:
+    """
+    Turn a configured duration into a non-negative whole number of minutes.
+
+    The steps list arrives as untyped JSON (read_config json.loads() the
+    ``punishment_steps`` row), so this value can be a string, a float, None, or
+    absent. Nothing downstream defends itself: get_duration_seconds() multiplies it by
+    60, is_unlimited_disable() compares it to 0 with ``==``, and get_display_text()
+    compares it to 60 with ``<``. A string therefore reached the panel as
+    ``"30" * 60`` - a 120-character string - and only failed later, after the user had
+    already been disabled but before anything recorded it, leaving a ban nothing would
+    ever lift. None raised before the disable instead, so the violation went
+    unpunished.
+
+    0 is a meaningful value, so anything unusable must not collapse to it. On a disable
+    step an unusable value becomes FALLBACK_DISABLE_MINUTES; on a warning or revoke
+    step it becomes 0, where the duration is ignored anyway.
+    """
+    unusable = FALLBACK_DISABLE_MINUTES if step_type == "disable" else 0
+
+    if isinstance(raw, bool):
+        # bool is a subclass of int; True would silently become 1 minute.
+        value = None
+    elif isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, float):
+        value = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            value = None
+    else:
+        value = None
+
+    if value is None or value < 0:
+        punishment_logger.error(
+            f"⚠️ Punishment step duration {raw!r} is not a whole number of minutes >= 0 "
+            f"(step type {step_type!r}) - using {unusable} instead. On a disable step "
+            f'"duration": 0 is the only way to ask for an unlimited ban.'
+        )
+        return unusable
+    return value
+
+
+def _coerce_window_hours(raw, default: int) -> int:
+    """
+    Turn a configured violation window into a positive whole number of hours.
+
+    cleanup_old_violations() computes ``window_hours * 60 * 60`` and subtracts it from
+    a timestamp, so a string here multiplied into a huge string and then raised
+    TypeError from inside the violation count, on the ban path.
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 0
+    if value < 1:
+        punishment_logger.error(
+            f"⚠️ Punishment window {raw!r} is not a positive number of hours - "
+            f"using the default of {default}h"
+        )
+        return default
+    return value
+
+
 @dataclass
 class PunishmentStep:
     """Represents a single punishment step"""
     step_type: str  # "warning", "disable", or "revoke"
     duration_minutes: int  # 0 = unlimited/permanent for disable, ignored for warning/revoke
+
+    def __post_init__(self):
+        """
+        Normalise both fields so no later reader has to defend itself.
+
+        This is the invariant the rest of the class relies on: after construction,
+        ``duration_minutes`` is always a non-negative int, whatever was passed in.
+        """
+        self.step_type = str(self.step_type or "").strip().lower()
+        self.duration_minutes = _coerce_duration_minutes(self.duration_minutes, self.step_type)
     
     def is_warning(self) -> bool:
         """Check if this step is a warning only"""
@@ -196,18 +281,58 @@ class PunishmentSystem:
         """
         punishment_config = config_data.get("punishment", {})
         
-        self.enabled = punishment_config.get("enabled", True)
-        self.window_hours = punishment_config.get("window_hours", self.DEFAULT_WINDOW_HOURS)
-        
+        self.enabled = bool(punishment_config.get("enabled", True))
+        self.window_hours = _coerce_window_hours(
+            punishment_config.get("window_hours", self.DEFAULT_WINDOW_HOURS),
+            self.DEFAULT_WINDOW_HOURS,
+        )
+
         # Load steps from config
         steps_config = punishment_config.get("steps", None)
         if steps_config and isinstance(steps_config, list) and len(steps_config) > 0:
             self.steps = []
-            for step in steps_config:
-                step_type = step.get("type", "disable")
-                duration = step.get("duration", 0)
+            for position, step in enumerate(steps_config, start=1):
+                if not isinstance(step, dict):
+                    punishment_logger.error(
+                        f"⚠️ Punishment step {position} is {type(step).__name__}, not an "
+                        f"object - skipping it"
+                    )
+                    continue
+
+                step_type = str(step.get("type") or "disable").strip().lower()
+                if step_type not in _VALID_STEP_TYPES:
+                    punishment_logger.error(
+                        f"⚠️ Punishment step {position} has unknown type "
+                        f"{step.get('type')!r} - treating it as a warning, so a step "
+                        f"nobody can read cannot disable anyone"
+                    )
+                    step_type = "warning"
+
+                if "duration" in step:
+                    duration = _coerce_duration_minutes(step["duration"], step_type)
+                elif step_type == "disable":
+                    # The old code read this with .get("duration", 0), and 0 on a
+                    # disable step means unlimited - so a step that simply forgot the
+                    # key was a permanent, manual-enable-only ban, logged nowhere.
+                    punishment_logger.error(
+                        f"⚠️ Punishment step {position} is a disable with no duration "
+                        f"key - using {FALLBACK_DISABLE_MINUTES} minutes. An unlimited "
+                        f'ban has to say so explicitly with "duration": 0.'
+                    )
+                    duration = FALLBACK_DISABLE_MINUTES
+                else:
+                    duration = 0
+
                 self.steps.append(PunishmentStep(step_type, duration))
-            punishment_logger.info(f"📋 Loaded {len(self.steps)} punishment steps from config (window: {self.window_hours}h)")
+
+            if not self.steps:
+                self.steps = self.DEFAULT_STEPS.copy()
+                punishment_logger.error(
+                    "⚠️ No usable punishment step in the configuration - falling back "
+                    "to the built-in steps"
+                )
+            else:
+                punishment_logger.info(f"📋 Loaded {len(self.steps)} punishment steps from config (window: {self.window_hours}h)")
         else:
             self.steps = self.DEFAULT_STEPS.copy()
             punishment_logger.debug("📋 Using default punishment steps")
