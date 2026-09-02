@@ -474,10 +474,10 @@ async def _clear_database_disable_flags(username: str, restored_groups: list[int
         restored_groups: Optional list of restored group IDs to update in DB.
     """
     try:
-        from db.database import get_db_session
+        from db.database import get_db
         from db.crud import UserCRUD
         
-        async with get_db_session() as db:
+        async with get_db() as db:
             user_record = await UserCRUD.get_by_username(db, username)
             if user_record:
                 user_record.is_disabled_by_limiter = False
@@ -522,10 +522,10 @@ async def enable_user_by_group(panel_data: PanelType, username: str) -> tuple[bo
         if original_groups is None:
             users_logger.debug(f"📦 No groups in JSON for {username}, checking database...")
             try:
-                from db.database import get_db_session
+                from db.database import get_db
                 from db.crud import UserCRUD
                 
-                async with get_db_session() as db:
+                async with get_db() as db:
                     user_record = await UserCRUD.get_disabled_record(db, username)
                     if user_record and user_record.original_groups:
                         original_groups = user_record.original_groups
@@ -950,10 +950,10 @@ async def disable_user_by_group(panel_data: PanelType, username: str, disabled_g
         
         # Also save to database (secondary backup for redundancy)
         try:
-            from db.database import get_db_session
+            from db.database import get_db
             from db.crud import UserCRUD
             
-            async with get_db_session() as db:
+            async with get_db() as db:
                 user_record = await UserCRUD.get_by_username(db, username)
                 if user_record:
                     user_record.original_groups = original_groups_to_save
