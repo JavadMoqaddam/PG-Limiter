@@ -170,12 +170,20 @@ def resolve_monitored_group_ids(config_data: dict) -> Optional[list[int]]:
 
 
 def resolve_monitored_admins(config_data: dict) -> Optional[list[str]]:
-    """Return the admin usernames the candidate query can be restricted to."""
-    admin_filter = config_data.get("admin_filter") or {}
-    if admin_filter.get("enabled") and admin_filter.get("mode", "include") == "include":
-        usernames = [str(a) for a in (admin_filter.get("admin_usernames") or []) if a]
-        if usernames:
-            return usernames
+    """
+    Always ``None``: the admin filter cannot be expressed as a panel-side filter.
+
+    The enforcement gate in ``check_usage`` is deliberately fail-open on ownership - a
+    user whose local ``owner_username`` is NULL is still limited, because a sync gap
+    must not silently exempt anyone. The panel's ``admin`` parameter is an ANY-of match
+    over named admins, so it cannot express "…or has no known owner" and would drop
+    exactly those users from the query while enforcement still judged them.
+
+    Same rule as ``resolve_monitored_group_ids``: narrowing is only allowed where it
+    provably cannot drop a user enforcement would judge. It does not hold here, so the
+    admin filter stays client-side. The query is still bounded by ``status=active`` and
+    the online-freshness window.
+    """
     return None
 
 

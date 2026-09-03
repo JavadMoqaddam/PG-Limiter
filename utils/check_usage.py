@@ -503,8 +503,12 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     for email in active_usernames_list:
         user_meta = users_metadata.get(email, {})
 
-        # Check group filter
-        if group_filter_enabled and group_filter_ids:
+        # Check group filter. Gated on `enabled` alone, not on `enabled and ids`: an
+        # enabled include filter with an empty group list makes NOBODY monitored, and
+        # requiring a non-empty list here made this report show every user as monitored
+        # while enforcement skipped all of them - the report contradicting the thing it
+        # is meant to describe.
+        if group_filter_enabled:
             user_gids = [str(x) for x in user_meta.get("group_ids", [])]
             user_in_group = any(g in group_filter_ids for g in user_gids)
             if group_filter_mode == "include" and not user_in_group:

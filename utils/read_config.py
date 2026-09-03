@@ -13,6 +13,7 @@ reading - see the note on the cache below.
 import copy
 import math
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from utils.logs import get_logger
@@ -37,6 +38,11 @@ except ImportError:
 # instead: ``read_config`` deep-copies on the way out. Read
 # ``read_config_scalar`` for the one case that does not need a copy.
 _config_cache: Optional[Dict[str, Any]] = None
+
+# Throttle for the database-failure traceback below. A degraded configuration is never
+# cached, so while the database is down every read retries and would log again.
+DB_FAILURE_LOG_INTERVAL = 60.0
+_db_failure_logged_at = -DB_FAILURE_LOG_INTERVAL
 
 
 async def invalidate_config_cache():
@@ -248,16 +254,30 @@ async def load_db_config() -> Dict[str, Any]:
     except Exception as error:  # pylint: disable=broad-except
         # Silence here was dangerous. An empty dict makes read_config build a config
         # with no whitelist, no special limits, no group limits and group_filter
-        # disabled - and a disabled group filter means "limit every user"
-        # (user_group_filter.should_limit_user returns True when it is off). One
+        # disabled - and a disabled group filter means "limit every user". One
         # transient SQLite error could therefore put every monitored user under the
         # general limit with no exceptions, and the result was cached for the life of
         # the process with nothing in the log to show it.
-        config_logger.exception(
-            f"❌ Could not load dynamic configuration from the database: {error}. "
-            f"Whitelist, special limits and group limits are unknown, so this "
-            f"configuration must not be used for enforcement."
-        )
+        #
+        # Throttled, because a degraded configuration is deliberately never cached: while
+        # the database is down every read rebuilds, and the SSE loop alone asks ~600
+        # times per cycle. Un-throttled that buried the actual failure under hundreds of
+        # identical tracebacks. The first one is full; after that it is one line a minute.
+        global _db_failure_logged_at
+
+        now = time.monotonic()
+        if now - _db_failure_logged_at > DB_FAILURE_LOG_INTERVAL:
+            _db_failure_logged_at = now
+            config_logger.exception(
+                f"❌ Could not load dynamic configuration from the database: {error}. "
+                f"Whitelist, special limits and group limits are unknown, so this "
+                f"configuration must not be used for enforcement."
+            )
+        else:
+            config_logger.error(
+                f"❌ Database configuration still unavailable: {error} "
+                f"(traceback throttled to once every {int(DB_FAILURE_LOG_INTERVAL)}s)"
+            )
         return {"_load_failed": True}
 
 

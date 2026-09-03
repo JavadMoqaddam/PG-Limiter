@@ -214,9 +214,17 @@ class TestResolveMonitoredGroupIds:
 
 
 class TestResolveMonitoredAdmins:
-    """Admin narrowing mirrors the group logic."""
+    """
+    The admin filter never narrows the panel query.
 
-    def test_include_mode_returns_usernames(self):
+    The enforcement gate is fail-open on ownership - a user whose local owner_username
+    is NULL is still limited, so a sync gap cannot silently exempt anyone. The panel's
+    admin parameter is an ANY-of match over named admins and cannot express "…or has no
+    known owner", so narrowing by it would drop exactly those users from the query while
+    enforcement still judged them.
+    """
+
+    def test_include_mode_does_not_narrow(self):
         from utils.ip_source_api import resolve_monitored_admins
 
         config = {
@@ -224,7 +232,7 @@ class TestResolveMonitoredAdmins:
                 "enabled": True, "mode": "include", "admin_usernames": ["reseller1"],
             }
         }
-        assert resolve_monitored_admins(config) == ["reseller1"]
+        assert resolve_monitored_admins(config) is None
 
     def test_exclude_mode_returns_none(self):
         from utils.ip_source_api import resolve_monitored_admins
