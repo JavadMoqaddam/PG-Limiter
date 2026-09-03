@@ -24,7 +24,7 @@ from utils.parse_logs import close_geo_client
 from utils.read_config import read_config
 from utils.types import PanelType
 
-VERSION = "1.4.2"
+VERSION = "1.5.0"
 
 # Main logger
 main_logger = get_logger("limiter.main")

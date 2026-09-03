@@ -4,6 +4,7 @@ Includes functions for creating and restoring backups.
 """
 
 import asyncio
+import html
 import json
 import os
 import shutil
@@ -18,6 +19,7 @@ from telegram.ext import (
     ConversationHandler,
 )
 from utils.atomic_io import atomic_write_json
+from utils.read_config import invalidate_config_cache
 
 from telegram_bot.constants import RESTORE_CONFIG
 from telegram_bot.handlers.admin import check_admin_privilege
@@ -264,20 +266,38 @@ async def restore_config_handler(update: Update, context: ContextTypes.DEFAULT_T
                     if config_data.get("enhanced_details") is not None:
                         await ConfigCRUD.set(db, "enhanced_details", str(config_data["enhanced_details"]).lower())
                     
-                    # Import special limits
+                    # Import special limits. A limit below 1 is refused by the CRUD (it
+                    # would ban the user rather than exempt them), so skip that entry and
+                    # report it instead of letting one bad row abort the whole import.
                     special_limits = config_data.get("limits", {}).get("special", {})
+                    skipped_limits = []
                     for username, limit in special_limits.items():
-                        await UserCRUD.set_special_limit(db, username, limit)
+                        try:
+                            await UserCRUD.set_special_limit(db, username, limit)
+                        except ValueError as error:
+                            skipped_limits.append(f"{username} ({error})")
                     
                     # Import except users
                     except_users = config_data.get("except_users", [])
                     for username in except_users:
                         await UserCRUD.set_excepted(db, username, True, reason="Restored from backup")
-                
+
+                # Nothing re-reads the configuration on a timer, so the imported
+                # whitelist and limits would sit unused until the next settings write.
+                await invalidate_config_cache()
+
                 await update.message.reply_html(
                     "✅ <b>Legacy config imported to database!</b>\n\n"
                     "📝 Panel credentials should be set in .env file.\n"
-                    "⚠️ Restart the service for changes to take effect."
+                    "ℹ️ The imported settings are already live; only .env changes "
+                    "need a service restart."
+                    + (
+                        "\n\n⚠️ Skipped these special limits because a limit must be 1 "
+                        "or greater — put the user in the whitelist for no limit:\n"
+                        + "\n".join(f"• <code>{html.escape(entry)}</code>" for entry in skipped_limits)
+                        if skipped_limits
+                        else ""
+                    )
                 )
                 
             except json.JSONDecodeError as e:
@@ -415,10 +435,12 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                 if "panel" in data or "limits" in data or "timing" in data:
                     backup_logger.info("Detected config.json format")
                     
-                    # Migrate panel settings (for reference only - actual auth is from .env)
-                    if "panel" in data:
-                        await ConfigCRUD.set(db, "panel_backup", data["panel"])
-                        stats["config_items"] += 1
+                    # Panel settings are deliberately NOT stored. Authentication comes
+                    # from .env, nothing ever read the "panel_backup" row this used to
+                    # write, and data["panel"] carries the panel password - so the only
+                    # thing that row achieved was keeping a plaintext copy of the
+                    # password in the database. The reply below already tells the
+                    # operator to put panel credentials in .env.
                     
                     # Migrate limits
                     if "limits" in data:
@@ -456,25 +478,31 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                         except Exception:
                             pass  # May already exist
                 
-                # Timing settings
-                if "timing" in data:
-                    await ConfigCRUD.set(db, "timing", data["timing"])
-                    stats["config_items"] += 1
-                elif "check_interval" in data or "time_to_active_users" in data:
-                    timing = {
-                        "check_interval": data.get("check_interval", 60),
-                        "time_to_active_users": data.get("time_to_active_users", 900),
-                    }
-                    await ConfigCRUD.set(db, "timing", timing)
-                    stats["config_items"] += 1
+                # Timing settings. read_config reads the flat check_interval and
+                # time_to_active_users keys, never a "timing" blob, so writing the blob
+                # restored nothing - the running process kept its old values while the
+                # import reported success.
+                timing = data.get("timing") if isinstance(data.get("timing"), dict) else None
+                if timing is None and ("check_interval" in data or "time_to_active_users" in data):
+                    timing = data
+                if timing:
+                    if "check_interval" in timing:
+                        await ConfigCRUD.set(db, "check_interval", str(int(timing["check_interval"])))
+                        stats["config_items"] += 1
+                    if "time_to_active_users" in timing:
+                        await ConfigCRUD.set(
+                            db, "time_to_active_users", str(int(timing["time_to_active_users"]))
+                        )
+                        stats["config_items"] += 1
                 
-                # Display settings
-                if "display" in data:
-                    await ConfigCRUD.set(db, "display", data["display"])
-                    stats["config_items"] += 1
-                
-                if "enhanced_details" in data:
-                    await ConfigCRUD.set(db, "enhanced_details", str(data["enhanced_details"]).lower())
+                # Display settings. Same story as "timing": read_config reads the flat
+                # enhanced_details key, never a "display" blob.
+                display = data.get("display") if isinstance(data.get("display"), dict) else {}
+                enhanced = data.get("enhanced_details", display.get("enhanced_details"))
+                if enhanced is None:
+                    enhanced = display.get("show_enhanced_details")
+                if enhanced is not None:
+                    await ConfigCRUD.set(db, "enhanced_details", str(enhanced).lower())
                     stats["config_items"] += 1
                 
                 # Disable method
@@ -491,15 +519,45 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                     await ConfigCRUD.set(db, "country_code", data["country_code"])
                     stats["config_items"] += 1
                 
-                # Punishment settings
-                if "punishment" in data:
-                    await ConfigCRUD.set(db, "punishment", data["punishment"])
-                    stats["config_items"] += 1
-                
-                # Group filter
-                if "group_filter" in data:
-                    await ConfigCRUD.set(db, "group_filter", data["group_filter"])
-                    stats["config_items"] += 1
+                # Punishment settings. read_config reads punishment_enabled,
+                # punishment_steps and punishment_window_hours - never a "punishment"
+                # blob - so restoring the blob silently left the escalation ladder at
+                # whatever it already was.
+                punishment = data.get("punishment")
+                if isinstance(punishment, dict):
+                    if "enabled" in punishment:
+                        await ConfigCRUD.set(
+                            db, "punishment_enabled", "true" if punishment["enabled"] else "false"
+                        )
+                        stats["config_items"] += 1
+                    if "window_hours" in punishment:
+                        await ConfigCRUD.set(
+                            db, "punishment_window_hours", str(int(punishment["window_hours"]))
+                        )
+                        stats["config_items"] += 1
+                    if isinstance(punishment.get("steps"), list):
+                        await ConfigCRUD.set(db, "punishment_steps", json.dumps(punishment["steps"]))
+                        stats["config_items"] += 1
+
+                # Group filter. Same again: the flat keys are group_filter_enabled,
+                # group_filter_mode and group_filter_ids.
+                group_filter = data.get("group_filter")
+                if isinstance(group_filter, dict):
+                    if "enabled" in group_filter:
+                        await ConfigCRUD.set(
+                            db, "group_filter_enabled", "true" if group_filter["enabled"] else "false"
+                        )
+                        stats["config_items"] += 1
+                    if group_filter.get("mode") in ("include", "exclude"):
+                        await ConfigCRUD.set(db, "group_filter_mode", str(group_filter["mode"]))
+                        stats["config_items"] += 1
+                    if isinstance(group_filter.get("group_ids"), list):
+                        await ConfigCRUD.set(
+                            db,
+                            "group_filter_ids",
+                            ",".join(str(int(gid)) for gid in group_filter["group_ids"]),
+                        )
+                        stats["config_items"] += 1
             
             # Check if it's a .disable_users.json file
             if "disabled_users" in data or "disable_user" in data or "enable_at" in data:
@@ -565,7 +623,12 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                 f"❌ Database error:\n<code>{str(db_err)}</code>"
             )
             return ConversationHandler.END
-        
+
+        # The configuration cache has no expiry: it is rebuilt only when a write
+        # invalidates it. Without this call the migrated settings stay invisible to the
+        # running limiter, which would make the "no restart needed" line below false.
+        await invalidate_config_cache()
+
         # Build result message
         total = (
             stats["config_items"] + 

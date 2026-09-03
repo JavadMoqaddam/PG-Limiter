@@ -12,6 +12,18 @@ import time
 import pytest
 
 
+def fresh() -> int:
+    """
+    A last-seen timestamp that passes the freshness filter.
+
+    The panel reports each IP's last-seen Unix epoch. Values below
+    ``STALE_EPOCH_FLOOR`` cannot be timestamps, so their age is unknown and they are
+    not counted as connected - a payload literal like ``3`` therefore tests the
+    rejection path, not the happy path.
+    """
+    return int(time.time())
+
+
 @pytest.fixture
 def panel():
     """Panel credentials; every network call is patched out."""
@@ -132,7 +144,13 @@ def _patch_collector(
 
 
 class TestResolveMonitoredGroupIds:
-    """Group narrowing decides how small the candidate query stays."""
+    """
+    Group narrowing decides how small the candidate query stays.
+
+    The rule it has to obey: never drop a user enforcement would judge. Only the
+    Group Filter in ``include`` mode gives that guarantee, because it is the one
+    setting that also makes those users ``is_monitored=False``.
+    """
 
     def test_group_filter_include_wins(self):
         from utils.ip_source_api import resolve_monitored_group_ids
@@ -143,44 +161,70 @@ class TestResolveMonitoredGroupIds:
         }
         assert resolve_monitored_group_ids(config) == [12, 15]
 
-    def test_group_limits_used_when_no_include_filter(self):
+    def test_group_limits_alone_do_not_narrow(self):
+        """
+        A group limit is a limit, not a monitoring scope.
+
+        Users in no limited group are still monitored and judged against the general
+        limit, so narrowing to the group_limits keys used to leave them uncollected
+        while coverage - measured over the narrowed set - still read 100%.
+        """
         from utils.ip_source_api import resolve_monitored_group_ids
 
         config = {"group_limits": {"15": 2, "12": 1}}
-        assert resolve_monitored_group_ids(config) == [12, 15]
+        assert resolve_monitored_group_ids(config) is None
 
     def test_exclude_mode_does_not_narrow(self):
+        """Exclude mode cannot be expressed panel-side, and group_limits must not stand in."""
         from utils.ip_source_api import resolve_monitored_group_ids
 
         config = {
             "group_filter": {"enabled": True, "mode": "exclude", "group_ids": [12]},
+            "group_limits": {"12": 4},
         }
         assert resolve_monitored_group_ids(config) is None
 
-    def test_disabled_filter_falls_through_to_group_limits(self):
+    def test_disabled_filter_does_not_narrow(self):
+        """A disabled filter means every active user is monitored."""
         from utils.ip_source_api import resolve_monitored_group_ids
 
         config = {
             "group_filter": {"enabled": False, "mode": "include", "group_ids": [7]},
             "group_limits": {"3": 1},
         }
-        assert resolve_monitored_group_ids(config) == [3]
+        assert resolve_monitored_group_ids(config) is None
+
+    def test_include_mode_with_no_group_ids_does_not_narrow(self):
+        """
+        Degenerate config: nobody is monitored, but an empty list means "no filter" to
+        the panel, so this asks wide and lets the client-side prefilter drop them.
+        """
+        from utils.ip_source_api import resolve_monitored_group_ids
+
+        config = {
+            "group_filter": {"enabled": True, "mode": "include", "group_ids": []},
+            "group_limits": {"3": 1},
+        }
+        assert resolve_monitored_group_ids(config) is None
 
     def test_no_configuration_returns_none(self):
         from utils.ip_source_api import resolve_monitored_group_ids
 
         assert resolve_monitored_group_ids({}) is None
 
-    def test_non_numeric_group_keys_are_skipped(self):
-        from utils.ip_source_api import resolve_monitored_group_ids
-
-        assert resolve_monitored_group_ids({"group_limits": {"abc": 2}}) is None
-
 
 class TestResolveMonitoredAdmins:
-    """Admin narrowing mirrors the group logic."""
+    """
+    The admin filter never narrows the panel query.
 
-    def test_include_mode_returns_usernames(self):
+    The enforcement gate is fail-open on ownership - a user whose local owner_username
+    is NULL is still limited, so a sync gap cannot silently exempt anyone. The panel's
+    admin parameter is an ANY-of match over named admins and cannot express "…or has no
+    known owner", so narrowing by it would drop exactly those users from the query while
+    enforcement still judged them.
+    """
+
+    def test_include_mode_does_not_narrow(self):
         from utils.ip_source_api import resolve_monitored_admins
 
         config = {
@@ -188,7 +232,7 @@ class TestResolveMonitoredAdmins:
                 "enabled": True, "mode": "include", "admin_usernames": ["reseller1"],
             }
         }
-        assert resolve_monitored_admins(config) == ["reseller1"]
+        assert resolve_monitored_admins(config) is None
 
     def test_exclude_mode_returns_none(self):
         from utils.ip_source_api import resolve_monitored_admins
@@ -342,7 +386,7 @@ class TestBuildUsersFromPayloads:
     async def test_device_info_matches_log_mode(self, api_config):
         from utils.ip_source_api import _build_users_from_payloads
 
-        payloads = {"alice": {1: {"5.6.7.8": 3, "9.9.9.9": 1}}}
+        payloads = {"alice": {1: {"5.6.7.8": fresh(), "9.9.9.9": fresh()}}}
         users, stats = await _build_users_from_payloads(
             payloads,
             {"alice": {"status": "active", "group_ids": [12]}},
@@ -363,7 +407,7 @@ class TestBuildUsersFromPayloads:
         assert {c.inbound_protocol for c in user.device_info.connections} == {"API"}
         assert stats == {
             "geo_lookups": 0, "nodes_seen": 1, "total_ips": 2, "users_with_ips": 1,
-            "stale_ips": 0, "future_ips": 0,
+            "stale_ips": 0, "future_ips": 0, "unknown_age_ips": 0,
         }
 
     @pytest.mark.asyncio
@@ -383,18 +427,39 @@ class TestBuildUsersFromPayloads:
         assert stats["stale_ips"] == 1
 
     @pytest.mark.asyncio
-    async def test_legacy_connection_counts_are_kept(self, api_config):
+    async def test_values_below_the_epoch_floor_are_not_counted(self, api_config):
         from utils.ip_source_api import _build_users_from_payloads
 
-        # Older panel builds returned a connection count instead of a
-        # timestamp. It carries no freshness information, so it must never be
-        # read as an ancient last-seen value and dropped.
-        payloads = {"alice": {1: {"5.6.7.8": 3}}}
+        # A value too small to be a last-seen epoch has an unknown age, so it cannot be
+        # shown to be a current connection. It used to be read as a legacy connection
+        # count and counted as live, which skipped the freshness filter entirely - and
+        # the panel never expires an entry, so a user who merely changed network looked
+        # like several simultaneous devices. Every unparseable value lands here too:
+        # _parse_ip_payload coerces an ISO-8601 string or a float-formatted epoch to 1.
+        payloads = {"alice": {1: {"5.6.7.8": 3, "9.9.9.9": 1}}}
+        users, stats = await _build_users_from_payloads(
+            payloads, {}, {1: "node"}, set(), api_config
+        )
+        assert users == {}
+        assert stats["unknown_age_ips"] == 2
+        # Counted as stale as well, so the existing "every IP filtered" gate skips the
+        # cycle rather than publishing an empty snapshot that clears pending warnings.
+        assert stats["stale_ips"] == 2
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_ip_survives_alongside_an_unknown_age_one(self, api_config):
+        from utils.ip_source_api import _build_users_from_payloads
+
+        payloads = {"alice": {1: {"5.6.7.8": fresh(), "9.9.9.9": 1}}}
         users, stats = await _build_users_from_payloads(
             payloads, {}, {1: "node"}, set(), api_config
         )
         assert users["alice"].ip == ["5.6.7.8"]
-        assert stats["stale_ips"] == 0
+        assert stats["unknown_age_ips"] == 1
+        assert stats["total_ips"] == 1
+        # Also counted as stale, which is what lets the all-stale gate fire when a whole
+        # payload comes back sub-floor.
+        assert stats["stale_ips"] == 1
 
     @pytest.mark.asyncio
     async def test_freshness_is_measured_from_the_fetch_time(self, api_config):
@@ -418,7 +483,7 @@ class TestBuildUsersFromPayloads:
     async def test_disabled_nodes_are_excluded(self, api_config):
         from utils.ip_source_api import _build_users_from_payloads
 
-        payloads = {"alice": {1: {"5.6.7.8": 1}, 2: {"9.9.9.9": 1}}}
+        payloads = {"alice": {1: {"5.6.7.8": fresh()}, 2: {"9.9.9.9": fresh()}}}
         users, stats = await _build_users_from_payloads(
             payloads, {}, {1: "keep", 2: "drop"}, {2}, api_config
         )
@@ -430,8 +495,8 @@ class TestBuildUsersFromPayloads:
         from utils.ip_source_api import _build_users_from_payloads
 
         payloads = {
-            "private_only": {1: {"192.168.1.5": 4}},
-            "real": {1: {"5.6.7.8": 1}},
+            "private_only": {1: {"192.168.1.5": fresh()}},
+            "real": {1: {"5.6.7.8": fresh()}},
         }
         users, stats = await _build_users_from_payloads(
             payloads, {}, {1: "node"}, set(), api_config
@@ -444,7 +509,7 @@ class TestBuildUsersFromPayloads:
     async def test_same_ip_on_two_nodes_stays_one_ip(self, api_config):
         from utils.ip_source_api import _build_users_from_payloads
 
-        payloads = {"alice": {1: {"5.6.7.8": 1}, 2: {"5.6.7.8": 1}}}
+        payloads = {"alice": {1: {"5.6.7.8": fresh()}, 2: {"5.6.7.8": fresh()}}}
         users, stats = await _build_users_from_payloads(
             payloads, {}, {1: "a", 2: "b"}, set(), api_config
         )
@@ -462,7 +527,7 @@ class TestBuildUsersFromPayloads:
 
         api_config["api_ip_sentinel_inbound"] = "PANEL"
         users, _ = await _build_users_from_payloads(
-            {"alice": {1: {"5.6.7.8": 1}}}, {}, {1: "node"}, set(), api_config
+            {"alice": {1: {"5.6.7.8": fresh()}}}, {}, {1: "node"}, set(), api_config
         )
         connection = users["alice"].device_info.connections[0]
         assert connection.inbound_protocol == "PANEL"
@@ -472,7 +537,7 @@ class TestBuildUsersFromPayloads:
         from utils.ip_source_api import _build_users_from_payloads
 
         users, _ = await _build_users_from_payloads(
-            {"alice": {7: {"5.6.7.8": 1}}}, {}, {}, set(), api_config
+            {"alice": {7: {"5.6.7.8": fresh()}}}, {}, {}, set(), api_config
         )
         assert users["alice"].device_info.connections[0].node_name == "Node-7"
 
@@ -481,9 +546,9 @@ class TestBuildUsersFromPayloads:
         from utils.ip_source_api import _build_users_from_payloads
 
         payloads = {
-            "nested": {1: {"5.6.7.8": 1}},
-            "flat": {1: {"9.9.9.9": 1}},
-            "legacy": {1: {"4.4.4.4": 1}},
+            "nested": {1: {"5.6.7.8": fresh()}},
+            "flat": {1: {"9.9.9.9": fresh()}},
+            "legacy": {1: {"4.4.4.4": fresh()}},
         }
         raw_by_name = {
             "nested": {"admin": {"username": "reseller1"}},
@@ -608,7 +673,7 @@ class TestCollectFailSafe:
         _patch_collector(
             monkeypatch,
             candidates=[{"username": f"u{i}", "id": i} for i in range(1, 5)],
-            payloads={"u1": {1: {"5.6.7.8": 1}}},
+            payloads={"u1": {1: {"5.6.7.8": fresh()}}},
             counters={"ok": 1, "failed": 3, "not_found": 0,
                       "forbidden": 0, "unauthorized": 0},
         )
@@ -626,7 +691,7 @@ class TestCollectFailSafe:
         _patch_collector(
             monkeypatch,
             candidates=[{"username": f"u{i}", "id": i} for i in range(1, 5)],
-            payloads={"u1": {1: {"5.6.7.8": 1}}},
+            payloads={"u1": {1: {"5.6.7.8": fresh()}}},
             counters={"ok": 1, "failed": 0, "not_found": 3,
                       "forbidden": 0, "unauthorized": 0},
             node_name_map={1: "node"},
@@ -642,11 +707,11 @@ class TestCollectFailSafe:
     ):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
 
-        fresh = int(time.time())
+        seen_at = int(time.time())
         _patch_collector(
             monkeypatch,
             candidates=[{"username": "alice", "id": 1}],
-            payloads={"alice": {1: {"5.6.7.8": fresh}}},
+            payloads={"alice": {1: {"5.6.7.8": seen_at}}},
             node_name_map={1: "de", 2: "nl", 3: "fr"},
         )
 
@@ -670,11 +735,11 @@ class TestCollectFailSafe:
 
         ACTIVE_USERS["carol"] = UserType(name="carol", ip=["1.2.3.4"])
         api_config["api_ip_min_node_coverage"] = 0.8
-        fresh = int(time.time())
+        seen_at = int(time.time())
         _patch_collector(
             monkeypatch,
             candidates=[{"username": "alice", "id": 1}],
-            payloads={"alice": {1: {"5.6.7.8": fresh}}},
+            payloads={"alice": {1: {"5.6.7.8": seen_at}}},
             node_name_map={1: "de", 2: "nl", 3: "fr"},
         )
 
@@ -693,11 +758,11 @@ class TestCollectFailSafe:
         from utils.shared_state import ACTIVE_USERS
 
         api_config["api_ip_min_node_coverage"] = 0.8
-        fresh = int(time.time())
+        seen_at = int(time.time())
         _patch_collector(
             monkeypatch,
             candidates=[{"username": "alice", "id": 1}],
-            payloads={"alice": {1: {"5.6.7.8": fresh}}},
+            payloads={"alice": {1: {"5.6.7.8": seen_at}}},
             node_name_map={1: "de", 2: "nl"},
             expected_node_ids={1},
         )
@@ -853,8 +918,8 @@ class TestCollectHappyPath:
                 {"username": "bob", "id": 2, "status": "active"},
             ],
             payloads={
-                "alice": {1: {"5.6.7.8": 2}},
-                "bob": {1: {"9.9.9.9": 1}, 2: {"4.4.4.4": 1}},
+                "alice": {1: {"5.6.7.8": fresh()}},
+                "bob": {1: {"9.9.9.9": fresh()}, 2: {"4.4.4.4": fresh()}},
             },
             node_name_map={1: "de", 2: "nl"},
         )
@@ -903,7 +968,7 @@ class TestCollectHappyPath:
                 {"username": "white", "id": 1},
                 {"username": "alice", "id": 2},
             ],
-            payloads={"alice": {1: {"5.6.7.8": 1}}},
+            payloads={"alice": {1: {"5.6.7.8": fresh()}}},
             node_name_map={1: "de"},
         )
 
@@ -921,7 +986,7 @@ class TestCollectHappyPath:
         assert api_mod.get_last_cycle_stats()["prefiltered"] == 1
 
     @pytest.mark.asyncio
-    async def test_candidate_query_is_narrowed_by_configured_groups(
+    async def test_candidate_query_is_narrowed_by_the_include_filter(
         self, panel, api_config, monkeypatch
     ):
         import utils.panel_api.online_ips as online_ips_mod
@@ -935,13 +1000,72 @@ class TestCollectHappyPath:
         _patch_collector(monkeypatch, candidates=[])
         monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", capture)
 
-        api_config["group_limits"] = {"12": 1, "15": 2}
+        api_config["group_filter"] = {
+            "enabled": True, "mode": "include", "group_ids": [12, 15]
+        }
         api_config["check_interval"] = 240
 
         assert await collect_active_users_from_api(panel, api_config) is True
         assert captured["group_ids"] == [12, 15]
         assert captured["status"] == "active"
         assert captured["online_window"] == 270
+
+    @pytest.mark.asyncio
+    async def test_group_limits_do_not_narrow_the_candidate_query(
+        self, panel, api_config, monkeypatch
+    ):
+        """
+        The regression that matters: group limits are limits, not a monitoring scope.
+
+        Users outside the limited groups are still judged against the general limit, so
+        asking the panel only about the limited groups left them uncollected - and the
+        coverage gate could not see it, because coverage is the answer rate over
+        whatever was asked for.
+        """
+        import utils.panel_api.online_ips as online_ips_mod
+        from utils.ip_source_api import collect_active_users_from_api
+
+        captured: dict = {}
+
+        async def capture(_panel, **kwargs):
+            captured.update(kwargs)
+            return []
+        _patch_collector(monkeypatch, candidates=[])
+        monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", capture)
+
+        api_config["group_limits"] = {"12": 1, "15": 2}
+
+        assert await collect_active_users_from_api(panel, api_config) is True
+        assert captured["group_ids"] is None
+        assert captured["status"] == "active"
+
+    @pytest.mark.asyncio
+    async def test_exclude_filter_does_not_narrow_to_the_excluded_group(
+        self, panel, api_config, monkeypatch
+    ):
+        """
+        The worst shape of the old bug: exclude mode fell through to group_limits, so a
+        limit on the very group being excluded made the query ask for exactly the users
+        enforcement must ignore - and enforcement then ran against nobody.
+        """
+        import utils.panel_api.online_ips as online_ips_mod
+        from utils.ip_source_api import collect_active_users_from_api
+
+        captured: dict = {}
+
+        async def capture(_panel, **kwargs):
+            captured.update(kwargs)
+            return []
+        _patch_collector(monkeypatch, candidates=[])
+        monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", capture)
+
+        api_config["group_filter"] = {
+            "enabled": True, "mode": "exclude", "group_ids": [7]
+        }
+        api_config["group_limits"] = {"7": 4}
+
+        assert await collect_active_users_from_api(panel, api_config) is True
+        assert captured["group_ids"] is None
 
     @pytest.mark.asyncio
     async def test_all_monitored_mode_drops_the_online_window(

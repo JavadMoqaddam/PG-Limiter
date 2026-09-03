@@ -57,6 +57,35 @@ class EnhancedWarningSystem:
         self.check_interval = max(5, int(check_interval))
         self.max_warnings = max(1, int(max_warnings))
         self.monitoring_period = self.check_interval * self.max_warnings
+
+    def effective_max_warnings(self, warning: UserLimitWarning) -> int:
+        """
+        How many consecutive violating scans this specific record needs before a ban.
+
+        check_usage calls update_settings() on every cycle, so self.max_warnings is a
+        live value. Comparing a counter that has been accumulating for two scans
+        against a threshold the operator just lowered would ban on the old count under
+        a new, stricter rule - a user mid-streak would be disabled without ever
+        completing the number of scans they were being monitored for.
+
+        Taking the maximum of the record's own threshold and the current one means a
+        settings change can only ever make a ban harder, never easier:
+
+          lowered  (3 -> 2): max(3, 2) = 3, the record keeps the rule it started under
+          raised   (3 -> 5): max(3, 5) = 5, the stricter-for-the-limiter value wins
+          new records:       stored == current, so the new setting applies in full
+
+        A record with no stored threshold predates this field and falls back to the
+        live value; those records expire within one monitoring window.
+        """
+        stored = getattr(warning, "max_warnings_at_creation", 0) or 0
+        try:
+            stored = int(stored)
+        except (TypeError, ValueError):
+            stored = 0
+        if stored < 1:
+            return self.max_warnings
+        return max(stored, self.max_warnings)
     
     def load_warning_history(self):
         """Load warning history from file"""
@@ -198,6 +227,7 @@ class EnhancedWarningSystem:
             user_limit=warning_data.get("user_limit", 1),
             consecutive_violations=warning_data.get("consecutive_violations", 1),
             last_scan_time=warning_data.get("last_scan_time", 0.0),
+            max_warnings_at_creation=warning_data.get("max_warnings_at_creation", 0),
         )
         warning.monitoring_history = monitoring_history
         return warning
@@ -281,7 +311,8 @@ class EnhancedWarningSystem:
                 "isp_change_pattern": warning.isp_change_pattern,
                 "connection_details": warning.connection_details,
                 "user_limit": getattr(warning, "user_limit", 1),
-                "consecutive_violations": getattr(warning, "consecutive_violations", 1)
+                "consecutive_violations": getattr(warning, "consecutive_violations", 1),
+                "max_warnings_at_creation": getattr(warning, "max_warnings_at_creation", 0)
             }
         
         atomic_write_json(self.filename, data)
@@ -369,11 +400,13 @@ class EnhancedWarningSystem:
                         f"(minimum {min_scan_gap:.0f}s)"
                     )
 
+            required_violations = self.effective_max_warnings(warning)
+
             if not counted:
                 warning_logger.warning(
                     f"⏱️ User {username} violated again but the violation was not counted: "
                     f"{not_counted_reason} - the record is refreshed, so no fast loop and no "
-                    f"restart can shortcut the {self.max_warnings}-scan rule"
+                    f"restart can shortcut the {required_violations}-scan rule"
                 )
 
             warning.ip_count = ip_count
@@ -402,7 +435,7 @@ class EnhancedWarningSystem:
             warning_logger.info(f"⚠️ User {username} consecutive violation scan #{warning.consecutive_violations} (trust={warning.trust_score:.0f})")
             log_monitoring_event("warning_updated", username, {"ip_count": ip_count, "trust_score": warning.trust_score, "consecutive": warning.consecutive_violations})
             
-            if warning.consecutive_violations >= self.max_warnings:
+            if warning.consecutive_violations >= required_violations:
                 return "violation_limit_reached"
             return "updated"
         
@@ -450,7 +483,8 @@ class EnhancedWarningSystem:
             connection_details=connection_details,
             user_limit=user_limit if user_limit and user_limit >= 1 else 1,
             consecutive_violations=1,
-            last_scan_time=current_time
+            last_scan_time=current_time,
+            max_warnings_at_creation=self.max_warnings
         )
         
         warning.trust_score = warning.calculate_trust_score()
@@ -546,7 +580,17 @@ class EnhancedWarningSystem:
                 subnets.add(ip)
         return subnets
     
-    async def check_persistent_violations(self, panel_data: PanelType, all_users_actual_ips: Dict[str, Set[str]], config_data: dict, batched_group_limits: dict = None, device_counts: Dict[str, int] = None) -> tuple[Set[str], Set[str]]:
+    async def check_persistent_violations(
+        self,
+        panel_data: PanelType,
+        all_users_actual_ips: Dict[str, Set[str]],
+        config_data: dict,
+        batched_group_limits: dict = None,
+        device_counts: Dict[str, int] = None,
+        sample_is_trustworthy: bool = True,
+        except_users=None,
+        known_users: Optional[Set[str]] = None,
+    ) -> tuple[Set[str], Set[str]]:
         """
         Check for users who still violate limits after the monitoring window ended.
 
@@ -554,6 +598,16 @@ class EnhancedWarningSystem:
             device_counts: Optional cycle-wide {username: device_count} map. When
                 given, the ban decision uses exactly the same number the warning
                 path used, instead of the raw unique-IP count.
+            sample_is_trustworthy: False when the caller judged this cycle's sample
+                incomplete. Nothing is banned and no record is deleted, because a
+                partial view cannot tell "this user disconnected" from "the node
+                carrying this user went silent".
+            except_users: Whitelisted usernames. The caller's main loop skips these;
+                without them here the second ban path could disable a user the
+                operator had explicitly excepted.
+            known_users: Usernames whose limit is actually known this cycle. A user
+                missing from it is left untouched: resolve_effective_limit would fall
+                back to the general limit, which is stricter than most group limits.
 
         Returns:
             Tuple[Set[str], Set[str]]: (disabled_users, warned_users) - sets of users who were disabled or warned
@@ -561,9 +615,33 @@ class EnhancedWarningSystem:
         disabled_users = set()
         warned_users = set()  # Track users who received warnings to prevent double processing
         users_to_remove = []
+
+        if not sample_is_trustworthy:
+            # Deliberately before any other work. This function used to run before the
+            # caller had even computed the trustworthiness of the sample, and its
+            # "user not found in current logs" branch deleted the record - so a few
+            # cycles with one silent node wiped the counters of every offender whose
+            # window had closed, and the guard that was supposed to prevent exactly
+            # that ran 200 lines later.
+            warning_logger.error(
+                f"⛔ Sample is not trustworthy this cycle - {len(self.warnings)} monitored "
+                f"record(s) are left exactly as they are: nothing banned, nothing deleted"
+            )
+            return disabled_users, warned_users
+
+        excepted = set(except_users or ())
         
         limits_config = config_data.get("limits", {})
-        special_limit = limits_config.get("special", {})
+        # A copy, not the cached dict itself. The DB refresh below calls .update() on
+        # this name, which used to mutate config_data["limits"]["special"] in place -
+        # so every cycle quietly rewrote the process-wide config cache, and because
+        # update() only ever adds keys, a special limit the operator REMOVED stayed
+        # visible until the cache happened to be rebuilt. The enforcement path does not
+        # read this dict (limits come from the per-cycle metadata batch); its readers
+        # are the Telegram display, the backup export and
+        # get_config_value("SPECIAL_LIMIT"), all of which should see what read_config
+        # loaded from the database rather than what this function last fetched.
+        special_limit = dict(limits_config.get("special", {}))
         limit_number = limits_config.get("general", 2)
         
         # Read special limits from DB if available
@@ -587,6 +665,31 @@ class EnhancedWarningSystem:
         for username, warning in list(self.warnings.items()):
             if not warning.is_monitoring_active():
                 warning_logger.debug(f"⚠️ Monitoring ended for {username}")
+
+                if username in excepted:
+                    # The caller's main loop skips whitelisted users before they can
+                    # ever be warned. This path had no equivalent check, so a user the
+                    # operator excepted while they were already under monitoring could
+                    # still be disabled here.
+                    warning_logger.info(
+                        f"✅ {username} is whitelisted - dropping the monitoring record "
+                        f"instead of judging it"
+                    )
+                    users_to_remove.append(username)
+                    continue
+
+                if known_users is not None and username not in known_users:
+                    # Their limit is unknown this cycle, and resolve_effective_limit
+                    # would quietly fall back to the general limit - stricter than most
+                    # group limits, so it disables users who are inside their real one.
+                    # Leave the record untouched and judge it when the data is back.
+                    warning_logger.warning(
+                        f"⚠️ Limit unknown for {username} this cycle - the monitoring "
+                        f"record is left as it is rather than judged against the general "
+                        f"fallback limit"
+                    )
+                    continue
+
                 if warning.active_monitoring_task and not warning.active_monitoring_task.done():
                     warning.active_monitoring_task.cancel()
                 
@@ -613,12 +716,13 @@ class EnhancedWarningSystem:
                     else:
                         device_count = len(current_ips)
                     activity_summary = warning.get_ip_activity_summary()
+                    required_violations = self.effective_max_warnings(warning)
 
-                    warning_logger.info(f"⚠️ User {username}: {device_count} devices / {len(current_ips)} IPs (limit: {user_limit_number}, violations: {warning.consecutive_violations}/{self.max_warnings}), trust={trust_score:.0f}")
-                    
+                    warning_logger.info(f"⚠️ User {username}: {device_count} devices / {len(current_ips)} IPs (limit: {user_limit_number}, violations: {warning.consecutive_violations}/{required_violations}), trust={trust_score:.0f}")
+
                     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    if device_count > user_limit_number and warning.consecutive_violations >= self.max_warnings:
+
+                    if device_count > user_limit_number and warning.consecutive_violations >= required_violations:
                         # ===== DOUBLE-CHECK BEFORE BAN (O(1) FAST RAM CHECK) =====
                         try:
                             if username in USER_METADATA_CACHE:
@@ -769,8 +873,26 @@ class EnhancedWarningSystem:
         """Check if a user is currently being monitored"""
         return username in self.warnings and self.warnings[username].is_monitoring_active()
     
-    async def cleanup_expired_warnings(self):
-        """Clean up expired warnings"""
+    async def cleanup_expired_warnings(self, sample_is_trustworthy: bool = True):
+        """
+        Delete monitoring records whose window has closed.
+
+        Takes the trustworthiness of the cycle's sample for the same reason
+        ``check_persistent_violations`` does: an expired record is only safe to drop
+        once it has actually been judged, and that function returns without judging
+        anything when the sample is partial. Running unconditionally afterwards deleted
+        precisely the records it had just preserved, so a partial sample still wiped
+        real offenders' counters - the failure those guards exist to prevent.
+        """
+        if not sample_is_trustworthy:
+            if self.warnings:
+                warning_logger.warning(
+                    f"⏳ Keeping {len(self.warnings)} monitoring record(s): the sample "
+                    f"was not trustworthy this cycle, so a closed window has not been "
+                    f"judged yet"
+                )
+            return
+
         expired_users = []
         for username, warning in self.warnings.items():
             if not warning.is_monitoring_active():

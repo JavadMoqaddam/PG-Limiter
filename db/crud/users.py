@@ -294,6 +294,18 @@ class UserCRUD:
             fetch_from_panel: If True, fetch user from panel if not in local DB
         """
         db_users_logger.debug(f"📝 Setting special limit for {username}: {limit}")
+        if limit is not None and limit < 1:
+            # Reject rather than store. A stored 0 makes one device a violation, so it
+            # bans the user instead of exempting them - the opposite of what anyone
+            # setting "0" intends. Unlimited is is_excepted; "use the general limit"
+            # is None. This is the backstop for the paths with no input validation of
+            # their own (the API, the CLI, a restored backup, the notification buttons);
+            # the Telegram handlers reject it earlier with a message naming the
+            # whitelist.
+            raise ValueError(
+                f"special limit must be 1 or greater, got {limit!r} - to exempt a user "
+                f"entirely set is_excepted, and to fall back to the general limit pass None"
+            )
         result = await db.execute(select(User).where(User.username == username))
         user = result.scalar_one_or_none()
         

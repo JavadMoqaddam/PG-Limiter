@@ -139,10 +139,57 @@ def calculate_user_effective_limit_and_monitoring(
     return (True, None)
 
 
-def _parse_panel_user_dict(user_data: dict, config: dict = None) -> dict | None:
+async def _load_local_user_state(
+    db, username: str | None = None
+) -> dict[str, tuple[bool, int | None]]:
+    """
+    Read the local-only user state the panel knows nothing about.
+
+    Returns ``{username: (is_excepted, special_limit)}`` and deliberately selects only
+    the rows that carry non-default state, because everyone else is ``(False, None)``
+    anyway. On ~15000 users that is a handful of rows rather than a full table scan.
+
+    Pass ``username`` to narrow it to one row. The single-user sync path runs once per
+    unknown user and up to five of those run concurrently, so it should not re-read the
+    whole whitelist each time to answer a question about one account.
+
+    The panel's user dict has no whitelist flag and no per-user limit, so a parser
+    working from the panel dict alone has to assume the defaults - and those two
+    assumptions are what decide ``is_monitored`` and ``effective_ip_limit``.
+    """
+    from db.models import User
+    from sqlalchemy import or_, select
+
+    stmt = select(User.username, User.is_excepted, User.special_limit).where(
+        or_(User.is_excepted.is_(True), User.special_limit.isnot(None))
+    )
+    if username is not None:
+        stmt = stmt.where(User.username == username)
+    result = await db.execute(stmt)
+    return {row.username: (bool(row.is_excepted), row.special_limit) for row in result}
+
+
+def _parse_panel_user_dict(
+    user_data: dict,
+    config: dict | None,
+    *,
+    is_excepted: bool,
+    special_limit: int | None,
+) -> dict | None:
     """
     Parse raw user dictionary from panel API into structured database/cache fields.
     Single source of truth for parsing panel user dicts across sync loops and single-user sync.
+
+    ``is_excepted`` and ``special_limit`` are local database state that the panel
+    payload does not contain, so callers have to supply them; see
+    [_load_local_user_state](utils/user_sync.py). They are only used to derive
+    ``is_monitored`` and ``effective_ip_limit`` and are not returned, because the bulk
+    upsert must not write the two columns it is not the source of truth for.
+
+    All three of those inputs are required rather than defaulted. Defaulting them is
+    exactly how this function came to assume ``is_excepted=False, special_limit=None``
+    and mark whitelisted users as monitored: a caller that forgets one now fails
+    loudly instead of silently getting the wrong premise back.
     """
     if not isinstance(user_data, dict):
         return None
@@ -188,8 +235,8 @@ def _parse_panel_user_dict(user_data: dict, config: dict = None) -> dict | None:
     is_monitored, effective_limit = calculate_user_effective_limit_and_monitoring(
         username=username,
         group_ids=group_ids,
-        is_excepted=False,
-        special_limit=None,
+        is_excepted=is_excepted,
+        special_limit=special_limit,
         config=config,
     )
     
@@ -220,8 +267,27 @@ async def recompute_all_user_limits(config: dict = None):
             from utils.read_config import read_config
             config = await read_config()
         except Exception as e:
-            sync_logger.error(f"Error reading config during limit recompute: {e}")
-            config = {}
+            # Falling back to {} here used to be the same hazard as a degraded config:
+            # an empty config has no group filter, which reads as "monitor everyone".
+            sync_logger.error(
+                f"⛔ Skipping the effective-limit recompute: the configuration could not "
+                f"be read ({e}). The existing flags are kept."
+            )
+            return
+
+    # A configuration whose database half failed has no group filter and no group
+    # limits, and an absent group filter reads as "monitor everyone". Recomputing from
+    # it would write is_monitored=True over every user the operator had filtered out -
+    # straight into the cache the enforcement gate reads - so the filter would stop
+    # being honoured until the next successful sync. Enforcement is skipped while the
+    # flag is set, but the flags would outlive it.
+    if config.get("config_degraded"):
+        sync_logger.error(
+            "⛔ Skipping the effective-limit recompute: the configuration is degraded "
+            "(no database settings), so the group filter and group limits are unknown. "
+            "The existing flags are kept until a database read succeeds."
+        )
+        return
     
     recomputed_count = 0
     for username, data in list(USER_METADATA_CACHE.items()):
@@ -409,12 +475,29 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
                 # Get existing usernames in local DB
                 local_usernames = await UserCRUD.get_all_usernames(db)
                 sync_logger.info(f"📊 Found {len(local_usernames)} existing users in local DB")
-                
+
+                # The whitelist and the per-user limits live only here, so read them
+                # before parsing: without them every excepted user is upserted with
+                # is_monitored=True and every special-limit user with the group or
+                # general limit, which is the direction that over-restricts.
+                local_state = await _load_local_user_state(db)
+                sync_logger.info(
+                    f"📊 {len(local_state)} users carry a whitelist flag or a special limit"
+                )
+
                 # Sync users from panel using native Bulk Upsert
                 users_to_upsert = []
                 for user_data in users:
                     try:
-                        parsed = _parse_panel_user_dict(user_data, config=config)
+                        excepted, special = local_state.get(
+                            user_data.get("username"), (False, None)
+                        )
+                        parsed = _parse_panel_user_dict(
+                            user_data,
+                            config=config,
+                            is_excepted=excepted,
+                            special_limit=special,
+                        )
                         if parsed:
                             users_to_upsert.append(parsed)
                     except Exception as e:
@@ -614,17 +697,37 @@ async def fetch_and_sync_single_user(username: str, panel_data: Optional[PanelTy
             sync_logger.error(f"❌ Error fetching user {username}: {user_data}")
             return None
         
-        # Extract user details using unified parser
-        parsed = _parse_panel_user_dict(user_data)
-        if not parsed:
-            sync_logger.error(f"❌ Failed to parse user data for {username}")
-            return None
-        
         # Save to database
         from db.database import get_db
         from db.crud.users import UserCRUD
-        
+        from utils.read_config import read_config as _read_config
+
+        # Imported and called here rather than reusing the ``config`` above: that one is
+        # only assigned when panel_data was not supplied, so reading it would be an
+        # UnboundLocalError on the path where the caller passed panel_data in.
+        parse_config = await _read_config()
+
         async with get_db() as db:
+            # Parse inside the session so the whitelist flag and the special limit come
+            # from the database rather than being assumed. create_or_update below does
+            # not write the two derived columns, so this only keeps the parser from
+            # being handed a wrong premise - but leaving the premise wrong here is how
+            # the bug would come back the day someone starts persisting them. The same
+            # reasoning applies to config: without it the group filter and the group
+            # limits are silently absent from the calculation.
+            excepted, special = (await _load_local_user_state(db, username)).get(
+                username, (False, None)
+            )
+            parsed = _parse_panel_user_dict(
+                user_data,
+                config=parse_config,
+                is_excepted=excepted,
+                special_limit=special,
+            )
+            if not parsed:
+                sync_logger.error(f"❌ Failed to parse user data for {username}")
+                return None
+
             user = await UserCRUD.create_or_update(
                 db,
                 username=parsed["username"],

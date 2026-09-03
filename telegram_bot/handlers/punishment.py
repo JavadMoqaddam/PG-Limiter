@@ -13,23 +13,38 @@ from telegram.ext import (
 
 from telegram_bot.handlers.admin import check_admin_privilege
 from telegram_bot.constants import CallbackData
+from utils.logs import get_logger
 from utils.read_config import read_config, invalidate_config_cache
+
+punishment_handler_logger = get_logger("punishment_handler")
 
 
 async def _save_punishment_setting(key: str, value) -> bool:
-    """Save a punishment setting to the database."""
+    """
+    Save a punishment setting to the database.
+
+    The failure went to ``print`` rather than the log, so a punishment ladder that
+    failed to store left no trace in the container logs at all - and the caller then
+    re-rendered the menu, showing the admin a change that was never written.
+    """
     try:
         from db.database import get_db
         from db.crud import ConfigCRUD
-        
+
         async with get_db() as db:
             await ConfigCRUD.set(db, key, value)
             await db.commit()
-        await invalidate_config_cache()
         return True
-    except Exception as e:
-        print(f"Error saving punishment setting {key}: {e}")
+    except Exception as error:  # pylint: disable=broad-except
+        punishment_handler_logger.exception(
+            f"❌ Failed to save punishment setting {key!r}: {error}. The previous value "
+            f"is still in effect."
+        )
         return False
+    finally:
+        # Unconditionally: see the note on save_config_value. A partially applied write
+        # that left the cache holding the old ladder would keep banning by it.
+        await invalidate_config_cache()
 
 
 async def _save_punishment_steps(steps: list) -> bool:

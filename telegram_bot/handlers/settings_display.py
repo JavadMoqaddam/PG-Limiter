@@ -25,6 +25,13 @@ from telegram_bot.handlers.admin import check_admin_privilege
 from telegram_bot.keyboards import create_back_to_main_keyboard
 from utils.read_config import read_config, save_config_value
 
+# Shown instead of a confirmation when the database write did not commit. Saying
+# "saved" for a write that failed is worse than saying nothing.
+SAVE_FAILED_NOTE = (
+    "❌ Could not write the setting to the database - it is unchanged. "
+    "Check the container logs."
+)
+
 
 def create_enhanced_details_keyboard():
     """Create enhanced details toggle keyboard."""
@@ -56,8 +63,10 @@ async def ipinfo_token_handler(update: Update, _context: ContextTypes.DEFAULT_TY
     token = update.message.text.strip()
 
     if token.lower() == "remove":
-        await save_ipinfo_token("")
-        await update.message.reply_html("✅ IPINFO_TOKEN removed!")
+        saved = await save_ipinfo_token("")
+        await update.message.reply_html(
+            "✅ IPINFO_TOKEN removed!" if saved else SAVE_FAILED_NOTE
+        )
         return ConversationHandler.END
 
     if len(token) < 10:
@@ -66,19 +75,23 @@ async def ipinfo_token_handler(update: Update, _context: ContextTypes.DEFAULT_TY
         )
         return ConversationHandler.END
 
-    await save_ipinfo_token(token)
-    await update.message.reply_html("✅ IPINFO_TOKEN set successfully!")
+    saved = await save_ipinfo_token(token)
+    await update.message.reply_html(
+        "✅ IPINFO_TOKEN set successfully!" if saved else SAVE_FAILED_NOTE
+    )
     return ConversationHandler.END
 
 
-async def save_ipinfo_token(token: str):
-    """Save the ipinfo.io token to database for persistent storage across restarts."""
-    try:
-        await save_config_value("ipinfo_token", token)
-        return True
-    except Exception as e:
-        print(f"Error saving ipinfo token: {e}")
-        return False
+async def save_ipinfo_token(token: str) -> bool:
+    """
+    Save the ipinfo.io token to the database so it survives a restart.
+
+    Returns whether the write committed. It used to return ``True`` unconditionally -
+    ``save_config_value`` reports a failed write by returning ``False``, not by
+    raising, so the ``except`` branch never ran and every caller told the admin the
+    token was stored whether or not it was.
+    """
+    return await save_config_value("ipinfo_token", token)
 
 
 async def handle_enhanced_menu_callback(query, _context: ContextTypes.DEFAULT_TYPE):
@@ -136,9 +149,9 @@ async def handle_ipinfo_token_input(update: Update, context: ContextTypes.DEFAUL
     """Handle text input for IPInfo token."""
     text = update.message.text.strip()
     if text.lower() == "remove":
-        await save_ipinfo_token("")
+        saved = await save_ipinfo_token("")
         await update.message.reply_html(
-            text="✅ IPInfo token removed!",
+            text="✅ IPInfo token removed!" if saved else SAVE_FAILED_NOTE,
             reply_markup=create_back_to_main_keyboard()
         )
     elif len(text) < 10:
@@ -147,9 +160,9 @@ async def handle_ipinfo_token_input(update: Update, context: ContextTypes.DEFAUL
             reply_markup=create_back_to_main_keyboard()
         )
     else:
-        await save_ipinfo_token(text)
+        saved = await save_ipinfo_token(text)
         await update.message.reply_html(
-            text="✅ IPInfo token set successfully!",
+            text="✅ IPInfo token set successfully!" if saved else SAVE_FAILED_NOTE,
             reply_markup=create_back_to_main_keyboard()
         )
     context.user_data["waiting_for"] = None

@@ -10,11 +10,45 @@ from telegram.ext import (
 )
 
 from telegram_bot.handlers.admin import check_admin_privilege
-from telegram_bot.utils import write_json_file
 from telegram_bot.keyboards import create_back_to_main_keyboard
 from telegram_bot.constants import CallbackData, SET_GROUP_LIMIT
 from telegram_bot.utils import send_response as _send_response
-from utils.read_config import read_config
+from utils.logs import get_logger
+from utils.read_config import invalidate_config_cache, read_config, save_config_value
+
+group_filter_logger = get_logger("group_filter")
+
+
+async def _save_group_filter_setting(key: str, value) -> bool:
+    """
+    Persist a group-filter setting and re-derive the flag enforcement actually reads.
+
+    ``is_monitored`` is not evaluated per request. It is pre-computed per user by
+    ``calculate_user_effective_limit_and_monitoring`` and read out of the RAM metadata
+    cache by the enforcement gate in ``check_usage``. Writing the config without
+    recomputing left every user's flag on the *previous* filter until the next user
+    sync - up to one ``user_sync_interval``, five minutes by default. Tightening the
+    filter inside that window therefore kept enforcing the users the operator had just
+    excluded, which is the direction that ends in a ban nobody earned.
+
+    ``receive_group_limit`` already did this for the group *limits* flow; every write
+    in the *filter* flow goes through here so the two cannot drift apart again.
+    """
+    saved = await save_config_value(key, value)
+    await invalidate_config_cache()
+    try:
+        from utils.user_sync import recompute_all_user_limits
+
+        await recompute_all_user_limits()
+    except Exception as error:  # pylint: disable=broad-except
+        # The setting is already durable, so a failed recompute must not be reported as
+        # a failed save. Say so plainly instead: the periodic sync repairs the flags,
+        # the change just is not live yet.
+        group_filter_logger.error(
+            f"⚠️ Group filter setting {key!r} was saved but is_monitored could not be "
+            f"recomputed: {error}. The change takes effect at the next user sync."
+        )
+    return saved
 
 
 async def group_filter_status(update: Update, _context: ContextTypes.DEFAULT_TYPE):
@@ -80,15 +114,12 @@ async def group_filter_toggle(update: Update, _context: ContextTypes.DEFAULT_TYP
     
     try:
         config_data = await read_config()
-        
-        if "group_filter" not in config_data:
-            config_data["group_filter"] = {"enabled": True, "mode": "include", "group_ids": []}
-        
-        current_state = config_data["group_filter"].get("enabled", False)
-        config_data["group_filter"]["enabled"] = not current_state
-        
-        await write_json_file(config_data)
-        
+        current_state = config_data.get("group_filter", {}).get("enabled", False)
+
+        await _save_group_filter_setting(
+            "group_filter_enabled", "false" if current_state else "true"
+        )
+
         new_state = "✅ Enabled" if not current_state else "❌ Disabled"
         await _send_response(
             update,
@@ -118,15 +149,8 @@ async def group_filter_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         
         try:
-            config_data = await read_config()
-            
-            if "group_filter" not in config_data:
-                config_data["group_filter"] = {"enabled": False, "mode": mode, "group_ids": []}
-            else:
-                config_data["group_filter"]["mode"] = mode
-            
-            await write_json_file(config_data)
-            
+            await _save_group_filter_setting("group_filter_mode", mode)
+
             if mode == "include":
                 desc = "Only users in specified groups will be monitored"
             else:
@@ -171,15 +195,10 @@ async def group_filter_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if gid:
                         group_ids.append(int(gid))
             
-            config_data = await read_config()
-            
-            if "group_filter" not in config_data:
-                config_data["group_filter"] = {"enabled": False, "mode": "include", "group_ids": group_ids}
-            else:
-                config_data["group_filter"]["group_ids"] = group_ids
-            
-            await write_json_file(config_data)
-            
+            await _save_group_filter_setting(
+                "group_filter_ids", ",".join(str(gid) for gid in group_ids)
+            )
+
             await _send_response(
                 update,
                 f"✅ Group filter set to IDs: <code>{group_ids}</code>"
@@ -221,29 +240,26 @@ async def group_filter_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         group_id = int(context.args[0])
-        
+
         config_data = await read_config()
-        
-        if "group_filter" not in config_data:
-            config_data["group_filter"] = {"enabled": False, "mode": "include", "group_ids": [group_id]}
-        else:
-            current_ids = config_data["group_filter"].get("group_ids", [])
-            if group_id not in current_ids:
-                current_ids.append(group_id)
-                config_data["group_filter"]["group_ids"] = current_ids
-            else:
-                await _send_response(
-                    update,
-                    f"ℹ️ Group ID <code>{group_id}</code> is already in the filter."
-                )
-                return ConversationHandler.END
-        
-        await write_json_file(config_data)
-        
+        current_ids = list(config_data.get("group_filter", {}).get("group_ids", []))
+
+        if group_id in current_ids:
+            await _send_response(
+                update,
+                f"ℹ️ Group ID <code>{group_id}</code> is already in the filter."
+            )
+            return ConversationHandler.END
+
+        current_ids.append(group_id)
+        await _save_group_filter_setting(
+            "group_filter_ids", ",".join(str(gid) for gid in current_ids)
+        )
+
         await _send_response(
             update,
             f"✅ Added group ID <code>{group_id}</code> to filter.\n"
-            f"Current groups: <code>{config_data['group_filter']['group_ids']}</code>"
+            f"Current groups: <code>{current_ids}</code>"
         )
         
     except ValueError:
@@ -379,15 +395,14 @@ async def handle_group_filter_menu_callback(query, _context: ContextTypes.DEFAUL
 async def handle_group_filter_toggle_callback(query, _context: ContextTypes.DEFAULT_TYPE):
     """Handle toggle callback for group filter."""
     try:
-        from utils.read_config import save_config_value, invalidate_config_cache
-        
         config_data = await read_config()
         filter_config = config_data.get("group_filter", {})
         current_state = filter_config.get("enabled", False)
-        
-        await save_config_value("group_filter_enabled", "true" if not current_state else "false")
-        await invalidate_config_cache()
-        
+
+        await _save_group_filter_setting(
+            "group_filter_enabled", "true" if not current_state else "false"
+        )
+
         # Refresh the menu
         await handle_group_filter_menu_callback(query, _context)
         
@@ -404,11 +419,8 @@ async def handle_group_filter_toggle_callback(query, _context: ContextTypes.DEFA
 async def handle_group_filter_mode_callback(query, _context: ContextTypes.DEFAULT_TYPE, mode: str):
     """Handle mode selection callback for group filter."""
     try:
-        from utils.read_config import save_config_value, invalidate_config_cache
-        
-        await save_config_value("group_filter_mode", mode)
-        await invalidate_config_cache()
-        
+        await _save_group_filter_setting("group_filter_mode", mode)
+
         # Refresh the menu
         await handle_group_filter_menu_callback(query, _context)
         
@@ -425,21 +437,22 @@ async def handle_group_filter_mode_callback(query, _context: ContextTypes.DEFAUL
 async def handle_group_filter_toggle_group_callback(query, _context: ContextTypes.DEFAULT_TYPE, group_id: int):
     """Handle group toggle callback for group filter."""
     try:
-        from utils.read_config import save_config_value, invalidate_config_cache
-        
         config_data = await read_config()
         filter_config = config_data.get("group_filter", {})
-        current_ids = filter_config.get("group_ids", [])
-        
+        # Local copy: config_data is the caller's own deep copy, but keeping the edit
+        # local makes it obvious that only the serialized value below is persisted.
+        current_ids = list(filter_config.get("group_ids", []))
+
         if group_id in current_ids:
             current_ids.remove(group_id)
         else:
             current_ids.append(group_id)
-        
+
         # Save as comma-separated string
-        await save_config_value("group_filter_ids", ",".join(str(gid) for gid in current_ids))
-        await invalidate_config_cache()
-        
+        await _save_group_filter_setting(
+            "group_filter_ids", ",".join(str(gid) for gid in current_ids)
+        )
+
         # Refresh the menu
         await handle_group_filter_menu_callback(query, _context)
         
@@ -467,22 +480,16 @@ async def group_filter_remove(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     try:
         group_id = int(context.args[0])
-        
+
         config_data = await read_config()
-        
-        if "group_filter" not in config_data:
-            await _send_response(
-                update,
-                "❌ No group filter configured."
-            )
-            return ConversationHandler.END
-        
-        current_ids = config_data["group_filter"].get("group_ids", [])
+        current_ids = list(config_data.get("group_filter", {}).get("group_ids", []))
+
         if group_id in current_ids:
             current_ids.remove(group_id)
-            config_data["group_filter"]["group_ids"] = current_ids
-            await write_json_file(config_data)
-            
+            await _save_group_filter_setting(
+                "group_filter_ids", ",".join(str(gid) for gid in current_ids)
+            )
+
             await _send_response(
                 update,
                 f"✅ Removed group ID <code>{group_id}</code> from filter.\n"

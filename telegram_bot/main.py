@@ -196,7 +196,13 @@ from telegram_bot.handlers.admin_filter import (
 )
 
 # Import utilities
-from telegram_bot.utils import check_admin, add_admin_to_config, add_except_user, handel_special_limit
+from telegram_bot.utils import (
+    check_admin,
+    add_admin_to_config,
+    add_except_user,
+    handel_special_limit,
+    special_limit_rejection,
+)
 from utils.logs import get_logger
 from utils.read_config import save_config_value, read_config
 
@@ -818,7 +824,22 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         parts = data.split(":")
         if len(parts) >= 3:
             username = parts[1]
-            limit = int(parts[2])
+            try:
+                limit = int(parts[2])
+            except ValueError:
+                await query.edit_message_text(
+                    text=f"❌ Malformed limit in the button: <code>{parts[2]}</code>",
+                    parse_mode="HTML"
+                )
+                return
+            # The button's number comes from the general limit at the time the
+            # notification was sent, so it can carry a value the CRUD layer now
+            # refuses. Without this the ValueError escapes callback_query_handler,
+            # which has no top-level except, and the admin gets no reply at all.
+            rejection = special_limit_rejection(limit)
+            if rejection:
+                await query.edit_message_text(text=rejection, parse_mode="HTML")
+                return
             result = await handel_special_limit(username, limit)
             if result:
                 await query.edit_message_text(
@@ -903,17 +924,24 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             text = update.message.text.strip()
             try:
                 limit = int(text)
-                result = await handel_special_limit(username, limit)
-                if result:
+                rejection = special_limit_rejection(limit)
+                if rejection:
                     await update.message.reply_html(
-                        text=f"✅ Special limit <b>{limit}</b> set for <code>{username}</code>!",
+                        text=rejection,
                         reply_markup=create_back_to_main_keyboard()
                     )
                 else:
-                    await update.message.reply_html(
-                        text=f"⚠️ Failed to set special limit for <code>{username}</code>.",
-                        reply_markup=create_back_to_main_keyboard()
-                    )
+                    result = await handel_special_limit(username, limit)
+                    if result:
+                        await update.message.reply_html(
+                            text=f"✅ Special limit <b>{limit}</b> set for <code>{username}</code>!",
+                            reply_markup=create_back_to_main_keyboard()
+                        )
+                    else:
+                        await update.message.reply_html(
+                            text=f"⚠️ Failed to set special limit for <code>{username}</code>.",
+                            reply_markup=create_back_to_main_keyboard()
+                        )
             except ValueError:
                 await update.message.reply_html(
                     text="❌ Invalid number. Please send a valid number.",

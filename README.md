@@ -3,7 +3,7 @@
   <img src="https://img.shields.io/badge/License-AGPL--3.0-green" alt="License">
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white" alt="Docker">
-  <img src="https://img.shields.io/badge/Version-1.4.2-orange" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.5.0-orange" alt="Version">
 </p>
 
 <h1 align="center">🛡️ PG-Limiter</h1>
@@ -194,8 +194,8 @@ The connected IPs of each user can come from either of two sources, switchable a
 Both modes write into the same `ACTIVE_USERS` structure, so device counting, subnet/CDN/high-trust grouping, the 3-cycle warning system, trust scoring and punishment behave identically.
 
 **How API mode keeps a cycle safe:**
-* **Candidate narrowing.** `GET /api/users` is filtered panel-side by the group IDs from Group Limits / Group Filter, by `status=active`, and by an online-freshness window equal to `CHECK_INTERVAL + 30s`, so only the handful of currently-online monitored users is queried.
-* **Coverage gate.** If fewer than `api_ip_min_coverage` (default **80%**) of the candidates answered, the whole cycle is skipped rather than enforced on partial data — an under-covered snapshot could otherwise clear the counters of real offenders.
+* **Candidate narrowing.** `GET /api/users` is filtered panel-side by `status=active` and by an online-freshness window equal to `CHECK_INTERVAL + 30s`, so only the handful of currently-online users is queried. A group filter in **include** mode narrows it further, because that setting is what makes users outside those groups unmonitored in the first place. Group Limits deliberately do *not* narrow the query: a group limit is a limit, not a monitoring scope, and users in no limited group are still judged against the general limit.
+* **Coverage gate.** If fewer than `API_IP_MIN_COVERAGE` (default **80%**, set as a percentage in `.env`) of the candidates answered, the whole cycle is skipped rather than enforced on partial data — an under-covered snapshot could otherwise clear the counters of real offenders.
 * **Never a false positive.** A snapshot can only report *fewer* IPs than continuous log streaming, never more, and a failed candidate query leaves the previous state untouched instead of wiping pending warnings.
 * **Auto-fallback.** After 3 consecutive cycles with no usable data (for example a missing `nodes:stats` permission) the IP source reverts to logs automatically and a Telegram alert is sent.
 * **Per-inbound CDN grouping is inactive** in API mode because the panel reports no inbound names — use **CDN Nodes** (per-node) instead of CDN Inbounds.

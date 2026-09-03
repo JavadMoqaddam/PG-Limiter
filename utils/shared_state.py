@@ -29,6 +29,19 @@ ACTIVE_USERS_LOCK = asyncio.Lock()
 # snapshotting. Readers copy with list() so they never iterate a mutating dict.
 NODE_LAST_EVENT: dict[int, float] = {}
 
+# How many check intervals of total silence mean a log stream is broken rather than
+# quiet. Every line the panel sends counts as a heartbeat, keep-alives included, so a
+# healthy node with no user traffic still reports in - silence past this window is a
+# dead stream, not an idle one. Three intervals also matches the warning system's own
+# monitoring window (check_interval x max_warnings at the default max of 3), so a node
+# cannot be declared silent for less than the time a user needs to earn a ban.
+NODE_SILENCE_INTERVALS = 3
+
+
+def node_silence_window(check_interval: float) -> float:
+    """The staleness window, in seconds, for deciding a node's stream has gone quiet."""
+    return max(120.0, float(check_interval) * NODE_SILENCE_INTERVALS)
+
 
 def note_node_event(node_id: int | None, when: float | None = None) -> None:
     """Record that ``node_id`` produced a log event."""

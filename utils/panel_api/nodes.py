@@ -12,11 +12,15 @@ from utils.panel_api.request_helper import panel_get
 # Module logger
 nodes_logger = get_logger("panel_api.nodes")
 
-# In-process nodes cache (1 hour)
+# In-process nodes cache (1 hour). Keyed on the panel AND on enabled_only: the two are
+# different result sets, and storing them under one key meant a caller asking for the
+# full fleet overwrote the entry that enabled-only callers then read - silently handing
+# them disabled nodes, and vice versa.
 _nodes_cache = {
     "nodes": None,
     "expires_at": 0,
-    "panel_domain": None
+    "panel_domain": None,
+    "enabled_only": None,
 }
 
 
@@ -24,6 +28,7 @@ async def invalidate_nodes_cache():
     """Invalidate the cached nodes list"""
     _nodes_cache["nodes"] = None
     _nodes_cache["expires_at"] = 0
+    _nodes_cache["enabled_only"] = None
     nodes_logger.info("🖥️ Nodes cache invalidated")
 
 
@@ -51,9 +56,10 @@ async def get_nodes(
     """
     if not force_refresh and _nodes_cache["nodes"] is not None:
         current_time = time.time()
-        # Check if cache is still valid and for same panel
-        if (_nodes_cache["expires_at"] > current_time and 
-            _nodes_cache["panel_domain"] == panel_data.panel_domain):
+        # Check if cache is still valid, for the same panel, and for the same scope
+        if (_nodes_cache["expires_at"] > current_time and
+                _nodes_cache["panel_domain"] == panel_data.panel_domain and
+                _nodes_cache["enabled_only"] == enabled_only):
             time_left = int(_nodes_cache["expires_at"] - current_time)
             nodes_logger.debug(f"🖥️ Using in-memory cached nodes list (expires in {time_left // 60} minutes)")
             return _nodes_cache["nodes"]
@@ -123,6 +129,7 @@ async def get_nodes(
     _nodes_cache["nodes"] = all_nodes
     _nodes_cache["expires_at"] = time.time() + 3600
     _nodes_cache["panel_domain"] = panel_data.panel_domain
+    _nodes_cache["enabled_only"] = enabled_only
     
     nodes_logger.info(f"🖥️ Fetched {len(all_nodes)} nodes (cached for 1 hour)")
     for node in all_nodes:

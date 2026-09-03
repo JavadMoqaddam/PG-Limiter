@@ -14,7 +14,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from telegram_bot.constants import CallbackData
-from utils.read_config import read_config, save_config_value
+from utils.read_config import normalize_min_coverage, read_config, save_config_value
 
 
 def _build_panel_data(config_data: dict):
@@ -74,7 +74,10 @@ def _build_ip_source_text(config_data: dict) -> str:
     freshness_label = (
         f"auto ({max(60, interval)}s = check interval)" if freshness == 0 else f"{freshness}s"
     )
-    coverage = float(config_data.get("api_ip_min_coverage") or 0.0)
+    # normalize_min_coverage rather than "or 0.0": an absent key means the documented
+    # default, and the old fallback would have shown 0% on this screen while the
+    # collector was actually enforcing 80%.
+    coverage = normalize_min_coverage(config_data.get("api_ip_min_coverage"))
     auto_fallback = "✅ on" if config_data.get("api_ip_auto_fallback", True) else "❌ off"
 
     if current_source == "api":
@@ -323,6 +326,23 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
     skipped = stats.get("skipped_reason") or ""
     verdict = f"⚠️ Cycle skipped — {skipped}" if skipped else "✅ Enforcement ran on this cycle"
 
+    # Nodes seen was rendered without its denominator, which is the number that matters:
+    # a per-user coverage of 100% says nothing about a fleet where two thirds of the
+    # nodes went quiet. The guard is required - node_coverage is set to 1.0 with
+    # nodes_expected 0 when the node list could not be read, and "1/0 (100%)" is a lie.
+    nodes_seen = stats.get("nodes_seen", 0)
+    nodes_expected = int(stats.get("nodes_expected") or 0)
+    nodes_label = (
+        f"{nodes_seen}/{nodes_expected} ({float(stats.get('node_coverage') or 0):.0%})"
+        if nodes_expected
+        else f"{nodes_seen}"
+    )
+    dropped = [f"{stats.get('stale_ips', 0)} stale"]
+    if stats.get("unknown_age_ips"):
+        dropped.append(f"{stats['unknown_age_ips']} undatable")
+    if stats.get("future_ips"):
+        dropped.append(f"{stats['future_ips']} future-dated")
+
     text = (
         "📊 <b>Last API Cycle</b>\n\n"
         f"<b>Ran:</b> {age_label} in <code>{stats.get('duration_ms', 0)}ms</code>\n"
@@ -339,8 +359,8 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
         "<b>Result:</b>\n"
         f"• Users with IPs: <code>{stats.get('users_with_ips', 0)}</code>\n"
         f"• Accepted IPs: <code>{stats.get('total_ips', 0)}</code>\n"
-        f"• Stale IPs dropped: <code>{stats.get('stale_ips', 0)}</code>\n"
-        f"• Nodes seen: <code>{stats.get('nodes_seen', 0)}</code>\n"
+        f"• IPs dropped: <code>{', '.join(dropped)}</code>\n"
+        f"• Nodes reporting: <code>{nodes_label}</code>\n"
         f"• Geo lookups: <code>{stats.get('geo_lookups', 0)}</code>"
     )
 

@@ -192,6 +192,52 @@ async def check_admin() -> list[int] | None:
     return []
 
 
+SPECIAL_LIMIT_MIN = 1
+
+
+def special_limit_rejection(limit: int) -> str | None:
+    """
+    Return an admin-facing rejection message for a bad special limit, or None if usable.
+
+    0 and negatives used to be stored as-is, and a stored limit of 0 makes a single
+    device a violation - so an admin reaching for "no limit" got the user banned on
+    their first connection. Unlimited has its own mechanism in this project: the
+    whitelist. A special limit is always a real device count of 1 or more.
+    """
+    if limit < SPECIAL_LIMIT_MIN:
+        return (
+            f"❌ A special limit must be <b>{SPECIAL_LIMIT_MIN}</b> or greater "
+            f"(you sent <code>{limit}</code>).\n\n"
+            "If you want this user to have <b>no limit at all</b>, add them to the "
+            "whitelist instead — a special limit of 0 would ban them on their first "
+            "device, not exempt them."
+        )
+    return None
+
+
+GENERAL_LIMIT_MIN = 1
+
+
+def general_limit_rejection(limit: int) -> str | None:
+    """
+    Return an admin-facing rejection message for a bad general limit, or None if usable.
+
+    Same trap as ``special_limit_rejection``, one blast radius wider: the general limit
+    applies to every user who has no special or group limit, so a stored 0 does not mean
+    "no limit" - it makes the first device a violation for the whole installation and
+    bans everyone after the usual consecutive scans. Exemption is the whitelist.
+    """
+    if limit < GENERAL_LIMIT_MIN:
+        return (
+            f"❌ The general limit must be <b>{GENERAL_LIMIT_MIN}</b> or greater "
+            f"(you sent <code>{limit}</code>).\n\n"
+            "A general limit of 0 would ban <b>every user</b> on their first device "
+            "rather than exempt them. To exempt specific users, add them to the "
+            "whitelist; to give a group more devices, use group limits."
+        )
+    return None
+
+
 async def handle_special_limit(username: str, limit: int) -> list:
     """
     Handles the special limit for a given username using database.
@@ -209,11 +255,16 @@ async def handle_special_limit(username: str, limit: int) -> list:
             # Check if limit was set before
             existing_limit = await UserCRUD.get_special_limit(db, username)
             set_before = 1 if existing_limit is not None else 0
-            
+
             # Set the new limit
             await UserCRUD.set_special_limit(db, username, limit)
             await db.commit()
-            return [set_before, limit]
+        # The enforcement loop re-reads special limits straight from the database, so it
+        # sees this immediately - but every other reader goes through the config cache,
+        # which has no expiry. Without this, /backup captures the previous limit and the
+        # status screens keep reporting it until some unrelated setting is written.
+        await invalidate_config_cache()
+        return [set_before, limit]
     
     # Fallback to config.json
     set_before = 0
@@ -343,33 +394,6 @@ async def get_special_limit_list() -> list | None:
     return None
 
 
-async def write_country_code_json(country_code: str) -> None:
-    """
-    Saves the country code to the database.
-    Falls back to config.json if database is not available.
-
-    Args:
-        country_code: The country code to write.
-    """
-    if DB_AVAILABLE:
-        async with get_db() as db:
-            await ConfigCRUD.set(db, "country_code", country_code)
-            await db.commit()
-            await invalidate_config_cache()
-            return
-    
-    # Fallback to config.json
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-    else:
-        data = {}
-    if "monitoring" not in data:
-        data["monitoring"] = {}
-    data["monitoring"]["ip_location"] = country_code
-    await write_json_file(data)
-    await invalidate_config_cache()
-
-
 async def add_except_user(except_user: str) -> str | None:
     """
     Add a user to the exception list using database.
@@ -485,13 +509,21 @@ async def save_general_limit(limit: int) -> int:
     """
     Save the general limit to the database.
     Falls back to config.json if database is not available.
+
+    Every path invalidates the configuration cache. That cache has no expiry - it is
+    dropped only by an explicit invalidation - and read_config() overlays the stored
+    general_limit onto config["limits"]["general"], which is what the enforcement loop
+    compares device counts against. Without the invalidation the new limit was written
+    to the database and then ignored for the life of the process, so raising the limit
+    from the bot did not stop the old one from banning people.
     """
     if DB_AVAILABLE:
         async with get_db() as db:
             await ConfigCRUD.set(db, "general_limit", limit)
             await db.commit()
-            return limit
-    
+        await invalidate_config_cache()
+        return limit
+
     # Fallback to config.json
     if os.path.exists("config.json"):
         data = await read_json_file()
@@ -499,61 +531,9 @@ async def save_general_limit(limit: int) -> int:
             data["limits"] = {}
         data["limits"]["general"] = limit
         await write_json_file(data)
+        await invalidate_config_cache()
         return limit
     data = {"limits": {"general": limit}}
     await write_json_file(data)
+    await invalidate_config_cache()
     return limit
-
-
-async def save_check_interval(interval: int) -> int:
-    """
-    Save the check interval to the database.
-    Falls back to config.json if database is not available.
-    """
-    if DB_AVAILABLE:
-        async with get_db() as db:
-            await ConfigCRUD.set(db, "check_interval", interval)
-            await db.commit()
-            await invalidate_config_cache()
-            return interval
-    
-    # Fallback to config.json
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-        if "monitoring" not in data:
-            data["monitoring"] = {}
-        data["monitoring"]["check_interval"] = interval
-        await write_json_file(data)
-        await invalidate_config_cache()
-        return interval
-    data = {"monitoring": {"check_interval": interval}}
-    await write_json_file(data)
-    await invalidate_config_cache()
-    return interval
-
-
-async def save_time_to_active_users(time_val: int) -> int:
-    """
-    Save the time to active users to the database.
-    Falls back to config.json if database is not available.
-    """
-    if DB_AVAILABLE:
-        async with get_db() as db:
-            await ConfigCRUD.set(db, "time_to_active_users", time_val)
-            await db.commit()
-            await invalidate_config_cache()
-            return time_val
-    
-    # Fallback to config.json
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-        if "monitoring" not in data:
-            data["monitoring"] = {}
-        data["monitoring"]["time_to_active_users"] = time_val
-        await write_json_file(data)
-        await invalidate_config_cache()
-        return time_val
-    data = {"monitoring": {"time_to_active_users": time_val}}
-    await write_json_file(data)
-    await invalidate_config_cache()
-    return time_val

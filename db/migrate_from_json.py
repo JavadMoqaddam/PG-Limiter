@@ -71,10 +71,20 @@ async def migrate_config(config_file: str = LEGACY_CONFIG):
                 await ConfigCRUD.set(db, "general_limit", limits["general"])
                 count += 1
             
-            # Special limits
+            # Special limits. A legacy 0 or negative is skipped rather than migrated:
+            # UserLimitCRUD refuses it now (a limit of 0 bans on the first device
+            # instead of exempting), and letting the ValueError escape would abandon
+            # the rest of the migration over one bad row.
             special_limits = limits.get("special", {})
             for username, limit in special_limits.items():
-                await UserLimitCRUD.set_limit(db, username, limit)
+                try:
+                    await UserLimitCRUD.set_limit(db, username, limit)
+                except ValueError as error:
+                    print(
+                        f"  ⚠️ Skipping special limit for {username}: {error} "
+                        f"(add them to the whitelist if they should have no limit)"
+                    )
+                    continue
                 count += 1
             
             # Except users

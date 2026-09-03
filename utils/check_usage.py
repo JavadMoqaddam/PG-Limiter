@@ -29,6 +29,7 @@ from utils.shared_state import (
     ACTIVE_USERS_LOCK,
     get_active_users_snapshot,
     get_node_event_ages,
+    node_silence_window,
     nodes_seen_within,
     pop_active_users_snapshot,
     tracked_node_count,
@@ -74,6 +75,38 @@ async def _ensure_isp_detector(config_data: dict) -> ISPDetector:
     return isp_detector
 
 
+# A limit below this bans on the first device, so it is never a usable limit.
+MIN_EFFECTIVE_LIMIT = 1
+# What a broken general limit falls back to: the same value .env.example ships and
+# read_config already uses when GENERAL_LIMIT is absent or unparseable.
+DEFAULT_GENERAL_LIMIT = 2
+
+
+def _usable_limit(raw, username: str, source: str) -> int | None:
+    """
+    Coerce one configured limit, or return ``None`` if it cannot serve as a limit.
+
+    A value below 1 is not "unlimited". It makes the very first device a violation and
+    bans the user after the usual consecutive scans, so treating it as a limit is the
+    one failure mode this project refuses to ship. ``None`` sends the caller on to the
+    next, less specific limit - the safe direction, and what keeps
+    ``resolve_effective_limit``'s promise of returning >= 1. Exemption is the
+    whitelist, not a limit of zero.
+    """
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        return None
+    if value >= MIN_EFFECTIVE_LIMIT:
+        return value
+    logger.warning(
+        f"Ignoring {source} {value!r} for {username}: a limit must be "
+        f"{MIN_EFFECTIVE_LIMIT} or greater. Falling back to the next limit in the "
+        f"chain - to exempt this user entirely, add them to the whitelist instead."
+    )
+    return None
+
+
 async def resolve_effective_limit(
     username: str,
     config: dict | None = None,
@@ -103,26 +136,23 @@ async def resolve_effective_limit(
     """
     # 1. Check direct special limit override
     if special_limit and username in special_limit:
-        try:
-            return int(special_limit[username])
-        except (ValueError, TypeError):
-            pass
+        resolved = _usable_limit(special_limit[username], username, "special limit")
+        if resolved is not None:
+            return resolved
 
     # 2. Check pre-computed metadata limit (if provided)
     if metadata and isinstance(metadata, dict):
         eff_limit = metadata.get("effective_ip_limit")
         if eff_limit is not None:
-            try:
-                return int(eff_limit)
-            except (ValueError, TypeError):
-                pass
+            resolved = _usable_limit(eff_limit, username, "pre-computed limit")
+            if resolved is not None:
+                return resolved
 
     # 3. Check Group Limit (from pre-batched mapping)
     if group_limits and username in group_limits:
-        try:
-            return int(group_limits[username])
-        except (ValueError, TypeError):
-            pass
+        resolved = _usable_limit(group_limits[username], username, "group limit")
+        if resolved is not None:
+            return resolved
 
     # 4. Direct Group Limit Fallback (Defense-in-depth from config & user group_ids)
     cfg_group_limits = config.get("group_limits", {}) if (config and isinstance(config, dict)) else {}
@@ -142,21 +172,44 @@ async def resolve_effective_limit(
             from utils.user_sync import get_max_group_limit
             max_glim = get_max_group_limit(user_gids, cfg_group_limits)
             if max_glim is not None:
-                return max_glim
+                resolved = _usable_limit(max_glim, username, "group limit")
+                if resolved is not None:
+                    return resolved
 
     # 5. General Fallback Limit
-    general_limit = 2
+    general_limit = DEFAULT_GENERAL_LIMIT
     if config and isinstance(config, dict):
-        limits_sec = config.get("limits", {})
-        if isinstance(limits_sec, dict):
-            general_limit = limits_sec.get("general", 2)
+        # The flat "general_limit" key used to be unreachable: config.get("limits", {})
+        # returns {} when the key is absent, {} is a dict, so the first branch always
+        # won and resolved to the hardcoded default. read_config always supplies
+        # "limits", so this only bit callers passing a partial config - and it bit them
+        # in the stricter direction, ignoring a configured higher limit.
+        limits_sec = config.get("limits")
+        if isinstance(limits_sec, dict) and "general" in limits_sec:
+            general_limit = limits_sec["general"]
         elif "general_limit" in config:
-            general_limit = config.get("general_limit", 2)
+            general_limit = config["general_limit"]
 
     try:
-        return int(general_limit)
+        resolved_general = int(general_limit)
     except (ValueError, TypeError):
-        return 2
+        return DEFAULT_GENERAL_LIMIT
+    if resolved_general >= MIN_EFFECTIVE_LIMIT:
+        return resolved_general
+
+    # Nothing left to fall through to, and returning this would ban every active user
+    # on the installation after the usual consecutive scans - the one outcome this
+    # project treats as unshippable. Values below 1 are refused at every input now, so
+    # reaching here means a hand-edited row or an old .env; the documented default is
+    # used instead and said loudly, because the operator's intent was almost certainly
+    # "no limit", which is the whitelist rather than a limit of zero.
+    logger.critical(
+        f"⛔ Configured general limit {resolved_general!r} is not a usable limit - a "
+        f"limit below {MIN_EFFECTIVE_LIMIT} would ban every active user. Using the "
+        f"default of {DEFAULT_GENERAL_LIMIT} instead. Set GENERAL_LIMIT to 1 or more, "
+        f"and use the whitelist to exempt users."
+    )
+    return DEFAULT_GENERAL_LIMIT
 
 
 class MetadataUnavailable(RuntimeError):
@@ -361,7 +414,12 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
         config_data = await read_config()
     general_limit = config_data.get("limits", {}).get("general", 2)
     except_users = config_data.get("except_users", [])  # except_users is at root level
-    show_enhanced_details = config_data.get("display", {}).get("show_enhanced_details", True)
+    # read_config exposes this as a root-level bool named "enhanced_details" (the key the
+    # Telegram toggle writes). This used to read config["display"]["show_enhanced_details"],
+    # a path read_config never creates, so it always fell back to True and the toggle did
+    # nothing. It only decides whether the per-IP detail lines are rendered - the device
+    # count itself is computed before the flag is consulted - so no ban outcome changes.
+    show_enhanced_details = bool(config_data.get("enhanced_details", True))
     device_config = DeviceCountingConfig.from_config(config_data)
 
     # Read special limits from database instead of config
@@ -445,8 +503,12 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     for email in active_usernames_list:
         user_meta = users_metadata.get(email, {})
 
-        # Check group filter
-        if group_filter_enabled and group_filter_ids:
+        # Check group filter. Gated on `enabled` alone, not on `enabled and ids`: an
+        # enabled include filter with an empty group list makes NOBODY monitored, and
+        # requiring a non-empty list here made this report show every user as monitored
+        # while enforcement skipped all of them - the report contradicting the thing it
+        # is meant to describe.
+        if group_filter_enabled:
             user_gids = [str(x) for x in user_meta.get("group_ids", [])]
             user_in_group = any(g in group_filter_ids for g in user_gids)
             if group_filter_mode == "include" and not user_in_group:
@@ -709,7 +771,7 @@ async def dispatch_chunked_warnings(
 
         header = (
             f"⚠️ <b>WARNINGS REPORT</b> ({batch_num}/{total_chunks}) - <code>{now_str}</code>\n"
-            f"📡 Monitoring Window: <code>{max_warnings} cycles (~{period_min} min)</code>\n"
+            f"📡 Monitoring Window (current setting): <code>{max_warnings} cycles (~{period_min} min)</code>\n"
             f"📊 Violators in cycle: <code>{total_violators}</code> | In batch: <code>{len(chunk)}</code>"
         )
 
@@ -747,6 +809,62 @@ async def dispatch_chunked_warnings(
         # Enqueue with safe TTL (10 minutes) so reports are not prematurely dropped
         warning_ttl = max(600.0, check_interval * 10)
         await send_warning_log(batch_msg, ttl=warning_ttl)
+
+
+def _sample_is_trustworthy(all_users_actual_ips: dict, check_interval: int) -> bool:
+    """
+    Whether this cycle's sample is complete enough to act on monitoring records.
+
+    An empty sample while users are under monitoring is not 2,350 people
+    disconnecting at once - it is the log pipeline having stopped. Acting on that
+    evidence hands every real offender a fresh start each cycle, which is how a
+    flaky stream stops bans altogether.
+
+    Two separate signals, because they catch different failures:
+
+      * an empty sample catches "everything is down";
+      * the per-node heartbeat catches *partial* failure, which an empty sample
+        cannot see. get_logs opens its client with read timeout None, so a half-open
+        stream never raises and the node keeps reporting "✅ Connected" while
+        delivering nothing. One dead node out of forty-nine still leaves plenty of
+        active users in the sample - and every user who was on that node looks like
+        they disconnected.
+
+    The staleness window is three check intervals (see node_silence_window). Every
+    line the panel sends counts as a heartbeat, keep-alives included, so a node with
+    no user traffic at all still reports in and a genuinely idle node never blocks
+    enforcement. Silence for three whole intervals is a broken stream, and the node
+    poller in get_logs reconnects on the same window.
+
+    Under-counting is the failure direction here, so the safe answer when in doubt
+    is False: leave every counter and every record exactly as it is.
+    """
+    if not all_users_actual_ips and warning_system.warnings:
+        logger.error(
+            f"⛔ No active users this cycle while {len(warning_system.warnings)} are under "
+            f"monitoring - treating the sample as unusable and leaving every counter alone"
+        )
+        return False
+
+    tracked_nodes = tracked_node_count()
+    if tracked_nodes and warning_system.warnings:
+        stale_window = node_silence_window(check_interval)
+        live_nodes = nodes_seen_within(stale_window)
+        if live_nodes < tracked_nodes:
+            silent_nodes = sorted(
+                node_id
+                for node_id, age in get_node_event_ages().items()
+                if age > stale_window
+            )
+            logger.error(
+                f"⛔ {len(silent_nodes)} of {tracked_nodes} log streams produced nothing in "
+                f"the last {int(stale_window)}s (node ids {silent_nodes}) while "
+                f"{len(warning_system.warnings)} users are under monitoring - the sample is "
+                f"incomplete, so no counter is cleared and no record is judged this cycle"
+            )
+            return False
+
+    return True
 
 
 async def check_users_usage(panel_data: PanelType, config_data: dict | None = None):
@@ -871,11 +989,30 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         f"{total_ips_cycle} per-user IPs (summed per user, not de-duplicated)"
     )
 
-    # Check for users who still violate limits after warning period
-    # Pass actual IPs, group limits and the cycle's unified device counts
+    # Judge the sample BEFORE the second ban path runs. This used to be computed
+    # ~200 lines below, after check_persistent_violations had already deleted every
+    # expired record - so the guard meant to stop a partial view from wiping counters
+    # ran too late to protect the records that path touches.
+    counters_are_trustworthy = _sample_is_trustworthy(all_users_actual_ips, check_interval)
+
+    # Check for users who still violate limits after warning period.
+    # Pass the actual IPs, group limits and the cycle's unified device counts, plus
+    # the three facts this path was missing: whether the sample can be trusted, who
+    # is whitelisted, and whose limit is actually known this cycle.
+    from utils.user_sync import USER_METADATA_CACHE as _metadata_cache
     disabled_users, warned_users = await warning_system.check_persistent_violations(
         panel_data, all_users_actual_ips, config_data, batched_group_limits,
-        device_counts=all_users_device_counts
+        device_counts=all_users_device_counts,
+        sample_is_trustworthy=counters_are_trustworthy,
+        except_users=except_users,
+        # "Known" has to mean "this user's limit can be resolved", which is what the
+        # guard downstream actually needs. The metadata batch only covers users active
+        # THIS cycle, so passing it alone made every offline monitored user look
+        # unresolvable: each one logged a warning saying its record was being kept, and
+        # cleanup_expired_warnings then deleted it anyway. The RAM cache holds every
+        # synced user, so an offline user is resolvable and gets judged normally - with
+        # no IPs their device count is 0, so the record is dropped without a ban.
+        known_users=set(users_metadata_usage) | set(_metadata_cache),
     )
 
     # Combine disabled and warned users to skip them in the loop
@@ -1073,6 +1210,12 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     behavior = w_obj.get_behavior_summary() if w_obj else ""
                     default_consecutive = 2 if result == "updated" else 1
                     consecutive = getattr(w_obj, "consecutive_violations", default_consecutive) if w_obj else default_consecutive
+                    # The record's own threshold, not the live setting: lowering
+                    # max_warning_count does not apply to a streak already in progress,
+                    # so "Scan 2 of 3" has to quote the rule this user is judged by.
+                    item_max_warnings = (
+                        warning_system.effective_max_warnings(w_obj) if w_obj else int(max_warning_count)
+                    )
                     cycle_new_warnings.append({
                         "username": user_name,
                         "ip_count": effective_device_count,
@@ -1081,7 +1224,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         "trust_level": trust_level,
                         "behavior": behavior,
                         "consecutive_violations": consecutive,
-                        "max_warnings": max_warning_count,
+                        "max_warnings": item_max_warnings,
                     })
                     if result == "new":
                         logger.warning(
@@ -1107,53 +1250,10 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
             )
             continue
 
-    # Check for users whose usage normalized (active devices <= limit or disconnected)
-    #
-    # An empty sample while users are under monitoring is not 2,350 people
-    # disconnecting at once - it is the log pipeline having stopped. Clearing on that
-    # evidence hands every real offender a fresh start each cycle, which is how a
-    # flaky stream stops bans altogether.
-    #
-    # Two separate signals, because they catch different failures:
-    #
-    #  * an empty sample catches "everything is down";
-    #  * the per-node heartbeat catches *partial* failure, which an empty sample
-    #    cannot see. get_logs opens its client with timeout=None, so a half-open
-    #    stream never raises and the node keeps reporting "✅ Connected" while
-    #    delivering nothing. One dead node out of forty-nine still leaves plenty of
-    #    active users in the sample - and every user who was on that node looks
-    #    like they disconnected.
-    #
-    # The staleness window is generous on purpose. A node with no traffic at all in
-    # two whole check intervals is not merely quiet on this installation, and
-    # erring long means a genuinely idle node never blocks enforcement.
-    counters_are_trustworthy = bool(all_users_actual_ips) or not warning_system.warnings
-    if not counters_are_trustworthy:
-        logger.error(
-            f"⛔ No active users this cycle while {len(warning_system.warnings)} are under "
-            f"monitoring - treating the sample as unusable and leaving every counter alone"
-        )
-
-    tracked_nodes = tracked_node_count()
-    if counters_are_trustworthy and tracked_nodes and warning_system.warnings:
-        stale_window = max(120.0, float(check_interval) * 2)
-        live_nodes = nodes_seen_within(stale_window)
-        if live_nodes < tracked_nodes:
-            silent_nodes = sorted(
-                node_id
-                for node_id, age in get_node_event_ages().items()
-                if age > stale_window
-            )
-            # Under-counting is the failure direction here, so the safe response is
-            # to leave every counter alone rather than to clear on a partial view.
-            counters_are_trustworthy = False
-            logger.error(
-                f"⛔ {len(silent_nodes)} of {tracked_nodes} log streams produced nothing in "
-                f"the last {int(stale_window)}s (node ids {silent_nodes}) while "
-                f"{len(warning_system.warnings)} users are under monitoring - the sample is "
-                f"incomplete, so no counter is cleared this cycle"
-            )
-
+    # Clear the records of users who came back inside their limit or went away.
+    # counters_are_trustworthy was decided before check_persistent_violations ran
+    # (see _sample_is_trustworthy); reusing it here keeps both paths on one verdict
+    # and stops the log from reporting the same partial sample twice.
     for monitored_user in list(warning_system.warnings.keys()):
         if not counters_are_trustworthy:
             break
@@ -1221,8 +1321,12 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     if cycle_new_warnings:
         await dispatch_chunked_warnings(cycle_new_warnings, check_interval, total_monitored, max_warnings=int(max_warning_count))
 
-    # Clean up expired warnings
-    await warning_system.cleanup_expired_warnings()
+    # Clean up expired warnings. Gated on the same trustworthiness verdict as
+    # check_persistent_violations: unconditional cleanup deleted exactly the records
+    # that function had just preserved.
+    await warning_system.cleanup_expired_warnings(
+        sample_is_trustworthy=counters_are_trustworthy
+    )
 
     all_users_log.clear()
 

@@ -24,6 +24,7 @@ import time
 from typing import Optional
 
 from utils.logs import get_logger
+from utils.read_config import normalize_min_coverage
 from utils.shared_state import ACTIVE_USERS, ACTIVE_USERS_LOCK
 from utils.types import PanelType, UserType
 
@@ -51,6 +52,11 @@ LAST_CYCLE_STATS: dict = {
     "duration_ms": 0,
     "geo_lookups": 0,
     "stale_ips": 0,
+    # Declared here so _reset_cycle_stats zeroes them: it iterates the live dict, and a
+    # key that only ever arrives via update(build_stats) would keep the previous cycle's
+    # value on any cycle that returns before the build.
+    "future_ips": 0,
+    "unknown_age_ips": 0,
     "skipped_reason": "",
 }
 
@@ -128,17 +134,31 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
 
 def resolve_monitored_group_ids(config_data: dict) -> Optional[list[int]]:
     """
-    Determine which group IDs the candidate query should be restricted to.
+    Determine which group IDs the candidate query may be restricted to.
 
-    Priority:
-      1. Group Filter in ``include`` mode — authoritative, since every user
-         outside those groups already has ``is_monitored=False``.
-      2. Group Limits keys — the groups that carry an explicit device limit.
-      3. ``None`` — no group narrowing (every user is a candidate).
+    Narrowing is only allowed when it provably cannot drop a user enforcement would
+    judge, and exactly one setting gives that guarantee: the Group Filter in
+    ``include`` mode. There, ``calculate_user_effective_limit_and_monitoring``
+    (``utils/user_sync.py``) sets ``is_monitored=False`` for every user outside the
+    listed groups, and the enforcement gate in ``check_usage`` skips on that flag, so
+    the users the panel omits are the same ones enforcement would ignore.
 
-    Group Filter in ``exclude`` mode cannot be expressed as a panel-side
-    filter, so it is left to the existing client-side filtering in
-    ``check_usage`` and no narrowing is applied here.
+    Everything else returns ``None`` - no group narrowing at all. The candidate query
+    is still bounded by ``status=active`` and the online-freshness window, which is
+    what keeps it cheap.
+
+    Group Limits deliberately do **not** narrow. That mapping only supplies an
+    *effective limit* per group; a user in no limited group is still monitored and is
+    judged against the general limit (``resolve_effective_limit`` step 5). Restricting
+    the query to the ``group_limits`` keys therefore left every general-limit user
+    uncollected, and because coverage is measured over the narrowed target set the
+    cycle still reported 100% and enforced - silently shrinking enforcement to the
+    limited groups while looking healthy.
+
+    Note the degenerate case: filter enabled in ``include`` mode with an empty group
+    list makes *nobody* monitored, but an empty return value means "no filter" to the
+    panel, so this returns ``None`` and lets ``_prefilter_candidates`` drop them all.
+    One wasted query, correct outcome.
     """
     group_filter = config_data.get("group_filter") or {}
     if group_filter.get("enabled") and group_filter.get("mode", "include") == "include":
@@ -146,27 +166,28 @@ def resolve_monitored_group_ids(config_data: dict) -> Optional[list[int]]:
         if filter_ids:
             return filter_ids
 
-    group_limits = config_data.get("group_limits") or {}
-    if group_limits:
-        limit_ids = []
-        for key in group_limits:
-            try:
-                limit_ids.append(int(key))
-            except (ValueError, TypeError):
-                continue
-        if limit_ids:
-            return sorted(set(limit_ids))
-
     return None
 
 
-def resolve_monitored_admins(config_data: dict) -> Optional[list[str]]:
-    """Return the admin usernames the candidate query can be restricted to."""
-    admin_filter = config_data.get("admin_filter") or {}
-    if admin_filter.get("enabled") and admin_filter.get("mode", "include") == "include":
-        usernames = [str(a) for a in (admin_filter.get("admin_usernames") or []) if a]
-        if usernames:
-            return usernames
+def resolve_monitored_admins(_config_data: dict) -> Optional[list[str]]:
+    """
+    Always ``None``: the admin filter cannot be expressed as a panel-side filter.
+
+    The configuration is still taken so the call site reads like its group counterpart
+    and so a future panel that can express the null-owner case has somewhere to read
+    from.
+
+    The enforcement gate in ``check_usage`` is deliberately fail-open on ownership - a
+    user whose local ``owner_username`` is NULL is still limited, because a sync gap
+    must not silently exempt anyone. The panel's ``admin`` parameter is an ANY-of match
+    over named admins, so it cannot express "…or has no known owner" and would drop
+    exactly those users from the query while enforcement still judged them.
+
+    Same rule as ``resolve_monitored_group_ids``: narrowing is only allowed where it
+    provably cannot drop a user enforcement would judge. It does not hold here, so the
+    admin filter stays client-side. The query is still bounded by ``status=active`` and
+    the online-freshness window.
+    """
     return None
 
 
@@ -387,6 +408,7 @@ async def _build_users_from_payloads(
     nodes_seen: set[int] = set()
     stale_dropped = 0
     future_dropped = 0
+    unknown_age = 0
     # Tolerance for ordinary clock skew between panel and limiter.
     future_cutoff = now + max(60.0, float(freshness or 0))
 
@@ -398,22 +420,37 @@ async def _build_users_from_payloads(
                 continue
             nodes_seen.add(node_id)
             for ip, value in ip_values.items():
-                # Values below the floor are legacy connection counts, not
-                # timestamps, and carry no freshness information.
-                if value >= STALE_EPOCH_FLOOR:
-                    if value > future_cutoff:
-                        # A last-seen stamp cannot be in the future. The panel clock is
-                        # ahead (or the value is garbage), which silently turned the
-                        # whole freshness filter into a no-op and let the panel's
-                        # never-expiring IP list inflate device counts again. Treat it
-                        # as unusable: if every value looks like this, the existing
-                        # "all IPs stale" gate skips the cycle instead of enforcing.
-                        future_dropped += 1
-                        stale_dropped += 1
-                        continue
-                    if value < stale_cutoff:
-                        stale_dropped += 1
-                        continue
+                if value < STALE_EPOCH_FLOOR:
+                    # Too small to be a last-seen Unix timestamp, so this IP's age is
+                    # unknown and it cannot be shown to be a current connection. It used
+                    # to be read as a legacy connection count and counted as a live
+                    # device, which skipped BOTH checks below - and since the panel never
+                    # expires an entry, that re-enabled the exact failure the freshness
+                    # filter exists to stop: a user who merely changed network looking
+                    # like several simultaneous devices. Every value int() cannot parse
+                    # lands here too, because _parse_ip_payload coerces those to 1 - an
+                    # ISO-8601 datetime string, a float-formatted epoch, a bool.
+                    #
+                    # Counted as stale on purpose rather than under its own name: if a
+                    # panel really did return counts for everything, the existing "every
+                    # IP filtered as stale" gate then skips the cycle, instead of
+                    # publishing an empty snapshot that clears every pending warning.
+                    unknown_age += 1
+                    stale_dropped += 1
+                    continue
+                if value > future_cutoff:
+                    # A last-seen stamp cannot be in the future. The panel clock is
+                    # ahead (or the value is garbage), which silently turned the
+                    # whole freshness filter into a no-op and let the panel's
+                    # never-expiring IP list inflate device counts again. Treat it
+                    # as unusable: if every value looks like this, the existing
+                    # "all IPs stale" gate skips the cycle instead of enforcing.
+                    future_dropped += 1
+                    stale_dropped += 1
+                    continue
+                if value < stale_cutoff:
+                    stale_dropped += 1
+                    continue
                 pairs.append((node_id, ip))
                 raw_ips.add(ip)
         if pairs:
@@ -461,6 +498,14 @@ async def _build_users_from_payloads(
             f"the panel clock runs ahead"
         )
 
+    if unknown_age:
+        api_ip_logger.warning(
+            f"🛰️ {unknown_age} reported IPs carried a value below the epoch floor "
+            f"({STALE_EPOCH_FLOOR}), so their age is unknown and they were not counted "
+            f"as connected. Either the panel reports connection counts rather than "
+            f"last-seen timestamps on this build, or the values are malformed"
+        )
+
     stats = {
         "geo_lookups": geo_lookups,
         "nodes_seen": len(nodes_seen),
@@ -468,6 +513,7 @@ async def _build_users_from_payloads(
         "users_with_ips": len(new_users),
         "stale_ips": stale_dropped,
         "future_ips": future_dropped,
+        "unknown_age_ips": unknown_age,
     }
     return new_users, stats
 
@@ -588,17 +634,17 @@ async def _handle_coverage_skip(reason: str) -> None:
         return
 
     api_ip_logger.error(
-        f"⛔ Enforcement has been skipped for {_consecutive_coverage_skips} consecutive "
-        f"cycles ({reason}). Nobody is being warned or banned. Check the panel's "
-        f"online-stats endpoint, api_ip_timeout and api_ip_concurrency."
+        f"⛔ Enforcement has been skipped {_consecutive_coverage_skips} times since the "
+        f"last usable sample ({reason}). Nobody is being warned or banned. Check the "
+        f"panel's online-stats endpoint, api_ip_timeout and api_ip_concurrency."
     )
     if _coverage_alert_sent:
         return
     _coverage_alert_sent = True
     await _notify(
         "🛰️ <b>API IP mode: enforcement has stopped</b>\n\n"
-        f"{_consecutive_coverage_skips} cycles in a row were skipped because the "
-        f"sample was incomplete (<code>{reason}</code>).\n"
+        f"{_consecutive_coverage_skips} cycles have been skipped since the last usable "
+        f"sample because it was incomplete (<code>{reason}</code>).\n"
         "Nobody is being warned or banned while this lasts. Raise "
         "<code>api_ip_timeout</code>, lower <code>api_ip_concurrency</code>, or "
         "switch the IP source back to Logs."
@@ -686,12 +732,18 @@ async def collect_active_users_from_api(
     if not targets:
         # A genuinely empty candidate set is a valid result, not a failure:
         # enforcement still has to run so normalized users get cleared.
+        #
+        # The dead-cycle streak is reset because the candidate query answered, so
+        # falling back to log mode is not the remedy. The coverage-skip streak is
+        # deliberately left alone: the per-user fan-out never ran this cycle, so it
+        # produced no evidence about whether the sample is usable. Clearing it here let
+        # an alternating pattern - empty cycle, low-coverage skip, empty cycle - hold
+        # the streak at 1 forever, so the "enforcement has stopped" alert could never
+        # fire no matter how long enforcement stayed down.
         await _publish_active_users({})
         LAST_CYCLE_STATS["coverage"] = 1.0
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         _consecutive_dead_cycles = 0
-        _consecutive_coverage_skips = 0
-        _coverage_alert_sent = False
         api_ip_logger.info("🛰️ No online candidates this cycle")
         return True
 
@@ -728,13 +780,10 @@ async def collect_active_users_from_api(
 
     # An absent key means "use the documented default", not "no floor at all".
     # `or 0.0` silently disabled the guard for any caller that assembled
-    # config_data without going through read_config, which is where the 0.8
-    # default actually lives.
-    raw_min_coverage = config_data.get("api_ip_min_coverage")
-    if raw_min_coverage is None or raw_min_coverage == "":
-        min_coverage = 0.8
-    else:
-        min_coverage = float(raw_min_coverage)
+    # config_data without going through read_config. normalize_min_coverage owns
+    # both the default and the percent-versus-fraction rule, so this file no longer
+    # keeps its own copy of 0.8 to drift from read_config's.
+    min_coverage = normalize_min_coverage(config_data.get("api_ip_min_coverage"))
 
     if coverage < min_coverage:
         LAST_CYCLE_STATS["skipped_reason"] = (
@@ -758,16 +807,28 @@ async def collect_active_users_from_api(
 
     _consecutive_dead_cycles = 0
     _forbidden_alert_sent = False
-    # A usable sample: clear the "enforcement has stopped" state so the alarm can
-    # fire again if it happens a second time.
-    _consecutive_coverage_skips = 0
-    _coverage_alert_sent = False
 
     raw_by_name = {name: raw for name, _, raw in targets}
     new_users, build_stats = await _build_users_from_payloads(
         payloads, raw_by_name, node_name_map, set(disabled_nodes), config_data,
         fetch_times=fetch_times,
     )
+
+    # Node coverage: how many of the nodes that ought to be reporting actually
+    # contributed an IP. The `coverage` gate above is a per-user answer rate and
+    # reads 1.0 even when a third of the fleet is silent, so this is the only
+    # signal that separates "users happen to be concentrated on a few nodes" from
+    # "these nodes stopped reporting" - and the second under-counts devices, which
+    # is what lets a real offender's consecutive-violation counter be cleared.
+    #
+    # Computed before the gates below so a skipped cycle still records it. Leaving it
+    # until after them meant the stats screen showed 0/0 on exactly the cycles an
+    # operator opens it to diagnose.
+    nodes_expected = len(expected_node_ids)
+    node_coverage = (build_stats["nodes_seen"] / nodes_expected) if nodes_expected else 1.0
+    LAST_CYCLE_STATS["nodes_seen"] = build_stats["nodes_seen"]
+    LAST_CYCLE_STATS["nodes_expected"] = nodes_expected
+    LAST_CYCLE_STATS["node_coverage"] = round(node_coverage, 4)
 
     # Every IP filtered out as stale while the panel answered normally means the
     # timestamps cannot be trusted (clock skew between panel and limiter is the
@@ -779,28 +840,23 @@ async def collect_active_users_from_api(
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         api_ip_logger.error(
             f"🛰️ Skipping enforcement: all {build_stats['stale_ips']} reported IPs were "
-            f"older than the freshness window. Check the clock skew between the panel "
-            f"and this container, or raise api_ip_freshness."
+            f"older than the freshness window, or carried a value too small to be a "
+            f"timestamp. Check the clock skew between the panel and this container, or "
+            f"raise api_ip_freshness."
         )
+        # Counted towards the alert streak. Clock skew does not heal by itself, so
+        # without this enforcement could stay off indefinitely with nothing but an
+        # ERROR line in the container log to show it.
+        await _handle_coverage_skip(LAST_CYCLE_STATS["skipped_reason"])
         return False
-
-    # Node coverage: how many of the nodes that ought to be reporting actually
-    # contributed an IP. The `coverage` gate above is a per-user answer rate and
-    # reads 1.0 even when a third of the fleet is silent, so this is the only
-    # signal that separates "users happen to be concentrated on a few nodes" from
-    # "these nodes stopped reporting" - and the second under-counts devices, which
-    # is what lets a real offender's consecutive-violation counter be cleared.
-    nodes_expected = len(expected_node_ids)
-    node_coverage = (build_stats["nodes_seen"] / nodes_expected) if nodes_expected else 1.0
-    LAST_CYCLE_STATS["nodes_seen"] = build_stats["nodes_seen"]
-    LAST_CYCLE_STATS["nodes_expected"] = nodes_expected
-    LAST_CYCLE_STATS["node_coverage"] = round(node_coverage, 4)
 
     # Off unless configured. A genuinely quiet node reports nothing, so the right
     # floor depends on the fleet and has to be observed before it is enforced -
     # guessing one here would skip healthy cycles. The ratio is logged either way,
     # which is the part that was missing.
-    min_node_coverage = float(config_data.get("api_ip_min_node_coverage") or 0.0)
+    min_node_coverage = normalize_min_coverage(
+        config_data.get("api_ip_min_node_coverage"), default=0.0
+    )
     if min_node_coverage and node_coverage < min_node_coverage:
         # The build already ran, so report what it found. Without this the
         # diagnostics show a cycle that collected nothing, which reads like a dead
@@ -819,6 +875,13 @@ async def collect_active_users_from_api(
         return False
 
     await _publish_active_users(new_users)
+
+    # Only here, past every gate: the streak means "cycles skipped since enforcement
+    # last actually ran". Clearing it as soon as the fan-out looked healthy meant the
+    # two gates below it - all-stale and node coverage - could skip forever without the
+    # streak ever passing 1, so their alarm never fired.
+    _consecutive_coverage_skips = 0
+    _coverage_alert_sent = False
 
     LAST_CYCLE_STATS.update(build_stats)
     LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)

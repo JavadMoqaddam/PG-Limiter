@@ -6,6 +6,144 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-03
+
+A correctness release, like 1.4.1, but this one changes behaviour in enough places to
+warrant a minor bump. The theme is settings that did not mean what they appeared to
+mean: a configuration object every task shared and could edit, writes that failed
+without saying so, and a filter change that took five minutes to take effect. Several
+of the fixes below were reachable in log mode, not just in the newer API mode.
+
+### Fixed
+
+- **A device limit could resolve below 1, which bans on the first device.** Four of the
+  five exits in `resolve_effective_limit` returned a stored `0` verbatim, and the widest
+  of them is the general limit - the one that applies to every user with no special or
+  group limit. The bot had no floor at either general-limit prompt, nor in
+  `save_general_limit`, nor in `read_config`, and `GENERAL_LIMIT=0` in `.env` worked too;
+  the CLI and the HTTP API already refused it. An operator typing `0` to mean "no limit"
+  would have banned the entire installation after `MAX_WARNING_COUNT` scans. Now floored
+  in three layers: unusable values fall through to the next limit, an unusable general
+  limit uses the documented default of 2 and says so at CRITICAL, the config layer
+  validates `GENERAL_LIMIT` and the database row once at load, and the bot refuses it at
+  input with a message pointing at the whitelist. A 5,760-combination sweep confirms
+  nothing resolves below 1.
+- **`read_config()` handed out the shared cache instead of a copy.** One mutable dict
+  with no TTL was returned to every caller in the process, from both exits, so a
+  Telegram handler doing `config_data["disabled_nodes"].append(id)` changed what the
+  enforcement loop saw for the life of the process, with nothing in the log. Eighteen
+  such writes existed across five settings handlers, all on containers enforcement
+  reads. Each was normally masked by the `save_config_value` that followed, but that
+  function returned `False` *without* dropping the cache when the write failed, and two
+  node handlers put a Telegram round-trip between the edit and the save. Both exits now
+  deep-copy: 33 µs per read, 0.011% of a 180 s cycle. A node wrongly dropped from
+  `disabled_nodes` gets its connections counted again, which is the direction that ends
+  in a ban nobody earned.
+- **A failed settings write reported success.** `save_config_value`,
+  `delete_config_value` and the punishment-settings helper caught every exception and
+  returned `False` with nothing logged - the punishment one used `print`, which does not
+  reach the container log. Callers show a green tick without reading the return value, so
+  a write that never landed looked applied and silently reverted at the next cache
+  rebuild. Failures are now logged with the key and a traceback, the cache is dropped
+  whether or not the write committed, and `save_ipinfo_token` propagates the real result
+  instead of a hardcoded `True`.
+- **A group-filter change did not apply until the next user sync.** `is_monitored` is
+  pre-computed per user and read from the RAM metadata cache by the enforcement gate.
+  All eight Telegram writes that change the filter updated the config and dropped the
+  config cache but never recomputed the flag, so for up to one `user_sync_interval` -
+  five minutes by default, fifteen if configured that way - tightening the filter kept
+  enforcing exactly the users who had just been excluded. Three cycles at a 180 s
+  interval fit inside that window. `recompute_all_user_limits` also now refuses a
+  degraded configuration, which reads as "group filter disabled" and would have marked
+  every filtered-out user monitored again.
+- **API mode counted IPs whose age could not be established.** The freshness filter only
+  applied to values at or above the epoch floor; anything below skipped both the
+  staleness and future-timestamp checks and was counted as a live device, on the
+  assumption that a small value is a legacy connection count. Since the payload parser
+  coerces anything unparseable to `1`, an ISO-8601 string, a float-formatted epoch, a
+  bool, a list or a null all landed there - and the panel never expires an entry, so a
+  user who merely changed network looked like several simultaneous devices. It was also
+  invisible: no counter moved, so no gate fired. Such values are now dropped as unknown
+  age and folded into the stale count, so a wholly undatable payload skips the cycle
+  instead of publishing an empty snapshot that clears every pending warning.
+- **Group Limits narrowed the API-mode candidate query.** A group limit is a limit, not
+  a monitoring scope: users in no limited group are still judged against the general
+  limit. Restricting `GET /api/users` to the `group_limits` keys left them uncollected,
+  so they were never counted, warned or banned - and coverage, measured over the
+  narrowed target set, still read 100%, so no gate noticed. Exclude mode fell through
+  into the same branch despite a docstring saying it did not, which meant a limit on the
+  excluded group made the query ask for precisely the users enforcement must ignore.
+  Only a group filter in `include` mode narrows now, and the admin filter never does -
+  the enforcement gate is fail-open on ownership and the panel cannot express "…or has
+  no known owner".
+- **The "enforcement has stopped" alarm was unreachable in three ways.** The
+  coverage-skip streak was cleared as soon as the per-user fan-out looked healthy, before
+  the two gates that follow it, so an all-stale or low-node-coverage skip could repeat
+  forever without the streak passing 1. The empty-candidate path cleared the streak and
+  the one-shot flag as well, so an alternating pattern of empty and skipped cycles never
+  accumulated. And the "every IP filtered as stale" skip - clock skew, which does not
+  heal by itself - only wrote a log line. All three now feed one streak meaning "cycles
+  skipped since enforcement last actually ran".
+- **The cleanup pass deleted the records the new guards had just preserved.**
+  `check_persistent_violations` returns without judging anything when the sample is
+  partial, then `cleanup_expired_warnings()` ran unconditionally and removed exactly
+  those records - so a partial sample still wiped real offenders' counters. It now takes
+  the same trustworthiness verdict. The companion `known_users` guard also matched every
+  *offline* monitored user rather than only unresolvable ones, logging a warning per user
+  per cycle for a record that was then deleted anyway.
+- **The node list cache mixed its two scopes.** It was keyed on the panel domain alone,
+  but `enabled_only=True` and `False` are different result sets, so the node-status poller
+  asking for the full fleet overwrote the entry that enabled-only callers then read -
+  serving them disabled nodes for up to an hour, including the node-coverage denominator.
+- **The second ban path had none of the main loop's guards.** `check_persistent_violations`
+  could ban on a sample the main loop had already judged untrustworthy.
+- **A lowered `max_warning_count` applied retroactively** to streaks already in
+  progress, so a user at two of three warnings was banned by the next cycle after the
+  operator lowered the threshold to two. The required count is now pinned per record at
+  creation.
+- **A special limit of `0` banned the user instead of exempting them.** Nothing treated
+  `0` as unlimited on this path, so the user was judged against a limit of zero devices
+  and banned on first sight. Values below 1 are now refused at every input with a message
+  pointing at the whitelist, which is the actual exemption mechanism.
+- **A malformed punishment duration was trusted as-is.** A string or `null` in the stored
+  ladder reached the ban path without coercion; only an explicit `0` should mean a
+  permanent disable. Twelve malformed shapes were tested against the parser.
+- **Node reconnection acted on an hour-old node list.** The poller read the cached list,
+  so a node that had reconnected minutes ago kept being treated as down for up to an
+  hour, and disabled nodes were omitted from the list entirely rather than being seen and
+  skipped.
+- **The panel-user parser was given local state the panel does not have.** `is_excepted`
+  was hardcoded, so every whitelisted user was upserted as monitored, and the
+  single-user sync path did not pass the config at all. All three derived inputs are now
+  required arguments so the defect cannot recur silently.
+- **Backup restore wrote keys `read_config` does not read.** Settings were restored into
+  `timing`/`display`/`punishment`/`group_filter` blobs while the reader looks at flat
+  keys, so a restore appeared to succeed and changed nothing. The panel password was also
+  being written to the backup archive for no consumer; that write is gone.
+- **The enhanced-details toggle did nothing.** The reporting path read
+  `config["display"]["show_enhanced_details"]`, a path `read_config` never creates, so it
+  always fell back to on.
+- **The SSE connect phase had no timeout** and ignored `PANEL_VERIFY_SSL`, so a node
+  whose TCP connect hung held its task open indefinitely.
+
+### Added
+
+- **`API_IP_MIN_COVERAGE`** in `.env`, as a percentage (default 80). This is the share of
+  queried users that must answer before an API-mode cycle is allowed to enforce; below
+  it the cycle is skipped rather than acting on a thin sample, because a thin sample
+  clears the violation counters of real offenders. Both spellings are accepted (`80` and
+  `0.8`), and a malformed value falls back to the default rather than to zero - a floor
+  of zero would silently disable the guard.
+- **`API_IP_MIN_NODE_COVERAGE`** in `.env`, also a percentage, off by default. The user
+  coverage gate is an answer rate per user and reads 100% even when two thirds of the
+  fleet is silent, which under-counts devices. The key existed and was read but had no
+  writer anywhere, so the gate was unreachable - and it was parsed with a plain
+  `float()`, so a hand-written `80` became 80, clamped to 100%, and would have skipped
+  every cycle.
+- **The "Last API Cycle" screen shows node coverage with its denominator** ("1/49 (2%)"
+  rather than a bare "Nodes seen: 1"), and lists undatable and future-dated IP drops next
+  to stale ones. Both numbers were already recorded and never rendered.
+
 ### Changed
 
 - **The Docker image is pinned to the release version** instead of `:latest`. A mutable
@@ -13,6 +151,14 @@ All notable changes to PG-Limiter are recorded here. Format follows
   replaced lost its tag so there was no simple way back, and two servers could run
   different code while both reporting `latest`. Updating now requires the matching
   `v*` git tag to have been pushed, and says so plainly when it has not.
+- **Every staleness window is now three check intervals**, with a 120 s floor, instead of
+  a mix of two intervals and hard-coded values. One helper, `node_silence_window`, is the
+  single source: node-status polling, the half-open stream detector and the
+  sample-trustworthiness check all read it, so they cannot drift apart. At the default
+  180 s interval that is 540 s.
+- **A live SSE stream is reconnected when the panel calls the node connected but the
+  stream has produced nothing** for one silence window. Keep-alive lines count, so
+  silence means a dead stream rather than an idle node.
 
 ### Removed
 
