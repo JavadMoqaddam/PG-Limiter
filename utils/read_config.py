@@ -126,6 +126,41 @@ def normalize_min_coverage(raw: Any, default: float = DEFAULT_API_IP_MIN_COVERAG
     return max(0.0, min(1.0, value))
 
 
+# The general limit applies to every user with no special or group limit, so an
+# unusable value here is the widest possible blast radius: a limit below 1 makes the
+# first device a violation and bans the whole installation after the usual consecutive
+# scans. Exemption is the whitelist, never a limit of zero.
+DEFAULT_GENERAL_LIMIT = 2
+
+
+def normalize_general_limit(
+    raw: Any, source: str, default: int = DEFAULT_GENERAL_LIMIT
+) -> int:
+    """
+    Coerce a configured general limit, falling back to ``default`` when unusable.
+
+    ``default`` lets the database row fall back to the environment value rather than to
+    the built-in, which is the precedence GENERAL_LIMIT and CHECK_INTERVAL already use.
+    """
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        config_logger.error(
+            f"⚠️ Ignoring {source} value {raw!r}: not a whole number - using {default}"
+        )
+        return default
+    if value >= 1:
+        return value
+    config_logger.critical(
+        f"⛔ Ignoring {source} value {value!r}: a general limit below 1 would ban every "
+        f"active user on their first device. Using {default} instead - to exempt users, "
+        f"add them to the whitelist."
+    )
+    return default
+
+
 def load_env_config() -> Dict[str, Any]:
     """Load configuration from environment variables."""
     return {
@@ -142,7 +177,9 @@ def load_env_config() -> Dict[str, Any]:
         },
         # Limiter settings (from ENV - defaults)
         "limits": {
-            "general": _get_env("GENERAL_LIMIT", 2, int),
+            "general": normalize_general_limit(
+                os.environ.get("GENERAL_LIMIT"), "GENERAL_LIMIT"
+            ),
             "special": {},  # Loaded from DB
         },
         "except_users": [],  # Loaded from DB
@@ -293,10 +330,11 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     }
     
     if "general_limit" in db_config:
-        try:
-            config["limits"]["general"] = int(db_config["general_limit"])
-        except (ValueError, TypeError):
-            pass
+        config["limits"]["general"] = normalize_general_limit(
+            db_config["general_limit"],
+            "general_limit",
+            default=config["limits"]["general"],
+        )
     
     config["disable_method"] = db_config.get("disable_method", "status")
     config["disabled_group_id"] = db_config.get("disabled_group_id")

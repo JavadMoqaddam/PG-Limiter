@@ -215,6 +215,29 @@ def special_limit_rejection(limit: int) -> str | None:
     return None
 
 
+GENERAL_LIMIT_MIN = 1
+
+
+def general_limit_rejection(limit: int) -> str | None:
+    """
+    Return an admin-facing rejection message for a bad general limit, or None if usable.
+
+    Same trap as ``special_limit_rejection``, one blast radius wider: the general limit
+    applies to every user who has no special or group limit, so a stored 0 does not mean
+    "no limit" - it makes the first device a violation for the whole installation and
+    bans everyone after the usual consecutive scans. Exemption is the whitelist.
+    """
+    if limit < GENERAL_LIMIT_MIN:
+        return (
+            f"❌ The general limit must be <b>{GENERAL_LIMIT_MIN}</b> or greater "
+            f"(you sent <code>{limit}</code>).\n\n"
+            "A general limit of 0 would ban <b>every user</b> on their first device "
+            "rather than exempt them. To exempt specific users, add them to the "
+            "whitelist; to give a group more devices, use group limits."
+        )
+    return None
+
+
 async def handle_special_limit(username: str, limit: int) -> list:
     """
     Handles the special limit for a given username using database.

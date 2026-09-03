@@ -18,6 +18,7 @@ from telegram_bot.constants import (
 from telegram_bot.utils import (
     check_admin,
     add_admin_to_config,
+    general_limit_rejection,
     get_special_limit_list,
     get_special_limits_dict,
     handel_special_limit,
@@ -138,6 +139,10 @@ async def get_general_limit_number_handler(
             text=f"Wrong input: <code>{update.message.text.strip()}"
             + "</code>\ntry again <b>/set_general_limit_number</b>"
         )
+        return ConversationHandler.END
+    rejection = general_limit_rejection(limit_number)
+    if rejection:
+        await update.message.reply_html(rejection)
         return ConversationHandler.END
     await save_general_limit(limit_number)
     await update.message.reply_text(f"General limit set to {limit_number}")
@@ -469,14 +474,26 @@ async def handle_general_limit_input(update: Update, context: ContextTypes.DEFAU
     text = update.message.text.strip()
     try:
         limit = int(text)
-        await save_general_limit(limit)
-        await update.message.reply_html(
-            text=f"✅ General limit set to <b>{limit}</b>",
-            reply_markup=create_back_to_main_keyboard()
-        )
     except ValueError:
         await update.message.reply_html(
             text="❌ Invalid number.",
             reply_markup=create_back_to_main_keyboard()
         )
+        context.user_data["waiting_for"] = None
+        return
+
+    rejection = general_limit_rejection(limit)
+    if rejection:
+        await update.message.reply_html(
+            text=rejection,
+            reply_markup=create_back_to_main_keyboard()
+        )
+        context.user_data["waiting_for"] = None
+        return
+
+    await save_general_limit(limit)
+    await update.message.reply_html(
+        text=f"✅ General limit set to <b>{limit}</b>",
+        reply_markup=create_back_to_main_keyboard()
+    )
     context.user_data["waiting_for"] = None

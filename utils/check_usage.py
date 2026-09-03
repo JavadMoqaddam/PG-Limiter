@@ -75,6 +75,38 @@ async def _ensure_isp_detector(config_data: dict) -> ISPDetector:
     return isp_detector
 
 
+# A limit below this bans on the first device, so it is never a usable limit.
+MIN_EFFECTIVE_LIMIT = 1
+# What a broken general limit falls back to: the same value .env.example ships and
+# read_config already uses when GENERAL_LIMIT is absent or unparseable.
+DEFAULT_GENERAL_LIMIT = 2
+
+
+def _usable_limit(raw, username: str, source: str) -> int | None:
+    """
+    Coerce one configured limit, or return ``None`` if it cannot serve as a limit.
+
+    A value below 1 is not "unlimited". It makes the very first device a violation and
+    bans the user after the usual consecutive scans, so treating it as a limit is the
+    one failure mode this project refuses to ship. ``None`` sends the caller on to the
+    next, less specific limit - the safe direction, and what keeps
+    ``resolve_effective_limit``'s promise of returning >= 1. Exemption is the
+    whitelist, not a limit of zero.
+    """
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        return None
+    if value >= MIN_EFFECTIVE_LIMIT:
+        return value
+    logger.warning(
+        f"Ignoring {source} {value!r} for {username}: a limit must be "
+        f"{MIN_EFFECTIVE_LIMIT} or greater. Falling back to the next limit in the "
+        f"chain - to exempt this user entirely, add them to the whitelist instead."
+    )
+    return None
+
+
 async def resolve_effective_limit(
     username: str,
     config: dict | None = None,
@@ -104,41 +136,23 @@ async def resolve_effective_limit(
     """
     # 1. Check direct special limit override
     if special_limit and username in special_limit:
-        try:
-            raw_special = int(special_limit[username])
-        except (ValueError, TypeError):
-            pass
-        else:
-            if raw_special >= 1:
-                return raw_special
-            # A stored limit of 0 or less is not a limit of zero - it would make one
-            # device a violation and ban the user after the usual consecutive scans.
-            # Zero is rejected at input now, so a row like this is legacy or hand-edited
-            # data. Treat it the way the sync half already does (user_sync.py checks
-            # "> 0") and fall through to the group or general limit, which is both the
-            # safe direction and the only reading that keeps this function's promise of
-            # returning >= 1. "Unlimited" is the whitelist, not a special limit of 0.
-            logger.warning(
-                f"Ignoring special limit {raw_special!r} for {username}: a special limit "
-                f"must be 1 or greater. Falling back to the group or general limit - to "
-                f"exempt this user entirely, add them to the whitelist instead."
-            )
+        resolved = _usable_limit(special_limit[username], username, "special limit")
+        if resolved is not None:
+            return resolved
 
     # 2. Check pre-computed metadata limit (if provided)
     if metadata and isinstance(metadata, dict):
         eff_limit = metadata.get("effective_ip_limit")
         if eff_limit is not None:
-            try:
-                return int(eff_limit)
-            except (ValueError, TypeError):
-                pass
+            resolved = _usable_limit(eff_limit, username, "pre-computed limit")
+            if resolved is not None:
+                return resolved
 
     # 3. Check Group Limit (from pre-batched mapping)
     if group_limits and username in group_limits:
-        try:
-            return int(group_limits[username])
-        except (ValueError, TypeError):
-            pass
+        resolved = _usable_limit(group_limits[username], username, "group limit")
+        if resolved is not None:
+            return resolved
 
     # 4. Direct Group Limit Fallback (Defense-in-depth from config & user group_ids)
     cfg_group_limits = config.get("group_limits", {}) if (config and isinstance(config, dict)) else {}
@@ -158,21 +172,44 @@ async def resolve_effective_limit(
             from utils.user_sync import get_max_group_limit
             max_glim = get_max_group_limit(user_gids, cfg_group_limits)
             if max_glim is not None:
-                return max_glim
+                resolved = _usable_limit(max_glim, username, "group limit")
+                if resolved is not None:
+                    return resolved
 
     # 5. General Fallback Limit
-    general_limit = 2
+    general_limit = DEFAULT_GENERAL_LIMIT
     if config and isinstance(config, dict):
-        limits_sec = config.get("limits", {})
-        if isinstance(limits_sec, dict):
-            general_limit = limits_sec.get("general", 2)
+        # The flat "general_limit" key used to be unreachable: config.get("limits", {})
+        # returns {} when the key is absent, {} is a dict, so the first branch always
+        # won and resolved to the hardcoded default. read_config always supplies
+        # "limits", so this only bit callers passing a partial config - and it bit them
+        # in the stricter direction, ignoring a configured higher limit.
+        limits_sec = config.get("limits")
+        if isinstance(limits_sec, dict) and "general" in limits_sec:
+            general_limit = limits_sec["general"]
         elif "general_limit" in config:
-            general_limit = config.get("general_limit", 2)
+            general_limit = config["general_limit"]
 
     try:
-        return int(general_limit)
+        resolved_general = int(general_limit)
     except (ValueError, TypeError):
-        return 2
+        return DEFAULT_GENERAL_LIMIT
+    if resolved_general >= MIN_EFFECTIVE_LIMIT:
+        return resolved_general
+
+    # Nothing left to fall through to, and returning this would ban every active user
+    # on the installation after the usual consecutive scans - the one outcome this
+    # project treats as unshippable. Values below 1 are refused at every input now, so
+    # reaching here means a hand-edited row or an old .env; the documented default is
+    # used instead and said loudly, because the operator's intent was almost certainly
+    # "no limit", which is the whitelist rather than a limit of zero.
+    logger.critical(
+        f"⛔ Configured general limit {resolved_general!r} is not a usable limit - a "
+        f"limit below {MIN_EFFECTIVE_LIMIT} would ban every active user. Using the "
+        f"default of {DEFAULT_GENERAL_LIMIT} instead. Set GENERAL_LIMIT to 1 or more, "
+        f"and use the whitelist to exempt users."
+    )
+    return DEFAULT_GENERAL_LIMIT
 
 
 class MetadataUnavailable(RuntimeError):
