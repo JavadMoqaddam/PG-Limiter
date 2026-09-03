@@ -169,9 +169,13 @@ def resolve_monitored_group_ids(config_data: dict) -> Optional[list[int]]:
     return None
 
 
-def resolve_monitored_admins(config_data: dict) -> Optional[list[str]]:
+def resolve_monitored_admins(_config_data: dict) -> Optional[list[str]]:
     """
     Always ``None``: the admin filter cannot be expressed as a panel-side filter.
+
+    The configuration is still taken so the call site reads like its group counterpart
+    and so a future panel that can express the null-owner case has somewhere to read
+    from.
 
     The enforcement gate in ``check_usage`` is deliberately fail-open on ownership - a
     user whose local ``owner_username`` is NULL is still limited, because a sync gap

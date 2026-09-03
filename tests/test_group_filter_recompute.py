@@ -119,7 +119,7 @@ class TestSaveGroupFilterSetting:
         async def fake_invalidate():
             return None
 
-        async def boom(config=None):
+        async def boom(_config=None):
             raise RuntimeError("database gone")
 
         monkeypatch.setattr(handler, "save_config_value", fake_save)
