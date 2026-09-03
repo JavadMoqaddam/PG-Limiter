@@ -52,6 +52,11 @@ LAST_CYCLE_STATS: dict = {
     "duration_ms": 0,
     "geo_lookups": 0,
     "stale_ips": 0,
+    # Declared here so _reset_cycle_stats zeroes them: it iterates the live dict, and a
+    # key that only ever arrives via update(build_stats) would keep the previous cycle's
+    # value on any cycle that returns before the build.
+    "future_ips": 0,
+    "unknown_age_ips": 0,
     "skipped_reason": "",
 }
 
@@ -391,6 +396,7 @@ async def _build_users_from_payloads(
     nodes_seen: set[int] = set()
     stale_dropped = 0
     future_dropped = 0
+    unknown_age = 0
     # Tolerance for ordinary clock skew between panel and limiter.
     future_cutoff = now + max(60.0, float(freshness or 0))
 
@@ -402,22 +408,37 @@ async def _build_users_from_payloads(
                 continue
             nodes_seen.add(node_id)
             for ip, value in ip_values.items():
-                # Values below the floor are legacy connection counts, not
-                # timestamps, and carry no freshness information.
-                if value >= STALE_EPOCH_FLOOR:
-                    if value > future_cutoff:
-                        # A last-seen stamp cannot be in the future. The panel clock is
-                        # ahead (or the value is garbage), which silently turned the
-                        # whole freshness filter into a no-op and let the panel's
-                        # never-expiring IP list inflate device counts again. Treat it
-                        # as unusable: if every value looks like this, the existing
-                        # "all IPs stale" gate skips the cycle instead of enforcing.
-                        future_dropped += 1
-                        stale_dropped += 1
-                        continue
-                    if value < stale_cutoff:
-                        stale_dropped += 1
-                        continue
+                if value < STALE_EPOCH_FLOOR:
+                    # Too small to be a last-seen Unix timestamp, so this IP's age is
+                    # unknown and it cannot be shown to be a current connection. It used
+                    # to be read as a legacy connection count and counted as a live
+                    # device, which skipped BOTH checks below - and since the panel never
+                    # expires an entry, that re-enabled the exact failure the freshness
+                    # filter exists to stop: a user who merely changed network looking
+                    # like several simultaneous devices. Every value int() cannot parse
+                    # lands here too, because _parse_ip_payload coerces those to 1 - an
+                    # ISO-8601 datetime string, a float-formatted epoch, a bool.
+                    #
+                    # Counted as stale on purpose rather than under its own name: if a
+                    # panel really did return counts for everything, the existing "every
+                    # IP filtered as stale" gate then skips the cycle, instead of
+                    # publishing an empty snapshot that clears every pending warning.
+                    unknown_age += 1
+                    stale_dropped += 1
+                    continue
+                if value > future_cutoff:
+                    # A last-seen stamp cannot be in the future. The panel clock is
+                    # ahead (or the value is garbage), which silently turned the
+                    # whole freshness filter into a no-op and let the panel's
+                    # never-expiring IP list inflate device counts again. Treat it
+                    # as unusable: if every value looks like this, the existing
+                    # "all IPs stale" gate skips the cycle instead of enforcing.
+                    future_dropped += 1
+                    stale_dropped += 1
+                    continue
+                if value < stale_cutoff:
+                    stale_dropped += 1
+                    continue
                 pairs.append((node_id, ip))
                 raw_ips.add(ip)
         if pairs:
@@ -465,6 +486,14 @@ async def _build_users_from_payloads(
             f"the panel clock runs ahead"
         )
 
+    if unknown_age:
+        api_ip_logger.warning(
+            f"🛰️ {unknown_age} reported IPs carried a value below the epoch floor "
+            f"({STALE_EPOCH_FLOOR}), so their age is unknown and they were not counted "
+            f"as connected. Either the panel reports connection counts rather than "
+            f"last-seen timestamps on this build, or the values are malformed"
+        )
+
     stats = {
         "geo_lookups": geo_lookups,
         "nodes_seen": len(nodes_seen),
@@ -472,6 +501,7 @@ async def _build_users_from_payloads(
         "users_with_ips": len(new_users),
         "stale_ips": stale_dropped,
         "future_ips": future_dropped,
+        "unknown_age_ips": unknown_age,
     }
     return new_users, stats
 

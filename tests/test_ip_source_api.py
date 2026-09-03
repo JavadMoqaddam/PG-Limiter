@@ -12,6 +12,18 @@ import time
 import pytest
 
 
+def fresh() -> int:
+    """
+    A last-seen timestamp that passes the freshness filter.
+
+    The panel reports each IP's last-seen Unix epoch. Values below
+    ``STALE_EPOCH_FLOOR`` cannot be timestamps, so their age is unknown and they are
+    not counted as connected - a payload literal like ``3`` therefore tests the
+    rejection path, not the happy path.
+    """
+    return int(time.time())
+
+
 @pytest.fixture
 def panel():
     """Panel credentials; every network call is patched out."""
@@ -366,7 +378,7 @@ class TestBuildUsersFromPayloads:
     async def test_device_info_matches_log_mode(self, api_config):
         from utils.ip_source_api import _build_users_from_payloads
 
-        payloads = {"alice": {1: {"5.6.7.8": 3, "9.9.9.9": 1}}}
+        payloads = {"alice": {1: {"5.6.7.8": fresh(), "9.9.9.9": fresh()}}}
         users, stats = await _build_users_from_payloads(
             payloads,
             {"alice": {"status": "active", "group_ids": [12]}},
@@ -387,7 +399,7 @@ class TestBuildUsersFromPayloads:
         assert {c.inbound_protocol for c in user.device_info.connections} == {"API"}
         assert stats == {
             "geo_lookups": 0, "nodes_seen": 1, "total_ips": 2, "users_with_ips": 1,
-            "stale_ips": 0, "future_ips": 0,
+            "stale_ips": 0, "future_ips": 0, "unknown_age_ips": 0,
         }
 
     @pytest.mark.asyncio
@@ -407,18 +419,39 @@ class TestBuildUsersFromPayloads:
         assert stats["stale_ips"] == 1
 
     @pytest.mark.asyncio
-    async def test_legacy_connection_counts_are_kept(self, api_config):
+    async def test_values_below_the_epoch_floor_are_not_counted(self, api_config):
         from utils.ip_source_api import _build_users_from_payloads
 
-        # Older panel builds returned a connection count instead of a
-        # timestamp. It carries no freshness information, so it must never be
-        # read as an ancient last-seen value and dropped.
-        payloads = {"alice": {1: {"5.6.7.8": 3}}}
+        # A value too small to be a last-seen epoch has an unknown age, so it cannot be
+        # shown to be a current connection. It used to be read as a legacy connection
+        # count and counted as live, which skipped the freshness filter entirely - and
+        # the panel never expires an entry, so a user who merely changed network looked
+        # like several simultaneous devices. Every unparseable value lands here too:
+        # _parse_ip_payload coerces an ISO-8601 string or a float-formatted epoch to 1.
+        payloads = {"alice": {1: {"5.6.7.8": 3, "9.9.9.9": 1}}}
+        users, stats = await _build_users_from_payloads(
+            payloads, {}, {1: "node"}, set(), api_config
+        )
+        assert users == {}
+        assert stats["unknown_age_ips"] == 2
+        # Counted as stale as well, so the existing "every IP filtered" gate skips the
+        # cycle rather than publishing an empty snapshot that clears pending warnings.
+        assert stats["stale_ips"] == 2
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_ip_survives_alongside_an_unknown_age_one(self, api_config):
+        from utils.ip_source_api import _build_users_from_payloads
+
+        payloads = {"alice": {1: {"5.6.7.8": fresh(), "9.9.9.9": 1}}}
         users, stats = await _build_users_from_payloads(
             payloads, {}, {1: "node"}, set(), api_config
         )
         assert users["alice"].ip == ["5.6.7.8"]
-        assert stats["stale_ips"] == 0
+        assert stats["unknown_age_ips"] == 1
+        assert stats["total_ips"] == 1
+        # Also counted as stale, which is what lets the all-stale gate fire when a whole
+        # payload comes back sub-floor.
+        assert stats["stale_ips"] == 1
 
     @pytest.mark.asyncio
     async def test_freshness_is_measured_from_the_fetch_time(self, api_config):
@@ -442,7 +475,7 @@ class TestBuildUsersFromPayloads:
     async def test_disabled_nodes_are_excluded(self, api_config):
         from utils.ip_source_api import _build_users_from_payloads
 
-        payloads = {"alice": {1: {"5.6.7.8": 1}, 2: {"9.9.9.9": 1}}}
+        payloads = {"alice": {1: {"5.6.7.8": fresh()}, 2: {"9.9.9.9": fresh()}}}
         users, stats = await _build_users_from_payloads(
             payloads, {}, {1: "keep", 2: "drop"}, {2}, api_config
         )
@@ -454,8 +487,8 @@ class TestBuildUsersFromPayloads:
         from utils.ip_source_api import _build_users_from_payloads
 
         payloads = {
-            "private_only": {1: {"192.168.1.5": 4}},
-            "real": {1: {"5.6.7.8": 1}},
+            "private_only": {1: {"192.168.1.5": fresh()}},
+            "real": {1: {"5.6.7.8": fresh()}},
         }
         users, stats = await _build_users_from_payloads(
             payloads, {}, {1: "node"}, set(), api_config
@@ -468,7 +501,7 @@ class TestBuildUsersFromPayloads:
     async def test_same_ip_on_two_nodes_stays_one_ip(self, api_config):
         from utils.ip_source_api import _build_users_from_payloads
 
-        payloads = {"alice": {1: {"5.6.7.8": 1}, 2: {"5.6.7.8": 1}}}
+        payloads = {"alice": {1: {"5.6.7.8": fresh()}, 2: {"5.6.7.8": fresh()}}}
         users, stats = await _build_users_from_payloads(
             payloads, {}, {1: "a", 2: "b"}, set(), api_config
         )
@@ -486,7 +519,7 @@ class TestBuildUsersFromPayloads:
 
         api_config["api_ip_sentinel_inbound"] = "PANEL"
         users, _ = await _build_users_from_payloads(
-            {"alice": {1: {"5.6.7.8": 1}}}, {}, {1: "node"}, set(), api_config
+            {"alice": {1: {"5.6.7.8": fresh()}}}, {}, {1: "node"}, set(), api_config
         )
         connection = users["alice"].device_info.connections[0]
         assert connection.inbound_protocol == "PANEL"
@@ -496,7 +529,7 @@ class TestBuildUsersFromPayloads:
         from utils.ip_source_api import _build_users_from_payloads
 
         users, _ = await _build_users_from_payloads(
-            {"alice": {7: {"5.6.7.8": 1}}}, {}, {}, set(), api_config
+            {"alice": {7: {"5.6.7.8": fresh()}}}, {}, {}, set(), api_config
         )
         assert users["alice"].device_info.connections[0].node_name == "Node-7"
 
@@ -505,9 +538,9 @@ class TestBuildUsersFromPayloads:
         from utils.ip_source_api import _build_users_from_payloads
 
         payloads = {
-            "nested": {1: {"5.6.7.8": 1}},
-            "flat": {1: {"9.9.9.9": 1}},
-            "legacy": {1: {"4.4.4.4": 1}},
+            "nested": {1: {"5.6.7.8": fresh()}},
+            "flat": {1: {"9.9.9.9": fresh()}},
+            "legacy": {1: {"4.4.4.4": fresh()}},
         }
         raw_by_name = {
             "nested": {"admin": {"username": "reseller1"}},
@@ -632,7 +665,7 @@ class TestCollectFailSafe:
         _patch_collector(
             monkeypatch,
             candidates=[{"username": f"u{i}", "id": i} for i in range(1, 5)],
-            payloads={"u1": {1: {"5.6.7.8": 1}}},
+            payloads={"u1": {1: {"5.6.7.8": fresh()}}},
             counters={"ok": 1, "failed": 3, "not_found": 0,
                       "forbidden": 0, "unauthorized": 0},
         )
@@ -650,7 +683,7 @@ class TestCollectFailSafe:
         _patch_collector(
             monkeypatch,
             candidates=[{"username": f"u{i}", "id": i} for i in range(1, 5)],
-            payloads={"u1": {1: {"5.6.7.8": 1}}},
+            payloads={"u1": {1: {"5.6.7.8": fresh()}}},
             counters={"ok": 1, "failed": 0, "not_found": 3,
                       "forbidden": 0, "unauthorized": 0},
             node_name_map={1: "node"},
@@ -666,11 +699,11 @@ class TestCollectFailSafe:
     ):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
 
-        fresh = int(time.time())
+        seen_at = int(time.time())
         _patch_collector(
             monkeypatch,
             candidates=[{"username": "alice", "id": 1}],
-            payloads={"alice": {1: {"5.6.7.8": fresh}}},
+            payloads={"alice": {1: {"5.6.7.8": seen_at}}},
             node_name_map={1: "de", 2: "nl", 3: "fr"},
         )
 
@@ -694,11 +727,11 @@ class TestCollectFailSafe:
 
         ACTIVE_USERS["carol"] = UserType(name="carol", ip=["1.2.3.4"])
         api_config["api_ip_min_node_coverage"] = 0.8
-        fresh = int(time.time())
+        seen_at = int(time.time())
         _patch_collector(
             monkeypatch,
             candidates=[{"username": "alice", "id": 1}],
-            payloads={"alice": {1: {"5.6.7.8": fresh}}},
+            payloads={"alice": {1: {"5.6.7.8": seen_at}}},
             node_name_map={1: "de", 2: "nl", 3: "fr"},
         )
 
@@ -717,11 +750,11 @@ class TestCollectFailSafe:
         from utils.shared_state import ACTIVE_USERS
 
         api_config["api_ip_min_node_coverage"] = 0.8
-        fresh = int(time.time())
+        seen_at = int(time.time())
         _patch_collector(
             monkeypatch,
             candidates=[{"username": "alice", "id": 1}],
-            payloads={"alice": {1: {"5.6.7.8": fresh}}},
+            payloads={"alice": {1: {"5.6.7.8": seen_at}}},
             node_name_map={1: "de", 2: "nl"},
             expected_node_ids={1},
         )
@@ -927,7 +960,7 @@ class TestCollectHappyPath:
                 {"username": "white", "id": 1},
                 {"username": "alice", "id": 2},
             ],
-            payloads={"alice": {1: {"5.6.7.8": 1}}},
+            payloads={"alice": {1: {"5.6.7.8": fresh()}}},
             node_name_map={1: "de"},
         )
 

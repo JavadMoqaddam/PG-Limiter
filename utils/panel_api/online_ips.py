@@ -135,9 +135,11 @@ def _parse_ip_payload(payload: dict) -> dict[int, dict[str, int]]:
 
     The per-IP value is the panel's **last-seen Unix timestamp** for that IP on
     that node (verified against a live panel: e.g. ``1788078039`` = 2026-08-30
-    08:20 UTC). Older panel builds documented it as a connection count, so
-    callers must treat any value below ``STALE_EPOCH_FLOOR`` as a count and skip
-    freshness filtering for it.
+    08:20 UTC). Older panel builds documented it as a connection count, and a value
+    this function cannot parse is coerced to ``1``, so callers must treat anything
+    below ``STALE_EPOCH_FLOOR`` as an unknown age rather than as a fresh connection -
+    the panel never expires an entry, so counting one would resurrect the
+    changed-network-looks-like-several-devices failure.
 
     Nodes the panel could not reach come back as ``null`` and are skipped, as
     are nodes that reported no IPs at all.
@@ -188,7 +190,7 @@ async def fetch_user_online_ips(
 
     Returns:
         ``(payload, outcome)`` where ``payload`` is
-        ``{node_id: {ip: connection_count}}`` on success and ``None``
+        ``{node_id: {ip: last_seen_epoch}}`` on success and ``None``
         otherwise, and ``outcome`` is one of the ``OUTCOME_*`` constants.
     """
     from utils.panel_api.request_helper import panel_request
