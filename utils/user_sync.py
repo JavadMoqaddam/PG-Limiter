@@ -267,8 +267,27 @@ async def recompute_all_user_limits(config: dict = None):
             from utils.read_config import read_config
             config = await read_config()
         except Exception as e:
-            sync_logger.error(f"Error reading config during limit recompute: {e}")
-            config = {}
+            # Falling back to {} here used to be the same hazard as a degraded config:
+            # an empty config has no group filter, which reads as "monitor everyone".
+            sync_logger.error(
+                f"⛔ Skipping the effective-limit recompute: the configuration could not "
+                f"be read ({e}). The existing flags are kept."
+            )
+            return
+
+    # A configuration whose database half failed has no group filter and no group
+    # limits, and an absent group filter reads as "monitor everyone". Recomputing from
+    # it would write is_monitored=True over every user the operator had filtered out -
+    # straight into the cache the enforcement gate reads - so the filter would stop
+    # being honoured until the next successful sync. Enforcement is skipped while the
+    # flag is set, but the flags would outlive it.
+    if config.get("config_degraded"):
+        sync_logger.error(
+            "⛔ Skipping the effective-limit recompute: the configuration is degraded "
+            "(no database settings), so the group filter and group limits are unknown. "
+            "The existing flags are kept until a database read succeeds."
+        )
+        return
     
     recomputed_count = 0
     for username, data in list(USER_METADATA_CACHE.items()):

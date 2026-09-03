@@ -910,8 +910,8 @@ class TestCollectHappyPath:
                 {"username": "bob", "id": 2, "status": "active"},
             ],
             payloads={
-                "alice": {1: {"5.6.7.8": 2}},
-                "bob": {1: {"9.9.9.9": 1}, 2: {"4.4.4.4": 1}},
+                "alice": {1: {"5.6.7.8": fresh()}},
+                "bob": {1: {"9.9.9.9": fresh()}, 2: {"4.4.4.4": fresh()}},
             },
             node_name_map={1: "de", 2: "nl"},
         )

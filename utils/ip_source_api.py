@@ -622,17 +622,17 @@ async def _handle_coverage_skip(reason: str) -> None:
         return
 
     api_ip_logger.error(
-        f"⛔ Enforcement has been skipped for {_consecutive_coverage_skips} consecutive "
-        f"cycles ({reason}). Nobody is being warned or banned. Check the panel's "
-        f"online-stats endpoint, api_ip_timeout and api_ip_concurrency."
+        f"⛔ Enforcement has been skipped {_consecutive_coverage_skips} times since the "
+        f"last usable sample ({reason}). Nobody is being warned or banned. Check the "
+        f"panel's online-stats endpoint, api_ip_timeout and api_ip_concurrency."
     )
     if _coverage_alert_sent:
         return
     _coverage_alert_sent = True
     await _notify(
         "🛰️ <b>API IP mode: enforcement has stopped</b>\n\n"
-        f"{_consecutive_coverage_skips} cycles in a row were skipped because the "
-        f"sample was incomplete (<code>{reason}</code>).\n"
+        f"{_consecutive_coverage_skips} cycles have been skipped since the last usable "
+        f"sample because it was incomplete (<code>{reason}</code>).\n"
         "Nobody is being warned or banned while this lasts. Raise "
         "<code>api_ip_timeout</code>, lower <code>api_ip_concurrency</code>, or "
         "switch the IP source back to Logs."
@@ -720,12 +720,18 @@ async def collect_active_users_from_api(
     if not targets:
         # A genuinely empty candidate set is a valid result, not a failure:
         # enforcement still has to run so normalized users get cleared.
+        #
+        # The dead-cycle streak is reset because the candidate query answered, so
+        # falling back to log mode is not the remedy. The coverage-skip streak is
+        # deliberately left alone: the per-user fan-out never ran this cycle, so it
+        # produced no evidence about whether the sample is usable. Clearing it here let
+        # an alternating pattern - empty cycle, low-coverage skip, empty cycle - hold
+        # the streak at 1 forever, so the "enforcement has stopped" alert could never
+        # fire no matter how long enforcement stayed down.
         await _publish_active_users({})
         LAST_CYCLE_STATS["coverage"] = 1.0
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         _consecutive_dead_cycles = 0
-        _consecutive_coverage_skips = 0
-        _coverage_alert_sent = False
         api_ip_logger.info("🛰️ No online candidates this cycle")
         return True
 
@@ -789,16 +795,28 @@ async def collect_active_users_from_api(
 
     _consecutive_dead_cycles = 0
     _forbidden_alert_sent = False
-    # A usable sample: clear the "enforcement has stopped" state so the alarm can
-    # fire again if it happens a second time.
-    _consecutive_coverage_skips = 0
-    _coverage_alert_sent = False
 
     raw_by_name = {name: raw for name, _, raw in targets}
     new_users, build_stats = await _build_users_from_payloads(
         payloads, raw_by_name, node_name_map, set(disabled_nodes), config_data,
         fetch_times=fetch_times,
     )
+
+    # Node coverage: how many of the nodes that ought to be reporting actually
+    # contributed an IP. The `coverage` gate above is a per-user answer rate and
+    # reads 1.0 even when a third of the fleet is silent, so this is the only
+    # signal that separates "users happen to be concentrated on a few nodes" from
+    # "these nodes stopped reporting" - and the second under-counts devices, which
+    # is what lets a real offender's consecutive-violation counter be cleared.
+    #
+    # Computed before the gates below so a skipped cycle still records it. Leaving it
+    # until after them meant the stats screen showed 0/0 on exactly the cycles an
+    # operator opens it to diagnose.
+    nodes_expected = len(expected_node_ids)
+    node_coverage = (build_stats["nodes_seen"] / nodes_expected) if nodes_expected else 1.0
+    LAST_CYCLE_STATS["nodes_seen"] = build_stats["nodes_seen"]
+    LAST_CYCLE_STATS["nodes_expected"] = nodes_expected
+    LAST_CYCLE_STATS["node_coverage"] = round(node_coverage, 4)
 
     # Every IP filtered out as stale while the panel answered normally means the
     # timestamps cannot be trusted (clock skew between panel and limiter is the
@@ -810,28 +828,23 @@ async def collect_active_users_from_api(
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         api_ip_logger.error(
             f"🛰️ Skipping enforcement: all {build_stats['stale_ips']} reported IPs were "
-            f"older than the freshness window. Check the clock skew between the panel "
-            f"and this container, or raise api_ip_freshness."
+            f"older than the freshness window, or carried a value too small to be a "
+            f"timestamp. Check the clock skew between the panel and this container, or "
+            f"raise api_ip_freshness."
         )
+        # Counted towards the alert streak. Clock skew does not heal by itself, so
+        # without this enforcement could stay off indefinitely with nothing but an
+        # ERROR line in the container log to show it.
+        await _handle_coverage_skip(LAST_CYCLE_STATS["skipped_reason"])
         return False
-
-    # Node coverage: how many of the nodes that ought to be reporting actually
-    # contributed an IP. The `coverage` gate above is a per-user answer rate and
-    # reads 1.0 even when a third of the fleet is silent, so this is the only
-    # signal that separates "users happen to be concentrated on a few nodes" from
-    # "these nodes stopped reporting" - and the second under-counts devices, which
-    # is what lets a real offender's consecutive-violation counter be cleared.
-    nodes_expected = len(expected_node_ids)
-    node_coverage = (build_stats["nodes_seen"] / nodes_expected) if nodes_expected else 1.0
-    LAST_CYCLE_STATS["nodes_seen"] = build_stats["nodes_seen"]
-    LAST_CYCLE_STATS["nodes_expected"] = nodes_expected
-    LAST_CYCLE_STATS["node_coverage"] = round(node_coverage, 4)
 
     # Off unless configured. A genuinely quiet node reports nothing, so the right
     # floor depends on the fleet and has to be observed before it is enforced -
     # guessing one here would skip healthy cycles. The ratio is logged either way,
     # which is the part that was missing.
-    min_node_coverage = float(config_data.get("api_ip_min_node_coverage") or 0.0)
+    min_node_coverage = normalize_min_coverage(
+        config_data.get("api_ip_min_node_coverage"), default=0.0
+    )
     if min_node_coverage and node_coverage < min_node_coverage:
         # The build already ran, so report what it found. Without this the
         # diagnostics show a cycle that collected nothing, which reads like a dead
@@ -850,6 +863,13 @@ async def collect_active_users_from_api(
         return False
 
     await _publish_active_users(new_users)
+
+    # Only here, past every gate: the streak means "cycles skipped since enforcement
+    # last actually ran". Clearing it as soon as the fan-out looked healthy meant the
+    # two gates below it - all-stale and node coverage - could skip forever without the
+    # streak ever passing 1, so their alarm never fired.
+    _consecutive_coverage_skips = 0
+    _coverage_alert_sent = False
 
     LAST_CYCLE_STATS.update(build_stats)
     LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)

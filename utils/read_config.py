@@ -201,6 +201,13 @@ def load_env_config() -> Dict[str, Any]:
         "api_ip_min_coverage": normalize_min_coverage(
             os.environ.get("API_IP_MIN_COVERAGE")
         ),
+        # Share of the connected node fleet that must report before an API-mode cycle
+        # enforces, as a percentage. 0 (the default) switches the gate off; a genuinely
+        # quiet node reports nothing, so the right floor has to be observed on a real
+        # fleet before it is enforced.
+        "api_ip_min_node_coverage": normalize_min_coverage(
+            os.environ.get("API_IP_MIN_NODE_COVERAGE"), default=0.0
+        ),
         # API settings (from ENV)
         "api": {
             "enabled": _get_env("API_ENABLED", False, bool),
@@ -578,14 +585,14 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     # ip_source_api reads this key, but nothing ever populated it, so the gate was
     # permanently off: the "only 16 of 49 nodes reported" cycles passed as healthy.
     # Default stays 0.0 (off) so wiring it up cannot change behaviour on its own.
-    try:
-        config["api_ip_min_node_coverage"] = float(
-            db_config.get("api_ip_min_node_coverage", "0.0")
-        )
-    except (ValueError, TypeError):
-        config["api_ip_min_node_coverage"] = 0.0
-    config["api_ip_min_node_coverage"] = max(
-        0.0, min(1.0, config["api_ip_min_node_coverage"])
+    #
+    # Shares normalize_min_coverage with the user-coverage floor so both accept the same
+    # spellings. The plain float() this used to do read a hand-written 80 as 80, clamped
+    # it to 100%, and would then have skipped every cycle - the trap being that the only
+    # way to set this was to write the row by hand in the first place.
+    config["api_ip_min_node_coverage"] = normalize_min_coverage(
+        db_config.get("api_ip_min_node_coverage"),
+        default=config.get("api_ip_min_node_coverage", 0.0),
     )
 
     # Automatically fall back to log mode after repeated total failures

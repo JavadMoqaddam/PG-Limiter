@@ -326,6 +326,23 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
     skipped = stats.get("skipped_reason") or ""
     verdict = f"⚠️ Cycle skipped — {skipped}" if skipped else "✅ Enforcement ran on this cycle"
 
+    # Nodes seen was rendered without its denominator, which is the number that matters:
+    # a per-user coverage of 100% says nothing about a fleet where two thirds of the
+    # nodes went quiet. The guard is required - node_coverage is set to 1.0 with
+    # nodes_expected 0 when the node list could not be read, and "1/0 (100%)" is a lie.
+    nodes_seen = stats.get("nodes_seen", 0)
+    nodes_expected = int(stats.get("nodes_expected") or 0)
+    nodes_label = (
+        f"{nodes_seen}/{nodes_expected} ({float(stats.get('node_coverage') or 0):.0%})"
+        if nodes_expected
+        else f"{nodes_seen}"
+    )
+    dropped = [f"{stats.get('stale_ips', 0)} stale"]
+    if stats.get("unknown_age_ips"):
+        dropped.append(f"{stats['unknown_age_ips']} undatable")
+    if stats.get("future_ips"):
+        dropped.append(f"{stats['future_ips']} future-dated")
+
     text = (
         "📊 <b>Last API Cycle</b>\n\n"
         f"<b>Ran:</b> {age_label} in <code>{stats.get('duration_ms', 0)}ms</code>\n"
@@ -342,8 +359,8 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
         "<b>Result:</b>\n"
         f"• Users with IPs: <code>{stats.get('users_with_ips', 0)}</code>\n"
         f"• Accepted IPs: <code>{stats.get('total_ips', 0)}</code>\n"
-        f"• Stale IPs dropped: <code>{stats.get('stale_ips', 0)}</code>\n"
-        f"• Nodes seen: <code>{stats.get('nodes_seen', 0)}</code>\n"
+        f"• IPs dropped: <code>{', '.join(dropped)}</code>\n"
+        f"• Nodes reporting: <code>{nodes_label}</code>\n"
         f"• Geo lookups: <code>{stats.get('geo_lookups', 0)}</code>"
     )
 
