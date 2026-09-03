@@ -995,12 +995,20 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # Pass the actual IPs, group limits and the cycle's unified device counts, plus
     # the three facts this path was missing: whether the sample can be trusted, who
     # is whitelisted, and whose limit is actually known this cycle.
+    from utils.user_sync import USER_METADATA_CACHE as _metadata_cache
     disabled_users, warned_users = await warning_system.check_persistent_violations(
         panel_data, all_users_actual_ips, config_data, batched_group_limits,
         device_counts=all_users_device_counts,
         sample_is_trustworthy=counters_are_trustworthy,
         except_users=except_users,
-        known_users=set(users_metadata_usage),
+        # "Known" has to mean "this user's limit can be resolved", which is what the
+        # guard downstream actually needs. The metadata batch only covers users active
+        # THIS cycle, so passing it alone made every offline monitored user look
+        # unresolvable: each one logged a warning saying its record was being kept, and
+        # cleanup_expired_warnings then deleted it anyway. The RAM cache holds every
+        # synced user, so an offline user is resolvable and gets judged normally - with
+        # no IPs their device count is 0, so the record is dropped without a ban.
+        known_users=set(users_metadata_usage) | set(_metadata_cache),
     )
 
     # Combine disabled and warned users to skip them in the loop
@@ -1309,8 +1317,12 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     if cycle_new_warnings:
         await dispatch_chunked_warnings(cycle_new_warnings, check_interval, total_monitored, max_warnings=int(max_warning_count))
 
-    # Clean up expired warnings
-    await warning_system.cleanup_expired_warnings()
+    # Clean up expired warnings. Gated on the same trustworthiness verdict as
+    # check_persistent_violations: unconditional cleanup deleted exactly the records
+    # that function had just preserved.
+    await warning_system.cleanup_expired_warnings(
+        sample_is_trustworthy=counters_are_trustworthy
+    )
 
     all_users_log.clear()
 

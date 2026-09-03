@@ -873,8 +873,26 @@ class EnhancedWarningSystem:
         """Check if a user is currently being monitored"""
         return username in self.warnings and self.warnings[username].is_monitoring_active()
     
-    async def cleanup_expired_warnings(self):
-        """Clean up expired warnings"""
+    async def cleanup_expired_warnings(self, sample_is_trustworthy: bool = True):
+        """
+        Delete monitoring records whose window has closed.
+
+        Takes the trustworthiness of the cycle's sample for the same reason
+        ``check_persistent_violations`` does: an expired record is only safe to drop
+        once it has actually been judged, and that function returns without judging
+        anything when the sample is partial. Running unconditionally afterwards deleted
+        precisely the records it had just preserved, so a partial sample still wiped
+        real offenders' counters - the failure those guards exist to prevent.
+        """
+        if not sample_is_trustworthy:
+            if self.warnings:
+                warning_logger.warning(
+                    f"⏳ Keeping {len(self.warnings)} monitoring record(s): the sample "
+                    f"was not trustworthy this cycle, so a closed window has not been "
+                    f"judged yet"
+                )
+            return
+
         expired_users = []
         for username, warning in self.warnings.items():
             if not warning.is_monitoring_active():
