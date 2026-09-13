@@ -1,12 +1,11 @@
 """CLI utility functions"""
-import fcntl
-import json
 import os
 from typing import List, Tuple
 
 import typer
 from rich.console import Console
 from rich.table import Table
+from utils.atomic_io import JsonSnapshot, atomic_update_json, read_json_snapshot
 
 console = Console()
 
@@ -49,47 +48,52 @@ def info(message: str):
     console.print(f"[blue]ℹ[/blue] {message}")
 
 
-def load_config() -> dict:
-    """Load the config file with shared file lock for cross-process safety."""
+def load_config() -> JsonSnapshot:
+    """Load a mergeable config snapshot under the cross-process sidecar lock."""
     if not os.path.exists(CONFIG_FILE):
         error(f"Config file '{CONFIG_FILE}' not found. Run the limiter first to create it.")
+    return read_json_snapshot(CONFIG_FILE)
 
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-        try:
-            return json.load(f)
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+def update_config(mutator):
+    """Apply a config mutation to the latest document under its sidecar lock."""
+    return atomic_update_json(CONFIG_FILE, mutator)
+
+
+def update_backup(mutator):
+    """Apply a backup mutation to the latest document under its sidecar lock."""
+    return atomic_update_json(
+        BACKUP_FILE,
+        mutator,
+        default={"special": {}, "except_users": []},
+    )
 
 
 def save_config(config: dict):
-    """Save the config file with exclusive file lock for cross-process safety."""
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            json.dump(config, f, indent=2)
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    """Commit this config snapshot without replacing unrelated concurrent edits."""
+    if isinstance(config, JsonSnapshot):
+        return atomic_update_json(CONFIG_FILE, config.commit)
+    return atomic_update_json(CONFIG_FILE, lambda _latest: config)
 
 
-def load_backup() -> dict:
-    """Load the backup file with shared file lock for cross-process safety."""
-    if not os.path.exists(BACKUP_FILE):
-        return {"special": {}, "except_users": []}
-
-    with open(BACKUP_FILE, "r", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-        try:
-            return json.load(f)
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+def load_backup() -> JsonSnapshot:
+    """Load a mergeable compatibility-backup snapshot."""
+    return read_json_snapshot(
+        BACKUP_FILE,
+        default={"special": {}, "except_users": []},
+    )
 
 
 def save_backup(backup: dict):
-    """Save the backup file with exclusive file lock for cross-process safety."""
-    with open(BACKUP_FILE, "w", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            json.dump(backup, f, indent=2)
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    """Commit this backup snapshot without replacing unrelated concurrent edits."""
+    if isinstance(backup, JsonSnapshot):
+        return atomic_update_json(
+            BACKUP_FILE,
+            backup.commit,
+            default={"special": {}, "except_users": []},
+        )
+    return atomic_update_json(
+        BACKUP_FILE,
+        lambda _latest: backup,
+        default={"special": {}, "except_users": []},
+    )

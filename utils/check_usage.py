@@ -1250,6 +1250,15 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
             )
             continue
 
+    # Queue the whole cycle's unknown set after policy evaluation. The queue helper
+    # deduplicates requests already cached or in flight, and batching the awaits here
+    # keeps panel-synchronization bookkeeping out of the per-user policy loop.
+    if unknown_metadata_users:
+        from utils.user_sync import queue_unknown_user_fetch
+
+        for username in sorted(unknown_metadata_users):
+            await queue_unknown_user_fetch(username)
+
     # Clear the records of users who came back inside their limit or went away.
     # counters_are_trustworthy was decided before check_persistent_violations ran
     # (see _sample_is_trustworthy); reusing it here keeps both paths on one verdict

@@ -111,6 +111,25 @@ async def load_disabled_users() -> dict:
     return await dis_registry.disabled_at_map()
 
 
+async def get_panel_data():
+    """Build panel connection data from the canonical configuration."""
+    from utils.read_config import read_config
+    from utils.types import PanelType
+
+    config = await read_config()
+    panel_config = config.get("panel", {})
+    if not panel_config.get("domain"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Panel not configured",
+        )
+    return PanelType(
+        panel_username=panel_config.get("username", ""),
+        panel_password=panel_config.get("password", ""),
+        panel_domain=panel_config["domain"],
+    )
+
+
 def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
     """
     HTTP Basic check that fails closed.
@@ -485,26 +504,54 @@ async def list_disabled_users_route(username: str = Depends(verify_credentials))
 
 @app.delete("/users/disabled/{user}", tags=["Disabled Users"])
 async def enable_disabled_user(user: str, username: str = Depends(verify_credentials)):
-    """Enable a disabled user (clear their disable record)"""
+    """Enable one user on the panel before clearing their recovery record."""
     from utils import handel_dis_users as dis_registry
+    from utils.panel_api import enable_selected_users
 
     if not await dis_registry.is_disabled(user):
         raise HTTPException(status_code=404, detail=f"User {user} is not in disabled list")
 
+    result = await enable_selected_users(await get_panel_data(), {user})
+    if user in result.get("failed", []):
+        raise HTTPException(status_code=502, detail="Panel enable failed; record preserved")
+    if user not in result.get("enabled", []) and user not in result.get("not_found", []):
+        raise HTTPException(status_code=502, detail="Panel returned no result; record preserved")
     if not await dis_registry.enable(user):
-        raise HTTPException(status_code=500, detail=f"Could not clear the disable record for {user}")
+        raise HTTPException(status_code=500, detail=f"Panel updated; could not clear the disable record for {user}")
 
-    return {"success": True, "message": f"User {user} removed from disabled list"}
+    return {"success": True, "message": f"User {user} enabled and removed from disabled list"}
 
 
 @app.delete("/users/disabled", tags=["Disabled Users"])
 async def enable_all_disabled_users(username: str = Depends(verify_credentials)):
-    """Enable all disabled users (clear every disable record)"""
+    """Enable every tracked user, retaining records for panel failures."""
     from utils import handel_dis_users as dis_registry
+    from utils.panel_api import enable_selected_users
 
-    cleared = await dis_registry.clear_all()
+    disabled_users = await dis_registry.disabled_usernames()
+    if not disabled_users:
+        return {"success": True, "message": "Cleared 0 users from disabled list"}
 
-    return {"success": True, "message": f"Cleared {len(cleared)} users from disabled list"}
+    result = await enable_selected_users(await get_panel_data(), disabled_users)
+    confirmed = set(result.get("enabled", [])) | set(result.get("not_found", []))
+    cleanup_failed = []
+    for user in confirmed:
+        if not await dis_registry.enable(user):
+            cleanup_failed.append(user)
+
+    panel_failed = sorted(set(result.get("failed", [])) | (disabled_users - confirmed - set(result.get("failed", []))))
+    if cleanup_failed:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Panel updated but registry cleanup failed for: {', '.join(sorted(cleanup_failed))}",
+        )
+    if panel_failed:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Panel enable failed; records preserved for: {', '.join(panel_failed)}",
+        )
+
+    return {"success": True, "message": f"Cleared {len(confirmed)} users from disabled list"}
 
 
 # ═══════════════════════════════════════════════════════════════

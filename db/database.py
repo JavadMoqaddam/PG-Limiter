@@ -3,6 +3,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -43,8 +44,6 @@ if DATABASE_URL.startswith("sqlite"):
         max_overflow=10,
     )
     
-    from sqlalchemy import event
-
     @event.listens_for(engine.sync_engine, "connect")
     def set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
@@ -71,6 +70,55 @@ AsyncSessionLocal = async_sessionmaker(
     autocommit=False,
     autoflush=False,
 )
+
+_PENDING_USER_INVALIDATIONS = "pending_user_cache_invalidations"
+_USER_INVALIDATION_OUTCOMES = "user_cache_invalidation_outcomes"
+
+
+def _current_session_transaction(session):
+    return session.get_nested_transaction() or session.get_transaction()
+
+
+@event.listens_for(AsyncSession.sync_session_class, "after_commit")
+def _record_user_invalidation_commit(session) -> None:
+    """Record which transaction level committed; resolution follows on end."""
+    transaction = _current_session_transaction(session)
+    if transaction is not None:
+        session.info.setdefault(_USER_INVALIDATION_OUTCOMES, {})[transaction] = True
+
+
+@event.listens_for(AsyncSession.sync_session_class, "after_rollback")
+def _record_user_invalidation_rollback(session) -> None:
+    """Record which transaction level rolled back; resolution follows on end."""
+    transaction = _current_session_transaction(session)
+    if transaction is not None:
+        session.info.setdefault(_USER_INVALIDATION_OUTCOMES, {})[transaction] = False
+
+
+@event.listens_for(AsyncSession.sync_session_class, "after_transaction_end")
+def _resolve_user_cache_invalidations(session, transaction) -> None:
+    """Merge committed savepoint effects or publish a committed root's effects."""
+    pending_by_transaction = session.info.get(_PENDING_USER_INVALIDATIONS, {})
+    outcomes = session.info.get(_USER_INVALIDATION_OUTCOMES, {})
+    outcome = outcomes.pop(transaction, None)
+    usernames = pending_by_transaction.pop(transaction, set())
+    parent = transaction.parent
+
+    if parent is not None and outcome is True and usernames:
+        pending_by_transaction.setdefault(parent, set()).update(usernames)
+
+    if parent is not None:
+        return
+
+    session.info.pop(_PENDING_USER_INVALIDATIONS, None)
+    session.info.pop(_USER_INVALIDATION_OUTCOMES, None)
+    if outcome is not True or not usernames:
+        return
+
+    from utils.user_sync import invalidate_user_metadata_cache
+
+    for username in usernames:
+        invalidate_user_metadata_cache(username)
 
 
 _init_db_lock = asyncio.Lock()
