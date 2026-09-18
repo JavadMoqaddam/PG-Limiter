@@ -22,7 +22,7 @@ Subcommands, each taking a path to a SQLite file:
   create-all <db>       build the schema the way a pre-Alembic release did
   seed-ip-history <db>  insert duplicate (username, ip) rows
   parity <db>           compare the file against db/models.py
-  assert-dedup <db>     check 007 kept the newest row of each duplicate pair
+  assert-dedup <db>     check 007 merged each duplicate pair without losing history
   assert-upsert <db>    run the ON CONFLICT statement bulk_record relies on
 """
 
@@ -36,14 +36,41 @@ from sqlalchemy import PrimaryKeyConstraint, UniqueConstraint, create_engine, in
 
 from db.models import Base  # noqa: E402
 
-# (username, ip, connection_count) - the two duplicate groups collapse to one row
-# each, and the survivor must be the highest id, i.e. the last one inserted here.
+HISTORY_COLUMNS = (
+    "username",
+    "ip",
+    "node_name",
+    "inbound_protocol",
+    "first_seen",
+    "last_seen",
+    "connection_count",
+)
+
+# Two duplicate groups that each collapse to one row, deliberately shaped so that a
+# survivor-only de-duplication cannot pass. In the first group the newest row by
+# last_seen is *not* the last one inserted, so keeping the highest id would surface
+# "ci-node-c"/grpc instead of "ci-node-b"/ws. In the second group last_seen is
+# identical on both rows, so the tie has to break on the higher id.
 SEED_ROWS = [
-    ("ci_dup_user", "198.51.100.1", 1),
-    ("ci_dup_user", "198.51.100.1", 2),
-    ("ci_dup_user", "198.51.100.1", 3),
-    ("ci_other_user", "198.51.100.2", 7),
-    ("ci_other_user", "198.51.100.2", 8),
+    ("ci_dup_user", "198.51.100.1", "ci-node-a", "tcp",
+     "2026-01-01 00:00:00", "2026-01-04 00:00:00", 1),
+    ("ci_dup_user", "198.51.100.1", "ci-node-b", "ws",
+     "2026-01-02 00:00:00", "2026-01-06 00:00:00", 2),
+    ("ci_dup_user", "198.51.100.1", "ci-node-c", "grpc",
+     "2026-01-03 00:00:00", "2026-01-05 00:00:00", 3),
+    ("ci_other_user", "198.51.100.2", "ci-node-tie-old", "tcp",
+     "2026-02-01 00:00:00", "2026-02-09 00:00:00", 7),
+    ("ci_other_user", "198.51.100.2", "ci-node-tie-new", "ws",
+     "2026-02-05 00:00:00", "2026-02-09 00:00:00", 8),
+]
+
+# What 007 must leave behind: earliest first_seen, latest last_seen, every count
+# summed, and node/protocol from the group's newest row.
+MERGED_ROWS = [
+    ("ci_dup_user", "198.51.100.1", "ci-node-b", "ws",
+     "2026-01-01 00:00:00", "2026-01-06 00:00:00", 6),
+    ("ci_other_user", "198.51.100.2", "ci-node-tie-new", "ws",
+     "2026-02-01 00:00:00", "2026-02-09 00:00:00", 15),
 ]
 
 
@@ -63,13 +90,15 @@ def cmd_seed_ip_history(path: str) -> int:
     conn = sqlite3.connect(path)
     try:
         conn.executemany(
-            "INSERT INTO ip_history (username, ip, connection_count) VALUES (?, ?, ?)",
+            f"INSERT INTO ip_history ({', '.join(HISTORY_COLUMNS)}) "
+            f"VALUES ({', '.join('?' * len(HISTORY_COLUMNS))})",
             SEED_ROWS,
         )
         conn.commit()
     finally:
         conn.close()
-    print(f"seeded {len(SEED_ROWS)} ip_history rows ({len(SEED_ROWS) - 2} of them duplicates)")
+    redundant = len(SEED_ROWS) - len({(row[0], row[1]) for row in SEED_ROWS})
+    print(f"seeded {len(SEED_ROWS)} ip_history rows ({redundant} of them duplicates)")
     return 0
 
 
@@ -181,20 +210,46 @@ def cmd_parity(path: str) -> int:
 
 
 def cmd_assert_dedup(path: str) -> int:
-    """Check 007 collapsed each duplicate pair onto its newest row."""
+    """
+    Check 007 merged each duplicate pair instead of discarding the losing rows.
+
+    Every column is compared, not just the count. Keeping only the highest id of a
+    group also produced one row per pair, so a count-only assertion passed while
+    first_seen jumped forward and connection_count silently shrank.
+
+    Only the seeded usernames are read, so this stays true after assert-upsert has
+    added rows of its own and can be re-run after an installer restamp.
+    """
+    seeded_users = sorted({row[0] for row in SEED_ROWS})
     conn = sqlite3.connect(path)
     try:
         rows = conn.execute(
-            "SELECT username, ip, connection_count FROM ip_history ORDER BY username"
+            f"SELECT {', '.join(HISTORY_COLUMNS)} FROM ip_history "
+            f"WHERE username IN ({', '.join('?' * len(seeded_users))}) "
+            "ORDER BY username, ip",
+            seeded_users,
         ).fetchall()
     finally:
         conn.close()
 
-    expected = [("ci_dup_user", "198.51.100.1", 3), ("ci_other_user", "198.51.100.2", 8)]
-    if rows != expected:
-        _fail(f"007 de-duplication left {rows}, expected {expected}")
+    if rows != MERGED_ROWS:
+        _fail("007 de-duplication did not preserve the merged history")
+        if len(rows) != len(MERGED_ROWS):
+            _fail(f"  row count: got {len(rows)}, expected {len(MERGED_ROWS)}")
+        else:
+            for got, want in zip(rows, MERGED_ROWS):
+                for column, got_value, want_value in zip(HISTORY_COLUMNS, got, want):
+                    if got_value != want_value:
+                        _fail(
+                            f"  {got[0]} {got[1]} {column}: got {got_value!r}, "
+                            f"expected {want_value!r}"
+                        )
+        _fail(f"  full result: {rows}")
         return 1
-    print(f"de-duplication OK: {len(SEED_ROWS)} seeded rows collapsed to {rows}")
+    print(
+        f"de-duplication OK: {len(SEED_ROWS)} seeded rows merged into {len(rows)}, "
+        "first_seen/last_seen bounds and summed counts intact"
+    )
     return 0
 
 
@@ -206,6 +261,11 @@ def cmd_assert_upsert(path: str) -> int:
     this. Without a unique index over the pair SQLite answers "ON CONFLICT clause
     does not match any PRIMARY KEY or UNIQUE constraint" - the production failure
     this whole job exists to catch.
+
+    The probe row is cleared first so the check means the same thing every time it
+    runs. Scenarios that repair a database call this once before the repair and
+    once after, and an installer restamp re-runs the whole chain; without the
+    reset the second run would count 6 writes and fail on a healthy database.
     """
     statement = (
         "INSERT INTO ip_history (username, ip, connection_count) VALUES (?, ?, 1) "
@@ -214,6 +274,7 @@ def cmd_assert_upsert(path: str) -> int:
     )
     conn = sqlite3.connect(path)
     try:
+        conn.execute("DELETE FROM ip_history WHERE username = ?", ("ci_upsert_user",))
         for _ in range(3):
             conn.execute(statement, ("ci_upsert_user", "203.0.113.7"))
         conn.commit()
