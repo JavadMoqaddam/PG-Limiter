@@ -101,6 +101,21 @@ def install(
     typer.completion.install_callback(ctx, None, shell)
 
 
+def _disabled_user_count() -> int:
+    """Count disabled users from the SQLite registry.
+
+    The CLI used to read the retired ``.disable_users.json``; the registry lives in
+    SQLite now, so query it. Runs its own loop because the CLI command is synchronous.
+    """
+    try:
+        import asyncio
+        from utils.handel_dis_users import disabled_usernames
+
+        return len(asyncio.run(disabled_usernames()))
+    except Exception:
+        return 0
+
+
 @app.command(name="status")
 def status():
     """Show current limiter status summary"""
@@ -121,17 +136,8 @@ def status():
         console.print("[red]Config file not found. Run the limiter first.[/red]")
         return
     
-    # Disabled users
-    disabled_count = 0
-    try:
-        with open(".disable_users.json", "r") as f:
-            data = json.load(f)
-            if "disabled_users" in data:
-                disabled_count = len(data["disabled_users"])
-            elif "disable_user" in data:
-                disabled_count = len(data["disable_user"])
-    except FileNotFoundError:
-        pass
+    # Disabled users (from the SQLite registry, not the retired JSON file)
+    disabled_count = _disabled_user_count()
     
     # Special limits
     special_count = 0

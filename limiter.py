@@ -32,11 +32,17 @@ main_logger = get_logger("limiter.main")
 # Strong references container for root background tasks
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
-parser = argparse.ArgumentParser(
-    description="Limiter - IP connection limiter for PasarGuard panel"
-)
-parser.add_argument("--version", action="version", version=f"Limiter v{VERSION}")
-args = parser.parse_args()
+def parse_args(argv=None):
+    """Parse CLI arguments. Called from __main__, not at import.
+
+    Parsing at import time meant any tool that imported limiter (a test, a linter,
+    another entry point) inherited its argv and exited on an unknown flag.
+    """
+    parser = argparse.ArgumentParser(
+        description="Limiter - IP connection limiter for PasarGuard panel"
+    )
+    parser.add_argument("--version", action="version", version=f"Limiter v{VERSION}")
+    return parser.parse_args(argv)
 
 
 async def _supervise(name: str, factory, restart_delay: float = 10.0) -> None:
@@ -337,6 +343,7 @@ async def cleanup_resources():
 
 
 if __name__ == "__main__":
+    parse_args()
     # One process, one event loop, one lifetime.
     #
     # This used to be `while True: asyncio.run(main())` with its own restart
