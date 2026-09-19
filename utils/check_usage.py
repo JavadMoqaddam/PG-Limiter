@@ -29,6 +29,7 @@ from utils.shared_state import (
     ACTIVE_USERS_LOCK,
     get_active_users_snapshot,
     get_node_event_ages,
+    merge_active_users_snapshot,
     node_silence_window,
     nodes_seen_within,
     pop_active_users_snapshot,
@@ -950,7 +951,15 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
             f"or cleared while limits and monitoring flags are unknown."
         )
         all_users_log.clear()
+        # The batch was consumed by pop_active_users_snapshot() but never evaluated;
+        # requeue it so still-connected users are not treated as absent next cycle.
+        await merge_active_users_snapshot(active_users_snapshot)
         return
+    except BaseException:
+        # Cancellation or an unexpected failure while resolving limits/metadata: the
+        # batch is still unevaluated, so give it back rather than dropping it.
+        await merge_active_users_snapshot(active_users_snapshot)
+        raise
 
     # ------------------------------------------------------------------
     # Single source of truth for the device count of this cycle.
