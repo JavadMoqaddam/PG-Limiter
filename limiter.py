@@ -151,10 +151,19 @@ async def main():
             _supervise("dispatcher_worker", dispatcher.start_worker), name="dispatcher_worker"
         )
         bot_task = asyncio.create_task(run_telegram_bot(), name="telegram_bot_runner")
+        # Supervised retention: prune old violation history and ISP cache, which
+        # otherwise grew without bound because their cleanup had no live caller.
+        from utils.maintenance import retention_maintenance_loop
+        retention_task = asyncio.create_task(
+            _supervise("retention_maintenance", retention_maintenance_loop),
+            name="retention_maintenance",
+        )
         _BACKGROUND_TASKS.add(dispatcher_task)
         _BACKGROUND_TASKS.add(bot_task)
+        _BACKGROUND_TASKS.add(retention_task)
         dispatcher_task.add_done_callback(_BACKGROUND_TASKS.discard)
         bot_task.add_done_callback(_BACKGROUND_TASKS.discard)
+        retention_task.add_done_callback(_BACKGROUND_TASKS.discard)
 
         def _log_bot_task_failure(task: asyncio.Task) -> None:
             """Surface a crash in the bot starter instead of swallowing it."""
