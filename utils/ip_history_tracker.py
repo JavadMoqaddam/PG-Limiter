@@ -127,7 +127,7 @@ class IPHistoryTracker:
         if not users_data:
             return (
                 f"📊 <b>{hours}H IP History Report</b>\n\n"
-                f"✅ No users exceeded their limits in the last {hours} hours."
+                f"✅ No users went over their unique-IP allowance in the last {hours} hours."
             )
 
         isp_info_batch = {}
@@ -143,14 +143,16 @@ class IPHistoryTracker:
             f"⏰ Period: Last {hours} hours",
             f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "",
-            f"🚫 <b>{len(users_data)} users exceeded limits:</b>",
+            f"🔎 <b>{len(users_data)} users with more unique IPs than their limit:</b>",
+            "ℹ️ This counts distinct IPs seen over the window, not concurrent "
+            "devices. It is history, not the device-count enforcement uses to ban.",
             "",
         ]
 
         for username, ip_count, limit, unique_ips in users_data:
             report_lines.append(f"👤 <code>{username}</code>")
             report_lines.append(f"   📍 Unique IPs: <b>{ip_count}</b> (Limit: {limit})")
-            report_lines.append(f"   ⚠️ Exceeded by: <b>{ip_count - limit}</b> IPs")
+            report_lines.append(f"   ⚠️ Over by: <b>{ip_count - limit}</b> unique IPs")
 
             ip_list = []
             for ip in sorted(unique_ips):
