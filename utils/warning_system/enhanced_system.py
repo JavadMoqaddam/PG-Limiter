@@ -139,6 +139,18 @@ class EnhancedWarningSystem:
             self.warning_history[username] = []
         self.warning_history[username].append(current_time)
         await self.save_warning_history()
+
+    async def record_disable_outcome(self, username: str, action: str) -> bool:
+        """Record disable history only when the panel actually disabled or revoked.
+
+        A warning, error, or skipped outcome must not add a disable-history entry: the
+        history feeds trust scoring, so a failed punishment must leave the record intact
+        rather than logging a disable that never happened.
+        """
+        if action in ("disabled", "revoked"):
+            await self.add_to_warning_history(username)
+            return True
+        return False
     
     async def clear_all_trust_data(self) -> tuple[int, int]:
         """
@@ -271,8 +283,12 @@ class EnhancedWarningSystem:
         except Exception as e:
             warning_logger.error(f"Error loading warnings: {e}")
     
-    def _sync_save_warnings(self):
-        """Synchronous serialization and file write for active warnings."""
+    def _serialize_warnings(self) -> dict:
+        """Build a plain, detached snapshot of the active warnings.
+
+        Runs on the event loop so a concurrent clear cannot mutate ``self.warnings``
+        while the writer thread iterates it; the thread only ever sees this snapshot.
+        """
         data = {}
         for username, warning in self.warnings.items():
             monitoring_history_serializable = []
@@ -314,17 +330,20 @@ class EnhancedWarningSystem:
                 "consecutive_violations": getattr(warning, "consecutive_violations", 1),
                 "max_warnings_at_creation": getattr(warning, "max_warnings_at_creation", 0)
             }
-        
-        atomic_write_json(self.filename, data)
-        return len(data)
+
+        return data
 
     async def save_warnings(self):
         """Save warnings to file using asyncio.to_thread to avoid blocking."""
         try:
             async with self._write_lock:
-                count = await asyncio.to_thread(self._sync_save_warnings)
+                # Snapshot on the loop under the lock, then hand the detached dict to
+                # the writer thread - so a concurrent clear cannot race the write.
+                data = self._serialize_warnings()
+                count = len(data)
+                await asyncio.to_thread(atomic_write_json, self.filename, data)
             warning_logger.debug(f"⚠️ Saved {count} warnings to file")
-                
+
         except Exception as e:
             warning_logger.error(f"Error saving warnings: {e}")
     
@@ -761,9 +780,11 @@ class EnhancedWarningSystem:
                             punishment_result = await safe_disable_user_with_punishment(
                                 panel_data, UserType(name=username, ip=[])
                             )
-                            
-                            await self.add_to_warning_history(username)
-                            
+
+                            # Only a real disable/revoke belongs in disable history; a
+                            # warning or a failed punishment must not log a disable.
+                            await self.record_disable_outcome(username, punishment_result.get("action", ""))
+
                             if punishment_result["action"] == "warning":
                                 await safe_send_warning_log(
                                     f"⚠️ <b>WARNING</b> - {time_str}\n\n"

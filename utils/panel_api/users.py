@@ -1070,10 +1070,14 @@ async def disable_user_with_punishment(panel_data: PanelType, username: UserType
     Returns:
         dict: Result containing action, step_index, violation_count, duration_minutes, message
     """
-    from utils.punishment_system import get_punishment_for_user, record_user_violation
-    
+    from utils.punishment_system import (
+        get_punishment_system,
+        record_user_violation,
+        ViolationRecordError,
+    )
+
     users_logger.info(f"⚖️ Processing punishment for user: {username.name}")
-    
+
     user_exists = await check_user_exists(panel_data, username.name)
     if not user_exists:
         message = f"User {username.name} not found in panel (deleted?), skipping"
@@ -1085,7 +1089,55 @@ async def disable_user_with_punishment(panel_data: PanelType, username: UserType
             "duration_minutes": 0,
             "message": message
         }
-    
+
+    system = get_punishment_system()
+
+    # A panel action applied earlier whose violation could not be recorded is
+    # reconciled here - retry the record only, never re-apply the side effect.
+    if system.has_unrecorded_incident(username.name):
+        step_index, duration_minutes = system.pop_unrecorded_incident(username.name)
+        try:
+            await record_user_violation(username.name, step_index, duration_minutes)
+            return {
+                "action": "reconciled",
+                "step_index": step_index,
+                "violation_count": 0,
+                "duration_minutes": duration_minutes,
+                "message": f"Reconciled a previously unrecorded punishment for {username.name}",
+            }
+        except ViolationRecordError:
+            system.mark_unrecorded(username.name, step_index, duration_minutes)
+            return {
+                "action": "applied_unrecorded",
+                "step_index": step_index,
+                "violation_count": 0,
+                "duration_minutes": duration_minutes,
+                "message": f"Punishment for {username.name} was applied but is still unrecorded",
+            }
+
+    # Deduplicate a concurrent application for the same user: apply once, not twice.
+    if not system.begin_incident(username.name):
+        return {
+            "action": "deduplicated",
+            "step_index": 0,
+            "violation_count": 0,
+            "duration_minutes": 0,
+            "message": f"Punishment for {username.name} is already being applied",
+        }
+    try:
+        return await _apply_punishment_locked(panel_data, username, system)
+    finally:
+        system.end_incident(username.name)
+
+
+async def _apply_punishment_locked(panel_data: PanelType, username: UserType, system) -> dict:
+    """Apply the escalating punishment while the caller holds the per-user incident claim.
+
+    Records that follow a panel side effect (disable/revoke) are reconciled through the
+    punishment system's unrecorded ledger on failure, so the side effect is never repeated.
+    """
+    from utils.punishment_system import get_punishment_for_user, record_user_violation, ViolationRecordError
+
     data = await read_config()
     punishment, step_index, violation_count = await get_punishment_for_user(username.name, data)
     
@@ -1114,7 +1166,18 @@ async def disable_user_with_punishment(panel_data: PanelType, username: UserType
             }
     
     if punishment.is_warning():
-        await record_user_violation(username.name, step_index, 0)
+        # A warning has no panel side effect, so a record failure is safely retried
+        # on the next cycle rather than reconciled.
+        try:
+            await record_user_violation(username.name, step_index, 0)
+        except ViolationRecordError as e:
+            return {
+                "action": "error",
+                "step_index": step_index,
+                "violation_count": violation_count,
+                "duration_minutes": 0,
+                "message": f"Could not record warning for {username.name}: {e}",
+            }
         message = (f"⚠️ Warning #{violation_count + 1} for {username.name}\n"
                    f"Next violation will result in: {punishment.get_display_text() if step_index + 1 >= len(data.get('punishment', {}).get('steps', [])) else 'disable'}")
         users_logger.info(f"⚠️ Warning issued to {username.name} (violation #{violation_count + 1})")
@@ -1145,8 +1208,23 @@ async def disable_user_with_punishment(panel_data: PanelType, username: UserType
             
             # Then permanently disable the user
             await disable_user(panel_data, username, 0, permanent=True)
-            await record_user_violation(username.name, step_index, 0)
-            
+            # The panel side effects above already happened; if recording fails, mark
+            # the incident unrecorded so the next attempt reconciles the record rather
+            # than revoking and disabling a second time.
+            try:
+                await record_user_violation(username.name, step_index, 0)
+            except ViolationRecordError:
+                system.mark_unrecorded(username.name, step_index, 0)
+                return {
+                    "action": "applied_unrecorded",
+                    "step_index": step_index,
+                    "violation_count": violation_count + 1,
+                    "duration_minutes": 0,
+                    "revoke_success": revoke_success,
+                    "uuid_reset_success": uuid_reset_success,
+                    "message": f"User {username.name} revoked + disabled; violation not yet recorded",
+                }
+
             # Build status message
             status_parts = []
             if revoke_success:
@@ -1186,8 +1264,20 @@ async def disable_user_with_punishment(panel_data: PanelType, username: UserType
     
     try:
         await disable_user(panel_data, username, duration_seconds, permanent=is_permanent)
-        await record_user_violation(username.name, step_index, punishment.duration_minutes)
-        
+        # The disable already happened; a record failure is reconciled next attempt,
+        # never by disabling again.
+        try:
+            await record_user_violation(username.name, step_index, punishment.duration_minutes)
+        except ViolationRecordError:
+            system.mark_unrecorded(username.name, step_index, punishment.duration_minutes)
+            return {
+                "action": "applied_unrecorded",
+                "step_index": step_index,
+                "violation_count": violation_count + 1,
+                "duration_minutes": punishment.duration_minutes,
+                "message": f"User {username.name} disabled; violation not yet recorded",
+            }
+
         if is_permanent:
             message = f"🚫 User {username.name} disabled permanently (violation #{violation_count + 1})"
             users_logger.info(f"🚫 Permanent disable for {username.name} (violation #{violation_count + 1})")
