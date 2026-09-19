@@ -311,3 +311,30 @@ class TestWarningPersistence:
         await shared_system.clear_all_trust_data()
         assert not shared_system.warnings
         assert not cu.warning_system.warnings
+
+
+async def test_successful_disable_records_history(tmp_path):
+    """A real disable/revoke adds a disable-history entry."""
+    from utils.warning_system.enhanced_system import EnhancedWarningSystem
+
+    system = EnhancedWarningSystem(
+        filename=str(tmp_path / "warnings.json"),
+        history_filename=str(tmp_path / "history.json"),
+    )
+    added = await system.record_disable_outcome("u", "disabled")
+    assert added is True
+    assert system.warning_history.get("u") and len(system.warning_history["u"]) == 1
+
+
+async def test_failed_punishment_preserves_record(tmp_path):
+    """A failed/warning outcome must not log a disable, leaving the record intact."""
+    from utils.warning_system.enhanced_system import EnhancedWarningSystem
+
+    system = EnhancedWarningSystem(
+        filename=str(tmp_path / "warnings.json"),
+        history_filename=str(tmp_path / "history.json"),
+    )
+    system.warning_history = {"u": [1234.0]}
+    added = await system.record_disable_outcome("u", "error")
+    assert added is False
+    assert system.warning_history["u"] == [1234.0]

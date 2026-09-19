@@ -211,6 +211,14 @@ class ViolationRecord:
     enabled_at: Optional[float] = None  # When user was re-enabled (for timed disables)
 
 
+class ViolationRecordError(Exception):
+    """Raised when a violation cannot be recorded to the authoritative store.
+
+    Distinct from a panel failure: the panel action may already have succeeded, so
+    the caller must reconcile the record rather than re-apply the side effect.
+    """
+
+
 class PunishmentSystem:
     """
     Smart punishment system with escalating penalties.
@@ -237,6 +245,13 @@ class PunishmentSystem:
         self.enabled: bool = True
         self._write_lock = asyncio.Lock()
         self._last_cleanup: float = 0.0
+        # Usernames whose punishment is being applied right now, so a concurrent
+        # duplicate for the same user is deduplicated instead of applied twice.
+        self._in_flight: set[str] = set()
+        # Panel action applied but the violation could not be recorded: username ->
+        # (step_index, duration_minutes). The next attempt reconciles the record
+        # instead of re-applying the panel side effect.
+        self._applied_unrecorded: dict[str, tuple[int, int]] = {}
         # Rate limit for the "reading the JSON copy instead of SQLite" warning: the
         # enforcement loop asks about thousands of users per cycle, so warning per
         # user would bury the log it is meant to make legible.
@@ -446,10 +461,20 @@ class PunishmentSystem:
             duration_minutes: Duration of disable in minutes (0 for warning or unlimited)
         """
         now = time.time()
+        db_available = False
         try:
-            from db.database import get_db, DB_AVAILABLE
+            from db.database import DB_AVAILABLE
+            db_available = DB_AVAILABLE
+        except Exception:
+            db_available = False
+
+        if db_available:
+            # SQLite is the authoritative store the escalation decision reads. A failed
+            # write must surface, not be swallowed while the JSON mirror advances - that
+            # divergence let the next cycle re-apply the same step. The caller reconciles.
+            from db.database import get_db
             from db.crud.violations import ViolationHistoryCRUD
-            if DB_AVAILABLE:
+            try:
                 async with get_db() as db:
                     await ViolationHistoryCRUD.add(
                         db=db,
@@ -458,8 +483,9 @@ class PunishmentSystem:
                         disable_duration=duration_minutes
                     )
                     await db.commit()
-        except Exception as e:
-            punishment_logger.error(f"Error saving violation to DB for {username}: {e}")
+            except Exception as e:
+                punishment_logger.error(f"Error saving violation to DB for {username}: {e}")
+                raise ViolationRecordError(str(e)) from e
 
         if username not in self.violations:
             self.violations[username] = []
@@ -473,9 +499,34 @@ class PunishmentSystem:
         
         self.violations[username].append(record)
         await self.save_violations()
-        
+
         punishment_logger.info(f"📝 Recorded violation #{len(self.violations[username])} for {username} (step {step_applied}, duration: {duration_minutes}min)")
-    
+
+    def begin_incident(self, username: str) -> bool:
+        """Claim a punishment incident for a user.
+
+        Returns False if one is already in flight, so a concurrent duplicate for the
+        same user is deduplicated instead of applying the panel action twice.
+        """
+        if username in self._in_flight:
+            return False
+        self._in_flight.add(username)
+        return True
+
+    def end_incident(self, username: str) -> None:
+        """Release an in-flight incident claim."""
+        self._in_flight.discard(username)
+
+    def mark_unrecorded(self, username: str, step_index: int, duration_minutes: int) -> None:
+        """Remember that a panel action was applied but its violation was not recorded."""
+        self._applied_unrecorded[username] = (step_index, duration_minutes)
+
+    def has_unrecorded_incident(self, username: str) -> bool:
+        return username in self._applied_unrecorded
+
+    def pop_unrecorded_incident(self, username: str) -> Optional[tuple[int, int]]:
+        return self._applied_unrecorded.pop(username, None)
+
     async def clear_user_history(self, username: str):
         """Clear all violation history for a user"""
         try:

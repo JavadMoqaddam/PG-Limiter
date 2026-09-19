@@ -119,6 +119,30 @@ def _split_message(msg: str, max_length: int) -> list[str]:
     return chunks
 
 
+# Upper bound on how long a dedup mark waits for delivery confirmation before giving
+# up. Skipping the mark risks a later duplicate, never suppression of a real message.
+_DEDUP_MARK_TIMEOUT = 300.0
+
+
+def _mark_dedup_after_delivery(topics_manager, topic_type, message_key, futures, expected=None):
+    """Mark a dedup key only after every required send is confirmed delivered.
+
+    Runs in the background so a fire-and-forget caller is not blocked, and marks
+    nothing unless each future resolves to a delivered (non-None) result.
+    """
+    required = expected if expected is not None else len(futures)
+
+    async def _await_and_mark():
+        try:
+            results = await asyncio.wait_for(asyncio.gather(*futures), timeout=_DEDUP_MARK_TIMEOUT)
+        except Exception:
+            return
+        if len(results) >= required and all(result is not None for result in results):
+            await topics_manager.mark_message_sent(topic_type, message_key)
+
+    asyncio.ensure_future(_await_and_mark())
+
+
 async def send_logs(
     msg: str,
     return_message_id: bool = False,
@@ -160,14 +184,18 @@ async def send_logs(
         tg_send_logger.debug(f"⏭️ Skipping duplicate message: {message_key[:50]}...")
         return None
 
+    # A dedup key needs a delivery outcome, so request a future even when the caller
+    # is fire-and-forget; the key is marked from that outcome, never before it.
+    need_future = return_message_id or bool(message_key)
+
     # Auto-split messages exceeding Telegram's 4096 char limit (use 3900 safe margin for HTML overhead)
     TELEGRAM_MAX_LENGTH = 3900
     if len(msg) > TELEGRAM_MAX_LENGTH:
         tg_send_logger.warning(f"⚠️ Message too long ({len(msg)} chars), auto-splitting into chunks")
         chunks = _split_message(msg, TELEGRAM_MAX_LENGTH)
-        last_result = None
+        dispatcher = get_dispatcher()
+        chunk_futures = []
         for i, chunk in enumerate(chunks):
-            dispatcher = get_dispatcher()
             chunk_future = await dispatcher.enqueue_send(
                 text=chunk,
                 topic_type=topic_type,
@@ -175,16 +203,24 @@ async def send_logs(
                 reply_markup=reply_markup if i == len(chunks) - 1 else None,
                 ttl=ttl,
                 cancel_key=f"{cancel_key}_part{i}" if cancel_key else None,
-                return_future=return_message_id,
+                return_future=need_future,
             )
-            if return_message_id and chunk_future:
-                try:
-                    last_result = await asyncio.wait_for(chunk_future, timeout=10.0)
-                except (asyncio.TimeoutError, Exception):
-                    pass
-        if message_key:
-            await topics_manager.mark_message_sent(topic_type, message_key)
-        return last_result
+            if chunk_future is not None:
+                chunk_futures.append(chunk_future)
+
+        if message_key and chunk_futures:
+            # Mark only once every chunk is confirmed delivered.
+            _mark_dedup_after_delivery(
+                topics_manager, topic_type, message_key, chunk_futures, expected=len(chunks)
+            )
+
+        if return_message_id and chunk_futures:
+            try:
+                results = await asyncio.wait_for(asyncio.gather(*chunk_futures), timeout=10.0)
+                return results[-1] if results else None
+            except (asyncio.TimeoutError, Exception):
+                return None
+        return None
 
     dispatcher = get_dispatcher()
     future = await dispatcher.enqueue_send(
@@ -194,11 +230,11 @@ async def send_logs(
         reply_markup=reply_markup,
         ttl=ttl,
         cancel_key=cancel_key,
-        return_future=return_message_id,
+        return_future=need_future,
     )
 
-    if message_key:
-        await topics_manager.mark_message_sent(topic_type, message_key)
+    if message_key and future is not None:
+        _mark_dedup_after_delivery(topics_manager, topic_type, message_key, [future])
 
     if return_message_id and future:
         try:
@@ -354,7 +390,7 @@ async def cancel_or_delete_disable_message(username: str) -> bool:
     cancel_key = f"disable:{username}"
 
     # 1. Try cancelling pending queue item
-    if dispatcher.cancel_pending(cancel_key):
+    if await dispatcher.cancel_pending(cancel_key):
         await remove_disable_message_tracking(username)
         tg_send_logger.info(f"🚫 Cancelled pending disable message in queue for {username}")
         return True

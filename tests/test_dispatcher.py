@@ -4,13 +4,16 @@ Uses standard library unittest and asyncio for universal test runner compatibili
 """
 
 import asyncio
+import json
 import sys
+import threading
 import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
-
+import telegram_bot.dispatcher as dispatcher_mod
 from telegram_bot.dispatcher import (
     ActionType,
     Priority,
@@ -95,7 +98,7 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
         )
 
         # Before worker processes it, cancel it
-        cancelled = dispatcher.cancel_pending(cancel_key)
+        cancelled = await dispatcher.cancel_pending(cancel_key)
         self.assertTrue(cancelled)
 
         # Future should resolve to None without calling Telegram
@@ -181,7 +184,7 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
         await dispatcher.reload_pending_critical_messages()
         # Verify cancel key is in _active_cancel_keys and cancel_pending works
         self.assertIn("disable:john_doe", dispatcher._active_cancel_keys)
-        cancelled = dispatcher.cancel_pending("disable:john_doe")
+        cancelled = await dispatcher.cancel_pending("disable:john_doe")
         self.assertTrue(cancelled)
 
     async def test_trailing_node_status_update(self):
@@ -205,6 +208,122 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
             # Wait for trailing task to finish
             await asyncio.sleep(0.08)
             mock_edit.assert_called_once_with((100, -100123456), "new updated status")
+
+
+async def test_concurrent_critical_enqueue_cancel_persists_exact_snapshot(tmp_path, monkeypatch):
+    """A save must serialize a stable snapshot taken when it was requested, not the
+    live dict that a concurrent enqueue/cancel keeps mutating on the event loop."""
+    monkeypatch.setattr(dispatcher_mod, "PENDING_NOTIFICATIONS_FILE", str(tmp_path / "pending.json"))
+    dispatcher = TelegramDispatcher()
+    dispatcher._pending_storage = {
+        "keep": {"text": "still pending", "status": "pending"},
+        "cancelme": {"text": "about to cancel", "status": "pending"},
+    }
+
+    loop = asyncio.get_running_loop()
+    in_writer = asyncio.Event()
+    release = threading.Event()
+    serialized = []
+
+    def gated_write(path, payload):
+        # Enter the writer, let the loop mutate the live dict, then read the payload.
+        # A live-dict payload would show the concurrent enqueue/cancel; a snapshot won't.
+        loop.call_soon_threadsafe(in_writer.set)
+        if not release.wait(2.0):
+            raise TimeoutError("writer was never released")
+        serialized.append(json.dumps(payload, sort_keys=True))
+
+    monkeypatch.setattr(dispatcher_mod, "atomic_write_json", gated_write)
+
+    expected = json.dumps(dict(dispatcher._pending_storage), sort_keys=True)
+    save_task = asyncio.create_task(dispatcher._save_pending_storage())
+    await asyncio.wait_for(in_writer.wait(), 2.0)
+
+    # Concurrent enqueue adds a row; concurrent cancel removes another.
+    dispatcher._pending_storage["freshly_enqueued"] = {"text": "new", "status": "pending"}
+    dispatcher._pending_storage.pop("cancelme")
+    release.set()
+    await asyncio.wait_for(save_task, 2.0)
+
+    assert serialized == [expected]
+
+
+async def test_persistence_failure_prevents_enqueue(tmp_path, monkeypatch):
+    """A critical message that cannot be persisted must not be queued as durable."""
+    monkeypatch.setattr(dispatcher_mod, "PENDING_NOTIFICATIONS_FILE", str(tmp_path / "pending.json"))
+    dispatcher = TelegramDispatcher()
+
+    def failing_write(path, payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(dispatcher_mod, "atomic_write_json", failing_write)
+
+    with pytest.raises(OSError):
+        await dispatcher.enqueue_send(
+            text="User Disabled",
+            topic_type=TopicType.DISABLE_ENABLE,
+            priority=Priority.CRITICAL,
+            cancel_key="disable:victim",
+        )
+
+    assert dispatcher.queue.empty()
+    assert dispatcher._pending_storage == {}
+    assert "disable:victim" not in dispatcher._active_cancel_keys
+
+
+async def test_worker_restart_does_not_duplicate_reloaded_critical_messages(tmp_path, monkeypatch):
+    """A worker restart replays reload over rows still queued in memory; each row is
+    enqueued once, not once per restart."""
+    monkeypatch.setattr(dispatcher_mod, "PENDING_NOTIFICATIONS_FILE", str(tmp_path / "pending.json"))
+    monkeypatch.setattr(dispatcher_mod, "atomic_write_json", lambda *a, **k: None)
+    dispatcher = TelegramDispatcher()
+    dispatcher._pending_storage = {
+        "id1": {
+            "action_type": ActionType.SEND,
+            "text": "User Ban",
+            "topic_type": "disable_enable",
+            "cancel_key": "disable:jane",
+            "created_at": 1000.0,
+        }
+    }
+
+    await dispatcher.reload_pending_critical_messages()
+    assert dispatcher.queue.qsize() == 1
+
+    # Simulate the supervisor restarting the worker: reload runs again over the same disk row.
+    await dispatcher.reload_pending_critical_messages()
+    assert dispatcher.queue.qsize() == 1
+
+
+async def test_stop_drains_all_items_before_worker_exit(tmp_path, monkeypatch):
+    """stop() must let the worker finish every queued item before it exits."""
+    monkeypatch.setattr(dispatcher_mod, "PENDING_NOTIFICATIONS_FILE", str(tmp_path / "pending.json"))
+    monkeypatch.setattr(dispatcher_mod, "atomic_write_json", lambda *a, **k: None)
+    dispatcher = TelegramDispatcher()
+
+    edited = []
+    bot = MagicMock()
+
+    async def fake_edit(**kwargs):
+        await asyncio.sleep(0.01)
+        edited.append(kwargs["message_id"])
+
+    bot.edit_message_text = fake_edit
+    dispatcher.set_bot(bot)
+
+    futures = []
+    for i in range(5):
+        futures.append(
+            await dispatcher.enqueue_edit(chat_id=1, message_id=100 + i, new_text=f"t{i}", return_future=True)
+        )
+
+    worker = asyncio.create_task(dispatcher.start_worker())
+    await asyncio.sleep(0)  # let the worker pick up the first item
+    await dispatcher.stop(wait_seconds=5.0)
+
+    assert sorted(edited) == [100, 101, 102, 103, 104]
+    assert all(f.done() for f in futures)
+    assert worker.done()
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from typing import AsyncGenerator, Dict, List, Optional
 
 import secrets
 
-from fastapi import FastAPI, HTTPException, Depends, Query, status
+from fastapi import FastAPI, HTTPException, Depends, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
@@ -32,6 +32,21 @@ _backup_lock = asyncio.Lock()
 
 # Security
 security = HTTPBasic()
+
+# Failed-auth throttle: too many wrong credentials from one client within the window
+# are refused with 429 instead of letting an unthrottled 0.0.0.0 bind be brute-forced.
+_AUTH_MAX_FAILURES = 5
+_AUTH_WINDOW_SECONDS = 60.0
+_failed_auth_attempts: Dict[str, List[float]] = {}
+
+
+def _record_auth_failure(client: str) -> int:
+    """Record a failed auth for a client and return its live failure count in the window."""
+    now = time.time()
+    recent = [t for t in _failed_auth_attempts.get(client, []) if now - t < _AUTH_WINDOW_SECONDS]
+    recent.append(now)
+    _failed_auth_attempts[client] = recent
+    return len(recent)
 
 # ═══════════════════════════════════════════════════════════════
 # Pydantic Models
@@ -130,7 +145,7 @@ async def get_panel_data():
     )
 
 
-def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
+def verify_credentials(request: Request = None, credentials: HTTPBasicCredentials = Depends(security)):
     """
     HTTP Basic check that fails closed.
 
@@ -171,11 +186,20 @@ def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
     )
 
     if not (is_correct_username and is_correct_password):
+        client = request.client.host if request and request.client else "unknown"
+        if _record_auth_failure(client) > _AUTH_MAX_FAILURES:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many failed authentication attempts; try again later",
+                headers={"Retry-After": str(int(_AUTH_WINDOW_SECONDS))},
+            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
             headers={"WWW-Authenticate": "Basic"},
         )
+    # A clean login clears the client's failure streak.
+    _failed_auth_attempts.pop(request.client.host if request and request.client else "unknown", None)
     return credentials.username
 
 
@@ -186,8 +210,16 @@ def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("🚀 Limiter API Server starting...")
-    yield
-    logger.info("🛑 Limiter API Server shutting down...")
+    # Own the database lifecycle: a bare `python api_server.py` used to serve requests
+    # against an uninitialised database and never close it. Management writes go
+    # through SQLite services, so the schema must be ready before the first request.
+    from db.database import init_db, close_db
+    await init_db()
+    try:
+        yield
+    finally:
+        await close_db()
+        logger.info("🛑 Limiter API Server shutting down...")
 
 
 def _docs_enabled() -> bool:
@@ -213,6 +245,21 @@ def _cors_origins() -> list[str]:
     """
     raw = os.getenv("API_CORS_ORIGINS", "")
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+def _resolve_bind_host() -> str:
+    """The address to bind, defaulting to loopback.
+
+    The old default was 0.0.0.0, which exposed the management API to the network the
+    moment it started. Remote exposure is now opt-in: set API_HOST (or api.host).
+    """
+    env_host = os.getenv("API_HOST")
+    if env_host:
+        return env_host
+    try:
+        return load_config().get("api", {}).get("host") or "127.0.0.1"
+    except Exception:
+        return "127.0.0.1"
 
 
 _DOCS_ON = _docs_enabled()
@@ -404,75 +451,46 @@ async def delete_user_limit(user: str, username: str = Depends(verify_credential
 
 @app.get("/users/except", tags=["Except Users"])
 async def list_except_users(username: str = Depends(verify_credentials)):
-    """List all except (whitelisted) users"""
-    async with _config_lock:
-        config = await asyncio.to_thread(load_config)
-    async with _backup_lock:
-        backup = await asyncio.to_thread(load_backup)
-    
-    except_users = set()
-    if "users" in config and "except" in config["users"]:
-        except_users.update(config["users"]["except"])
-    if "except_users" in backup:
-        except_users.update(backup["except_users"])
-    
+    """List whitelisted users from the canonical store enforcement reads."""
+    from utils.read_config import read_config
+
+    config = await read_config()
+    except_users = config.get("except_users", []) or []
+
     return {
         "success": True,
-        "data": sorted(list(except_users))
+        "data": sorted(set(except_users))
     }
 
 
 @app.post("/users/except", tags=["Except Users"])
 async def add_except_user(user: ExceptUser, username: str = Depends(verify_credentials)):
-    """Add a user to the except list"""
-    async with _config_lock:
-        async with _backup_lock:
-            config = await asyncio.to_thread(load_config)
-            backup = await asyncio.to_thread(load_backup)
-            
-            if "users" not in config:
-                config["users"] = {}
-            if "except" not in config["users"]:
-                config["users"]["except"] = []
-            if "except_users" not in backup:
-                backup["except_users"] = []
-            
-            if user.username in config["users"]["except"] or user.username in backup["except_users"]:
-                raise HTTPException(status_code=400, detail=f"User {user.username} is already in except list")
-            
-            config["users"]["except"].append(user.username)
-            backup["except_users"].append(user.username)
-            
-            await asyncio.to_thread(save_config, config)
-            await asyncio.to_thread(save_backup, backup)
-    
+    """Whitelist a user through the canonical SQLite store enforcement reads."""
+    from db.database import get_db
+    from db.crud import UserCRUD
+
+    async with get_db() as db:
+        await UserCRUD.set_excepted(db, user.username, excepted=True, excepted_by="api")
+        await db.commit()
+
     return {"success": True, "message": f"User {user.username} added to except list"}
 
 
 @app.delete("/users/except/{user}", tags=["Except Users"])
 async def delete_except_user(user: str, username: str = Depends(verify_credentials)):
-    """Remove a user from the except list"""
-    removed = False
-    
-    async with _config_lock:
-        async with _backup_lock:
-            config = await asyncio.to_thread(load_config)
-            backup = await asyncio.to_thread(load_backup)
-            
-            if "users" in config and "except" in config["users"]:
-                if user in config["users"]["except"]:
-                    config["users"]["except"].remove(user)
-                    await asyncio.to_thread(save_config, config)
-                    removed = True
-            
-            if "except_users" in backup and user in backup["except_users"]:
-                backup["except_users"].remove(user)
-                await asyncio.to_thread(save_backup, backup)
-                removed = True
-    
-    if not removed:
+    """Remove a user from the whitelist in the canonical SQLite store."""
+    from utils.read_config import read_config
+    from db.database import get_db
+    from db.crud import UserCRUD
+
+    config = await read_config()
+    if user not in (config.get("except_users", []) or []):
         raise HTTPException(status_code=404, detail=f"User {user} not found in except list")
-    
+
+    async with get_db() as db:
+        await UserCRUD.set_excepted(db, user, excepted=False, excepted_by="api")
+        await db.commit()
+
     return {"success": True, "message": f"User {user} removed from except list"}
 
 
@@ -580,16 +598,14 @@ async def get_config(username: str = Depends(verify_credentials)):
 
 @app.put("/config/limits/general", tags=["Configuration"])
 async def set_general_limit(limit: int = Query(..., ge=1), username: str = Depends(verify_credentials)):
-    """Set the general IP limit"""
-    async with _config_lock:
-        config = await asyncio.to_thread(load_config)
-        
-        if "limits" not in config:
-            config["limits"] = {}
-        
-        config["limits"]["general"] = limit
-        await asyncio.to_thread(save_config, config)
-    
+    """Set the general IP limit through the canonical store enforcement reads."""
+    from utils.read_config import save_config_value
+
+    if not await save_config_value("general_limit", limit):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to persist the general limit",
+        )
     return {"success": True, "message": f"General limit set to {limit}"}
 
 
@@ -696,13 +712,11 @@ if __name__ == "__main__":
     import uvicorn
     
     # Load config for API settings
+    host = _resolve_bind_host()
     try:
-        config = load_config()
-        api_config = config.get("api", {})
-        host = os.getenv("API_HOST", api_config.get("host", "0.0.0.0"))
+        api_config = load_config().get("api", {})
         port = int(os.getenv("API_PORT", api_config.get("port", 8080)))
     except Exception:
-        host = "0.0.0.0"
         port = 8080
     
     docs_line = f"  Docs: http://{host}:{port}/docs" if _DOCS_ON else "  Docs: disabled (API_DOCS=true)"

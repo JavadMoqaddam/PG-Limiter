@@ -212,3 +212,54 @@ class TestIPAPIEndpoints:
         detector = ISPDetector()
         
         assert detector.rate_limited is False
+
+
+async def test_removing_token_clears_secret_and_enables_fallback():
+    """Emptying the token must drop the secret and fall back, not keep the old auth."""
+    import asyncio  # noqa: F401
+    from utils.isp_detector import ISPDetector
+
+    detector = ISPDetector(token="secret_token_value", use_fallback_only=False, use_db_cache=False)
+    assert detector.token == "secret_token_value"
+    assert detector.use_fallback_only is False
+
+    await detector.reconfigure(token=None, fallback=False)
+
+    assert detector.token is None
+    assert detector.use_fallback_only is True
+    assert detector.config_signature == (None, False)
+    await detector.close()
+
+
+async def test_reconfigure_updates_fallback_mode():
+    from utils.isp_detector import ISPDetector
+
+    detector = ISPDetector(token="tok", use_fallback_only=False, use_db_cache=False)
+    assert detector.use_fallback_only is False
+
+    await detector.reconfigure(token="tok", fallback=True)
+
+    assert detector.use_fallback_only is True
+    assert detector.config_signature == ("tok", True)
+    await detector.close()
+
+
+async def test_close_cancels_background_tasks_and_closes_client():
+    import asyncio
+    from utils.isp_detector import ISPDetector
+
+    detector = ISPDetector(token=None, use_fallback_only=True, use_db_cache=False)
+    client = await detector._get_client()
+    assert client.is_closed is False
+
+    async def _never_finishes():
+        await asyncio.sleep(3600)
+
+    task = detector._create_background_task(_never_finishes())
+    await asyncio.sleep(0)  # let the task start
+
+    await detector.close()
+
+    assert task.cancelled() or task.done()
+    assert detector._client is None
+    assert not detector._background_tasks

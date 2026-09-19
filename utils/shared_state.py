@@ -124,3 +124,29 @@ async def pop_active_users_snapshot() -> dict[str, UserType]:
         snapshot = _clone_user_map(ACTIVE_USERS)
         ACTIVE_USERS.clear()
         return snapshot
+
+
+async def merge_active_users_snapshot(batch: dict[str, UserType]) -> int:
+    """Requeue a consumed batch when the cycle failed before it could be evaluated.
+
+    A ``pop_active_users_snapshot()`` clears ACTIVE_USERS, so a failure later in the
+    cycle would lose the batch: the next cycle would see those still-connected users as
+    absent and clear their warnings. This restores each user from the batch, but merges
+    by connection identity - a newer event that arrived during the cycle is kept, never
+    overwritten by the stale sample.
+
+    Returns the number of users actually restored (those without a newer observation).
+    """
+    if not batch:
+        return 0
+    restored = 0
+    async with ACTIVE_USERS_LOCK:
+        for email, user in batch.items():
+            if not email or not user:
+                continue
+            if email in ACTIVE_USERS:
+                # A newer observation arrived during the cycle; do not overwrite it.
+                continue
+            ACTIVE_USERS[email] = user
+            restored += 1
+    return restored

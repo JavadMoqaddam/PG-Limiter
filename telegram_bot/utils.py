@@ -288,6 +288,10 @@ async def handle_special_limit(username: str, limit: int) -> list:
 handel_special_limit = handle_special_limit
 
 
+class LastAdminError(Exception):
+    """Raised when a removal would leave the bot with no administrator."""
+
+
 async def remove_admin_from_config(admin_id: int) -> bool:
     """
     Removes an admin from the configuration.
@@ -298,10 +302,18 @@ async def remove_admin_from_config(admin_id: int) -> bool:
 
     Returns:
         bool: True if the admin was successfully removed, False otherwise.
+
+    Raises:
+        LastAdminError: if the target is the only remaining administrator. Enforced
+            here so every path (command continuation and callback) is covered.
     """
     data = await read_json_file()
     admins = data.get("telegram", {}).get("admins", [])
     if admin_id in admins:
+        if len(admins) <= 1:
+            raise LastAdminError(
+                "Refusing to remove the last administrator; add another admin first."
+            )
         admins.remove(admin_id)
         data["telegram"]["admins"] = admins
         await write_json_file(data)
