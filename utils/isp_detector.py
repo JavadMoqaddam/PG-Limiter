@@ -37,9 +37,13 @@ class ISPDetector:
             use_fallback_only (bool): If True, use only ip-api.com instead of ipinfo.io
             use_db_cache (bool): If True, use database-backed subnet cache for persistence
         """
-        self.token = token
+        self.token = token or None
+        # The fallback flag as configured, kept apart from the effective mode so the
+        # detector's config_signature can be compared against config without the
+        # "no token implies fallback" rule blurring the two.
+        self._configured_fallback = bool(use_fallback_only)
         # Auto-enable fallback if no token provided (ipinfo.io rate limits quickly without token)
-        self.use_fallback_only = use_fallback_only or (not token)
+        self.use_fallback_only = self._configured_fallback or (not self.token)
         self.use_db_cache = use_db_cache and DB_AVAILABLE
         self.cache: Dict[str, Dict[str, str]] = {}  # Bounded cache to avoid memory leak
         self._max_cache_size = 5000  # Cap cache entries for RAM safety
@@ -54,8 +58,8 @@ class ISPDetector:
             logger.info("ISPDetector initialized with database-backed subnet cache")
         if self.use_fallback_only:
             logger.info("ISPDetector using ip-api.com (fallback mode - no token configured)")
-        elif token:
-            logger.info(f"ISPDetector initialized with token: {token[:20]}...")
+        elif self.token:
+            logger.info("ISPDetector initialized with an ipinfo token")
 
     def _set_cache(self, key: str, value: Dict[str, str]) -> None:
         """Store ISP entry in RAM with LRU-style eviction to prevent memory leak."""
@@ -75,13 +79,41 @@ class ISPDetector:
         return task
     
     def update_token(self, token: Optional[str]):
-        """Update ipinfo token dynamically"""
+        """Update ipinfo token dynamically.
+
+        Kept for callers that only ever set a token; removal and fallback changes go
+        through ``reconfigure`` so an emptied token actually clears the secret.
+        """
         if token:
             self.token = token
+            self._configured_fallback = False
             self.use_fallback_only = False
             self.rate_limited = False
-            logger.info(f"🔑 ISPDetector token updated: {token[:20]}...")
-    
+            logger.info("🔑 ISPDetector token updated")
+
+    @property
+    def config_signature(self) -> Tuple[Optional[str], bool]:
+        """The token and configured-fallback pair, for detecting a config change."""
+        return (self.token or None, bool(self._configured_fallback))
+
+    async def reconfigure(self, token: Optional[str] = None, fallback: bool = False) -> None:
+        """Apply a new token / fallback setting, clearing stale auth.
+
+        Unlike ``update_token`` this honours an emptied token: the secret is dropped
+        and fallback is enabled. The shared client is closed so the next request builds
+        a fresh one that carries the new authorization.
+        """
+        self.token = token or None
+        self._configured_fallback = bool(fallback)
+        self.use_fallback_only = self._configured_fallback or (not self.token)
+        self.rate_limited = False
+        await self.close()
+        logger.info(
+            "🔧 ISPDetector reconfigured (token %s, fallback=%s)",
+            "set" if self.token else "cleared",
+            self.use_fallback_only,
+        )
+
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create the shared httpx AsyncClient"""
         if self._client is None or self._client.is_closed:
@@ -94,7 +126,12 @@ class ISPDetector:
     _get_session = _get_client
     
     async def close(self):
-        """Close the httpx AsyncClient"""
+        """Cancel background lookups and close the shared httpx AsyncClient."""
+        if self._background_tasks:
+            for task in list(self._background_tasks):
+                task.cancel()
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            self._background_tasks.clear()
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None

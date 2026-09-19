@@ -293,6 +293,15 @@ async def cleanup_resources():
     except Exception as e:
         main_logger.debug(f"Error closing Panel client: {e}")
 
+    # 3b. Close the ISP detector's shared HTTP client and background lookups.
+    try:
+        import utils.check_usage as check_usage_mod
+        if check_usage_mod.isp_detector is not None:
+            await check_usage_mod.isp_detector.close()
+            main_logger.debug("✓ ISP detector closed")
+    except Exception as e:
+        main_logger.debug(f"Error closing ISP detector: {e}")
+
     # 4. Stop Telegram Dispatcher cleanly
     try:
         from telegram_bot.dispatcher import get_dispatcher

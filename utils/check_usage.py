@@ -65,13 +65,15 @@ async def _ensure_isp_detector(config_data: dict) -> ISPDetector:
 
         if isp_detector is None:
             logger.info(f"Loading IPINFO_TOKEN from config: {'Present' if ipinfo_token else 'NOT FOUND'}")
-            if ipinfo_token:
-                logger.info(f"Token preview: {ipinfo_token[:20]}...")
             if use_fallback_api:
                 logger.info("Using fallback ISP API (ip-api.com) for all requests")
             isp_detector = ISPDetector(token=ipinfo_token if ipinfo_token else None, use_fallback_only=use_fallback_api)
-        elif ipinfo_token and getattr(isp_detector, "token", None) != ipinfo_token:
-            isp_detector.update_token(ipinfo_token)
+        else:
+            # Reconfigure on any change - including a token that was removed, which the
+            # old truthy-only update ignored, leaving the old secret live until restart.
+            desired = (ipinfo_token or None, bool(use_fallback_api))
+            if isp_detector.config_signature != desired:
+                await isp_detector.reconfigure(token=ipinfo_token or None, fallback=use_fallback_api)
 
     return isp_detector
 
