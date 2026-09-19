@@ -102,7 +102,9 @@ async def _set_device_count_mode(query, context, mode: str, label: str):
         await query.answer(f"Already counting {label}")
         return
 
-    await save_config_value("device_count_mode", mode)
+    if not await save_config_value("device_count_mode", mode):
+        await query.answer("⚠️ Could not save; try again")
+        return
     await query.answer(f"✅ Now counting {label}")
     await handle_device_count_menu_callback(query, context)
 
