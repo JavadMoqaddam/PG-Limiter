@@ -182,6 +182,12 @@ jobs:
           python tools/ci_migration_checks.py assert-upsert ./data/misstamped.db
           python tools/ci_migration_checks.py parity ./data/misstamped.db
 
+      # assert-dedup compares every column, not just connection_count. 007 used to
+      # keep the highest id of each duplicate pair and delete the rest, which also
+      # produced one row per pair - so a count-only assertion passed while first_seen
+      # jumped forward to whenever the surviving row was written and the earlier
+      # rows' connection counts vanished. The seed rows are shaped so that survivor-
+      # only behaviour returns the wrong node and protocol too.
       - name: Scenario 4 - a populated 001..006 database survives the upgrade
         env:
           DATABASE_URL: sqlite+aiosqlite:///./data/populated.db
@@ -192,6 +198,15 @@ jobs:
           python tools/ci_migration_checks.py assert-dedup ./data/populated.db
           python tools/ci_migration_checks.py parity ./data/populated.db
           python tools/ci_migration_checks.py assert-upsert ./data/populated.db
+          # start.sh restamps 006 and re-runs the chain whenever the schema and the
+          # recorded version disagree, so 007 runs again over rows it already merged.
+          # The second pass must change nothing: merging an aggregate a second time
+          # would double every connection_count.
+          python -m alembic stamp 006_drop_patterns
+          python -m alembic upgrade head
+          python tools/ci_migration_checks.py assert-dedup ./data/populated.db
+          python tools/ci_migration_checks.py assert-upsert ./data/populated.db
+          python tools/ci_migration_checks.py parity ./data/populated.db
 
       - name: Scenario 5 - the chain is linear and downgrades cleanly
         env:
