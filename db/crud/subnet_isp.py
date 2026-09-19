@@ -2,6 +2,7 @@
 Subnet ISP Cache CRUD operations.
 """
 
+import ipaddress
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -19,14 +20,19 @@ class SubnetISPCRUD:
     
     @staticmethod
     def get_subnet_from_ip(ip: str) -> str:
-        """Extract standard /24 subnet from IP address (e.g. 192.168.1.100 -> 192.168.1.0/24)."""
-        parts = ip.split(".")
-        if len(parts) == 4:
-            return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
-        if ":" in ip:
-            parts = ip.split(":")
-            return ":".join(parts[:4]) + "::/64"
-        return ip
+        """Canonical subnet for an IP: /24 for IPv4, /64 for IPv6.
+
+        Uses ipaddress so equivalent IPv6 spellings collapse to one key. The old
+        colon-split produced malformed, spelling-dependent keys (``2a01:5ec0::1`` and
+        ``2a01:5ec0:0:0:0:0:0:1`` cached under different rows). Unparseable input is
+        returned unchanged so a bad value cannot break the lookup.
+        """
+        try:
+            address = ipaddress.ip_address(ip)
+        except ValueError:
+            return ip
+        prefix = 24 if address.version == 4 else 64
+        return str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
     
     @staticmethod
     async def get_by_ip(db: AsyncSession, ip: str) -> Optional[SubnetISP]:
