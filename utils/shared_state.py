@@ -4,6 +4,7 @@ Decouples state ownership to eliminate circular dependencies between check_usage
 """
 
 import asyncio
+import copy
 import time
 
 from utils.types import UserType
@@ -89,14 +90,17 @@ def _clone_user_map(users: dict[str, UserType]) -> dict[str, UserType]:
             name=user.name,
             status=user.status,
             ip=list(user.ip) if hasattr(user, "ip") and user.ip else [],
-            isp_info=user.isp_info,
-            device_info=user.device_info,
+            # Deep-clone the nested state too: a shallow copy aliased isp_info,
+            # device_info and group_ids, so ongoing ingestion into the live map
+            # mutated a report already reading the snapshot.
+            isp_info=copy.deepcopy(user.isp_info),
+            device_info=copy.deepcopy(user.device_info),
             panel_status=user.panel_status,
             data_limit=user.data_limit,
             used_traffic=user.used_traffic,
             lifetime_used_traffic=user.lifetime_used_traffic,
             expire=user.expire,
-            group_ids=user.group_ids,
+            group_ids=copy.deepcopy(user.group_ids),
             online_at=user.online_at,
             admin_username=user.admin_username,
             is_monitored=getattr(user, "is_monitored", True),
