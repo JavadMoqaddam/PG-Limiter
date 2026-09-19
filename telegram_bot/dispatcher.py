@@ -12,6 +12,7 @@ Provides a robust, centralized message dispatching engine with:
 """
 
 import asyncio
+import copy
 from dataclasses import dataclass, field
 from enum import IntEnum
 import html
@@ -30,6 +31,9 @@ dispatcher_logger = get_logger("telegram.dispatcher")
 
 # Persistence file for Priority 1 (Critical) messages
 PENDING_NOTIFICATIONS_FILE = "data/pending_notifications.json"
+
+# Queued to wake a worker parked on an empty queue so it can observe a stop().
+_SHUTDOWN_SENTINEL = object()
 
 
 class Priority(IntEnum):
@@ -115,9 +119,13 @@ class TelegramDispatcher:
         self._active_cancel_keys: Dict[str, QueueItem] = {}
         self._paused_until: float = 0.0
         self._is_running: bool = False
+        self._shutting_down: bool = False
         self._worker_task: Optional[asyncio.Task] = None
         self._persistence_lock = asyncio.Lock()
         self._pending_storage: Dict[str, dict] = {}
+        # db_ids currently live in the queue (or being processed). Reload on a worker
+        # restart consults this so a row already queued in memory is not enqueued twice.
+        self._queued_db_ids: set = set()
         self._bot = None
         self._load_pending_storage()
 
@@ -136,17 +144,17 @@ class TelegramDispatcher:
             dispatcher_logger.error(f"❌ Failed to load pending notifications: {e}")
             self._pending_storage = {}
 
-    def _sync_save_pending_storage(self) -> None:
-        """Synchronously persist pending notifications to disk."""
-        try:
-            atomic_write_json(PENDING_NOTIFICATIONS_FILE, self._pending_storage)
-        except Exception as e:
-            dispatcher_logger.error(f"❌ Failed to save pending notifications: {e}")
-
     async def _save_pending_storage(self) -> None:
-        """Save pending storage asynchronously."""
+        """Persist pending notifications to disk.
+
+        The snapshot is taken on the event loop under the persistence lock, so the
+        writer thread never touches the live dict a concurrent enqueue/cancel is
+        mutating. A write failure propagates instead of being swallowed, so a caller
+        cannot treat an unpersisted critical message as durable.
+        """
         async with self._persistence_lock:
-            await asyncio.to_thread(self._sync_save_pending_storage)
+            snapshot = copy.deepcopy(self._pending_storage)
+            await asyncio.to_thread(atomic_write_json, PENDING_NOTIFICATIONS_FILE, snapshot)
 
     async def reload_pending_critical_messages(self) -> None:
         """Reload any un-sent Priority 1 messages on startup and re-enqueue them."""
@@ -155,6 +163,10 @@ class TelegramDispatcher:
 
         dispatcher_logger.info(f"🔄 Re-enqueuing {len(self._pending_storage)} pending critical notifications...")
         for db_id, data in list(self._pending_storage.items()):
+            # A worker restart replays this over rows already queued in memory; skip
+            # those so a restart does not send the same notification twice.
+            if db_id in self._queued_db_ids:
+                continue
             topic_str = data.get("topic_type", "disable_enable")
             try:
                 topic_enum = TopicType(topic_str)
@@ -189,6 +201,7 @@ class TelegramDispatcher:
             if cancel_key:
                 self._active_cancel_keys[cancel_key] = item
 
+            self._queued_db_ids.add(db_id)
             seq = next(self._sequence_counter)
             await self.queue.put((item.priority, seq, item))
 
@@ -217,6 +230,10 @@ class TelegramDispatcher:
         Returns:
             asyncio.Future or None
         """
+        if self._shutting_down:
+            dispatcher_logger.warning("⚠️ Dispatcher is shutting down; refusing new send")
+            return None
+
         loop = asyncio.get_running_loop()
         future = loop.create_future() if return_future else None
 
@@ -231,7 +248,13 @@ class TelegramDispatcher:
                 "created_at": time.time(),
                 "status": "pending",
             }
-            await self._save_pending_storage()
+            # A critical message is only durable once it is on disk; if the write
+            # fails, drop the record and surface the error rather than queueing it.
+            try:
+                await self._save_pending_storage()
+            except Exception:
+                self._pending_storage.pop(db_id, None)
+                raise
 
         item = QueueItem(
             priority=priority,
@@ -247,6 +270,8 @@ class TelegramDispatcher:
 
         if cancel_key:
             self._active_cancel_keys[cancel_key] = item
+        if db_id:
+            self._queued_db_ids.add(db_id)
 
         seq = next(self._sequence_counter)
         await self.queue.put((priority, seq, item))
@@ -262,6 +287,10 @@ class TelegramDispatcher:
         return_future: bool = False,
     ) -> Optional[asyncio.Future]:
         """Enqueue a message edit action."""
+        if self._shutting_down:
+            dispatcher_logger.warning("⚠️ Dispatcher is shutting down; refusing new edit")
+            return None
+
         loop = asyncio.get_running_loop()
         future = loop.create_future() if return_future else None
 
@@ -286,6 +315,10 @@ class TelegramDispatcher:
         return_future: bool = False,
     ) -> Optional[asyncio.Future]:
         """Enqueue a message delete action."""
+        if self._shutting_down:
+            dispatcher_logger.warning("⚠️ Dispatcher is shutting down; refusing new delete")
+            return None
+
         loop = asyncio.get_running_loop()
         future = loop.create_future() if return_future else None
 
@@ -301,22 +334,26 @@ class TelegramDispatcher:
         dispatcher_logger.debug(f"📥 Enqueued message delete (chat={chat_id}, msg={message_id})")
         return future
 
-    def cancel_pending(self, cancel_key: str) -> bool:
+    async def cancel_pending(self, cancel_key: str) -> bool:
         """
         Cancel a pending message in the queue if it has not yet been dispatched.
-        
+
         Args:
             cancel_key: The cancel key associated with the message
-            
+
         Returns:
             True if a pending message was found and marked cancelled, False otherwise
         """
         if cancel_key in self._active_cancel_keys:
             item = self._active_cancel_keys.pop(cancel_key)
             item.is_cancelled = True
-            if item.db_id and item.db_id in self._pending_storage:
-                del self._pending_storage[item.db_id]
-                asyncio.create_task(self._save_pending_storage())
+            if item.db_id:
+                self._queued_db_ids.discard(item.db_id)
+                if item.db_id in self._pending_storage:
+                    del self._pending_storage[item.db_id]
+                    # Awaited, not fire-and-forget: the caller owns the persistence
+                    # outcome and the removal is durable before it returns.
+                    await self._save_pending_storage()
             if item.future and not item.future.done():
                 item.future.set_result(None)
             dispatcher_logger.info(f"🚫 Cancelled pending message before send: {cancel_key}")
@@ -347,10 +384,15 @@ class TelegramDispatcher:
                 continue
 
             try:
+                # A stop() puts this to wake the worker; drain has already finished.
+                if item is _SHUTDOWN_SENTINEL:
+                    break
+
                 # Check if item was cancelled before sending
                 if item.is_cancelled:
                     if item.cancel_key and item.cancel_key in self._active_cancel_keys:
                         self._active_cancel_keys.pop(item.cancel_key, None)
+                    self._queued_db_ids.discard(item.db_id)
                     continue
 
                 # Check if item expired (TTL)
@@ -359,6 +401,7 @@ class TelegramDispatcher:
                     dispatcher_logger.debug(f"⏰ Dropped expired item (topic={item.topic_type.value}, age={now - item.created_at:.1f}s, ttl={item.ttl}s)")
                     if item.future and not item.future.done():
                         item.future.set_result(None)
+                    self._queued_db_ids.discard(item.db_id)
                     continue
 
                 # Enforce global pause if currently in backoff from 429
@@ -390,10 +433,12 @@ class TelegramDispatcher:
                     else:
                         if item.cancel_key and item.cancel_key in self._active_cancel_keys:
                             self._active_cancel_keys.pop(item.cancel_key, None)
+                        self._queued_db_ids.discard(item.db_id)
                 else:
                     # Finalized successfully or cancelled
                     if item.cancel_key and item.cancel_key in self._active_cancel_keys:
                         self._active_cancel_keys.pop(item.cancel_key, None)
+                    self._queued_db_ids.discard(item.db_id)
                     if item.db_id and item.db_id in self._pending_storage:
                         del self._pending_storage[item.db_id]
                         await self._save_pending_storage()
@@ -551,31 +596,58 @@ class TelegramDispatcher:
 
         return True
 
+    def _resolve_remaining_futures(self) -> None:
+        """Resolve any awaiter still attached to a queued item so no caller is stranded."""
+        while not self.queue.empty():
+            try:
+                _, _, item = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self.queue.task_done()
+            if item is _SHUTDOWN_SENTINEL:
+                continue
+            if getattr(item, "future", None) and not item.future.done():
+                item.future.set_result(None)
+
     async def stop(self, wait_seconds: float = 5.0) -> None:
         """
         Gracefully stop the Telegram Dispatcher worker and drain pending tasks.
-        
+
+        New work is refused first, then the already-queued items are drained before
+        the worker is asked to exit, so nothing accepted before stop() is dropped.
+
         Args:
             wait_seconds: Maximum seconds to wait for in-flight tasks before stopping
         """
         dispatcher_logger.info(f"🛑 Stopping Telegram Dispatcher (draining queue, max wait: {wait_seconds}s)...")
-        self._is_running = False
+        self._shutting_down = True
 
         if self._worker_task and not self._worker_task.done():
             try:
-                # Wait briefly for queue to drain if items exist
-                start_wait = time.time()
-                while not self.queue.empty() and (time.time() - start_wait < wait_seconds):
-                    await asyncio.sleep(0.2)
+                # Let the worker finish everything already queued before it exits.
+                await asyncio.wait_for(self.queue.join(), timeout=wait_seconds)
+            except asyncio.TimeoutError:
+                dispatcher_logger.warning("⚠️ Drain timed out; stopping with items still queued")
+
+            self._is_running = False
+            # Wake a worker parked on an empty queue so it observes the stop and exits.
+            seq = next(self._sequence_counter)
+            await self.queue.put((Priority.CRITICAL, seq, _SHUTDOWN_SENTINEL))
+            try:
+                await asyncio.wait_for(self._worker_task, timeout=wait_seconds)
+            except asyncio.TimeoutError:
                 self._worker_task.cancel()
-                await asyncio.wait_for(self._worker_task, timeout=1.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
+            except asyncio.CancelledError:
                 pass
             except Exception as e:
                 dispatcher_logger.debug(f"Worker shutdown note: {e}")
 
-        # Ensure remaining state is persisted
-        await self._save_pending_storage()
+        # Resolve any stragglers (e.g. a drain that timed out), then persist state.
+        self._resolve_remaining_futures()
+        try:
+            await self._save_pending_storage()
+        except Exception as e:
+            dispatcher_logger.error(f"❌ Failed to persist pending notifications during shutdown: {e}")
         dispatcher_logger.info("✓ Telegram Dispatcher stopped cleanly")
 
 

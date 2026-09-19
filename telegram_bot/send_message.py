@@ -354,7 +354,7 @@ async def cancel_or_delete_disable_message(username: str) -> bool:
     cancel_key = f"disable:{username}"
 
     # 1. Try cancelling pending queue item
-    if dispatcher.cancel_pending(cancel_key):
+    if await dispatcher.cancel_pending(cancel_key):
         await remove_disable_message_tracking(username)
         tg_send_logger.info(f"🚫 Cancelled pending disable message in queue for {username}")
         return True
