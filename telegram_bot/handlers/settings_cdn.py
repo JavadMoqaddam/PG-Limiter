@@ -131,9 +131,9 @@ async def cdn_mode_remove_inbound_callback(query, context: ContextTypes.DEFAULT_
             break
 
     if removed:
-        # Save updated list
-        await save_config_value("cdn_inbounds", ",".join(cdn_inbounds))
-
+        if not await save_config_value("cdn_inbounds", ",".join(cdn_inbounds)):
+            await query.answer("⚠️ Could not save; try again", show_alert=True)
+            return
         await query.answer(f"✅ Removed: {removed}")
     else:
         await query.answer("❌ Inbound not found", show_alert=True)
@@ -144,7 +144,9 @@ async def cdn_mode_remove_inbound_callback(query, context: ContextTypes.DEFAULT_
 
 async def cdn_mode_clear_callback(query, context: ContextTypes.DEFAULT_TYPE):
     """Handle clearing all CDN inbounds."""
-    await save_config_value("cdn_inbounds", "")
+    if not await save_config_value("cdn_inbounds", ""):
+        await query.answer("⚠️ Could not save; try again", show_alert=True)
+        return
     await query.answer("✅ All CDN inbounds cleared")
     await cdn_mode_menu_callback(query, context)
 

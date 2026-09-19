@@ -251,7 +251,9 @@ async def punishment_toggle(update: Update, _context: ContextTypes.DEFAULT_TYPE)
         current_state = config_data.get("punishment", {}).get("enabled", True)
         new_state = not current_state
 
-        await _save_punishment_setting("punishment_enabled", str(new_state).lower())
+        if not await _save_punishment_setting("punishment_enabled", str(new_state).lower()):
+            await _send_response(update, "⚠️ Could not save the punishment setting; try again")
+            return
 
         # Return to punishment menu with updated status
         await punishment_status(update, _context)

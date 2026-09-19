@@ -457,10 +457,12 @@ async def handle_admin_filter_toggle_admin_callback(query, _context: ContextType
             current_admins.remove(admin_username)
         else:
             current_admins.append(admin_username)
-        
-        await save_config_value("admin_filter_usernames", ",".join(current_admins))
+
+        if not await save_config_value("admin_filter_usernames", ",".join(current_admins)):
+            await query.answer("⚠️ Could not save; try again", show_alert=True)
+            return
         await invalidate_config_cache()
-        
+
         # Refresh the menu
         await handle_admin_filter_menu_callback(query, _context)
         

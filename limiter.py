@@ -32,11 +32,17 @@ main_logger = get_logger("limiter.main")
 # Strong references container for root background tasks
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
-parser = argparse.ArgumentParser(
-    description="Limiter - IP connection limiter for PasarGuard panel"
-)
-parser.add_argument("--version", action="version", version=f"Limiter v{VERSION}")
-args = parser.parse_args()
+def parse_args(argv=None):
+    """Parse CLI arguments. Called from __main__, not at import.
+
+    Parsing at import time meant any tool that imported limiter (a test, a linter,
+    another entry point) inherited its argv and exited on an unknown flag.
+    """
+    parser = argparse.ArgumentParser(
+        description="Limiter - IP connection limiter for PasarGuard panel"
+    )
+    parser.add_argument("--version", action="version", version=f"Limiter v{VERSION}")
+    return parser.parse_args(argv)
 
 
 async def _supervise(name: str, factory, restart_delay: float = 10.0) -> None:
@@ -151,10 +157,19 @@ async def main():
             _supervise("dispatcher_worker", dispatcher.start_worker), name="dispatcher_worker"
         )
         bot_task = asyncio.create_task(run_telegram_bot(), name="telegram_bot_runner")
+        # Supervised retention: prune old violation history and ISP cache, which
+        # otherwise grew without bound because their cleanup had no live caller.
+        from utils.maintenance import retention_maintenance_loop
+        retention_task = asyncio.create_task(
+            _supervise("retention_maintenance", retention_maintenance_loop),
+            name="retention_maintenance",
+        )
         _BACKGROUND_TASKS.add(dispatcher_task)
         _BACKGROUND_TASKS.add(bot_task)
+        _BACKGROUND_TASKS.add(retention_task)
         dispatcher_task.add_done_callback(_BACKGROUND_TASKS.discard)
         bot_task.add_done_callback(_BACKGROUND_TASKS.discard)
+        retention_task.add_done_callback(_BACKGROUND_TASKS.discard)
 
         def _log_bot_task_failure(task: asyncio.Task) -> None:
             """Surface a crash in the bot starter instead of swallowing it."""
@@ -328,6 +343,7 @@ async def cleanup_resources():
 
 
 if __name__ == "__main__":
+    parse_args()
     # One process, one event loop, one lifetime.
     #
     # This used to be `while True: asyncio.run(main())` with its own restart

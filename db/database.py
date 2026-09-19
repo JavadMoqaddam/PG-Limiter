@@ -239,12 +239,25 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         yield session
         await session.commit()
         db_logger.debug("✅ Database session committed")
-    except Exception as e:
-        await session.rollback()
-        db_logger.error(f"❌ Database error (rolled back): {e}")
+    except BaseException as e:
+        # BaseException, not Exception: a cancelled task must still roll back rather
+        # than leave an open transaction. Shield the rollback so a second cancellation
+        # cannot interrupt it mid-flight.
+        try:
+            await asyncio.shield(session.rollback())
+        except Exception as rollback_error:
+            db_logger.error(f"❌ Rollback failed during cleanup: {rollback_error}")
+        if isinstance(e, asyncio.CancelledError):
+            db_logger.debug("↩️ Database session cancelled (rolled back)")
+        else:
+            db_logger.error(f"❌ Database error (rolled back): {e}")
         raise
     finally:
-        await session.close()
+        # Shielded so cancellation cannot leak a connection by skipping close.
+        try:
+            await asyncio.shield(session.close())
+        except Exception as close_error:
+            db_logger.debug(f"Session close note: {close_error}")
         db_logger.debug("📁 Database session closed")
 
 

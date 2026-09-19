@@ -448,10 +448,12 @@ async def handle_group_filter_toggle_group_callback(query, _context: ContextType
         else:
             current_ids.append(group_id)
 
-        # Save as comma-separated string
-        await _save_group_filter_setting(
+        # Save as comma-separated string; do not confirm a write that did not land.
+        if not await _save_group_filter_setting(
             "group_filter_ids", ",".join(str(gid) for gid in current_ids)
-        )
+        ):
+            await query.answer("⚠️ Could not save; try again", show_alert=True)
+            return
 
         # Refresh the menu
         await handle_group_filter_menu_callback(query, _context)

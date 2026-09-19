@@ -164,13 +164,16 @@ async def node_cdn_toggle_callback(query, context: ContextTypes.DEFAULT_TYPE, no
 
     if node_id in cdn_nodes:
         cdn_nodes.remove(node_id)
-        await query.answer(f"❌ Node #{node_id} removed from CDN mode")
+        message = f"❌ Node #{node_id} removed from CDN mode"
     else:
         cdn_nodes.append(node_id)
-        await query.answer(f"✅ Node #{node_id} added to CDN mode")
+        message = f"✅ Node #{node_id} added to CDN mode"
 
-    # Save updated list
-    await save_config_value("cdn_nodes", ",".join(str(n) for n in cdn_nodes))
+    # Persist first, and only confirm the change if the write actually landed.
+    if not await save_config_value("cdn_nodes", ",".join(str(n) for n in cdn_nodes)):
+        await query.answer("⚠️ Could not save; try again")
+        return
+    await query.answer(message)
 
     # Refresh menu
     await node_cdn_menu_callback(query, context)
@@ -178,7 +181,9 @@ async def node_cdn_toggle_callback(query, context: ContextTypes.DEFAULT_TYPE, no
 
 async def node_cdn_clear_callback(query, context: ContextTypes.DEFAULT_TYPE):
     """Clear all CDN nodes."""
-    await save_config_value("cdn_nodes", "")
+    if not await save_config_value("cdn_nodes", ""):
+        await query.answer("⚠️ Could not save; try again")
+        return
     await query.answer("✅ All CDN nodes cleared")
     await node_cdn_menu_callback(query, context)
 
@@ -253,13 +258,16 @@ async def node_disabled_toggle_callback(query, context: ContextTypes.DEFAULT_TYP
 
     if node_id in disabled_nodes:
         disabled_nodes.remove(node_id)
-        await query.answer(f"✅ Node #{node_id} is now monitored")
+        message = f"✅ Node #{node_id} is now monitored"
     else:
         disabled_nodes.append(node_id)
-        await query.answer(f"🚫 Node #{node_id} is now disabled")
+        message = f"🚫 Node #{node_id} is now disabled"
 
-    # Save updated list
-    await save_config_value("disabled_nodes", ",".join(str(n) for n in disabled_nodes))
+    # Persist first, and only confirm the change if the write actually landed.
+    if not await save_config_value("disabled_nodes", ",".join(str(n) for n in disabled_nodes)):
+        await query.answer("⚠️ Could not save; try again")
+        return
+    await query.answer(message)
 
     # Refresh menu
     await node_disabled_menu_callback(query, context)
@@ -267,6 +275,8 @@ async def node_disabled_toggle_callback(query, context: ContextTypes.DEFAULT_TYP
 
 async def node_disabled_clear_callback(query, context: ContextTypes.DEFAULT_TYPE):
     """Clear all disabled nodes."""
-    await save_config_value("disabled_nodes", "")
+    if not await save_config_value("disabled_nodes", ""):
+        await query.answer("⚠️ Could not save; try again")
+        return
     await query.answer("✅ All nodes are now monitored")
     await node_disabled_menu_callback(query, context)

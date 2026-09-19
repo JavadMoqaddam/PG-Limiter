@@ -151,30 +151,44 @@ async def users_by_protocol_command(update: Update, context: ContextTypes.DEFAUL
         await _send_response(update, f"Error generating report: {str(e)}")
 
 
+def _build_report_isp_detector(config_data: dict):
+    """Build a report-scoped ISP detector from the canonical config keys.
+
+    The old lookups read IPINFO_TOKEN / USE_FALLBACK_ISP_API, which the config never
+    contains, so the report always ran tokenless. The keys are ipinfo_token (root or
+    under api) and api.use_fallback_isp_api, matching the enforcement path.
+    """
+    from utils.isp_detector import ISPDetector
+
+    api_config = config_data.get("api", {}) if isinstance(config_data.get("api"), dict) else {}
+    ipinfo_token = config_data.get("ipinfo_token") or api_config.get("ipinfo_token", "")
+    use_fallback_api = api_config.get("use_fallback_isp_api", False)
+    if ipinfo_token or use_fallback_api:
+        return ISPDetector(token=ipinfo_token or None, use_fallback_only=use_fallback_api)
+    return None
+
+
 async def ip_history_12h_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show users exceeding limits in last 12 hours"""
+    """Show users whose unique-IP count over the last 12 hours exceeds their limit."""
     check = await check_admin_privilege(update)
     if check:
         return check
-    
+
     try:
         await _send_response(update, "⏳ Generating 12-hour IP history report...")
-        
+
         from utils.ip_history_tracker import ip_history_tracker
-        from utils.isp_detector import ISPDetector
-        
+
         config_data = await read_config()
-        
-        # Get ISP detector with token if available
-        isp_detector = None
-        ipinfo_token = config_data.get("IPINFO_TOKEN", "")
-        use_fallback_api = config_data.get("USE_FALLBACK_ISP_API", False)
-        if ipinfo_token or use_fallback_api:
-            isp_detector = ISPDetector(token=ipinfo_token, use_fallback_only=use_fallback_api)
-        
-        # Generate report
-        report = await ip_history_tracker.generate_report(12, config_data, isp_detector)
-        
+        isp_detector = _build_report_isp_detector(config_data)
+
+        try:
+            report = await ip_history_tracker.generate_report(12, config_data, isp_detector)
+        finally:
+            # Report-scoped detector owns its own httpx client; close it here.
+            if isp_detector is not None:
+                await isp_detector.close()
+
         # Split if too long (Telegram limit)
         if len(report) > 4000:
             # Split into chunks
@@ -224,22 +238,18 @@ async def ip_history_48h_command(update: Update, context: ContextTypes.DEFAULT_T
     
     try:
         await _send_response(update, "⏳ Generating 48-hour IP history report...")
-        
+
         from utils.ip_history_tracker import ip_history_tracker
-        from utils.isp_detector import ISPDetector
-        
+
         config_data = await read_config()
-        
-        # Get ISP detector with token if available
-        isp_detector = None
-        ipinfo_token = config_data.get("IPINFO_TOKEN", "")
-        use_fallback_api = config_data.get("USE_FALLBACK_ISP_API", False)
-        if ipinfo_token or use_fallback_api:
-            isp_detector = ISPDetector(token=ipinfo_token, use_fallback_only=use_fallback_api)
-        
-        # Generate report
-        report = await ip_history_tracker.generate_report(48, config_data, isp_detector)
-        
+        isp_detector = _build_report_isp_detector(config_data)
+
+        try:
+            report = await ip_history_tracker.generate_report(48, config_data, isp_detector)
+        finally:
+            if isp_detector is not None:
+                await isp_detector.close()
+
         # Split if too long (Telegram limit)
         if len(report) > 4000:
             # Split into chunks

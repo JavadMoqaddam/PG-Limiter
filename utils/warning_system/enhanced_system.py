@@ -198,8 +198,55 @@ class EnhancedWarningSystem:
         
         if had_data:
             warning_logger.info(f"🗑️ Cleared trust data for user: {username}")
-        
+
         return had_data
+
+    async def analyze_user_activity_patterns(self, username: str) -> dict:
+        """Summarize a monitored user's IP activity for the analytics view.
+
+        Derived from the record already on hand (monitoring_history plus the
+        first/last-seen maps). An unknown user returns the same keys with empty
+        values, so the caller never has to guard for a missing contract.
+        """
+        empty = {
+            "consistently_active_ips": set(),
+            "total_snapshots": 0,
+            "ip_change_frequency": 0.0,
+            "peak_ip_count": 0,
+            "average_ip_count": 0.0,
+        }
+        warning = self.warnings.get(username)
+        if warning is None:
+            return empty
+
+        history = list(warning.monitoring_history or [])
+        counts = [int(snapshot.get("ip_count", 0)) for snapshot in history]
+        total = len(history)
+        peak = max(counts) if counts else int(warning.ip_count)
+        average = (sum(counts) / total) if total else float(warning.ip_count)
+
+        # Mean size of the symmetric difference between consecutive IP sets.
+        changes = 0
+        for previous, current in zip(history, history[1:]):
+            changes += len(set(previous.get("ips", set())) ^ set(current.get("ips", set())))
+        ip_change_frequency = (changes / (total - 1)) if total > 1 else 0.0
+
+        # An IP is "consistently active" once it has been seen across >= 4 minutes.
+        first_seen = warning.ip_first_seen or {}
+        last_seen = warning.ip_last_seen or {}
+        consistently_active_ips = {
+            ip
+            for ip in (warning.ips or set())
+            if last_seen.get(ip, 0.0) - first_seen.get(ip, 0.0) >= 240.0
+        }
+
+        return {
+            "consistently_active_ips": consistently_active_ips,
+            "total_snapshots": total,
+            "ip_change_frequency": ip_change_frequency,
+            "peak_ip_count": peak,
+            "average_ip_count": average,
+        }
     
     @staticmethod
     def _deserialize_warning(warning_data: dict) -> UserLimitWarning:
