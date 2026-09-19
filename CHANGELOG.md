@@ -6,6 +6,120 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-19
+
+An audit-remediation release. A full-project audit found that enforcement intent was
+sound but the persistence, notification, and asynchronous-ownership boundaries around it
+were not reliable under rollback, concurrency, partial failure, or operator recovery.
+This release closes the P0 and P1 findings in scope and hardens the P2 boundaries, each
+fix landing test-first. Three P1 items and two P2 items are deliberately out of scope
+and are listed under Known limitations.
+
+### Fixed
+
+- **REST enable endpoints erased the only recovery record without enabling the panel
+  user.** `DELETE /users/disabled/{user}` and the bulk variant cleared the SQLite
+  registry (and group `original_groups`) without ever calling the panel, so the account
+  stayed disabled while automatic recovery could no longer find it. Enable now goes
+  through the panel first and clears only confirmed users; a panel failure preserves the
+  record.
+- **User-metadata cache invalidation ran before commit, and bulk deletion skipped it.**
+  Between invalidation and commit an enforcement reader could re-cache the old committed
+  row, leaving whitelist, monitoring, group and limit decisions stale until a full
+  refresh; `delete_many()` left deleted users cached. Invalidation is now registered
+  transaction-locally and published on `after_commit`, cleared on rollback, and covers
+  every deleted username.
+- **Unknown active users were skipped but never queued for synchronization.** An active
+  username missing from batch metadata was skipped without calling
+  `queue_unknown_user_fetch()`, so a new account avoided limit evaluation until the next
+  full sync. It is now queued once (deduplicated) while still failing closed on defaults.
+- **Cross-process JSON persistence could truncate and lose updates.** Management writes
+  now serialize through a stable sidecar lock with atomic replacement and read-modify-
+  write transactions; a malformed read is preserved and surfaced rather than replaced
+  with environment defaults.
+- **Legacy tables could resurrect cleared policy on restart, and migrations could report
+  success after lossy or incomplete schema changes.** Legacy state is migrated once under
+  Alembic rather than replayed at every startup, and revision 007 now merges duplicate
+  `ip_history` rows (min `first_seen`, max `last_seen`, summed `connection_count`, per-
+  column newest-non-null metadata) in a staged, verified, idempotent rebuild instead of
+  keeping only the highest-id row.
+- **The Telegram dispatcher was racy, unowned, non-idempotent, and could not drain on
+  shutdown.** Critical-message persistence now snapshots under the lock, propagates save
+  failures instead of queueing an unpersisted message as durable, tracks queued `db_id`s
+  so a worker restart does not re-send, awaits cancel persistence, and drains the queue
+  before the worker exits.
+- **A notification dedup key was marked before delivery.** The key is now marked only
+  from the delivery outcome — a single message when its future resolves, a split message
+  only when every chunk is delivered — and the background marking task is strongly
+  referenced so it cannot be garbage-collected mid-flight.
+- **Conversation continuations trusted entry-time authorization and could be shadowed.**
+  The catch-all text/document handlers moved to a later handler group so an active
+  conversation is not consumed first, every mutating continuation re-checks admin
+  privilege, and the last administrator can no longer be removed through any path.
+- **Warning and punishment state could diverge after a side effect.** A violation that
+  cannot be recorded now surfaces instead of advancing only the JSON mirror; a panel
+  action whose record fails is reconciled on the next attempt rather than re-applied;
+  concurrent same-user punishment is deduplicated; active warnings serialize from a
+  detached snapshot; disable history is added only for a real disabled/revoked outcome.
+- **A failed enforcement cycle destroyed the active-log batch.** The batch consumed by
+  `pop_active_users_snapshot()` is now requeued on failure (metadata unavailable or
+  cancellation), merged by connection identity so a newer mid-cycle event is not
+  overwritten.
+- **The ISP detector kept a removed token, and its client leaked on shutdown.** A
+  `config_signature`/`reconfigure()` now honours an emptied token by dropping the secret
+  and enabling fallback, `close()` cancels background lookups, and shutdown closes the
+  detector. Token previews are no longer logged.
+- **Management surfaces wrote a retired state plane and the API lifecycle was
+  incomplete.** The FastAPI lifespan now runs `init_db()`/`close_db()`, the general-limit
+  and whitelist REST writes route through the canonical services enforcement reads, the
+  API defaults to a loopback bind, and repeated failed Basic auth is throttled.
+- **Snapshots of active users were shallow.** `isp_info`, `device_info` and `group_ids`
+  are deep-cloned so a report reading a snapshot is not mutated by ongoing ingestion.
+- **IPv6 subnet cache keys were malformed and spelling-dependent.** Keys are derived
+  through `ipaddress` (/24 for IPv4, /64 for IPv6) so equivalent spellings collapse to
+  one row; unparseable input is returned unchanged.
+- **Retention had no owner.** A supervised loop prunes the violation history and ISP
+  subnet cache every six hours (30-day window); both cleanups previously had no live
+  caller.
+- **`get_db` did not roll back on cancellation.** It caught `Exception`, which excludes
+  `CancelledError`; it now catches `BaseException`, rolls back on cancellation, and
+  shields rollback and close so a second cancellation cannot leak a connection.
+- **Settings handlers confirmed writes that never persisted.** Device-count, CDN and
+  node toggles, admin-filter, group-filter and punishment handlers now persist first and
+  confirm only on success.
+- **The detailed-monitoring view called a method that did not exist.**
+  `analyze_user_activity_patterns` is implemented from the record already held.
+- **The IP-history report claimed device-limit parity it did not have.** It is reframed
+  as unique IPs over the window (history, not the device count used to ban) and its ISP
+  detector now reads the canonical config keys and is closed after use.
+- **Top-level entry points were stale.** `limiter` no longer parses argv at import, and
+  the status CLI reads the SQLite registry instead of the retired `.disable_users.json`.
+
+### Changed
+
+- Dependabot now tracks pip, GitHub Actions and Docker, grouping routine minor/patch
+  upgrades into one PR per ecosystem.
+- Dependencies refreshed to the latest compatible releases (sqlalchemy 2.0.54, alembic
+  1.20.0, uvicorn 0.53.0, cachetools 7.2.0, typer 0.27.2).
+- Ruff targets the CI floor (py312) and now lints the test suite for correctness rules
+  (E9/F63/F7/F82) instead of ignoring it wholesale.
+
+### Known limitations
+
+Out of scope for this release and unchanged:
+
+- **P1-2** — non-SQLite `DATABASE_URL`s are still accepted although runtime SQL is
+  SQLite-only; the recommended near-term contract (explicit rejection) is not yet
+  implemented.
+- **P1-7** — backup/restore still copies live files without staging, manifest/integrity
+  checks, writer quiescence or atomic swap.
+- **P1-13** — node heartbeat, source-generation and cancellation ownership remain
+  incomplete.
+- **P2-10** — operational hardening (panel TLS-verify default, secret file modes, PID-1
+  signal forwarding, immutable image IDs, release-workflow gating) is not addressed.
+- **P2-11** — the broad enforcement modules are not decomposed; this awaits
+  characterization tests per the audit's own guidance.
+
 ## [1.5.0] - 2026-09-03
 
 A correctness release, like 1.4.1, but this one changes behaviour in enough places to
