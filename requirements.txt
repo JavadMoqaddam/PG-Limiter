@@ -1,11 +1,11 @@
 httpx==0.28.1
 python-telegram-bot[job-queue]==22.8
-cachetools==7.1.7
-typer[all]==0.27.1
+cachetools==7.2.0
+typer[all]==0.27.2
 rich==15.0.0
 fastapi==0.141.1
-uvicorn==0.52.3
+uvicorn==0.53.0
 # Database
-sqlalchemy[asyncio]==2.0.52
+sqlalchemy[asyncio]==2.0.54
 aiosqlite==0.22.1
-alembic==1.19.1
+alembic==1.20.0

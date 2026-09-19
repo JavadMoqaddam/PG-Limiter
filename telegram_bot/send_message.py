@@ -123,6 +123,11 @@ def _split_message(msg: str, max_length: int) -> list[str]:
 # up. Skipping the mark risks a later duplicate, never suppression of a real message.
 _DEDUP_MARK_TIMEOUT = 300.0
 
+# Strong references to the background dedup-mark tasks. The event loop only holds a
+# weak reference, so without this a task could be garbage-collected mid-flight and the
+# dedup key would silently never be marked.
+_pending_dedup_tasks: set = set()
+
 
 def _mark_dedup_after_delivery(topics_manager, topic_type, message_key, futures, expected=None):
     """Mark a dedup key only after every required send is confirmed delivered.
@@ -140,7 +145,9 @@ def _mark_dedup_after_delivery(topics_manager, topic_type, message_key, futures,
         if len(results) >= required and all(result is not None for result in results):
             await topics_manager.mark_message_sent(topic_type, message_key)
 
-    asyncio.ensure_future(_await_and_mark())
+    task = asyncio.ensure_future(_await_and_mark())
+    _pending_dedup_tasks.add(task)
+    task.add_done_callback(_pending_dedup_tasks.discard)
 
 
 async def send_logs(

@@ -102,3 +102,33 @@ async def test_split_message_marks_only_after_all_chunks_succeed(monkeypatch):
 
     await _settle()
     tm.mark_message_sent.assert_not_called()
+
+
+async def test_dedup_mark_task_is_retained_until_complete(monkeypatch):
+    """The background dedup-mark task must be strongly referenced, or it can be
+    garbage-collected before delivery and the key would never be marked."""
+    tm = _fake_topics_manager()
+    monkeypatch.setattr(sm, "get_topics_manager", lambda: tm)
+
+    loop = asyncio.get_running_loop()
+    pending = loop.create_future()
+    dispatcher = MagicMock()
+
+    async def fake_enqueue(**kwargs):
+        return pending
+
+    dispatcher.enqueue_send = fake_enqueue
+    monkeypatch.setattr(sm, "get_dispatcher", lambda: dispatcher)
+    sm._pending_dedup_tasks.clear()
+
+    await sm.send_logs("hi", topic_type=TopicType.NO_LIMIT, message_key="k")
+
+    # Retained while in flight...
+    assert len(sm._pending_dedup_tasks) == 1
+
+    pending.set_result((1, -1001234567890))
+    await _settle()
+
+    # ...and released once complete.
+    assert len(sm._pending_dedup_tasks) == 0
+    tm.mark_message_sent.assert_awaited_once()
