@@ -13,16 +13,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db.models import User
 from utils.logs import get_logger
 
+_PENDING_USER_INVALIDATIONS = "pending_user_cache_invalidations"
+
+
+def register_user_cache_invalidation(db: AsyncSession, username: str) -> None:
+    """Publish this user-cache eviction only if the transaction commits."""
+    register_user_cache_invalidations(db, {username})
+
+
+def register_user_cache_invalidations(
+    db: AsyncSession, usernames: List[str] | set[str]
+) -> None:
+    """Register cache evictions on the currently active transaction level."""
+    session = db.sync_session
+    transaction = session.get_nested_transaction() or session.get_transaction()
+    if transaction is None:
+        raise RuntimeError("User cache invalidation requires an active transaction")
+    pending_by_transaction = session.info.setdefault(_PENDING_USER_INVALIDATIONS, {})
+    pending_by_transaction.setdefault(transaction, set()).update(usernames)
+
+
 db_users_logger = get_logger("db.users")
-
-
-async def _invalidate_user_caches(username: str, reason: str = "user_mutation"):
-    """Drop the user's entry from the in-RAM metadata cache after a mutation."""
-    try:
-        from utils.user_sync import invalidate_user_metadata_cache
-        invalidate_user_metadata_cache(username)
-    except Exception as e:
-        db_users_logger.debug(f"Failed to invalidate user RAM cache for {username}: {e}")
 
 
 class UserCRUD:
@@ -82,7 +93,7 @@ class UserCRUD:
             db.add(user)
         
         await db.flush()
-        await _invalidate_user_caches(username, reason="create_or_update")
+        register_user_cache_invalidation(db, username)
         return user
     
     @staticmethod
@@ -175,7 +186,7 @@ class UserCRUD:
         result = await db.execute(delete(User).where(User.username == username))
         deleted = result.rowcount > 0
         if deleted:
-            await _invalidate_user_caches(username, reason="delete")
+            register_user_cache_invalidation(db, username)
             db_users_logger.info(f"✅ Deleted user: {username}")
         else:
             db_users_logger.warning(f"⚠️ User not found for deletion: {username}")
@@ -189,6 +200,8 @@ class UserCRUD:
         db_users_logger.debug(f"🗑️ Deleting {len(usernames)} users")
         result = await db.execute(delete(User).where(User.username.in_(usernames)))
         deleted = result.rowcount
+        if deleted:
+            register_user_cache_invalidations(db, usernames)
         db_users_logger.info(f"✅ Deleted {deleted} users")
         return deleted
     
@@ -245,7 +258,7 @@ class UserCRUD:
         
         await db.flush()
         action = "added to" if excepted else "removed from"
-        await _invalidate_user_caches(username, reason=f"set_exception:{excepted}")
+        register_user_cache_invalidation(db, username)
         db_users_logger.info(f"✅ User {username} {action} exception list")
         return user
     
@@ -333,7 +346,7 @@ class UserCRUD:
         user.special_limit_updated_at = datetime.now(timezone.utc) if limit is not None else None
         
         await db.flush()
-        await _invalidate_user_caches(username, reason="set_special_limit")
+        register_user_cache_invalidation(db, username)
         if limit is not None:
             db_users_logger.info(f"✅ Special limit set for {username}: {limit}")
         else:
@@ -448,7 +461,7 @@ class UserCRUD:
             db_users_logger.info(f"✅ User {username} enabled")
         
         await db.flush()
-        await _invalidate_user_caches(username, reason=f"set_disabled:{disabled}")
+        register_user_cache_invalidation(db, username)
         return user
     
     @staticmethod
@@ -615,5 +628,8 @@ class UserCRUD:
             count += len(chunk)
             
         await db.flush()
+        register_user_cache_invalidations(
+            db, {user_data["username"] for user_data in users_data}
+        )
         db_users_logger.info(f"✅ Native Bulk Upsert completed for {count} users")
         return count

@@ -12,8 +12,8 @@ from cli.utils import (
     load_backup,
     load_config,
     print_table,
-    save_backup,
-    save_config,
+    update_backup,
+    update_config,
     success,
 )
 
@@ -77,12 +77,18 @@ def add_except_user(
     if name in config["users"]["except"] or name in backup["except_users"]:
         error(f"User '{name}' is already in the except list")
     
-    # Add to both
-    config["users"]["except"].append(name)
-    backup["except_users"].append(name)
-    
-    save_config(config)
-    save_backup(backup)
+    def add_to_config(latest):
+        users = latest.setdefault("users", {}).setdefault("except", [])
+        if name not in users:
+            users.append(name)
+
+    def add_to_backup(latest):
+        users = latest.setdefault("except_users", [])
+        if name not in users:
+            users.append(name)
+
+    update_config(add_to_config)
+    update_backup(add_to_backup)
     
     success(f"User '{name}' added to except list")
 
@@ -100,14 +106,22 @@ def delete_except_user(
     # Remove from config
     if "users" in config and "except" in config["users"]:
         if name in config["users"]["except"]:
-            config["users"]["except"].remove(name)
-            save_config(config)
+            def remove_from_config(latest):
+                users = latest.get("users", {}).get("except", [])
+                if name in users:
+                    users.remove(name)
+
+            update_config(remove_from_config)
             removed = True
-    
+
     # Remove from backup
     if "except_users" in backup and name in backup["except_users"]:
-        backup["except_users"].remove(name)
-        save_backup(backup)
+        def remove_from_backup(latest):
+            users = latest.get("except_users", [])
+            if name in users:
+                users.remove(name)
+
+        update_backup(remove_from_backup)
         removed = True
     
     if removed:
