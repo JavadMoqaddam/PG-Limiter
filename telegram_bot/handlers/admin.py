@@ -3,6 +3,8 @@ Admin management handlers for the Telegram bot.
 Includes functions for adding, removing, and listing admins.
 """
 
+from functools import wraps
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ContextTypes,
@@ -10,6 +12,7 @@ from telegram.ext import (
 )
 
 from telegram_bot.utils import (
+    LastAdminError,
     add_admin_to_config,
     check_admin,
     remove_admin_from_config,
@@ -121,6 +124,25 @@ async def check_admin_privilege(update: Update):
         )
         return ConversationHandler.END
     return None
+
+
+def require_admin_continuation(handler):
+    """Re-check admin privilege before a stateful continuation mutates anything.
+
+    Entry points authorize once; a continuation must verify again so a revoked admin
+    cannot finish a mutation begun while they were still authorized. On failure the
+    conversation state is cleared and the flow ends.
+    """
+    @wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if await check_admin_privilege(update) is not None:
+            user_data = getattr(context, "user_data", None)
+            if user_data is not None:
+                user_data.clear()
+            return ConversationHandler.END
+        return await handler(update, context, *args, **kwargs)
+
+    return wrapper
 
 
 async def add_admin(update: Update, _context: ContextTypes.DEFAULT_TYPE):
@@ -257,11 +279,13 @@ async def handle_delete_admin_callback(query, _context: ContextTypes.DEFAULT_TYP
     try:
         admin_id_int = int(admin_id)
         result = await remove_admin_from_config(admin_id_int)
-        
+
         if result:
             text = f"✅ Admin <code>{admin_id}</code> removed successfully!"
         else:
             text = f"❌ Admin <code>{admin_id}</code> not found."
+    except LastAdminError:
+        text = "⚠️ <b>Cannot delete last admin!</b> Add another admin first."
     except ValueError:
         text = f"❌ Invalid admin ID: <code>{admin_id}</code>"
     
@@ -300,7 +324,14 @@ async def get_chat_id_to_remove(update: Update, _context: ContextTypes.DEFAULT_T
             + "</code>\ntry again <b>/remove_admin</b>"
         )
         return ConversationHandler.END
-    if await remove_admin_from_config(admin_id_to_remove):
+    try:
+        removed = await remove_admin_from_config(admin_id_to_remove)
+    except LastAdminError:
+        await update.message.reply_html(
+            text="⚠️ <b>Cannot remove the last admin.</b> Add another admin first."
+        )
+        return ConversationHandler.END
+    if removed:
         await update.message.reply_html(
             text=f"Admin <code>{admin_id_to_remove}</code> removed successfully!"
         )

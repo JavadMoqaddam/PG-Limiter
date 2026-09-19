@@ -64,6 +64,7 @@ from telegram_bot.handlers.admin import (
     add_admin,
     admins_list,
     check_admin_privilege,
+    require_admin_continuation,
     get_chat_id,
     get_chat_id_to_remove,
     remove_admin,
@@ -887,10 +888,17 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages for inline keyboard flows."""
     waiting_for = context.user_data.get("waiting_for")
-    
+
     if not waiting_for:
         return
-    
+
+    # A waiting_for state is a pending mutation begun from an inline flow. Re-check
+    # privilege here so a revoked admin cannot complete it; entry authorization alone
+    # is not enough for a continuation.
+    if await check_admin_privilege(update) is not None:
+        context.user_data["waiting_for"] = None
+        return
+
     # Handle different input types based on waiting_for state
     if waiting_for == "general_limit":
         await handle_general_limit_input(update, context)
@@ -1003,25 +1011,28 @@ async def document_message_handler(update: Update, context: ContextTypes.DEFAULT
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("help", help_command))
 
-# Callback and message handlers
+# Callback handler stays in the default group; the catch-all text router is pushed to
+# a later group so an active ConversationHandler (group 0) sees its text state first.
+# python-telegram-bot runs at most one handler per group, so a same-group catch-all
+# would otherwise consume the reply before the conversation.
 application.add_handler(CallbackQueryHandler(callback_query_handler))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler), group=1)
 
-# NOTE: Document handler is registered AFTER all ConversationHandlers
-# to allow ConversationHandlers to handle documents first
+# NOTE: Document handler is likewise registered in a later group so
+# ConversationHandlers handle documents first
 
 # Admin management
 application.add_handler(
     ConversationHandler(
         entry_points=[CommandHandler("add_admin", add_admin)],
-        states={GET_CHAT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_chat_id)]},
+        states={GET_CHAT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_chat_id))]},
         fallbacks=[],
     )
 )
 application.add_handler(
     ConversationHandler(
         entry_points=[CommandHandler("remove_admin", remove_admin)],
-        states={GET_CHAT_ID_TO_REMOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_chat_id_to_remove)]},
+        states={GET_CHAT_ID_TO_REMOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_chat_id_to_remove))]},
         fallbacks=[],
     )
 )
@@ -1032,9 +1043,9 @@ application.add_handler(
     ConversationHandler(
         entry_points=[CommandHandler("create_config", set_panel_domain)],
         states={
-            GET_DOMAIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_domain)],
-            GET_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_username)],
-            GET_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_password)],
+            GET_DOMAIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_domain))],
+            GET_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_username))],
+            GET_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_password))],
         },
         fallbacks=[],
     )
@@ -1045,8 +1056,8 @@ application.add_handler(
     ConversationHandler(
         entry_points=[CommandHandler("set_special_limit", set_special_limit)],
         states={
-            GET_SPECIAL_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_special_limit)],
-            GET_LIMIT_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_limit_number)],
+            GET_SPECIAL_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_special_limit))],
+            GET_LIMIT_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_limit_number))],
         },
         fallbacks=[],
     )
@@ -1055,7 +1066,7 @@ application.add_handler(CommandHandler("show_special_limit", show_special_limit_
 application.add_handler(
     ConversationHandler(
         entry_points=[CommandHandler("set_general_limit_number", get_general_limit_number)],
-        states={GET_GENERAL_LIMIT_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_general_limit_number_handler)]},
+        states={GET_GENERAL_LIMIT_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_general_limit_number_handler))]},
         fallbacks=[],
     )
 )
@@ -1064,14 +1075,14 @@ application.add_handler(
 application.add_handler(
     ConversationHandler(
         entry_points=[CommandHandler("set_except_user", set_except_users)],
-        states={SET_EXCEPT_USERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_except_users_handler)]},
+        states={SET_EXCEPT_USERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(set_except_users_handler))]},
         fallbacks=[],
     )
 )
 application.add_handler(
     ConversationHandler(
         entry_points=[CommandHandler("remove_except_user", remove_except_user)],
-        states={REMOVE_EXCEPT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_except_user_handler)]},
+        states={REMOVE_EXCEPT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(remove_except_user_handler))]},
         fallbacks=[],
     )
 )
@@ -1081,7 +1092,7 @@ application.add_handler(CommandHandler("show_except_users", show_except_users))
 application.add_handler(
     ConversationHandler(
         entry_points=[CommandHandler("set_ipinfo_token", set_ipinfo_token)],
-        states={SET_IPINFO_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, ipinfo_token_handler)]},
+        states={SET_IPINFO_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(ipinfo_token_handler))]},
         fallbacks=[],
     )
 )
@@ -1105,7 +1116,7 @@ application.add_handler(CommandHandler("backup", send_backup))
 application.add_handler(
     ConversationHandler(
         entry_points=[CommandHandler("restore", restore_config)],
-        states={RESTORE_CONFIG: [MessageHandler(filters.Document.ALL, restore_config_handler)]},
+        states={RESTORE_CONFIG: [MessageHandler(filters.Document.ALL, require_admin_continuation(restore_config_handler))]},
         fallbacks=[],
     )
 )
@@ -1116,8 +1127,8 @@ application.add_handler(
         entry_points=[CommandHandler("migrate_backup", migrate_backup_start)],
         states={
             MIGRATE_WAITING_FILE: [
-                MessageHandler(filters.Document.ALL, migrate_backup_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, migrate_backup_handler),
+                MessageHandler(filters.Document.ALL, require_admin_continuation(migrate_backup_handler)),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(migrate_backup_handler)),
             ],
         },
         fallbacks=[
@@ -1151,8 +1162,8 @@ application.add_handler(CommandHandler("admin_filter_set", admin_filter_set))
 application.add_handler(CommandHandler("admin_filter_add", admin_filter_add))
 application.add_handler(CommandHandler("admin_filter_remove", admin_filter_remove))
 
-# Fallback document handler (must be after all ConversationHandlers)
-application.add_handler(MessageHandler(filters.Document.ALL, document_message_handler))
+# Fallback document handler in a later group so ConversationHandlers get documents first
+application.add_handler(MessageHandler(filters.Document.ALL, document_message_handler), group=1)
 
 
 async def global_telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
