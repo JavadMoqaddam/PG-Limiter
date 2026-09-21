@@ -3,6 +3,7 @@ Telegram Bot Main Module
 Contains the main bot setup and handler registration.
 """
 
+import html
 import os
 import sys
 
@@ -810,12 +811,12 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         result = await add_except_user(username)
         if result:
             await query.edit_message_text(
-                text=f"✅ User <code>{username}</code> added to except list!",
+                text=f"✅ User <code>{html.escape(username)}</code> added to except list!",
                 parse_mode="HTML"
             )
         else:
             await query.edit_message_text(
-                text=f"⚠️ Failed to add <code>{username}</code> to except list.",
+                text=f"⚠️ Failed to add <code>{html.escape(username)}</code> to except list.",
                 parse_mode="HTML"
             )
         return
@@ -844,12 +845,12 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             result = await handel_special_limit(username, limit)
             if result:
                 await query.edit_message_text(
-                    text=f"✅ Special limit <b>{limit}</b> set for <code>{username}</code>!",
+                    text=f"✅ Special limit <b>{limit}</b> set for <code>{html.escape(username)}</code>!",
                     parse_mode="HTML"
                 )
             else:
                 await query.edit_message_text(
-                    text=f"⚠️ Failed to set special limit for <code>{username}</code>.",
+                    text=f"⚠️ Failed to set special limit for <code>{html.escape(username)}</code>.",
                     parse_mode="HTML"
                 )
         return
@@ -860,7 +861,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data["selected_user"] = username
         context.user_data["waiting_for"] = "notification_custom_limit"
         await query.edit_message_text(
-            text=f"🎯 <b>Set Custom Limit for: {username}</b>\n\n"
+            text=f"🎯 <b>Set Custom Limit for: {html.escape(username)}</b>\n\n"
                  "Send the device limit number (e.g., <code>3</code>):",
             parse_mode="HTML"
         )
@@ -942,12 +943,12 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     result = await handel_special_limit(username, limit)
                     if result:
                         await update.message.reply_html(
-                            text=f"✅ Special limit <b>{limit}</b> set for <code>{username}</code>!",
+                            text=f"✅ Special limit <b>{limit}</b> set for <code>{html.escape(username)}</code>!",
                             reply_markup=create_back_to_main_keyboard()
                         )
                     else:
                         await update.message.reply_html(
-                            text=f"⚠️ Failed to set special limit for <code>{username}</code>.",
+                            text=f"⚠️ Failed to set special limit for <code>{html.escape(username)}</code>.",
                             reply_markup=create_back_to_main_keyboard()
                         )
             except ValueError:
