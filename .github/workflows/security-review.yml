@@ -1,0 +1,39 @@
+name: "Security Review (Claude Code)"
+
+# Anthropic's official AI security reviewer. It diffs the pull request, reasons
+# about the change for injection/authz/secret-handling classes that pattern
+# scanners miss, and posts findings as PR comments. It complements, rather than
+# replaces, the existing CodeQL (codeql.yml) and Bandit (ci.yml) scans.
+#
+# Scoped to pull requests targeting the default branch, matching the convention
+# in ci.yml and codeql.yml. The API key is read from a repository secret and is
+# never hardcoded - see the setup note below.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: read the code, write PR comments. Nothing else.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  security-review:
+    name: Claude Code Security Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Check out the PR head and enough history for the action to diff the
+          # change against its base.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+
+      - name: Run Claude Code Security Review
+        uses: anthropics/claude-code-security-review@main
+        with:
+          comment-pr: true
+          claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
