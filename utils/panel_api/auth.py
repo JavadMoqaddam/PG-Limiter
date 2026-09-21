@@ -143,7 +143,9 @@ async def _fetch_new_token(panel_data: PanelType) -> PanelType:
                     json_obj = response.json()
                 except Exception as json_error:
                     auth_logger.error(f"Failed to parse JSON from {url}: {json_error}")
-                    auth_logger.debug(f"Response text: {response.text[:200]}")
+                    # repr() the untrusted, truncated body so control characters
+                    # cannot corrupt the log line.
+                    auth_logger.debug(f"Response text (truncated): {response.text[:200]!r}")
                     continue
                 
                 # Check if response is a dict and has access_token
@@ -170,7 +172,11 @@ async def _fetch_new_token(panel_data: PanelType) -> PanelType:
             except httpx.HTTPStatusError:
                 elapsed = (time.perf_counter() - start_time) * 1000
                 log_api_request("POST", url, response.status_code, elapsed, f"HTTP {response.status_code}")
-                message = f"[{response.status_code}] {response.text}"
+                # Do not forward the raw panel response body: it is untrusted
+                # external input that would otherwise be relayed verbatim into the
+                # operator Telegram channel (HTML-parse-mode injection) and written
+                # unbounded into app.log. Report the status code only.
+                message = f"Panel token request failed: HTTP {response.status_code}"
                 await safe_send_logs_panel(message)
                 auth_logger.error(f"HTTP error: {message}")
                 continue
