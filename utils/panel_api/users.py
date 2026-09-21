@@ -4,6 +4,7 @@ User operations for panel API.
 
 import asyncio
 import time
+from urllib.parse import quote
 
 from utils import handel_dis_users as dis_users
 from utils.user_groups_storage import UserGroupsStorage
@@ -250,7 +251,7 @@ async def check_user_exists(panel_data: PanelType, username: str) -> bool:
     
     response = await panel_get(
         panel_data,
-        f"/api/user/{username}",
+        f"/api/user/{quote(username, safe='')}",
         timeout=10.0,
         max_retries=2,
     )
@@ -286,7 +287,7 @@ async def get_user_details(panel_data: PanelType, username: str) -> dict | None 
     users_logger.debug(f"👤 Getting details for user: {username}")
     response = await panel_get(
         panel_data, 
-        f"/api/user/{username}",
+        f"/api/user/{quote(username, safe='')}",
         timeout=15.0,
         max_retries=3
     )
@@ -359,7 +360,7 @@ async def update_user_groups(panel_data: PanelType, username: str, group_ids: li
     
     response = await panel_put(
         panel_data,
-        f"/api/user/{username}",
+        f"/api/user/{quote(username, safe='')}",
         json_data=payload,
         timeout=15.0,
         max_retries=3,
@@ -406,7 +407,7 @@ async def enable_all_user(panel_data: PanelType) -> None | ValueError:
         username = user_obj.name
         response = await panel_put(
             panel_data,
-            f"/api/user/{username}",
+            f"/api/user/{quote(username, safe='')}",
             json_data=status,
             timeout=10.0,
             max_retries=2,
@@ -445,7 +446,7 @@ async def enable_user_by_status(panel_data: PanelType, username: str) -> tuple[b
     
     response = await panel_put(
         panel_data,
-        f"/api/user/{username}",
+        f"/api/user/{quote(username, safe='')}",
         json_data=status,
         timeout=10.0,
         max_retries=3,
@@ -700,7 +701,7 @@ async def _update_user_groups_and_status(panel_data: PanelType, username: str, g
     payload = {"group_ids": group_ids, "status": status}
     response = await panel_put(
         panel_data,
-        f"/api/user/{username}",
+        f"/api/user/{quote(username, safe='')}",
         json_data=payload,
         timeout=10.0,
         max_retries=3,
@@ -804,7 +805,7 @@ async def revoke_user_subscription(panel_data: PanelType, username: str) -> bool
     users_logger.info(f"🔄 Revoking subscription for user: {username}")
     response = await panel_post(
         panel_data,
-        f"/api/user/{username}/revoke_sub",
+        f"/api/user/{quote(username, safe='')}/revoke_sub",
         json_data={},
         timeout=15.0,
         max_retries=3
@@ -856,7 +857,7 @@ async def reset_user_uuid(panel_data: PanelType, username: str) -> bool:
     
     response = await panel_put(
         panel_data,
-        f"/api/user/{username}",
+        f"/api/user/{quote(username, safe='')}",
         json_data=payload,
         timeout=15.0,
         max_retries=3
@@ -896,7 +897,7 @@ async def disable_user_by_status(panel_data: PanelType, username: str) -> bool:
     
     response = await panel_put(
         panel_data,
-        f"/api/user/{username}",
+        f"/api/user/{quote(username, safe='')}",
         json_data=status,
         timeout=10.0,
         max_retries=3,
@@ -969,7 +970,7 @@ async def disable_user_by_group(panel_data: PanelType, username: str, disabled_g
         
         response = await panel_put(
             panel_data,
-            f"/api/user/{username}",
+            f"/api/user/{quote(username, safe='')}",
             json_data=payload,
             timeout=10.0,
             max_retries=3,
