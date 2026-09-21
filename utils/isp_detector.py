@@ -6,6 +6,7 @@ database-backed subnet cache, and only then from the external APIs.
 """
 
 import asyncio
+from urllib.parse import quote
 from typing import Dict, Optional, Tuple
 import httpx
 from utils.logs import logger
@@ -188,7 +189,7 @@ class ISPDetector:
         
         try:
             # Try ipinfo.io API first
-            url = f"https://ipinfo.io/{ip}/json"
+            url = f"https://ipinfo.io/{quote(ip, safe=':')}/json"
             headers = {}
             if self.token:
                 headers["Authorization"] = f"Bearer {self.token}"
@@ -289,7 +290,7 @@ class ISPDetector:
         """
         # Try ip-api.com (free, no token needed, 45 req/min)
         try:
-            url = f"http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,region,regionName,city,isp,org,as,asname"
+            url = f"http://ip-api.com/json/{quote(ip, safe=':')}?fields=status,message,country,countryCode,region,regionName,city,isp,org,as,asname"
             
             client = await self._get_client()
             response = await client.get(url, timeout=8.0)
@@ -397,7 +398,7 @@ class ISPDetector:
         async def lookup_subnet(subnet_key: str, sample_ip: str) -> Tuple[str, Dict[str, str]]:
             async with semaphore:
                 try:
-                    url = f"http://ip-api.com/json/{sample_ip}?fields=status,country,countryCode,regionName,city,isp,org,asname"
+                    url = f"http://ip-api.com/json/{quote(sample_ip, safe=':')}?fields=status,country,countryCode,regionName,city,isp,org,asname"
                     response = await client.get(url, timeout=4.0)
                     if response.status_code == 200:
                         data = response.json()
