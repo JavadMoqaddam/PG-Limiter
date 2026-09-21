@@ -431,7 +431,7 @@ async def send_enable_notification(username: str, delete_disable_msg: bool = Fal
 
     # Send enable notification with Priority.CRITICAL
     enable_time = datetime.now().strftime("%H:%M:%S")
-    msg = f"✅ <b>User Enabled</b>\n\n👤 User: <code>{username}</code>\n🕐 Time: <code>{enable_time}</code>"
+    msg = f"✅ <b>User Enabled</b>\n\n👤 User: <code>{html_lib.escape(username)}</code>\n🕐 Time: <code>{enable_time}</code>"
     await send_disable_enable_log(msg)
 
 
