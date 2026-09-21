@@ -300,6 +300,8 @@ COUNTRY_CODE=
 TZ=UTC
 DATABASE_URL=sqlite+aiosqlite:////var/lib/pg-limiter/data/pg_limiter.db
 EOF
+    # The .env holds the panel password and bot token; keep it owner-only.
+    chmod 600 "$ENV_FILE"
 }
 
 replace_or_append_env_var() {
@@ -307,11 +309,17 @@ replace_or_append_env_var() {
     local value="$2"
     local target_file="${3:-$ENV_FILE}"
     
+    # Never interpolate the (untrusted) value into a sed program: a value
+    # containing the sed delimiter, & or \ could execute a shell command via
+    # GNU sed's e flag or corrupt the file. Drop any existing line for the key,
+    # then append key=value with the value passed as data. `cat > "$target_file"`
+    # truncates in place, preserving the file's existing 0600 permissions.
     if grep -q "^$key=" "$target_file"; then
-        sed -i "s|^$key=.*|$key=$value|" "$target_file"
-    else
-        printf '%s=%s\n' "$key" "$value" >> "$target_file"
+        grep -v "^$key=" "$target_file" > "$target_file.tmp"
+        cat "$target_file.tmp" > "$target_file"
+        rm -f "$target_file.tmp"
     fi
+    printf '%s=%s\n' "$key" "$value" >> "$target_file"
 }
 
 configure_interactive() {
@@ -403,7 +411,28 @@ configure_interactive() {
 
 install_script() {
     colorized_echo blue "Installing pg-limiter script..."
-    curl -sSL "$SCRIPT_URL" | install -m 755 /dev/stdin /usr/local/bin/pg-limiter
+    # Download to a temp file and validate it before installing. Without -f, curl
+    # writes an HTTP error page to stdout with a success exit, which would then be
+    # installed as the mode-755 CLI that root runs. Mirrors the hardened cmd_update.
+    local new_script
+    new_script=$(mktemp)
+    if ! curl -fsSL "$SCRIPT_URL" -o "$new_script"; then
+        rm -f "$new_script"
+        colorized_echo red "Could not download $SCRIPT_URL. Nothing was installed."
+        exit 1
+    fi
+    if ! head -n 1 "$new_script" | grep -q '^#!'; then
+        rm -f "$new_script"
+        colorized_echo red "The download is not a shell script. Nothing was installed."
+        exit 1
+    fi
+    if ! grep -q 'cmd_update()' "$new_script"; then
+        rm -f "$new_script"
+        colorized_echo red "The download looks truncated. Nothing was installed."
+        exit 1
+    fi
+    install -m 755 "$new_script" /usr/local/bin/pg-limiter
+    rm -f "$new_script"
     colorized_echo green "✓ pg-limiter script installed"
 }
 
@@ -868,7 +897,9 @@ EOF
     # Create zip file
     cd "$temp_dir"
     zip -r "$backup_path" . -x "*.zip" >/dev/null
-    
+    # The archive bundles .env (panel password + bot token); keep it owner-only.
+    chmod 600 "$backup_path"
+
     # Cleanup
     rm -rf "$temp_dir"
     
