@@ -6,6 +6,54 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-09-22
+
+A security-hardening release. A report-only whole-tree security review found no critical
+or high-severity issues; authorization gates and query parameterization were sound. This
+release fixes the confirmed medium and low findings — all defense-in-depth, with no
+change to externally observable defaults — and adds an automated pull-request security
+review to CI. Two behavior-changing findings (flipping the panel `PANEL_VERIFY_SSL`
+default and running the container as non-root) are deferred to avoid regressions and are
+listed under Known limitations.
+
+### Added
+
+- **Automated security review in CI.** A new workflow runs Anthropic's
+  `claude-code-security-review` on every pull request into `main`, reading its API key
+  from the `ANTHROPIC_API_KEY` repository secret. It complements the existing CodeQL and
+  Bandit scans.
+
+### Security
+
+- **Panel token-endpoint error bodies were relayed verbatim to Telegram and logs.** The
+  untrusted panel response body is no longer forwarded into the HTML-parse-mode operator
+  channel or written unbounded to `app.log`; only the status code is reported, and the
+  truncated debug body is `repr()`-escaped.
+- **Panel-derived usernames and IP activity were interpolated unescaped into HTML
+  messages.** Enable notifications, callback confirmations, the set-limit prompt, and the
+  warning/disable/revoke notifications now HTML-escape externally sourced values before
+  embedding them, so panel- or MITM-supplied markup cannot inject into the operator view.
+- **Usernames were interpolated unencoded into panel API request paths.** Every
+  `/api/user/{username}` path now percent-encodes the username, preventing request-path
+  reshaping.
+- **GeoIP lookups disabled TLS verification and interpolated IPs unencoded.** The GeoIP
+  client now verifies certificates for its public CA-signed endpoints, and IP addresses
+  are URL-encoded before use.
+- **Secret files were written world-readable and the installer had injection-prone
+  paths.** The installer now `chmod 600`s the `.env` (panel password + bot token) and the
+  backup archive, replaces a `sed`-injection-prone env-var writer with a data-safe one,
+  and validates the downloaded script (`-f` plus shebang and marker checks) before
+  installing it.
+- **The startup reachability probe hardcoded disabled TLS verification.** It now honors
+  the operator's `PANEL_VERIFY_SSL` setting (default unchanged).
+
+### Known limitations
+
+- The panel API client still defaults `PANEL_VERIFY_SSL` to `false`; enabling it by
+  default would break self-signed-panel deployments and is deferred to a dedicated change.
+- The container still runs as root; adding a non-root user requires re-owning the mounted
+  data volume and is deferred.
+
 ## [1.6.0] - 2026-09-19
 
 An audit-remediation release. A full-project audit found that enforcement intent was
