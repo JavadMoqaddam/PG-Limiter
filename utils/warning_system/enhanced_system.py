@@ -4,6 +4,7 @@ This module provides a warning system with monitoring periods for users who exce
 """
 
 import asyncio
+import html
 import json
 import os
 import time
@@ -606,7 +607,7 @@ class EnhancedWarningSystem:
         if send_telegram_notification:
             await safe_send_warning_log(
                 f"⚠️ <b>WARNING</b> - {time_str}\n\n"
-                f"User: <code>{username}</code>\n"
+                f"User: <code>{html.escape(username)}</code>\n"
                 f"Active IPs: <code>{ip_count}</code>\n"
                 f"{limit_text}"
                 f"Trust Level: {trust_level} (<code>{warning.trust_score:.0f}</code>)\n"
@@ -835,7 +836,7 @@ class EnhancedWarningSystem:
                             if punishment_result["action"] == "warning":
                                 await safe_send_warning_log(
                                     f"⚠️ <b>WARNING</b> - {time_str}\n\n"
-                                    f"User: <code>{username}</code>\n"
+                                    f"User: <code>{html.escape(username)}</code>\n"
                                     f"Active Devices: <code>{device_count}</code> ({len(current_ips)} IPs)\n"
                                     f"User limit: <code>{user_limit_number}</code>\n"
                                     f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
@@ -856,13 +857,13 @@ class EnhancedWarningSystem:
                                 
                                 await safe_send_disable_notification(
                                     f"🚫 <b>USER DISABLED</b> - {time_str}\n\n"
-                                    f"User: <code>{username}</code>\n"
+                                    f"User: <code>{html.escape(username)}</code>\n"
                                     f"Active Devices: <code>{device_count}</code> ({len(current_ips)} IPs)\n"
                                     f"User limit: <code>{user_limit_number}</code>\n"
                                     f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                                     f"📊 Violation #{punishment_result['violation_count']} (Step {punishment_result['step_index'] + 1})\n"
                                     f"{duration_text}"
-                                    f"📊 IP Activity:\n<code>{activity_summary}</code>",
+                                    f"📊 IP Activity:\n<code>{html.escape(activity_summary)}</code>",
                                     username
                                 )
                                 
@@ -876,14 +877,14 @@ class EnhancedWarningSystem:
                                 
                                 await safe_send_disable_notification(
                                     f"🔄 <b>SUBSCRIPTION REVOKED + DISABLED</b> - {time_str}\n\n"
-                                    f"User: <code>{username}</code>\n"
+                                    f"User: <code>{html.escape(username)}</code>\n"
                                     f"Active Devices: <code>{device_count}</code> ({len(current_ips)} IPs)\n"
                                     f"User limit: <code>{user_limit_number}</code>\n"
                                     f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                                     f"📊 Violation #{punishment_result['violation_count']} (Step {punishment_result['step_index'] + 1})\n"
                                     f"{revoke_note}, {uuid_note}\n"
                                     f"Duration: <code>Until manual enable</code>\n"
-                                    f"📊 IP Activity:\n<code>{activity_summary}</code>",
+                                    f"📊 IP Activity:\n<code>{html.escape(activity_summary)}</code>",
                                     username
                                 )
                                 

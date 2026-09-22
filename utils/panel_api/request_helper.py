@@ -371,7 +371,9 @@ async def panel_request(
                 
                 # Other errors
                 _record_failure(scheme)
-                last_error = f"HTTP {response.status_code}: {response.text[:100]}"
+                # Do not embed the untrusted panel response body in the error
+                # string returned to callers/logs; the status code is enough.
+                last_error = f"HTTP {response.status_code}"
                     
             except (SSLError, httpx.TimeoutException, httpx.ConnectError, httpx.RequestError) as e:
                 elapsed = (time.perf_counter() - start_time) * 1000

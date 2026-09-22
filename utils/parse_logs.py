@@ -78,7 +78,9 @@ async def get_geo_client() -> httpx.AsyncClient:
     global _geo_client
     if _geo_client is None or _geo_client.is_closed:
         limits = httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0)
-        _geo_client = httpx.AsyncClient(verify=False, timeout=5.0, limits=limits)
+        # These GeoIP providers are public, CA-signed HTTPS hosts, so certificate
+        # verification is safe to enable (unlike a possibly self-signed panel).
+        _geo_client = httpx.AsyncClient(verify=True, timeout=5.0, limits=limits)
     return _geo_client
 
 

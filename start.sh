@@ -383,12 +383,15 @@ logging.disable(logging.CRITICAL)
 async def check_panel():
     import httpx
     domain = os.environ.get('PANEL_DOMAIN', '')
-    
+    # Honor the operator's PANEL_VERIFY_SSL setting rather than hardcoding an
+    # insecure client. Defaults to False to preserve behavior for self-signed panels.
+    verify_ssl = os.environ.get('PANEL_VERIFY_SSL', 'false').lower() in ('true', '1', 'yes')
+
     # Try HTTPS first, then HTTP
     for scheme in ['https', 'http']:
         url = f'{scheme}://{domain}/api/'
         try:
-            async with httpx.AsyncClient(verify=False, timeout=10) as client:
+            async with httpx.AsyncClient(verify=verify_ssl, timeout=10) as client:
                 response = await client.get(url)
                 if response.status_code in [200, 401, 403, 404]:
                     print(f'REACHABLE: {scheme}://{domain} (status: {response.status_code})')

@@ -5,6 +5,7 @@ Enhanced with warning system and ISP detection.
 """
 
 import asyncio
+import html
 import re
 import time
 
@@ -723,7 +724,7 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
             ip_count = user_data["ip_count"]
 
             action_message = (
-                f"⚙️ <b>Set Limit for: {email}</b>\n"
+                f"⚙️ <b>Set Limit for: {html.escape(email)}</b>\n"
                 f"📱 Devices: {device_count} | 🌐 IPs: {ip_count}\n"
                 f"No special limit set - using general limit ({general_limit})"
             )
