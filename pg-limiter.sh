@@ -315,7 +315,9 @@ replace_or_append_env_var() {
     # then append key=value with the value passed as data. `cat > "$target_file"`
     # truncates in place, preserving the file's existing 0600 permissions.
     if grep -q "^$key=" "$target_file"; then
-        grep -v "^$key=" "$target_file" > "$target_file.tmp"
+        # `|| true`: grep -v exits 1 when it filters out every line, which under
+        # `set -e` (top of file) would abort the installer.
+        grep -v "^$key=" "$target_file" > "$target_file.tmp" || true
         cat "$target_file.tmp" > "$target_file"
         rm -f "$target_file.tmp"
     fi
