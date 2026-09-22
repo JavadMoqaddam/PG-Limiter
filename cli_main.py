@@ -181,7 +181,7 @@ def version():
     from rich.console import Console
     console = Console()
     console.print(BANNER)
-    console.print("Version: 1.5.0")
+    console.print("Version: 1.6.1")
 
 
 if __name__ == "__main__":
