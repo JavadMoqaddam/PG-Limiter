@@ -34,6 +34,10 @@ jobs:
 
       - name: Run Claude Code Security Review
         uses: anthropics/claude-code-security-review@main
+        env:
+          # Route Claude API traffic through the self-hosted gateway. The
+          # underlying Claude Code process reads this from the environment.
+          ANTHROPIC_BASE_URL: "https://api.justwoker.icu"
         with:
           comment-pr: true
           claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
