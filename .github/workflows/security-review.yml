@@ -22,6 +22,12 @@ permissions:
 jobs:
   security-review:
     name: Claude Code Security Review
+    # Dependabot and fork PRs have no repository secrets. Their ordinary tests,
+    # Bandit and CodeQL still run; the API-backed reviewer needs a trusted event.
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

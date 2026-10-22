@@ -1,6 +1,6 @@
-ARG PYTHON_VERSION=3.14.9
+FROM python:3.14.9-slim-bookworm AS base
 
-FROM python:$PYTHON_VERSION-slim-bookworm AS builder
+FROM base AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -16,7 +16,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 
-FROM python:$PYTHON_VERSION-slim-bookworm
+FROM base
 
 # Install zip for backup/restore functionality
 RUN apt-get update && apt-get install -y --no-install-recommends \
