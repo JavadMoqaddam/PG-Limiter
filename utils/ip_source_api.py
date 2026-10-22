@@ -20,13 +20,20 @@ Collection is a two-stage process:
 """
 
 import asyncio
+import copy
 import time
 from typing import Optional
 
 from utils.logs import get_logger
-from utils.read_config import normalize_min_coverage
-from utils.shared_state import ACTIVE_USERS, ACTIVE_USERS_LOCK
-from utils.types import PanelType, UserType
+from utils.read_config import get_config_revision, normalize_api_ip_freshness, normalize_min_coverage
+from utils.shared_state import (
+    APISampleEvidence,
+    ActiveUsersSnapshot,
+    begin_api_collection,
+    api_evidence_is_current,
+    publish_api_snapshot,
+)
+from utils.types import ConnectionInfo, PanelType, UserType
 
 api_ip_logger = get_logger("ip_source_api")
 
@@ -58,6 +65,10 @@ LAST_CYCLE_STATS: dict = {
     "future_ips": 0,
     "unknown_age_ips": 0,
     "skipped_reason": "",
+    # Separate remote collection health from the bool returned to enforcement:
+    # complete users may still be judged during a partial collection.
+    "collection_outcome": "failure",  # success, partial, failure, superseded
+    "unknown_users": 0,
 }
 
 # Consecutive cycles that produced no usable data at all. Used to fall back to
@@ -128,6 +139,8 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
             if getattr(node, "status", None) == "connected":
                 connected_node_ids.add(node.node_id)
 
+    if nodes is None or isinstance(nodes, ValueError):
+        raise ValueError("Node availability is unknown")
     disabled_nodes = set(config_data.get("disabled_nodes") or [])
     return node_name_map, disabled_nodes, connected_node_ids - disabled_nodes
 
@@ -256,9 +269,7 @@ async def _validate_ips(raw_ips: set[str], config_data: dict) -> tuple[set[str],
                 return ip, False
 
     accepted: set[str] = set()
-    results = await asyncio.gather(
-        *[_decide(ip) for ip in raw_ips], return_exceptions=True
-    )
+    results = await asyncio.gather(*[_decide(ip) for ip in raw_ips], return_exceptions=True)
     for item in results:
         if isinstance(item, tuple) and item[1]:
             accepted.add(item[0])
@@ -266,21 +277,28 @@ async def _validate_ips(raw_ips: set[str], config_data: dict) -> tuple[set[str],
     return accepted, geo_lookup_count() - lookups_before
 
 
+class OnlineIPResults(dict[str, dict[int, dict[str, int] | None]]):
+    """Fan-out payloads with definitive deleted-user answers kept separately."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.not_found_users: set[str] = set()
+
+
 async def _fetch_all_online_ips(
     panel_data: PanelType,
     targets: list[tuple[str, int, dict]],
     concurrency: int,
     timeout: float,
-) -> tuple[dict[str, dict[int, dict[str, int]]], dict[str, int], dict[str, float]]:
+) -> tuple[OnlineIPResults, dict[str, int], dict[str, float]]:
     """
     Run the bounded-concurrency fan-out over the candidate users.
 
     Returns:
         ``({username: {node_id: {ip: last_seen}}}, counters, {username: fetched_at})``
 
-    ``fetched_at`` matters because the fan-out can take minutes on a slow
-    panel: freshness has to be judged against the moment that user was
-    sampled, not against the moment the whole pass finished.
+    ``fetched_at`` is receipt time for diagnostics. Eligibility uses the source
+    timestamp at evaluation, including after the entire fan-out completes.
     """
     from utils.panel_api.online_ips import (
         OUTCOME_FORBIDDEN,
@@ -292,7 +310,7 @@ async def _fetch_all_online_ips(
     )
 
     counters = {"ok": 0, "failed": 0, "not_found": 0, "forbidden": 0, "unauthorized": 0}
-    payloads: dict[str, dict[int, dict[str, int]]] = {}
+    payloads = OnlineIPResults()
     fetch_times: dict[str, float] = {}
     if not targets:
         return payloads, counters, fetch_times
@@ -306,9 +324,7 @@ async def _fetch_all_online_ips(
 
     async def _one(username: str, user_id: int, active_token: str):
         async with semaphore:
-            payload, outcome = await fetch_user_online_ips(
-                panel_data, user_id, active_token, timeout=timeout
-            )
+            payload, outcome = await fetch_user_online_ips(panel_data, user_id, active_token, timeout=timeout)
             return username, user_id, payload, outcome, time.time()
 
     async def _run(batch: list[tuple[str, int]], active_token: str) -> list[tuple[str, int]]:
@@ -325,11 +341,12 @@ async def _fetch_all_online_ips(
             username, user_id, payload, outcome, fetched_at = item
             if outcome == OUTCOME_OK:
                 counters["ok"] += 1
-                if payload:
-                    payloads[username] = payload
-                    fetch_times[username] = fetched_at
+                payloads[username] = payload if payload is not None else {}
+                fetch_times[username] = fetched_at
             elif outcome == OUTCOME_NOT_FOUND:
                 counters["not_found"] += 1
+                payloads.not_found_users.add(username)
+                fetch_times[username] = fetched_at
             elif outcome == OUTCOME_FORBIDDEN:
                 counters["forbidden"] += 1
             elif outcome == OUTCOME_UNAUTHORIZED:
@@ -368,108 +385,83 @@ def _extract_admin_username(raw: dict) -> Optional[str]:
 
 
 async def _build_users_from_payloads(
-    payloads: dict[str, dict[int, dict[str, int]]],
+    payloads: dict[str, dict[int, dict[str, int] | None]],
     raw_by_name: dict[str, dict],
     node_name_map: dict[int, str],
     disabled_nodes: set,
     config_data: dict,
     fetch_times: dict[str, float] | None = None,
+    expected_node_ids: set[int] | None = None,
 ) -> tuple[dict[str, UserType], dict]:
-    """
-    Convert the fan-out payloads into the ``ACTIVE_USERS`` structure.
+    """Build source-timestamp observations and retain each user's uncertainty.
 
-    The panel reports ``{node_id: {ip: last_seen_epoch}}`` with no inbound
-    information, so a single sentinel inbound name stands in for all of them.
-    The device-counting key therefore keeps its ``(ip, inbound_protocol)`` shape
-    and subnet and CDN-node grouping continue to work unchanged.
-
-    The panel keeps an IP in that map long after the client stopped using it, so
-    every IP older than the freshness window is dropped here. Without it a user
-    who simply changed network during the window looks like several simultaneous
-    devices - the main source of false positives in API mode. Freshness is
-    measured against the moment that user was sampled, because a slow fan-out
-    can finish minutes after the first users were fetched.
-
-    Returns:
-        ``({username: UserType}, stats)``
+    Receipt times are retained in the transport interface for diagnostics only.
+    Xray timestamps are evaluated after asynchronous IP admission, and again
+    after enforcement preparation; an old connection never gets a new timestamp.
     """
     from utils.panel_api.online_ips import STALE_EPOCH_FLOOR
-    from utils.parse_logs import update_user_device_info_with_node
 
-    sentinel_inbound = str(config_data.get("api_ip_sentinel_inbound") or "API")
     freshness = _resolve_freshness_window(config_data)
-    fetch_times = fetch_times or {}
+    sentinel = str(config_data.get("api_ip_sentinel_inbound") or "API")
+    raw_ips = set()
+    pairs_by_user = {}
+    unknown = set()
+    nodes_seen = set()
+    stats = {
+        "geo_lookups": 0,
+        "nodes_seen": 0,
+        "total_ips": 0,
+        "users_with_ips": 0,
+        "stale_ips": 0,
+        "future_ips": 0,
+        "unknown_age_ips": 0,
+    }
     now = time.time()
-
-    # Flatten first so IP validation runs once per unique IP for the whole
-    # cycle instead of once per (user, node, ip) triple.
-    per_user_pairs: dict[str, list[tuple[int, str]]] = {}
-    raw_ips: set[str] = set()
-    nodes_seen: set[int] = set()
-    stale_dropped = 0
-    future_dropped = 0
-    unknown_age = 0
-    # Tolerance for ordinary clock skew between panel and limiter.
-    future_cutoff = now + max(60.0, float(freshness or 0))
-
     for username, node_map in payloads.items():
-        pairs: list[tuple[int, str]] = []
-        stale_cutoff = fetch_times.get(username, now) - freshness
+        if expected_node_ids and not expected_node_ids.issubset(node_map):
+            unknown.add(username)
+        pairs = []
         for node_id, ip_values in node_map.items():
             if node_id in disabled_nodes:
                 continue
+            if ip_values is None:
+                unknown.add(username)
+                continue
             nodes_seen.add(node_id)
-            for ip, value in ip_values.items():
-                if value < STALE_EPOCH_FLOOR:
-                    # Too small to be a last-seen Unix timestamp, so this IP's age is
-                    # unknown and it cannot be shown to be a current connection. It used
-                    # to be read as a legacy connection count and counted as a live
-                    # device, which skipped BOTH checks below - and since the panel never
-                    # expires an entry, that re-enabled the exact failure the freshness
-                    # filter exists to stop: a user who merely changed network looking
-                    # like several simultaneous devices. Every value int() cannot parse
-                    # lands here too, because _parse_ip_payload coerces those to 1 - an
-                    # ISO-8601 datetime string, a float-formatted epoch, a bool.
-                    #
-                    # Counted as stale on purpose rather than under its own name: if a
-                    # panel really did return counts for everything, the existing "every
-                    # IP filtered as stale" gate then skips the cycle, instead of
-                    # publishing an empty snapshot that clears every pending warning.
-                    unknown_age += 1
-                    stale_dropped += 1
+            for ip, stamp in ip_values.items():
+                if type(stamp) is not int or stamp < STALE_EPOCH_FLOOR:
+                    unknown.add(username)
+                    stats["unknown_age_ips"] += 1
                     continue
-                if value > future_cutoff:
-                    # A last-seen stamp cannot be in the future. The panel clock is
-                    # ahead (or the value is garbage), which silently turned the
-                    # whole freshness filter into a no-op and let the panel's
-                    # never-expiring IP list inflate device counts again. Treat it
-                    # as unusable: if every value looks like this, the existing
-                    # "all IPs stale" gate skips the cycle instead of enforcing.
-                    future_dropped += 1
-                    stale_dropped += 1
+                if stamp > now:
+                    unknown.add(username)
+                    stats["future_ips"] += 1
                     continue
-                if value < stale_cutoff:
-                    stale_dropped += 1
-                    continue
-                pairs.append((node_id, ip))
+                pairs.append((node_id, ip, stamp))
                 raw_ips.add(ip)
-        if pairs:
-            per_user_pairs[username] = pairs
+        pairs_by_user[username] = pairs
 
-    accepted_ips, geo_lookups = await _validate_ips(raw_ips, config_data)
-
-    new_users: dict[str, UserType] = {}
-    total_ips = 0
-    for username, pairs in per_user_pairs.items():
-        usable = [(node_id, ip) for node_id, ip in pairs if ip in accepted_ips]
-        if not usable:
+    accepted, stats["geo_lookups"] = await _validate_ips(raw_ips, config_data)
+    evaluated_at = time.time()
+    users = ActiveUsersSnapshot()
+    users.unknown_users = frozenset(unknown)
+    for username, pairs in pairs_by_user.items():
+        usable = []
+        for node_id, ip, stamp in pairs:
+            age = evaluated_at - stamp
+            if age < 0:
+                unknown.add(username)
+                stats["future_ips"] += 1
+            elif age >= freshness:
+                stats["stale_ips"] += 1
+            elif ip in accepted:
+                usable.append((node_id, ip, stamp))
+        if not usable or username in unknown:
             continue
         raw = raw_by_name.get(username) or {}
-        # ``status`` stays None: UserType.status is the local UserStatus enum,
-        # while the panel's textual status belongs in ``panel_status``.
         user = UserType(
             name=username,
-            ip=sorted({ip for _, ip in usable}),
+            ip=sorted({ip for _, ip, _ in usable}),
             panel_status=raw.get("status"),
             data_limit=raw.get("data_limit"),
             used_traffic=raw.get("used_traffic"),
@@ -479,101 +471,36 @@ async def _build_users_from_payloads(
             online_at=raw.get("online_at"),
             admin_username=_extract_admin_username(raw),
         )
-        for node_id, ip in usable:
-            await update_user_device_info_with_node(
-                user,
-                ip,
-                sentinel_inbound,
-                node_id,
-                node_name_map.get(node_id, f"Node-{node_id}"),
+        for node_id, ip, stamp in usable:
+            user.device_info.connections.append(
+                ConnectionInfo(
+                    ip=ip,
+                    node_id=node_id,
+                    node_name=node_name_map.get(node_id, f"Node-{node_id}"),
+                    inbound_protocol=sentinel,
+                    last_seen=stamp,
+                )
             )
-        new_users[username] = user
-        total_ips += len(user.ip)
-
-    if future_dropped:
-        api_ip_logger.warning(
-            f"🛰️ {future_dropped} reported IP timestamps were in the future (more than "
-            f"{future_cutoff - now:.0f}s ahead) and were discarded - check the clock skew "
-            f"between the panel and this host, the freshness filter cannot work while "
-            f"the panel clock runs ahead"
-        )
-
-    if unknown_age:
-        api_ip_logger.warning(
-            f"🛰️ {unknown_age} reported IPs carried a value below the epoch floor "
-            f"({STALE_EPOCH_FLOOR}), so their age is unknown and they were not counted "
-            f"as connected. Either the panel reports connection counts rather than "
-            f"last-seen timestamps on this build, or the values are malformed"
-        )
-
-    stats = {
-        "geo_lookups": geo_lookups,
-        "nodes_seen": len(nodes_seen),
-        "total_ips": total_ips,
-        "users_with_ips": len(new_users),
-        "stale_ips": stale_dropped,
-        "future_ips": future_dropped,
-        "unknown_age_ips": unknown_age,
-    }
-    return new_users, stats
+        user.device_info.unique_ips = set(user.ip)
+        user.device_info.unique_nodes = {node_id for node_id, _, _ in usable}
+        user.device_info.inbound_protocols = {sentinel}
+        user.device_info.is_multi_device = len(user.ip) > 1
+        users[username] = user
+    users.unknown_users = frozenset(unknown)
+    stats.update(
+        nodes_seen=len(nodes_seen), total_ips=sum(len(u.ip) for u in users.values()), users_with_ips=len(users)
+    )
+    return users, stats
 
 
-async def _publish_active_users(new_users: dict[str, UserType]) -> None:
-    """
-    Replace ``ACTIVE_USERS`` with the freshly collected sample.
-
-    Each API cycle is a complete instantaneous snapshot, so it replaces rather
-    than merges. Merging would accumulate stale IPs across cycles and inflate
-    device counts — exactly the false-positive risk this mode must avoid.
-    """
-    async with ACTIVE_USERS_LOCK:
-        ACTIVE_USERS.clear()
-        ACTIVE_USERS.update(new_users)
-
-
-def _resolve_online_window(config_data: dict) -> int:
-    """
-    Freshness window for the candidate query.
-
-    ``api_ip_online_window = 0`` means auto: the check interval plus a 30s
-    grace margin, so the window always tracks ``CHECK_INTERVAL`` from ENV/DB
-    and no user who connected just after the previous cycle can be missed.
-    """
-    configured = int(config_data.get("api_ip_online_window") or 0)
-    if configured > 0:
-        return configured
-
-    interval = config_data.get("check_interval") or (
-        config_data.get("monitoring") or {}
-    ).get("check_interval", 60)
-    try:
-        interval = int(float(interval))
-    except (ValueError, TypeError):
-        interval = 60
-    return max(60, interval + 30)
+def _resolve_online_window(_config_data: dict) -> int:
+    """Compatibility value selecting online=true, independent of the interval."""
+    return 110
 
 
 def _resolve_freshness_window(config_data: dict) -> int:
-    """
-    Age limit for a reported IP, in seconds.
-
-    The panel's online-stats map retains an IP with its last-seen timestamp long
-    after the client left, so anything older than this window is not a currently
-    connected device. ``api_ip_freshness = 0`` means auto: the check interval
-    itself, which is exactly the sample width log mode produces.
-    """
-    configured = int(config_data.get("api_ip_freshness") or 0)
-    if configured > 0:
-        return max(30, configured)
-
-    interval = config_data.get("check_interval") or (
-        config_data.get("monitoring") or {}
-    ).get("check_interval", 60)
-    try:
-        interval = int(float(interval))
-    except (ValueError, TypeError):
-        interval = 60
-    return max(60, interval)
+    """Read exact normalized seconds; only read_config migrates legacy Auto."""
+    return normalize_api_ip_freshness(config_data.get("api_ip_freshness"))
 
 
 def _reset_cycle_stats() -> None:
@@ -581,6 +508,7 @@ def _reset_cycle_stats() -> None:
     for key in LAST_CYCLE_STATS:
         LAST_CYCLE_STATS[key] = "" if key == "skipped_reason" else 0
     LAST_CYCLE_STATS["ran_at"] = time.time()
+    LAST_CYCLE_STATS["collection_outcome"] = "failure"
 
 
 async def _handle_dead_cycle(config_data: dict, reason: str) -> None:
@@ -667,23 +595,22 @@ async def _alert_forbidden_once() -> None:
     )
 
 
-async def collect_active_users_from_api(
-    panel_data: PanelType, config_data: dict
-) -> bool:
+async def collect_active_users_from_api(panel_data: PanelType, config_data: dict) -> bool:
     """
     Collect the connected IPs of monitored users into ``ACTIVE_USERS``.
 
     This is the API-mode counterpart of the SSE log pipeline and the only
     function ``check_usage`` needs to call. Everything downstream reads the
-    same ``ACTIVE_USERS`` structure, so device counting, subnet/CDN grouping,
-    the consecutive-warning system, trust scoring and punishment are untouched.
+    same user/connection structure. A separately cloned API snapshot prevents
+    log tasks winding down from changing that cycle's evidence. Device counting,
+    warning thresholds and the punishment policy remain unchanged.
 
     Returns:
         ``True`` when the sample is trustworthy enough for enforcement to run
-        this cycle, ``False`` when the cycle must be skipped. Skipping is the
-        safe direction: a partial snapshot would clear the consecutive-violation
-        counters of genuine offenders, whereas under-counted IPs can never
-        escalate an innocent user into a ban.
+        this cycle, ``False`` when the cycle must be skipped. The sample carries
+        unknown users so none of their warning, ban or clearing paths can run.
+        LAST_CYCLE_STATS.collection_outcome separately records whether every
+        candidate answered completely, for source-recovery accounting.
     """
     global _consecutive_dead_cycles, _forbidden_alert_sent
     global _consecutive_coverage_skips, _coverage_alert_sent
@@ -691,8 +618,18 @@ async def collect_active_users_from_api(
     from utils.panel_api.online_ips import fetch_online_candidates
     from utils.panel_api.request_helper import is_panel_available
 
+    source_config = config_data
+    config_data = copy.deepcopy(config_data)
+    evidence = APISampleEvidence(
+        begin_api_collection(),
+        config_data.get("_revision", get_config_revision()),
+        _resolve_freshness_window(config_data),
+    )
     started = time.perf_counter()
     _reset_cycle_stats()
+    if not api_evidence_is_current(evidence):
+        LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration changed")
+        return False
 
     if not is_panel_available():
         LAST_CYCLE_STATS["skipped_reason"] = "panel unavailable"
@@ -700,14 +637,13 @@ async def collect_active_users_from_api(
         api_ip_logger.warning("🛰️ Skipping API IP collection: panel marked unavailable")
         return False
 
-    node_name_map, disabled_nodes, expected_node_ids = await _resolve_node_context(
-        panel_data, config_data
-    )
+    try:
+        node_name_map, disabled_nodes, expected_node_ids = await _resolve_node_context(panel_data, config_data)
+    except ValueError:
+        LAST_CYCLE_STATS["skipped_reason"] = "node availability unknown"
+        return False
 
-    candidate_mode = str(config_data.get("api_ip_candidate_mode") or "online")
-    online_window = (
-        0 if candidate_mode == "all_monitored" else _resolve_online_window(config_data)
-    )
+    online_window = _resolve_online_window(config_data)
 
     candidates = await fetch_online_candidates(
         panel_data,
@@ -717,6 +653,9 @@ async def collect_active_users_from_api(
         online_window=online_window,
         page_size=int(config_data.get("api_ip_page_size") or 500),
     )
+    if not api_evidence_is_current(evidence) or source_config != config_data:
+        LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
+        return False
     # None means the candidate query itself failed. Treating that as "nobody is
     # online" would wipe every pending warning, so the cycle is abandoned.
     if candidates is None:
@@ -727,6 +666,13 @@ async def collect_active_users_from_api(
 
     LAST_CYCLE_STATS["candidates"] = len(candidates)
     targets = _prefilter_candidates(candidates)
+    group_filter = config_data.get("group_filter") or {}
+    if (
+        group_filter.get("enabled")
+        and group_filter.get("mode", "include") == "include"
+        and not group_filter.get("group_ids")
+    ):
+        targets = []
     LAST_CYCLE_STATS["prefiltered"] = len(targets)
 
     if not targets:
@@ -740,7 +686,9 @@ async def collect_active_users_from_api(
         # an alternating pattern - empty cycle, low-coverage skip, empty cycle - hold
         # the streak at 1 forever, so the "enforcement has stopped" alert could never
         # fire no matter how long enforcement stayed down.
-        await _publish_active_users({})
+        if not await publish_api_snapshot({}, evidence):
+            return False
+        LAST_CYCLE_STATS["collection_outcome"] = "success"
         LAST_CYCLE_STATS["coverage"] = 1.0
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         _consecutive_dead_cycles = 0
@@ -753,6 +701,10 @@ async def collect_active_users_from_api(
         concurrency=int(config_data.get("api_ip_concurrency") or 20),
         timeout=float(config_data.get("api_ip_timeout") or 8.0),
     )
+
+    if not api_evidence_is_current(evidence) or source_config != config_data:
+        LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
+        return False
 
     # A 404 is a definitive answer (the user vanished from the panel), so it
     # counts as covered; 403/timeouts/5xx leave the user's state unknown.
@@ -772,7 +724,7 @@ async def collect_active_users_from_api(
     if counters["forbidden"]:
         await _alert_forbidden_once()
 
-    if counters["ok"] == 0:
+    if answered == 0:
         LAST_CYCLE_STATS["skipped_reason"] = "no successful lookups"
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         await _handle_dead_cycle(config_data, "no successful lookups")
@@ -786,9 +738,8 @@ async def collect_active_users_from_api(
     min_coverage = normalize_min_coverage(config_data.get("api_ip_min_coverage"))
 
     if coverage < min_coverage:
-        LAST_CYCLE_STATS["skipped_reason"] = (
-            f"coverage {coverage:.0%} below {min_coverage:.0%}"
-        )
+        LAST_CYCLE_STATS["collection_outcome"] = "partial"
+        LAST_CYCLE_STATS["skipped_reason"] = f"coverage {coverage:.0%} below {min_coverage:.0%}"
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         api_ip_logger.warning(
             f"🛰️ Skipping enforcement: coverage {coverage:.1%} < {min_coverage:.0%} "
@@ -810,16 +761,18 @@ async def collect_active_users_from_api(
 
     raw_by_name = {name: raw for name, _, raw in targets}
     new_users, build_stats = await _build_users_from_payloads(
-        payloads, raw_by_name, node_name_map, set(disabled_nodes), config_data,
+        payloads,
+        raw_by_name,
+        node_name_map,
+        set(disabled_nodes),
+        config_data,
         fetch_times=fetch_times,
+        expected_node_ids=expected_node_ids,
     )
 
-    # Node coverage: how many of the nodes that ought to be reporting actually
-    # contributed an IP. The `coverage` gate above is a per-user answer rate and
-    # reads 1.0 even when a third of the fleet is silent, so this is the only
-    # signal that separates "users happen to be concentrated on a few nodes" from
-    # "these nodes stopped reporting" - and the second under-counts devices, which
-    # is what lets a real offender's consecutive-violation counter be cleared.
+    # Node coverage counts a healthy empty map as a response too. Individual
+    # users with missing nodes are protected separately; this aggregate is for
+    # diagnostics and the optional fleet-wide coverage gate.
     #
     # Computed before the gates below so a skipped cycle still records it. Leaving it
     # until after them meant the stats screen showed 0/0 on exactly the cycles an
@@ -830,60 +783,55 @@ async def collect_active_users_from_api(
     LAST_CYCLE_STATS["nodes_expected"] = nodes_expected
     LAST_CYCLE_STATS["node_coverage"] = round(node_coverage, 4)
 
-    # Every IP filtered out as stale while the panel answered normally means the
-    # timestamps cannot be trusted (clock skew between panel and limiter is the
-    # usual cause). Publishing the resulting empty snapshot would clear every
-    # pending warning, so the cycle is abandoned instead.
-    if not new_users and build_stats["stale_ips"] and payloads:
+    answered_users = set(payloads) | getattr(payloads, "not_found_users", set())
+    unknown_users = (set(raw_by_name) - answered_users) | set(new_users.unknown_users)
+    if not api_evidence_is_current(evidence) or source_config != config_data:
+        LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
+        return False
+    LAST_CYCLE_STATS["unknown_users"] = len(unknown_users)
+    if unknown_users == set(raw_by_name):
+        LAST_CYCLE_STATS["collection_outcome"] = "partial"
         LAST_CYCLE_STATS.update(build_stats)
-        LAST_CYCLE_STATS["skipped_reason"] = "every IP filtered as stale"
-        LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
-        api_ip_logger.error(
-            f"🛰️ Skipping enforcement: all {build_stats['stale_ips']} reported IPs were "
-            f"older than the freshness window, or carried a value too small to be a "
-            f"timestamp. Check the clock skew between the panel and this container, or "
-            f"raise api_ip_freshness."
-        )
-        # Counted towards the alert streak. Clock skew does not heal by itself, so
-        # without this enforcement could stay off indefinitely with nothing but an
-        # ERROR line in the container log to show it.
+        LAST_CYCLE_STATS["skipped_reason"] = "all user evidence unknown"
         await _handle_coverage_skip(LAST_CYCLE_STATS["skipped_reason"])
         return False
 
-    # Off unless configured. A genuinely quiet node reports nothing, so the right
-    # floor depends on the fleet and has to be observed before it is enforced -
-    # guessing one here would skip healthy cycles. The ratio is logged either way,
-    # which is the part that was missing.
-    min_node_coverage = normalize_min_coverage(
-        config_data.get("api_ip_min_node_coverage"), default=0.0
-    )
-    if min_node_coverage and node_coverage < min_node_coverage:
+    # Preserve the optional aggregate gate. It never makes an individual user's
+    # missing-node evidence complete, even when the configured floor is zero.
+    min_node_coverage = normalize_min_coverage(config_data.get("api_ip_min_node_coverage"), default=0.0)
+    # Deleted users need no node observation; their absence is definitive even
+    # if every candidate disappeared between the list and per-user requests.
+    if payloads and min_node_coverage and node_coverage < min_node_coverage:
         # The build already ran, so report what it found. Without this the
         # diagnostics show a cycle that collected nothing, which reads like a dead
         # panel rather than a partial fleet - the opposite of the diagnosis needed.
         LAST_CYCLE_STATS.update(build_stats)
-        LAST_CYCLE_STATS["skipped_reason"] = (
-            f"node coverage {node_coverage:.0%} below {min_node_coverage:.0%}"
-        )
+        LAST_CYCLE_STATS["skipped_reason"] = f"node coverage {node_coverage:.0%} below {min_node_coverage:.0%}"
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         api_ip_logger.error(
             f"🛰️ Skipping enforcement: only {build_stats['nodes_seen']} of "
-            f"{nodes_expected} connected nodes reported an IP "
+            f"{nodes_expected} connected nodes returned an IP map "
             f"({node_coverage:.1%} < {min_node_coverage:.0%})"
         )
         await _handle_coverage_skip(LAST_CYCLE_STATS["skipped_reason"])
         return False
 
-    await _publish_active_users(new_users)
+    evidence = APISampleEvidence(
+        evidence.generation, evidence.config_revision, evidence.freshness_seconds, frozenset(unknown_users)
+    )
+    if not await publish_api_snapshot(new_users, evidence):
+        LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
+        return False
 
     # Only here, past every gate: the streak means "cycles skipped since enforcement
     # last actually ran". Clearing it as soon as the fan-out looked healthy meant the
-    # two gates below it - all-stale and node coverage - could skip forever without the
+    # evidence and node-coverage gates could skip forever without the
     # streak ever passing 1, so their alarm never fired.
     _consecutive_coverage_skips = 0
     _coverage_alert_sent = False
 
     LAST_CYCLE_STATS.update(build_stats)
+    LAST_CYCLE_STATS["collection_outcome"] = "partial" if unknown_users else "success"
     LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
 
     api_ip_logger.info(

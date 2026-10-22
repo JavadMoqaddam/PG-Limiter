@@ -6,6 +6,7 @@ Decouples state ownership to eliminate circular dependencies between check_usage
 import asyncio
 import copy
 import time
+from dataclasses import dataclass
 
 from utils.types import UserType
 
@@ -14,6 +15,91 @@ ACTIVE_USERS: dict[str, UserType] = {}
 
 # Module-level lock protecting concurrent access to ACTIVE_USERS
 ACTIVE_USERS_LOCK = asyncio.Lock()
+
+
+@dataclass(frozen=True)
+class APISampleEvidence:
+    """The settings and unknown users belonging to one completed API collection."""
+
+    generation: int
+    config_revision: int
+    freshness_seconds: int
+    unknown_users: frozenset[str] = frozenset()
+
+
+class ActiveUsersSnapshot(dict[str, UserType]):
+    """A normal user mapping with evidence attached to API observations only."""
+
+    api_evidence: APISampleEvidence | None = None
+    unknown_users: frozenset[str] = frozenset()
+
+
+_api_generation = 0
+_api_snapshot: ActiveUsersSnapshot | None = None
+
+
+def begin_api_collection() -> int:
+    """Invalidate the previous API sample before beginning another collection."""
+    global _api_generation, _api_snapshot
+    _api_generation += 1
+    if _api_snapshot is not None:
+        ACTIVE_USERS.clear()
+    _api_snapshot = None
+    return _api_generation
+
+
+def api_evidence_is_current(evidence: APISampleEvidence) -> bool:
+    """A newer collection or configuration write invalidates an older sample."""
+    from utils.read_config import get_config_revision
+
+    return evidence.generation == _api_generation and evidence.config_revision == get_config_revision()
+
+
+def refresh_api_user(user: UserType, freshness_seconds: int) -> bool:
+    """Evaluate source timestamps locally, including after asynchronous preparation."""
+    evaluated_at = time.time()
+    connections = user.device_info.connections
+    if any(connection.last_seen > evaluated_at for connection in connections):
+        return False
+    connections = [
+        connection for connection in connections if 0 <= evaluated_at - connection.last_seen < freshness_seconds
+    ]
+    user.device_info.connections = connections
+    user.ip = sorted({connection.ip for connection in connections})
+    user.device_info.unique_ips = set(user.ip)
+    user.device_info.unique_nodes = {connection.node_id for connection in connections}
+    user.device_info.inbound_protocols = {connection.inbound_protocol for connection in connections}
+    user.device_info.is_multi_device = len(user.ip) > 1
+    return True
+
+
+async def publish_api_snapshot(users: dict[str, UserType], evidence: APISampleEvidence) -> bool:
+    """Publish only a current sample, isolated from log tasks winding down."""
+    global _api_snapshot
+    async with ACTIVE_USERS_LOCK:
+        if not api_evidence_is_current(evidence):
+            return False
+        snapshot = _clone_user_map(users)
+        snapshot.api_evidence = evidence
+        _api_snapshot = snapshot
+        ACTIVE_USERS.clear()
+        # Log readers still see the ordinary public mapping. Its objects must not
+        # alias the enforcement sample: parked SSE tasks can finish a pending read.
+        ACTIVE_USERS.update(_clone_user_map(users))
+        return True
+
+
+async def pop_api_users_snapshot() -> ActiveUsersSnapshot | None:
+    """Consume API evidence once; an old or failed cycle cannot be reused."""
+    global _api_snapshot
+    async with ACTIVE_USERS_LOCK:
+        snapshot = _api_snapshot
+        _api_snapshot = None
+        ACTIVE_USERS.clear()
+        if snapshot is None or not api_evidence_is_current(snapshot.api_evidence):
+            return None
+        return snapshot
+
 
 # Per-node "last event seen" wall clock, {node_id: timestamp}.
 #
@@ -80,9 +166,11 @@ def get_node_event_ages() -> dict[int, float]:
     return {node_id: now - seen for node_id, seen in list(NODE_LAST_EVENT.items())}
 
 
-def _clone_user_map(users: dict[str, UserType]) -> dict[str, UserType]:
+def _clone_user_map(users: dict[str, UserType]) -> ActiveUsersSnapshot:
     """Clone mapping of active users to guarantee point-in-time isolation."""
-    snapshot = {}
+    snapshot = ActiveUsersSnapshot()
+    snapshot.api_evidence = getattr(users, "api_evidence", None)
+    snapshot.unknown_users = getattr(users, "unknown_users", frozenset())
     for email, user in users.items():
         if not email or not user:
             continue
@@ -115,6 +203,10 @@ async def get_active_users_snapshot() -> dict[str, UserType]:
     Guarantees callers have an isolated, thread-safe view without blocking ongoing log streaming.
     """
     async with ACTIVE_USERS_LOCK:
+        if _api_snapshot is not None:
+            if not api_evidence_is_current(_api_snapshot.api_evidence):
+                return ActiveUsersSnapshot()
+            return _clone_user_map(_api_snapshot)
         return _clone_user_map(ACTIVE_USERS)
 
 
@@ -124,7 +216,12 @@ async def pop_active_users_snapshot() -> dict[str, UserType]:
     Guarantees that new connections arriving during cycle analysis are preserved for the next cycle
     and never orphaned or dropped by a delayed clear.
     """
+    global _api_snapshot
     async with ACTIVE_USERS_LOCK:
+        if _api_snapshot is not None:
+            _api_snapshot = None
+            ACTIVE_USERS.clear()
+            return ActiveUsersSnapshot()
         snapshot = _clone_user_map(ACTIVE_USERS)
         ACTIVE_USERS.clear()
         return snapshot
@@ -141,7 +238,8 @@ async def merge_active_users_snapshot(batch: dict[str, UserType]) -> int:
 
     Returns the number of users actually restored (those without a newer observation).
     """
-    if not batch:
+    if not batch or getattr(batch, "api_evidence", None) is not None:
+        # API observations belong to exactly one cycle; only Logs are requeued.
         return 0
     restored = 0
     async with ACTIVE_USERS_LOCK:

@@ -103,6 +103,8 @@ from telegram_bot.handlers.settings_ip_source import (
     handle_ip_source_set_api_callback,
     handle_ip_source_concurrency_callback,
     ip_source_concurrency_handler,
+    handle_ip_source_freshness_callback,
+    ip_source_freshness_handler,
     handle_ip_source_stats_callback,
 )
 from telegram_bot.handlers.settings_device_count import (
