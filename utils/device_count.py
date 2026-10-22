@@ -327,8 +327,9 @@ def count_devices_and_details(
 
     Returns:
         tuple[list[str], int]: (display lines, device count). The lines are empty
-        when ``show_enhanced_details`` is False. With no connection information
-        the count comes from ``count_devices_from_ips``, which applies the same
+        when ``show_enhanced_details`` is False. With no connection information,
+        "inbound" mode returns zero. In other modes, the count comes from
+        ``count_devices_from_ips``, which applies the same
         subnet rule the full path uses - it used to be the number of formatted
         display strings, which collapsed "1.2.3.x (5)" to 1 and so disagreed with
         the number enforcement acted on for the very same user.

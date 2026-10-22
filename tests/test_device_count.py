@@ -3,7 +3,7 @@
 Unit tests for device counting.
 
 This is the number every ban is decided on, so each counting rule is pinned
-down here: the two counting modes, CDN collapsing, disabled nodes, subnet
+down here: the three counting modes, CDN collapsing, disabled nodes, subnet
 grouping, High Trust grouping and the no-connection fallback.
 """
 
