@@ -143,7 +143,7 @@ The bot features a comprehensive menu structure with support for Telegram Superg
 ├── 🎯 Limits        → General & special user limit management
 ├── 👥 Users         → Exception whitelist, disabled users & manual enable
 ├── 📡 Monitoring    → Live active violations & connection monitor
-├── 📊 Reports       → ISP, protocol, node usage & IP history reports
+├── 📊 Reports       → Protocol, node usage & IP history reports
 └── 👑 Admin         → Manage authorized Telegram admins
 ```
 
@@ -292,8 +292,12 @@ Runs on port `8080` by default. Swagger documentation available at `http://local
 | **Access Tokens** | 30 min | Panel API authentication |
 | **Node List** | 1 hour | Active PasarGuard SSE nodes |
 | **Configuration** | 5 min | Dynamic runtime parameters |
-| **Subnet & ISP Info** | 7 days | IP-to-carrier resolution cache |
 | **User Metadata** | 1 min | Pre-computed limits held in RAM |
+
+ISP lookups run only for successful disable notifications, once per raw IP, with
+no memory/database cache or subnet request aggregation. Warnings and reports do
+not request ISP information. `/24` device grouping remains available; the former
+ISP-dependent `/16` mode now uses `/24`. See [ISP notifications](docs/ISP_NOTIFICATIONS.md).
 
 ---
 
@@ -318,14 +322,14 @@ PG-Limiter/
 │       ├── limits.py           # General & custom limit handlers
 │       ├── users.py            # User whitelist & disable controllers
 │       ├── monitoring.py       # Live connection monitor
-│       ├── reports.py          # Detailed connection & ISP reports
+│       ├── reports.py          # Connection and IP history reports
 │       └── backup.py           # Backup & restore handlers
 │
 ├── utils/                      # Core Business Logic & Workers
 │   ├── check_usage.py          # IP analysis, limits resolution & enforcement
 │   ├── ip_source_api.py        # API-mode IP collector (panel online-stats)
 │   ├── user_sync.py            # Fast parallel panel user synchronization
-│   ├── isp_detector.py         # Subnet & ISP detection engine
+│   ├── isp_detector.py         # Fresh per-IP lookups for disable notifications
 │   ├── punishment_system.py    # Tiered punishment duration manager
 │   └── warning_system/         # 3-cycle consecutive tracking & trust scoring
 │

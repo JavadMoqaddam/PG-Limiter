@@ -48,7 +48,6 @@ LOCAL_ID_CACHE = TTLCache(maxsize=30000, ttl=600)
 # API endpoints with fallback order (from most reliable to least)
 API_ENDPOINTS = [
     {"url": "http://ip-api.com/json/{ip}?fields=countryCode", "key": "countryCode", "name": "ip-api.com"},
-    {"url": "https://ipinfo.io/{ip}/json", "key": "country", "name": "ipinfo.io"},
     {"url": "https://api.iplocation.net/?ip={ip}", "key": "country_code2", "name": "iplocation.net"},
     {"url": "https://ipapi.co/{ip}/country", "key": None, "name": "ipapi.co"},
 ]

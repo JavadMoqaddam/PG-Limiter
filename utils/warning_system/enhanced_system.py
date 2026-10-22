@@ -20,6 +20,7 @@ from utils.warning_system.helpers import (
     safe_send_warning_log,
     safe_send_disable_notification,
     safe_disable_user_with_punishment,
+    get_disable_ip_activity,
 )
 from utils.atomic_io import atomic_write_json
 
@@ -148,7 +149,7 @@ class EnhancedWarningSystem:
         history feeds trust scoring, so a failed punishment must leave the record intact
         rather than logging a disable that never happened.
         """
-        if action in ("disabled", "revoked"):
+        if action in ("disabled", "revoked", "applied_unrecorded"):
             await self.add_to_warning_history(username)
             return True
         return False
@@ -261,7 +262,7 @@ class EnhancedWarningSystem:
             })
 
         ip_to_inbounds = {}
-        for ip, inbounds in (warning_data.get('ip_to_inbounds') or {}).items():
+        for ip, inbounds in (warning_data.get("ip_to_inbounds") or {}).items():
             ip_to_inbounds[ip] = set(inbounds)
 
         warning = UserLimitWarning(
@@ -276,13 +277,11 @@ class EnhancedWarningSystem:
             ip_seen_count=warning_data.get("ip_seen_count", {}),
             trust_score=warning_data.get("trust_score", 0.0),
             inbound_protocols=set(warning_data.get("inbound_protocols", [])),
-            isp_names=set(warning_data.get("isp_names", [])),
             ip_subnets=set(warning_data.get("ip_subnets", [])),
             previous_warnings_12h=warning_data.get("previous_warnings_12h", 0),
             previous_warnings_24h=warning_data.get("previous_warnings_24h", 0),
             ip_to_inbounds=ip_to_inbounds,
             same_ip_multiple_inbounds=warning_data.get("same_ip_multiple_inbounds", False),
-            isp_change_pattern=warning_data.get("isp_change_pattern"),
             connection_details=warning_data.get("connection_details", []),
             user_limit=warning_data.get("user_limit", 1),
             consecutive_violations=warning_data.get("consecutive_violations", 1),
@@ -290,6 +289,8 @@ class EnhancedWarningSystem:
             max_warnings_at_creation=warning_data.get("max_warnings_at_creation", 0),
         )
         warning.monitoring_history = monitoring_history
+        if "isp_names" in warning_data or "isp_change_pattern" in warning_data:
+            warning.trust_score = warning.calculate_trust_score()
         return warning
 
     def load_warnings(self):
@@ -366,17 +367,15 @@ class EnhancedWarningSystem:
                 "ip_seen_count": warning.ip_seen_count,
                 "trust_score": warning.trust_score,
                 "inbound_protocols": list(warning.inbound_protocols),
-                "isp_names": list(warning.isp_names),
                 "ip_subnets": list(warning.ip_subnets),
                 "previous_warnings_12h": warning.previous_warnings_12h,
                 "previous_warnings_24h": warning.previous_warnings_24h,
                 "ip_to_inbounds": ip_to_inbounds_serializable,
                 "same_ip_multiple_inbounds": warning.same_ip_multiple_inbounds,
-                "isp_change_pattern": warning.isp_change_pattern,
                 "connection_details": warning.connection_details,
                 "user_limit": getattr(warning, "user_limit", 1),
                 "consecutive_violations": getattr(warning, "consecutive_violations", 1),
-                "max_warnings_at_creation": getattr(warning, "max_warnings_at_creation", 0)
+                "max_warnings_at_creation": getattr(warning, "max_warnings_at_creation", 0),
             }
 
         return data
@@ -395,9 +394,16 @@ class EnhancedWarningSystem:
         except Exception as e:
             warning_logger.error(f"Error saving warnings: {e}")
     
-    async def add_warning(self, username: str, ip_count: int, ips: Set[str], user_limit: int = None, 
-                         user_data: 'UserType' = None, isp_info: dict = None,
-                         panel_data: 'PanelType' = None, send_telegram_notification: bool = True) -> str:
+    async def add_warning(
+        self,
+        username: str,
+        ip_count: int,
+        ips: Set[str],
+        user_limit: int = None,
+        user_data: "UserType" = None,
+        panel_data: "PanelType" = None,
+        send_telegram_notification: bool = True,
+    ) -> str:
         """
         Add a warning for a user, updating the consecutive-scan counter.
 
@@ -463,8 +469,7 @@ class EnhancedWarningSystem:
                     counted = True
                 else:
                     not_counted_reason = (
-                        f"it came only {elapsed_since_scan:.0f}s after the previous scan "
-                        f"(minimum {min_scan_gap:.0f}s)"
+                        f"it came only {elapsed_since_scan:.0f}s after the previous scan (minimum {min_scan_gap:.0f}s)"
                     )
 
             required_violations = self.effective_max_warnings(warning)
@@ -492,9 +497,7 @@ class EnhancedWarningSystem:
             if user_data and user_data.device_info:
                 warning.inbound_protocols = user_data.device_info.inbound_protocols
                 warning.ip_to_inbounds = self._extract_ip_to_inbounds(user_data)
-            if isp_info:
-                warning.isp_names = set(info.get('isp', 'Unknown') for info in isp_info.values())
-                warning.ip_subnets = self._extract_subnets(ips)
+            warning.ip_subnets = self._extract_subnets(ips)
             
             warning.trust_score = warning.calculate_trust_score()
             
@@ -511,7 +514,6 @@ class EnhancedWarningSystem:
         warning_logger.debug(f"⚠️ User {username} history: {previous_warnings_12h} in 12h, {previous_warnings_24h} in 24h")
         
         inbound_protocols = set()
-        isp_names = set()
         ip_subnets = self._extract_subnets(ips)
         ip_to_inbounds = {}
         connection_details = []
@@ -520,16 +522,15 @@ class EnhancedWarningSystem:
             inbound_protocols = user_data.device_info.inbound_protocols
             ip_to_inbounds = self._extract_ip_to_inbounds(user_data)
             for conn in user_data.device_info.connections:
-                connection_details.append({
-                    'ip': conn.ip,
-                    'node_id': conn.node_id,
-                    'node_name': conn.node_name,
-                    'inbound_protocol': conn.inbound_protocol,
-                    'last_seen': conn.last_seen
-                })
-        
-        if isp_info:
-            isp_names = set(info.get('isp', 'Unknown') for info in isp_info.values())
+                connection_details.append(
+                    {
+                        "ip": conn.ip,
+                        "node_id": conn.node_id,
+                        "node_name": conn.node_name,
+                        "inbound_protocol": conn.inbound_protocol,
+                        "last_seen": conn.last_seen,
+                    }
+                )
         
         same_ip_multiple_inbounds = any(len(inbounds) > 1 for inbounds in ip_to_inbounds.values())
         
@@ -541,7 +542,6 @@ class EnhancedWarningSystem:
             monitoring_end_time=current_time + self.monitoring_period,
             warned=True,
             inbound_protocols=inbound_protocols,
-            isp_names=isp_names,
             ip_subnets=ip_subnets,
             previous_warnings_12h=previous_warnings_12h,
             previous_warnings_24h=previous_warnings_24h,
@@ -551,7 +551,7 @@ class EnhancedWarningSystem:
             user_limit=user_limit if user_limit and user_limit >= 1 else 1,
             consecutive_violations=1,
             last_scan_time=current_time,
-            max_warnings_at_creation=self.max_warnings
+            max_warnings_at_creation=self.max_warnings,
         )
         
         warning.trust_score = warning.calculate_trust_score()
@@ -569,29 +569,6 @@ class EnhancedWarningSystem:
             trust_details.append(f"📱 Same IP uses multiple inbounds (likely 1 device)")
         elif len(inbound_protocols) > 1:
             trust_details.append(f"🔴 {len(inbound_protocols)} different inbounds with different IPs")
-        
-        if warning.isp_change_pattern == "sim_swap" or warning.isp_change_pattern == "possible_sim_swap":
-            trust_details.append(f"📶 Possible SIM card change detected")
-        elif warning.isp_change_pattern == "multi_device":
-            trust_details.append(f"📲 Multi-device ISP pattern")
-        
-        if len(ip_subnets) > 1 and len(isp_names) == 1:
-            # show /24 count but also indicate collapsed /16 groups if they exist
-            grouped_16 = set()
-            for s in ip_subnets:
-                parts = s.split('.')
-                if len(parts) >= 2:
-                    grouped_16.add(f"{parts[0]}.{parts[1]}")
-                else:
-                    grouped_16.add(s)
-            if len(grouped_16) == 1:
-                trust_details.append(
-                    f"🟠 {len(ip_subnets)} /24 subnets (same /16), same ISP"
-                )
-            else:
-                trust_details.append(
-                    f"🟠 {len(ip_subnets)} subnets ({len(grouped_16)} /16 groups), same ISP"
-                )
         
         if previous_warnings_12h > 0:
             trust_details.append(f"⚠️ {previous_warnings_12h} disables in last 12h")
@@ -739,8 +716,7 @@ class EnhancedWarningSystem:
                     # operator excepted while they were already under monitoring could
                     # still be disabled here.
                     warning_logger.info(
-                        f"✅ {username} is whitelisted - dropping the monitoring record "
-                        f"instead of judging it"
+                        f"✅ {username} is whitelisted - dropping the monitoring record instead of judging it"
                     )
                     users_to_remove.append(username)
                     continue
@@ -829,9 +805,40 @@ class EnhancedWarningSystem:
                                 panel_data, UserType(name=username, ip=[])
                             )
 
+                            # Remove the applied incident before optional lookup or
+                            # notification I/O can fail or be cancelled.
+                            self.warnings.pop(username, None)
+                            await self.save_warnings()
+
+                            if punishment_result.get("action") in ("reconciled", "deduplicated") or (
+                                punishment_result.get("action") == "applied_unrecorded"
+                                and not punishment_result.get("newly_applied", False)
+                            ):
+                                # A ledger retry or duplicate claim applies nothing
+                                # new; do not report or count another disable, or
+                                # let the main scan warn the same user again this cycle.
+                                disabled_users.add(username)
+                                warning_logger.info(
+                                    "Punishment result for %s: %s; no new panel action was applied",
+                                    username,
+                                    punishment_result.get("action"),
+                                )
+                                continue
+
                             # Only a real disable/revoke belongs in disable history; a
                             # warning or a failed punishment must not log a disable.
                             await self.record_disable_outcome(username, punishment_result.get("action", ""))
+
+                            notice_action = punishment_result.get("action")
+                            record_note = ""
+                            if notice_action == "applied_unrecorded":
+                                # Only the history write failed; the panel disable was applied.
+                                notice_action = "revoked" if "revoke_success" in punishment_result else "disabled"
+                                record_note = f"⚠️ {html.escape(str(punishment_result.get('message') or 'Violation not yet recorded'))}\n"
+
+                            if notice_action in ("disabled", "revoked"):
+                                warning.update_ip_activity(current_ips, time.time())
+                                activity_summary = await get_disable_ip_activity(warning, config_data)
 
                             if punishment_result["action"] == "warning":
                                 await safe_send_warning_log(
@@ -846,7 +853,7 @@ class EnhancedWarningSystem:
                                 warning_logger.warning(f"⚠️ WARNING: User {username} - {device_count} IPs (limit: {user_limit_number}) - violation #{punishment_result['violation_count']}")
                                 log_monitoring_event("persistent_warning", username, {"devices": device_count, "limit": user_limit_number, "violation": punishment_result['violation_count']})
                                 warned_users.add(username)  # Track warned users to prevent double processing
-                            elif punishment_result["action"] == "disabled":
+                            elif notice_action == "disabled":
                                 disabled_users.add(username)
                                 
                                 duration_text = ""
@@ -863,13 +870,14 @@ class EnhancedWarningSystem:
                                     f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                                     f"📊 Violation #{punishment_result['violation_count']} (Step {punishment_result['step_index'] + 1})\n"
                                     f"{duration_text}"
+                                    f"{record_note}"
                                     f"📊 IP Activity:\n<code>{html.escape(activity_summary)}</code>",
-                                    username
+                                    username,
                                 )
                                 
                                 warning_logger.warning(f"🚫 Disabled user {username}: {device_count} IPs (limit: {user_limit_number}) - step {punishment_result['step_index'] + 1}")
                                 log_monitoring_event("user_disabled", username, {"devices": device_count, "limit": user_limit_number, "duration_min": punishment_result.get("duration_minutes", 0)})
-                            elif punishment_result["action"] == "revoked":
+                            elif notice_action == "revoked":
                                 disabled_users.add(username)
                                 
                                 revoke_note = "✅ Sub revoked" if punishment_result.get("revoke_success", False) else "⚠️ Revoke failed"
@@ -884,8 +892,9 @@ class EnhancedWarningSystem:
                                     f"📊 Violation #{punishment_result['violation_count']} (Step {punishment_result['step_index'] + 1})\n"
                                     f"{revoke_note}, {uuid_note}\n"
                                     f"Duration: <code>Until manual enable</code>\n"
+                                    f"{record_note}"
                                     f"📊 IP Activity:\n<code>{html.escape(activity_summary)}</code>",
-                                    username
+                                    username,
                                 )
                                 
                                 warning_logger.warning(f"🔄 Revoked + disabled user {username}: {device_count} IPs (limit: {user_limit_number}) - step {punishment_result['step_index'] + 1}")
