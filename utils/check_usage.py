@@ -14,6 +14,7 @@ from utils.logs import logger
 from utils.read_config import read_config, get_config_value
 from utils.types import PanelType, UserType, EnhancedUserInfo
 from utils.device_count import (
+    COUNT_MODE_INBOUND,
     DeviceCountingConfig,
     count_devices,
     count_devices_and_details,
@@ -879,6 +880,9 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
 
     if config_data is None:
         config_data = await read_config()
+    if config_data.get("device_count_mode") == COUNT_MODE_INBOUND and config_data.get("ip_source") == "api":
+        logger.error("⛔ Per Inbound requires node logs - skipping enforcement; samples and counters are preserved")
+        return
     active_users_snapshot = await pop_active_users_snapshot()
     all_users_log = await check_ip_used(config_data=config_data, active_users_snapshot=active_users_snapshot)
 
@@ -1372,6 +1376,11 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
             logger.critical(
                 "⛔ Configuration is degraded (database settings unavailable) - skipping "
                 "enforcement this cycle. Counters keep their values."
+            )
+            run_enforcement = False
+        elif config_data.get("device_count_mode") == COUNT_MODE_INBOUND and config_data.get("ip_source") == "api":
+            logger.error(
+                "⛔ Per Inbound requires node logs - skipping collection and enforcement; counters are preserved"
             )
             run_enforcement = False
         elif str(config_data.get("ip_source") or "logs") == "api":

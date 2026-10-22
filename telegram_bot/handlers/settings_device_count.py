@@ -1,5 +1,5 @@
 """
-Device counting mode: per device (inbound-aware) or per IP.
+Device counting mode: per device, per IP, or per observed inbound.
 
 Which one is right depends on the deployment - with two nodes per inbound one
 client legitimately appears twice, with one node per inbound it does not. The
@@ -13,6 +13,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from telegram_bot.constants import CallbackData
+from utils.device_count import COUNT_MODE_INBOUND
 from utils.read_config import read_config, save_config_value
 
 
@@ -20,15 +21,15 @@ def create_device_count_keyboard(current_mode: str):
     """Create the device counting mode keyboard with the active mode marked."""
     device_prefix = "✅" if current_mode == "device" else "⬜"
     ip_prefix = "✅" if current_mode == "ip" else "⬜"
+    inbound_prefix = "✅" if current_mode == COUNT_MODE_INBOUND else "⬜"
     keyboard = [
-        [InlineKeyboardButton(
-            f"{device_prefix} 🖥️ Per Device (by inbound)",
-            callback_data=CallbackData.DEVICE_COUNT_SET_DEVICE
-        )],
-        [InlineKeyboardButton(
-            f"{ip_prefix} 🌐 Per IP",
-            callback_data=CallbackData.DEVICE_COUNT_SET_IP
-        )],
+        [
+            InlineKeyboardButton(
+                f"{device_prefix} 🖥️ Per Device (by inbound)", callback_data=CallbackData.DEVICE_COUNT_SET_DEVICE
+            )
+        ],
+        [InlineKeyboardButton(f"{ip_prefix} 🌐 Per IP", callback_data=CallbackData.DEVICE_COUNT_SET_IP)],
+        [InlineKeyboardButton(f"{inbound_prefix} 🚪 Per Inbound", callback_data=CallbackData.DEVICE_COUNT_SET_INBOUND)],
         [InlineKeyboardButton("« Back to Settings", callback_data=CallbackData.SETTINGS_MENU)],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -42,7 +43,13 @@ def _build_device_count_text(config_data: dict) -> str:
     subnet_mode = str(config_data.get("subnet_grouping_mode") or "/24")
     high_trust_on = "✅ on" if config_data.get("high_trust_ip_grouping") else "❌ off"
 
-    if current_mode == "ip":
+    if current_mode == COUNT_MODE_INBOUND:
+        active = "🚪 <b>Per Inbound</b>"
+        active_note = (
+            "Each distinct inbound observed during the check window counts as <b>one device</b>, "
+            "regardless of how many IPs use it. Requires <b>Node Logs (SSE)</b>."
+        )
+    elif current_mode == "ip":
         active = "🌐 <b>Per IP</b>"
         active_note = (
             "One client IP counts as <b>one device</b>, whatever it connects to. "
@@ -66,14 +73,15 @@ def _build_device_count_text(config_data: dict) -> str:
         f"• Subnet grouping: {subnet_on} (<code>{subnet_mode}</code>)\n"
         f"• High trust grouping: {high_trust_on}\n\n"
         "<b>Notes:</b>\n"
-        "• The node is <b>never</b> part of the device key in either mode: when "
+        "• The node is <b>never</b> part of the device key: when "
         "several nodes serve the same core config, one client is registered on "
         "all of them at once.\n"
-        "• Subnet grouping applies in both modes (same <code>/24</code> counts "
+        "• Subnet grouping applies in Per Device and Per IP modes (same <code>/24</code> counts "
         "once). High Trust grouping is inactive in <b>Per IP</b> mode.\n"
-        "• CDN nodes and CDN inbounds keep their own grouping rules.\n"
-        "• In API mode the panel does not expose the inbound, so both modes "
-        "behave the same there."
+        "• In Per Inbound mode, CDN, subnet and High Trust grouping do not change the count. "
+        "Blank or <code>Unknown</code> inbound tags contribute nothing.\n"
+        "• In API mode the panel does not expose the inbound. Per Device and Per IP "
+        "behave the same there; Per Inbound is unavailable."
     )
 
 
@@ -86,7 +94,7 @@ async def handle_device_count_menu_callback(query, _context: ContextTypes.DEFAUL
         await query.edit_message_text(
             text=_build_device_count_text(config_data),
             reply_markup=create_device_count_keyboard(current_mode),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     except BadRequest as e:
         if "message is not modified" in str(e).lower():
@@ -98,6 +106,9 @@ async def handle_device_count_menu_callback(query, _context: ContextTypes.DEFAUL
 async def _set_device_count_mode(query, context, mode: str, label: str):
     """Persist the device counting mode and refresh the menu."""
     config_data = await read_config()
+    if mode == COUNT_MODE_INBOUND and config_data.get("ip_source") == "api":
+        await query.answer("⚠️ Per Inbound requires node logs; switch IP Source to Logs first")
+        return
     if str(config_data.get("device_count_mode") or "device") == mode:
         await query.answer(f"Already counting {label}")
         return
@@ -117,3 +128,8 @@ async def handle_device_count_set_device_callback(query, context: ContextTypes.D
 async def handle_device_count_set_ip_callback(query, context: ContextTypes.DEFAULT_TYPE):
     """Switch to pure IP counting."""
     await _set_device_count_mode(query, context, "ip", "per IP")
+
+
+async def handle_device_count_set_inbound_callback(query, context: ContextTypes.DEFAULT_TYPE):
+    """Switch to counting distinct observed inbound tags."""
+    await _set_device_count_mode(query, context, COUNT_MODE_INBOUND, "per inbound")

@@ -6,7 +6,7 @@ path and the "user normalized" clearing path all compare it against the user's
 limit - so it lives in its own module with no database, panel or Telegram
 imports, and is unit tested directly.
 
-Two counting modes exist because operators deploy nodes differently. Neither
+Three counting modes exist because operators deploy nodes differently. No
 mode ever puts ``node_id`` in the key: several nodes commonly serve one core
 config, so a single client is registered on all of them at once and would
 otherwise be counted once per node.
@@ -15,11 +15,15 @@ otherwise be counted once per node.
                                        two devices. This is what catches
                                        several people sharing one connection.
     "ip"      (ip-or-subnet)           one client IP is exactly one device.
+    "inbound" (inbound)                every observed inbound tag counts once,
+                                       regardless of client IPs or grouping rules.
 
-CDN traffic is collapsed before either rule applies, because a CDN presents many
+CDN traffic is collapsed in "device" and "ip" modes, because a CDN presents many
 edge addresses for one client: every CDN node together counts as one device, and
 a CDN inbound counts as one device per inbound in "device" mode - all of them
-together in "ip" mode.
+together in "ip" mode. In "inbound" mode, CDN, subnet and High Trust grouping
+do not affect the count. Missing tags (including the reserved "Unknown"
+placeholder) contribute nothing, and bare IPs cannot establish an inbound count.
 """
 
 import ipaddress
@@ -30,6 +34,7 @@ from utils.types import ConnectionInfo, EnhancedUserInfo, UserType
 # Counting modes, as stored in the ``device_count_mode`` config key.
 COUNT_MODE_DEVICE = "device"
 COUNT_MODE_IP = "ip"
+COUNT_MODE_INBOUND = "inbound"
 
 
 @dataclass(slots=True)
@@ -130,6 +135,12 @@ def device_key(
     if conn.node_id in config.disabled_nodes:
         return None
 
+    if config.count_mode == COUNT_MODE_INBOUND:
+        inbound = (conn.inbound_protocol or "").strip()
+        if not inbound or inbound == "Unknown":
+            return None
+        return ("INBOUND_ONLY", inbound)
+
     # A CDN presents many addresses for one client, so its traffic collapses.
     # The node id is deliberately NOT part of the key: several nodes serve one
     # core config, so a single client is registered on all of them at once and
@@ -186,10 +197,9 @@ def count_devices_from_ips(
     would have produced through ``device_key``.
 
     The same subnet rule ``device_key`` applies is reused here, so the fallback
-    and the full path agree. Inbound is unknown, so "device" mode cannot tell two
-    devices behind one address apart; the count is identical in both modes and is
-    therefore a lower bound - the safe direction, since it can never invent a
-    violation that the full path would not have found.
+    and the full path agree in "device" and "ip" modes. Inbound is unknown, so
+    "device" mode cannot tell two devices behind one address apart. "inbound"
+    mode returns zero because addresses alone cannot establish any inbound tags.
 
     Args:
         ips: The user's unique addresses.
@@ -201,6 +211,9 @@ def count_devices_from_ips(
     """
     if config is None:
         config = DeviceCountingConfig()
+
+    if config.count_mode == COUNT_MODE_INBOUND:
+        return 0
 
     keys = set()
     for ip in ips or ():
@@ -228,9 +241,10 @@ def count_devices(
         config: Counting and grouping rules; defaults are used when omitted.
         trust_score: Current trust score, for High Trust grouping.
         isp_info: ``{ip: isp_info}`` used by "/16" subnet grouping.
-        fallback_count: Returned when there is no connection information at all
+        fallback_count: Returned in "device" or "ip" mode when there is no connection information at all
             (log or API collection gave IPs but no inbound/node detail); the
-            caller passes the user's unique-IP count there.
+            caller passes the user's grouped-IP count there. "inbound" mode ignores
+            this fallback and returns zero without inbound information.
 
     Returns:
         int: Number of distinct devices.
@@ -240,17 +254,15 @@ def count_devices(
 
     connections = _connections_of(user)
     if not connections:
+        if config.count_mode == COUNT_MODE_INBOUND:
+            return 0
         return fallback_count
 
-    apply_high_trust = (
-        config.high_trust_ip_grouping and trust_score >= config.high_trust_threshold
-    )
+    apply_high_trust = config.high_trust_ip_grouping and trust_score >= config.high_trust_threshold
 
     unique_devices = set()
     for conn in connections:
-        key = device_key(
-            conn, config, apply_high_trust=apply_high_trust, isp_info=isp_info
-        )
+        key = device_key(conn, config, apply_high_trust=apply_high_trust, isp_info=isp_info)
         if key is not None:
             unique_devices.add(key)
     return len(unique_devices)
@@ -325,6 +337,8 @@ def count_devices_and_details(
         device_config = DeviceCountingConfig()
 
     if not _connections_of(original_user):
+        if device_config.count_mode == COUNT_MODE_INBOUND:
+            return [], 0
         raw_ips = getattr(original_user, "ip", None)
         if not raw_ips:
             # Nothing but display strings to go on; keep the old behaviour rather

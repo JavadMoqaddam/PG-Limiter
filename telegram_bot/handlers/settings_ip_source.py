@@ -14,6 +14,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from telegram_bot.constants import CallbackData
+from utils.device_count import COUNT_MODE_INBOUND
 from utils.read_config import normalize_min_coverage, read_config, save_config_value
 
 
@@ -193,6 +194,9 @@ async def handle_ip_source_set_api_callback(query, context: ContextTypes.DEFAULT
     endpoint actually answers.
     """
     config_data = await read_config()
+    if config_data.get("device_count_mode") == COUNT_MODE_INBOUND:
+        await query.answer("⚠️ Per Inbound requires node logs; select Per Device or Per IP first")
+        return
     if str(config_data.get("ip_source") or "logs") == "api":
         await query.answer("Already using the panel API")
         return
