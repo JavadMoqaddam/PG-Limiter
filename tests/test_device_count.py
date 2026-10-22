@@ -3,7 +3,7 @@
 Unit tests for device counting.
 
 This is the number every ban is decided on, so each counting rule is pinned
-down here: the two counting modes, CDN collapsing, disabled nodes, subnet
+down here: the three counting modes, CDN collapsing, disabled nodes, subnet
 grouping, High Trust grouping and the no-connection fallback.
 """
 
@@ -96,6 +96,69 @@ class TestCountingModes:
     def test_ip_mode_still_counts_distinct_ips(self, ip_mode):
         user = make_user([("5.6.7.8", "Vless", 1), ("9.9.9.9", "Vmess", 2)])
         assert count_devices(user, ip_mode) == 2
+
+
+class TestInboundCounting:
+    """Inbound counting measures observed tags, independent of client addresses."""
+
+    def test_distinct_ips_on_the_same_inbound_count_once(self):
+        user = make_user([("5.6.7.8", "Vless", 1), ("9.9.9.9", "Vless", 2)])
+        assert count_devices(user, DeviceCountingConfig(count_mode="inbound")) == 1
+
+    def test_tags_are_trimmed_but_case_sensitive(self):
+        user = make_user([("5.6.7.8", " Vless ", 1), ("9.9.9.9", "Vless", 2), ("4.4.4.4", "vless", 3)])
+        assert count_devices(user, DeviceCountingConfig(count_mode="inbound")) == 2
+
+    def test_distinct_inbounds_on_one_ip_count_separately(self):
+        user = make_user([("5.6.7.8", "Vless TCP", 1), ("5.6.7.8", "Vless WS", 1)])
+        assert count_devices(user, DeviceCountingConfig(count_mode="inbound")) == 2
+
+    def test_ip_grouping_rules_cannot_merge_distinct_inbounds(self):
+        config = DeviceCountingConfig(
+            count_mode="inbound",
+            cdn_nodes=[1, 2],
+            cdn_inbounds=["Vless", "Vmess"],
+            subnet_ip_grouping=True,
+            subnet_grouping_mode="/16",
+            high_trust_ip_grouping=True,
+        )
+        user = make_user([("5.6.7.8", "Vless", 1), ("9.9.9.9", "Vless", 3), ("5.6.8.8", "Vmess", 2)])
+        assert count_devices(user, config, trust_score=90) == 2
+
+    def test_disabled_nodes_do_not_add_inbounds(self):
+        config = DeviceCountingConfig(count_mode="inbound", disabled_nodes=[9])
+        user = make_user([("5.6.7.8", "Vless", 9), ("9.9.9.9", "Vmess", 1)])
+        assert count_devices(user, config) == 1
+
+    @pytest.mark.parametrize("inbound", ["", "  ", "Unknown", " Unknown ", None])
+    def test_missing_inbound_information_does_not_add_a_device(self, inbound):
+        user = make_user([("5.6.7.8", inbound, 1)])
+        assert count_devices(user, DeviceCountingConfig(count_mode="inbound"), fallback_count=7) == 0
+
+    @pytest.mark.parametrize("user", [None, UserType(name="user1", ip=["5.6.7.8", "9.9.9.9"])])
+    def test_connectionless_users_ignore_ip_fallback(self, user):
+        assert count_devices(user, DeviceCountingConfig(count_mode="inbound"), fallback_count=7) == 0
+
+    def test_bare_addresses_cannot_establish_an_inbound_count(self):
+        assert count_devices_from_ips(["5.6.7.8", "9.9.9.9"], DeviceCountingConfig(count_mode="inbound")) == 0
+
+    @pytest.mark.parametrize("ips", [[], ["5.6.7.8", "9.9.9.9"]])
+    def test_report_does_not_fall_back_to_ip_or_display_counts(self, ips):
+        user = UserType(name="user1", ip=ips)
+        info = EnhancedUserInfo(user=user, formatted_ips=["5.6.7.8", "9.9.9.9"])
+        assert count_devices_and_details(info, user, device_config=DeviceCountingConfig(count_mode="inbound")) == (
+            [],
+            0,
+        )
+
+    def test_report_counts_inbounds_even_with_ip_details_enabled(self):
+        user = make_user([("5.6.7.8", "Vless", 1), ("9.9.9.9", "Vless", 2)])
+        info = EnhancedUserInfo(user=user, formatted_ips=["5.6.7.8", "9.9.9.9"])
+        details, count = count_devices_and_details(
+            info, user, True, device_config=DeviceCountingConfig(count_mode="inbound")
+        )
+        assert count == 1
+        assert len(details) == 2
 
 
 class TestCdnCollapsing:

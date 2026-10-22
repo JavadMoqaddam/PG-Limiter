@@ -191,7 +191,7 @@ The connected IPs of each user can come from either of two sources, switchable a
 | Inbound detail | Real inbound name per connection | Single sentinel inbound (`API`) |
 | Requires | Node logs reachable over SSE | Panel account with the `nodes:stats` permission |
 
-Both modes write into the same `ACTIVE_USERS` structure, so device counting, subnet/CDN/high-trust grouping, the 3-cycle warning system, trust scoring and punishment behave identically.
+Both sources write into the same `ACTIVE_USERS` structure and share the 3-cycle warning system, trust scoring and punishment. **Per Inbound** counting requires node logs because the panel API does not expose inbound names.
 
 **How API mode keeps a cycle safe:**
 * **Candidate narrowing.** `GET /api/users` is filtered panel-side by `status=active` and by an online-freshness window equal to `CHECK_INTERVAL + 30s`, so only the handful of currently-online users is queried. A group filter in **include** mode narrows it further, because that setting is what makes users outside those groups unmonitored in the first place. Group Limits deliberately do *not* narrow the query: a group limit is a limit, not a monitoring scope, and users in no limited group are still judged against the general limit.
@@ -201,6 +201,19 @@ Both modes write into the same `ACTIVE_USERS` structure, so device counting, sub
 * **Per-inbound CDN grouping is inactive** in API mode because the panel reports no inbound names — use **CDN Nodes** (per-node) instead of CDN Inbounds.
 
 Switching to API mode runs a pre-flight probe against a real online user first, and refuses to switch if the endpoint is not reachable. **Settings → 🛰️ IP Source → 📊 Last API Cycle** shows the last cycle's candidate narrowing, coverage, 403/404 counts and duration.
+
+### 7. Device Counting Modes
+Choose the enforcement measure at runtime from **Settings → 🧮 Device Counting**:
+
+| Mode | What counts as one device |
+|---|---|
+| **Per Device (by inbound)** — default | One client IP (or grouped subnet) on one inbound |
+| **Per IP** | One client IP (or grouped subnet), regardless of inbound |
+| **Per Inbound** | One distinct inbound tag observed during the current check window, regardless of IPs |
+
+In Per Inbound mode, ten IPs on one inbound count as **1**, while one IP on three inbounds counts as **3**. The same inbound tag across several nodes counts once. Tags are trimmed and case-sensitive; disabled nodes, blank tags and the reserved `Unknown` placeholder contribute nothing. Without inbound information, the count is **0** and never falls back to the number of IPs. CDN, subnet and High Trust grouping do not change this count.
+
+Per Inbound uses accepted log traffic collected between checks, so it measures observed activity during that window. It requires **Node Logs (SSE)**: switch the IP source to logs before selecting it, and choose Per Device or Per IP before switching to the panel API. If an incompatible API + Per Inbound combination is persisted externally, collection and enforcement pause while existing samples and warning counters are preserved. The mode is stored in the dynamic database setting `device_count_mode`; changing it requires no restart or schema migration.
 
 ---
 

@@ -497,10 +497,12 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     #               device. Subnet grouping still applies when enabled; High
     #               Trust grouping has no effect (IP counting is already the
     #               most lenient key).
+    #   "inbound" -> distinct observed inbound tags only, regardless of IPs or
+    #               grouping settings. Requires log mode for real inbound names.
     config["device_count_mode"] = str(
         db_config.get("device_count_mode", "device")
     ).strip().lower()
-    if config["device_count_mode"] not in ("device", "ip"):
+    if config["device_count_mode"] not in ("device", "ip", "inbound"):
         config["device_count_mode"] = "device"
 
     # Disabled nodes - list of node IDs to exclude from monitoring
