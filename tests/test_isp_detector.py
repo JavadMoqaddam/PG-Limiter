@@ -9,7 +9,8 @@ from utils.isp_detector import ISPDetector
 
 
 @pytest.mark.parametrize(
-    "token,fallback,host", [("tok", False, "ipinfo.io"), (None, False, "ip-api.com"), ("tok", True, "ip-api.com")]
+    "token,fallback,host",
+    [("tok", False, "api.ipinfo.io"), (None, False, "ip-api.com"), ("tok", True, "ip-api.com")],
 )
 async def test_selected_provider_receives_each_fresh_lookup(token, fallback, host):
     requests = []
@@ -27,7 +28,19 @@ async def test_selected_provider_receives_each_fresh_lookup(token, fallback, hos
                     "city": "Tehran",
                 },
             )
-        return httpx.Response(200, json={"org": "Example ISP", "country": "IR", "region": "Tehran", "city": "Tehran"})
+        return httpx.Response(
+            200,
+            json={
+                "ip": "5.6.7.10",
+                "asn": "AS123",
+                "as_name": "Example ISP",
+                "as_domain": "example.net",
+                "country_code": "IR",
+                "country": "Iran",
+                "continent_code": "AS",
+                "continent": "Asia",
+            },
+        )
 
     detector = ISPDetector(token=token, use_fallback_only=fallback)
     detector._client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
@@ -39,9 +52,16 @@ async def test_selected_provider_receives_each_fresh_lookup(token, fallback, hos
         assert (
             first
             == second
-            == {"ip": "5.6.7.10", "isp": "Example ISP", "country": "IR", "region": "Tehran", "city": "Tehran"}
+            == {
+                "ip": "5.6.7.10",
+                "isp": "Example ISP",
+                "country": "IR",
+                "region": "Unknown" if host == "api.ipinfo.io" else "Tehran",
+                "city": "Unknown" if host == "api.ipinfo.io" else "Tehran",
+            }
         )
-        if host == "ipinfo.io":
+        if host == "api.ipinfo.io":
+            assert requests[0].url.path == "/lite/5.6.7.10"
             assert requests[0].headers["Authorization"] == "Bearer tok"
         else:
             assert "Authorization" not in requests[0].headers
@@ -70,7 +90,7 @@ async def test_token_removal_switches_provider_and_discards_previous_auth():
         await detector.close()
 
 
-@pytest.mark.parametrize("payload", [{}, [], {"org": None}, {"org": "", "country": "IR"}])
+@pytest.mark.parametrize("payload", [{}, [], {"as_name": None}, {"as_name": "", "country_code": "IR"}])
 async def test_missing_provider_isp_is_explicitly_unknown(payload):
     detector = ISPDetector(token="tok")
     detector._client = httpx.AsyncClient(
@@ -84,6 +104,32 @@ async def test_missing_provider_isp_is_explicitly_unknown(payload):
         await detector.close()
 
 
+@pytest.mark.parametrize(
+    "payload,isp,country",
+    [
+        ({"as_name": "", "as_domain": "example.net", "country_code": "IR", "country": "Iran"}, "example.net", "IR"),
+        ({"as_name": None, "as_domain": None, "org": "Legacy ISP", "country": "IR"}, "Legacy ISP", "IR"),
+    ],
+)
+async def test_missing_lite_fields_keep_available_provider_information(payload, isp, country):
+    """Missing optional fields retain the provider's available name and country."""
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json=payload)
+
+    detector = ISPDetector(token="tok")
+    detector._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        info = await detector.get_isp_info("5.6.7.10")
+        assert info["isp"] == isp
+        assert info["country"] == country
+        assert len(requests) == 1
+    finally:
+        await detector.close()
+
+
 @pytest.mark.parametrize("status", [403, 429, 500])
 async def test_failed_response_does_not_prevent_a_fresh_later_request(status):
     requests = []
@@ -92,7 +138,7 @@ async def test_failed_response_does_not_prevent_a_fresh_later_request(status):
         requests.append(request)
         if len(requests) == 1:
             return httpx.Response(status, json={"error": "unavailable"})
-        return httpx.Response(200, json={"org": "Recovered ISP", "country": "IR"})
+        return httpx.Response(200, json={"as_name": "Recovered ISP", "country_code": "IR"})
 
     detector = ISPDetector(token="tok")
     detector._client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
@@ -106,9 +152,9 @@ async def test_failed_response_does_not_prevent_a_fresh_later_request(status):
 
 async def test_notice_deadline_keeps_completed_results_and_marks_slow_ip_unknown():
     async def transport(request):
-        if request.url.path == "/5.6.7.20/json":
+        if request.url.path == "/lite/5.6.7.20":
             await asyncio.sleep(1)
-        return httpx.Response(200, json={"org": "Fast ISP", "country": "IR"})
+        return httpx.Response(200, json={"as_name": "Fast ISP", "country_code": "IR"})
 
     detector = ISPDetector(token="tok")
     detector._client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
@@ -125,13 +171,13 @@ async def test_lookup_quotes_user_controlled_url_path():
 
     def transport(request):
         requests.append(request)
-        return httpx.Response(200, json={"org": "Example ISP", "country": "IR"})
+        return httpx.Response(200, json={"as_name": "Example ISP", "country_code": "IR"})
 
     detector = ISPDetector(token="tok")
     detector._client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
     try:
         await detector.get_isp_info("5.6.7.10?token=other/fragment")
         assert requests[0].url.query == b""
-        assert requests[0].url.raw_path == b"/5.6.7.10%3Ftoken%3Dother%2Ffragment/json"
+        assert requests[0].url.raw_path == b"/lite/5.6.7.10%3Ftoken%3Dother%2Ffragment"
     finally:
         await detector.close()

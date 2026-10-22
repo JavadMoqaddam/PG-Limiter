@@ -149,7 +149,7 @@ class EnhancedWarningSystem:
         history feeds trust scoring, so a failed punishment must leave the record intact
         rather than logging a disable that never happened.
         """
-        if action in ("disabled", "revoked"):
+        if action in ("disabled", "revoked", "applied_unrecorded"):
             await self.add_to_warning_history(username)
             return True
         return False
@@ -810,11 +810,33 @@ class EnhancedWarningSystem:
                             self.warnings.pop(username, None)
                             await self.save_warnings()
 
+                            if punishment_result.get("action") in ("reconciled", "deduplicated") or (
+                                punishment_result.get("action") == "applied_unrecorded"
+                                and not punishment_result.get("newly_applied", False)
+                            ):
+                                # A ledger retry or duplicate claim applies nothing
+                                # new; do not report or count another disable, or
+                                # let the main scan warn the same user again this cycle.
+                                disabled_users.add(username)
+                                warning_logger.info(
+                                    "Punishment result for %s: %s; no new panel action was applied",
+                                    username,
+                                    punishment_result.get("action"),
+                                )
+                                continue
+
                             # Only a real disable/revoke belongs in disable history; a
                             # warning or a failed punishment must not log a disable.
                             await self.record_disable_outcome(username, punishment_result.get("action", ""))
 
-                            if punishment_result.get("action") in ("disabled", "revoked"):
+                            notice_action = punishment_result.get("action")
+                            record_note = ""
+                            if notice_action == "applied_unrecorded":
+                                # Only the history write failed; the panel disable was applied.
+                                notice_action = "revoked" if "revoke_success" in punishment_result else "disabled"
+                                record_note = f"⚠️ {html.escape(str(punishment_result.get('message') or 'Violation not yet recorded'))}\n"
+
+                            if notice_action in ("disabled", "revoked"):
                                 warning.update_ip_activity(current_ips, time.time())
                                 activity_summary = await get_disable_ip_activity(warning, config_data)
 
@@ -831,7 +853,7 @@ class EnhancedWarningSystem:
                                 warning_logger.warning(f"⚠️ WARNING: User {username} - {device_count} IPs (limit: {user_limit_number}) - violation #{punishment_result['violation_count']}")
                                 log_monitoring_event("persistent_warning", username, {"devices": device_count, "limit": user_limit_number, "violation": punishment_result['violation_count']})
                                 warned_users.add(username)  # Track warned users to prevent double processing
-                            elif punishment_result["action"] == "disabled":
+                            elif notice_action == "disabled":
                                 disabled_users.add(username)
                                 
                                 duration_text = ""
@@ -848,13 +870,14 @@ class EnhancedWarningSystem:
                                     f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                                     f"📊 Violation #{punishment_result['violation_count']} (Step {punishment_result['step_index'] + 1})\n"
                                     f"{duration_text}"
+                                    f"{record_note}"
                                     f"📊 IP Activity:\n<code>{html.escape(activity_summary)}</code>",
                                     username,
                                 )
                                 
                                 warning_logger.warning(f"🚫 Disabled user {username}: {device_count} IPs (limit: {user_limit_number}) - step {punishment_result['step_index'] + 1}")
                                 log_monitoring_event("user_disabled", username, {"devices": device_count, "limit": user_limit_number, "duration_min": punishment_result.get("duration_minutes", 0)})
-                            elif punishment_result["action"] == "revoked":
+                            elif notice_action == "revoked":
                                 disabled_users.add(username)
                                 
                                 revoke_note = "✅ Sub revoked" if punishment_result.get("revoke_success", False) else "⚠️ Revoke failed"
@@ -869,6 +892,7 @@ class EnhancedWarningSystem:
                                     f"📊 Violation #{punishment_result['violation_count']} (Step {punishment_result['step_index'] + 1})\n"
                                     f"{revoke_note}, {uuid_note}\n"
                                     f"Duration: <code>Until manual enable</code>\n"
+                                    f"{record_note}"
                                     f"📊 IP Activity:\n<code>{html.escape(activity_summary)}</code>",
                                     username,
                                 )

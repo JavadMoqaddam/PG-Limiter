@@ -13,8 +13,11 @@ deadline; a failed or slow lookup displays `Unknown ISP` and does not prevent th
 disable notification.
 
 Configure the ipinfo token through Telegram's `/set_ipinfo_token` command or the
-IPInfo settings screen. With a token, notices use ipinfo.io; without a token, they
-use ip-api.com. Country filtering still uses its own country providers and caches,
+IPInfo settings screen. With a token, notices use the
+[IPinfo Lite API](https://ipinfo.io/developers/lite-api), which accepts current and
+existing legacy tokens. Each IP uses one request to `https://api.ipinfo.io/lite/{ip}`;
+the ISP name and country code appear in the notice. Without a token, notices use
+ip-api.com. Country filtering still uses its own country providers and caches,
 without requesting ISP information or contacting ipinfo.io.
 
 Subnet IP Grouping remains available for `/24` device counting. The previous

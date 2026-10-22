@@ -1110,6 +1110,7 @@ async def disable_user_with_punishment(panel_data: PanelType, username: UserType
             system.mark_unrecorded(username.name, step_index, duration_minutes)
             return {
                 "action": "applied_unrecorded",
+                "newly_applied": False,
                 "step_index": step_index,
                 "violation_count": 0,
                 "duration_minutes": duration_minutes,
@@ -1218,6 +1219,7 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
                 system.mark_unrecorded(username.name, step_index, 0)
                 return {
                     "action": "applied_unrecorded",
+                    "newly_applied": True,
                     "step_index": step_index,
                     "violation_count": violation_count + 1,
                     "duration_minutes": 0,
@@ -1273,6 +1275,7 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
             system.mark_unrecorded(username.name, step_index, punishment.duration_minutes)
             return {
                 "action": "applied_unrecorded",
+                "newly_applied": True,
                 "step_index": step_index,
                 "violation_count": violation_count + 1,
                 "duration_minutes": punishment.duration_minutes,

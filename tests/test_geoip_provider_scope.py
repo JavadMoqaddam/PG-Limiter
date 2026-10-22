@@ -12,7 +12,7 @@ async def test_country_fallback_does_not_query_ipinfo(monkeypatch):
         hosts.append(request.url.host)
         if request.url.host == "ip-api.com":
             return httpx.Response(503)
-        if request.url.host == "ipinfo.io":
+        if request.url.host in {"ipinfo.io", "api.ipinfo.io"}:
             return httpx.Response(200, json={"country": "DE"})
         return httpx.Response(200, json={"country_code2": "DE"})
 

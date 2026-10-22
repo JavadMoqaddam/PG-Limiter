@@ -1,8 +1,10 @@
 """ISP requests belong to successful disable notices, never warning scans or reports."""
 
 import asyncio
+import json
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -10,6 +12,8 @@ import httpx
 import pytest
 
 import utils.check_usage as usage
+import utils.panel_api.users as panel_users
+import utils.punishment_system as punishment_module
 import utils.user_sync as user_sync
 import utils.warning_system as warning_package
 import utils.warning_system.enhanced_system as warning_module
@@ -17,6 +21,7 @@ from db.crud import UserCRUD
 from utils.isp_detector import ISPDetector
 from utils.types import ConnectionInfo, PanelType, UserType
 from utils.warning_system.enhanced_system import EnhancedWarningSystem
+from utils.warning_system.helpers import safe_disable_user_with_punishment
 
 
 @pytest.fixture
@@ -60,7 +65,16 @@ def notice_cycle(tmp_path, monkeypatch):
             return httpx.Response(200, json={})
         return httpx.Response(
             200,
-            json={"org": "AS123 Example <ISP> & Co", "country": "IR", "city": "Tehran", "region": "Tehran"},
+            json={
+                "ip": request.url.path.rsplit("/", 1)[-1],
+                "asn": "AS123",
+                "as_name": "Example <ISP> & Co",
+                "as_domain": "example.net",
+                "country_code": "IR",
+                "country": "Iran",
+                "continent_code": "AS",
+                "continent": "Asia",
+            },
         )
 
     detector = ISPDetector(token="notice-token")
@@ -186,7 +200,7 @@ async def test_repeated_isp_lookups_fetch_each_raw_ip_again():
 
     def transport(request):
         requests.append(request)
-        return httpx.Response(200, json={"org": "Example ISP", "country": "IR"})
+        return httpx.Response(200, json={"as_name": "Example ISP", "country_code": "IR"})
 
     detector = ISPDetector(token="notice-token")
     detector._client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
@@ -195,7 +209,7 @@ async def test_repeated_isp_lookups_fetch_each_raw_ip_again():
         first = await detector.get_multiple_isp_info(ips)
         second = await detector.get_multiple_isp_info(ips)
         assert len(requests) == 4
-        assert {request.url.host for request in requests} == {"ipinfo.io"}
+        assert {request.url.host for request in requests} == {"api.ipinfo.io"}
         assert first["5.6.7.10"]["isp"] == second["5.6.7.20"]["isp"] == "Example ISP"
     finally:
         await detector.close()
@@ -218,8 +232,8 @@ async def test_successful_disable_freshly_enriches_each_activity_ip(notice_cycle
         await run_cycle(case)
 
         assert len(case["requests"]) == 2
-        assert {request.url.host for request in case["requests"]} == {"ipinfo.io"}
-        assert {request.url.path for request in case["requests"]} == {"/5.6.7.10/json", "/5.6.7.20/json"}
+        assert {request.url.host for request in case["requests"]} == {"api.ipinfo.io"}
+        assert {request.url.path for request in case["requests"]} == {"/lite/5.6.7.10", "/lite/5.6.7.20"}
         assert all(request.headers["Authorization"] == "Bearer notice-token" for request in case["requests"])
         assert case["request_states"] == [False, False]
         assert "alice" not in case["system"].warnings
@@ -229,6 +243,149 @@ async def test_successful_disable_freshly_enriches_each_activity_ip(notice_cycle
         assert "5.6.7.10" in message and "5.6.7.20" in message
         assert message.count("60s active, seen 2x") == 2
     finally:
+        await case["detector"].close()
+
+
+@pytest.mark.parametrize("path", ["scan", "expired"])
+@pytest.mark.parametrize("step_type", ["disable", "revoke"])
+async def test_applied_disable_with_failed_record_still_enriches_and_notifies(
+    notice_cycle, monkeypatch, path, step_type
+):
+    """A failed history write cannot hide an applied panel disable or start another warning."""
+    case = notice_cycle
+    system = punishment_module.PunishmentSystem(filename=str(case["system"].filename) + ".violations")
+    monkeypatch.setattr(punishment_module, "get_punishment_system", lambda: system)
+    monkeypatch.setattr(panel_users, "check_user_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        panel_users,
+        "read_config",
+        AsyncMock(return_value={"punishment": {"enabled": True, "steps": [{"type": step_type, "duration": 15}]}}),
+    )
+    monkeypatch.setattr(
+        punishment_module,
+        "get_punishment_for_user",
+        AsyncMock(return_value=(punishment_module.PunishmentStep(step_type, 15), 1, 1)),
+    )
+
+    panel_disables = []
+
+    async def disable(_panel, user, *_args, **_kwargs):
+        panel_disables.append(user.name)
+
+    async def fail_record(*_args):
+        raise punishment_module.ViolationRecordError("history unavailable after panel success")
+
+    monkeypatch.setattr(panel_users, "disable_user", disable)
+    monkeypatch.setattr(panel_users, "revoke_user_subscription", AsyncMock(return_value=True))
+    monkeypatch.setattr(panel_users, "reset_user_uuid", AsyncMock(return_value=True))
+    monkeypatch.setattr(punishment_module, "record_user_violation", fail_record)
+    monkeypatch.setattr(warning_package, "safe_disable_user_with_punishment", safe_disable_user_with_punishment)
+    monkeypatch.setattr(warning_module, "safe_disable_user_with_punishment", safe_disable_user_with_punishment)
+
+    try:
+        await case["system"].add_warning(
+            "alice", 2, set(case["users"]["alice"].ip), 1, send_telegram_notification=False
+        )
+        warning = case["system"].warnings["alice"]
+        warning.consecutive_violations = 2 if path == "scan" else 3
+        if path == "expired":
+            warning.monitoring_end_time = 900
+        case["now"][0] += 60
+        await run_cycle(case)
+
+        assert panel_disables == ["alice"]
+        assert system.has_unrecorded_incident("alice")
+        assert "alice" not in case["system"].warnings
+        assert "alice" not in json.loads(Path(case["system"].filename).read_text())
+        assert len(case["messages"]) == 1
+        message, username = case["messages"][0]
+        assert username == "alice"
+        assert "DISABLED" in message
+        assert "not yet recorded" in message
+        if step_type == "revoke":
+            assert "SUBSCRIPTION REVOKED + DISABLED" in message
+            assert "✅ Sub revoked" in message and "✅ UUID reset" in message
+        assert "Example &lt;ISP&gt; &amp; Co" in message
+        assert "5.6.7.10" in message and "5.6.7.20" in message
+        assert len(case["requests"]) == 2
+        assert case["request_states"] == [False, False]
+        if path == "expired":
+            assert case["system"].warning_history["alice"] == [1060.0]
+
+        # A still-failing ledger retry applies no new punishment and must not
+        # produce another disable notice, lookup, or trust-history entry.
+        history_after_disable = {name: list(times) for name, times in case["system"].warning_history.items()}
+        case["now"][0] += 60
+        await case["system"].add_warning(
+            "alice", 2, set(case["users"]["alice"].ip), 1, send_telegram_notification=False
+        )
+        retry_warning = case["system"].warnings["alice"]
+        retry_warning.consecutive_violations = 2 if path == "scan" else 3
+        if path == "expired":
+            retry_warning.monitoring_end_time = case["now"][0] - 1
+        case["now"][0] += 60
+        await run_cycle(case)
+
+        assert panel_disables == ["alice"]
+        assert system.has_unrecorded_incident("alice")
+        assert "alice" not in case["system"].warnings
+        assert "alice" not in json.loads(Path(case["system"].filename).read_text())
+        assert len(case["messages"]) == 1
+        assert len(case["requests"]) == 2
+        assert case["system"].warning_history == history_after_disable
+
+        # A recovered history writer reconciles the original ledger without another panel action.
+        monkeypatch.setattr(punishment_module, "record_user_violation", AsyncMock())
+        case["now"][0] += 60
+        await case["system"].add_warning(
+            "alice", 2, set(case["users"]["alice"].ip), 1, send_telegram_notification=False
+        )
+        recovery_warning = case["system"].warnings["alice"]
+        recovery_warning.consecutive_violations = 2 if path == "scan" else 3
+        if path == "expired":
+            recovery_warning.monitoring_end_time = case["now"][0] - 1
+        case["now"][0] += 60
+        await run_cycle(case)
+
+        assert not system.has_unrecorded_incident("alice")
+        assert panel_disables == ["alice"]
+        assert "alice" not in case["system"].warnings
+        assert "alice" not in json.loads(Path(case["system"].filename).read_text())
+        assert len(case["messages"]) == 1
+        assert len(case["requests"]) == 2
+        assert case["system"].warning_history == history_after_disable
+    finally:
+        await case["detector"].close()
+
+
+@pytest.mark.parametrize("path", ["scan", "expired"])
+async def test_duplicate_incident_does_not_report_a_disable_or_rewarn(notice_cycle, monkeypatch, path):
+    """A claimed incident causes the real helper to deduplicate, with no new panel action."""
+    case = notice_cycle
+    system = punishment_module.PunishmentSystem(filename=str(case["system"].filename) + ".violations")
+    monkeypatch.setattr(punishment_module, "get_punishment_system", lambda: system)
+    monkeypatch.setattr(panel_users, "check_user_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(warning_package, "safe_disable_user_with_punishment", safe_disable_user_with_punishment)
+    monkeypatch.setattr(warning_module, "safe_disable_user_with_punishment", safe_disable_user_with_punishment)
+    assert system.begin_incident("alice")
+    try:
+        await case["system"].add_warning(
+            "alice", 2, set(case["users"]["alice"].ip), 1, send_telegram_notification=False
+        )
+        warning = case["system"].warnings["alice"]
+        warning.consecutive_violations = 2 if path == "scan" else 3
+        if path == "expired":
+            warning.monitoring_end_time = 900
+        case["now"][0] += 60
+        await run_cycle(case)
+
+        assert "alice" not in case["system"].warnings
+        assert "alice" not in json.loads(Path(case["system"].filename).read_text())
+        assert case["messages"] == []
+        assert case["requests"] == []
+        assert case["system"].warning_history == {}
+    finally:
+        system.end_incident("alice")
         await case["detector"].close()
 
 

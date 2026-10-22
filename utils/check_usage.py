@@ -1095,15 +1095,32 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     activity_summary = w_obj.get_ip_activity_summary() if w_obj else ""
 
                     ban_action = str(punishment_result.get("action") or "")
+                    notice_action = ban_action
+                    record_note = ""
+                    if ban_action == "applied_unrecorded":
+                        # The panel disable succeeded even though its history write failed.
+                        notice_action = "revoked" if "revoke_success" in punishment_result else "disabled"
+                        record_note = (
+                            f"⚠️ {html.escape(str(punishment_result.get('message') or 'Violation not yet recorded'))}\n"
+                        )
                     # Clear the incident before optional network enrichment or Telegram.
                     # A provider failure must never repeat an applied punishment.
                     await warning_system.clear_user_trust_data(user_name)
-                    if ban_action in ("disabled", "revoked") and w_obj is not None:
+                    if ban_action in ("reconciled", "deduplicated") or (
+                        ban_action == "applied_unrecorded" and not punishment_result.get("newly_applied", False)
+                    ):
+                        logger.info(
+                            "Punishment result for %s: %s; no new panel action was applied", user_name, ban_action
+                        )
+                        continue
+                    if notice_action in ("disabled", "revoked") and w_obj is not None:
                         from utils.warning_system.helpers import get_disable_ip_activity
 
                         activity_summary = await get_disable_ip_activity(w_obj, config_data)
-                    if ban_action == "revoked":
-                        revoke_note = "✅ Sub revoked" if punishment_result.get("revoke_success", False) else "⚠️ Revoke failed"
+                    if notice_action == "revoked":
+                        revoke_note = (
+                            "✅ Sub revoked" if punishment_result.get("revoke_success", False) else "⚠️ Revoke failed"
+                        )
                         uuid_note = "✅ UUID reset" if punishment_result.get("uuid_reset_success", False) else "⚠️ UUID failed"
                         msg = (
                             f"🔄 <b>SUBSCRIPTION REVOKED + DISABLED</b> - {time_str}\n\n"
@@ -1114,6 +1131,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                             f"📊 Violation #{punishment_result.get('violation_count', 1)} (Step {punishment_result.get('step_index', 0) + 1})\n"
                             f"{revoke_note}, {uuid_note}\n"
                             f"Duration: <code>Until manual enable</code>\n"
+                            f"{record_note}"
                             f"📊 IP Activity:\n<code>{html.escape(activity_summary)}</code>"
                         )
                     elif ban_action in ("error", "skipped"):
@@ -1152,6 +1170,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                             f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                             f"📊 Violation #{punishment_result.get('violation_count', 1)} (Step {punishment_result.get('step_index', 0) + 1})\n"
                             f"{duration_text}"
+                            f"{record_note}"
                             f"📊 IP Activity:\n<code>{html.escape(activity_summary)}</code>"
                         )
                     await safe_send_disable_notification(msg, user_name)

@@ -59,7 +59,7 @@ class ISPDetector:
                 f"http://ip-api.com/json/{quote(ip, safe=':')}?fields=status,countryCode,regionName,city,isp,org,asname"
             )
         else:
-            url = f"https://ipinfo.io/{quote(ip, safe=':')}/json"
+            url = f"https://api.ipinfo.io/lite/{quote(ip, safe=':')}"
             headers["Authorization"] = f"Bearer {self.token}"
 
         try:
@@ -76,8 +76,8 @@ class ISPDetector:
                 country = data.get("countryCode")
                 region = data.get("regionName")
             else:
-                isp = data.get("as_domain") or data.get("as_name") or data.get("org")
-                country = data.get("country")
+                isp = data.get("as_name") or data.get("as_domain") or data.get("org")
+                country = data.get("country_code") or data.get("country")
                 region = data.get("region")
             return {
                 "ip": ip,
