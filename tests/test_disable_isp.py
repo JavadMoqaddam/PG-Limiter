@@ -15,7 +15,7 @@ import utils.warning_system as warning_package
 import utils.warning_system.enhanced_system as warning_module
 from db.crud import UserCRUD
 from utils.isp_detector import ISPDetector
-from utils.types import PanelType, UserType
+from utils.types import ConnectionInfo, PanelType, UserType
 from utils.warning_system.enhanced_system import EnhancedWarningSystem
 
 
@@ -118,6 +118,44 @@ async def test_warning_scans_make_no_isp_requests(notice_cycle):
         assert case["system"].warnings["alice"].consecutive_violations == 2
         assert case["requests"] == []
         assert case["outcomes"] == []
+    finally:
+        await case["detector"].close()
+
+
+async def test_inbound_counting_fetches_isp_only_after_two_inbounds_cause_disable(notice_cycle):
+    case = notice_cycle
+    case["config"]["device_count_mode"] = "inbound"
+    user = case["users"]["alice"]
+
+    def observe(inbounds):
+        user.device_info.connections = [
+            ConnectionInfo(ip, 1, "node", inbound, case["now"][0]) for ip, inbound in zip(user.ip, inbounds)
+        ]
+        user.device_info.inbound_protocols = set(inbounds)
+
+    try:
+        observe(["Vless TCP", "Vless TCP"])
+        await run_cycle(case)
+        assert "alice" not in case["system"].warnings
+        assert case["requests"] == []
+
+        observe(["Vless TCP", "Vless WS"])
+        for _ in range(2):
+            case["now"][0] += 60
+            await run_cycle(case)
+        assert case["system"].warnings["alice"].consecutive_violations == 2
+        assert case["requests"] == []
+
+        case["now"][0] += 60
+        await run_cycle(case)
+        assert case["outcomes"] == ["alice"]
+        assert len(case["requests"]) == 2
+        assert case["request_states"] == [False, False]
+        message, _username = case["messages"][-1]
+        assert "USER DISABLED" in message
+        assert "Example &lt;ISP&gt; &amp; Co" in message
+        assert "5.6.7.10" in message and "5.6.7.20" in message
+        assert "alice" not in case["system"].warnings
     finally:
         await case["detector"].close()
 
