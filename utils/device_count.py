@@ -115,8 +115,9 @@ def device_key(
     """
     Return the identity of the device behind a single connection.
 
-    Two connections that map to the same key are the same device. ``None`` means
-    the connection must not be counted at all.
+    Two connections that map to the same key are the same device. CDN keys are
+    broad groups; ``count_devices`` also resolves overlapping observations across
+    groups. ``None`` means the connection must not be counted at all.
 
     Args:
         conn: One connection of the user.
@@ -223,6 +224,10 @@ def count_devices(
     """
     Count the distinct devices of one user.
 
+    A CDN group adds no device when its observations overlap traffic outside the
+    group: matching IP/inbound in "device" mode, or matching IP in "ip" mode.
+    Distinct ordinary device groups stay separate.
+
     Args:
         user: The user whose connections are counted.
         config: Counting and grouping rules; defaults are used when omitted.
@@ -242,18 +247,37 @@ def count_devices(
     if not connections:
         return fallback_count
 
-    apply_high_trust = (
-        config.high_trust_ip_grouping and trust_score >= config.high_trust_threshold
-    )
+    apply_high_trust = config.high_trust_ip_grouping and trust_score >= config.high_trust_threshold
 
     unique_devices = set()
+    direct_observations: set[tuple] = set()
+    non_cdn_node_observations: set[tuple] = set()
+    cdn_node_observations: set[tuple] = set()
+    cdn_inbound_observations: dict[tuple, set[tuple]] = {}
     for conn in connections:
-        key = device_key(
-            conn, config, apply_high_trust=apply_high_trust, isp_info=isp_info
-        )
+        key = device_key(conn, config, apply_high_trust=apply_high_trust, isp_info=isp_info)
         if key is not None:
-            unique_devices.add(key)
-    return len(unique_devices)
+            # Match real observations rather than subnet/trust keys, so grouping
+            # never invents a link between different IPs across CDN categories.
+            observation = (conn.ip,) if config.count_mode == COUNT_MODE_IP else (conn.ip, conn.inbound_protocol)
+            if key == ("CDN_NODE",):
+                cdn_node_observations.add(observation)
+            elif key[0] == "CDN_INBOUND":
+                cdn_inbound_observations.setdefault(key, set()).add(observation)
+                non_cdn_node_observations.add(observation)
+            else:
+                unique_devices.add(key)
+                direct_observations.add(observation)
+                non_cdn_node_observations.add(observation)
+
+    # Suppress a broad CDN bucket if one of its observations is already counted
+    # outside it. Do not union all overlapping buckets: that would merge distinct
+    # ordinary devices or CDN inbound tags through the shared CDN-node bucket.
+    inbound_count = sum(
+        observations.isdisjoint(direct_observations) for observations in cdn_inbound_observations.values()
+    )
+    node_count = bool(cdn_node_observations) and cdn_node_observations.isdisjoint(non_cdn_node_observations)
+    return len(unique_devices) + inbound_count + int(node_count)
 
 
 def build_ip_details(user_info: EnhancedUserInfo, original_user: UserType | None) -> list[str]:
