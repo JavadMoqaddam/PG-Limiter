@@ -1,7 +1,7 @@
 """
 This module checks if a user (name and IP address)
 appears more than two times in the ACTIVE_USERS list.
-Enhanced with warning system and ISP detection.
+Enhanced with warning monitoring and device counting.
 """
 
 import asyncio
@@ -413,8 +413,6 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
        (for setting their limit via inline buttons)
     3. Respects group filter and admin filter settings
     """
-    global isp_detector
-
     if config_data is None:
         config_data = await read_config()
     general_limit = config_data.get("limits", {}).get("general", 2)
@@ -436,13 +434,8 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     # Get panel data for filter checks
     panel_config = config_data.get("panel", {})
     panel_data = PanelType(
-        panel_config.get("username", ""),
-        panel_config.get("password", ""),
-        panel_config.get("domain", "")
+        panel_config.get("username", ""), panel_config.get("password", ""), panel_config.get("domain", "")
     )
-
-    # Initialize or update ISP detector with token from config
-    isp_detector = await _ensure_isp_detector(config_data)
 
     if active_users_snapshot is None:
         active_users_snapshot = await get_active_users_snapshot()
@@ -452,8 +445,7 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     enhanced_users_info = {}
     filtered_users = set()  # Users filtered out by group/admin filters
 
-    # Collect all unique IPs for batch ISP lookup
-    all_ips = set()
+    # Keep display grouping separate from the raw addresses used for counting.
     ip_mappings = {}
     all_actual_ips = set()
 
@@ -475,20 +467,6 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
         subnet_ips, ip_mapping = group_ips_by_subnet(all_unique_ips)
         all_users_log[email] = subnet_ips
         ip_mappings[email] = ip_mapping
-
-        for ip in all_unique_ips:
-            all_ips.add(ip)
-
-    logger.info(f"📊 Collected {len(all_ips)} unique IPs from {len(all_users_log)} users")
-
-    # Get ISP information for all IPs
-    if all_ips:
-        logger.info(f"🔍 Looking up ISP info for {len(all_ips)} IPs...")
-        isp_info_batch = await isp_detector.get_multiple_isp_info(list(all_ips))
-        logger.info(f"✅ ISP lookup complete: {len(isp_info_batch)} results")
-    else:
-        isp_info_batch = {}
-        logger.info("📊 No IPs to look up (no active connections)")
 
     # Pre-filter users based on group and admin filter settings (In-Memory Batch)
     logger.debug("🔍 Applying user filters (In-Memory Batch)...")
@@ -552,29 +530,10 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
             continue
 
         ip_mapping = ip_mappings.get(email, {})
-        enhanced_formatted_ips = []
         actual_ips_for_counting = []
 
         for formatted_ip in formatted_ips:
-            actual_ips = ip_mapping.get(formatted_ip, [formatted_ip])
-            actual_ips_for_counting.extend(actual_ips)
-
-            if len(actual_ips) == 1:
-                ip = actual_ips[0]
-                if ip in isp_info_batch:
-                    isp_info = isp_info_batch[ip]
-                    enhanced_ip = isp_detector.format_ip_with_isp(ip, isp_info)
-                else:
-                    enhanced_ip = ip
-                enhanced_formatted_ips.append(enhanced_ip)
-            else:
-                first_ip = actual_ips[0]
-                if first_ip in isp_info_batch:
-                    isp_info = isp_info_batch[first_ip]
-                    enhanced_ip = f"{formatted_ip} ({isp_info['isp']}, {isp_info['country']})"
-                else:
-                    enhanced_ip = formatted_ip
-                enhanced_formatted_ips.append(enhanced_ip)
+            actual_ips_for_counting.extend(ip_mapping.get(formatted_ip, [formatted_ip]))
 
         is_monitored = warning_system.is_user_being_monitored(email)
         time_remaining = 0
@@ -583,9 +542,9 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
 
         enhanced_users_info[email] = EnhancedUserInfo(
             user=UserType(name=email, ip=actual_ips_for_counting),
-            formatted_ips=enhanced_formatted_ips,
+            formatted_ips=formatted_ips,
             is_being_monitored=is_monitored,
-            warning_time_remaining=time_remaining
+            warning_time_remaining=time_remaining,
         )
 
     total_ips = len(all_actual_ips)
@@ -608,14 +567,12 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
         if email in warning_system.warnings:
             user_trust_score = warning_system.warnings[email].trust_score
 
-        # Get ISP info for this user's IPs
-        user_isp_info = {ip: isp_info_batch.get(ip, {}) for ip in user_info.user.ip if ip in isp_info_batch}
-
         ip_details, device_count = count_devices_and_details(
-            user_info, original_user, show_enhanced_details,
+            user_info,
+            original_user,
+            show_enhanced_details,
             device_config=device_config,
             user_trust_score=user_trust_score,
-            isp_info=user_isp_info,
         )
         all_user_device_counts[email] = device_count
         all_user_ip_details[email] = ip_details
@@ -874,10 +831,8 @@ def _sample_is_trustworthy(all_users_actual_ips: dict, check_interval: int) -> b
 
 async def check_users_usage(panel_data: PanelType, config_data: dict | None = None):
     """
-    Enhanced function to check usage with warning system and ISP detection
+    Check device usage and monitor consecutive violations before applying punishment.
     """
-    global isp_detector
-
     if config_data is None:
         config_data = await read_config()
     if config_data.get("device_count_mode") == COUNT_MODE_INBOUND and config_data.get("ip_source") == "api":
@@ -899,9 +854,6 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     async with get_db() as db:
         special_limit = await UserCRUD.get_all_special_limits(db)
 
-    # Initialize or update ISP detector
-    isp_detector = await _ensure_isp_detector(config_data)
-
     # Sync dynamic check interval and max warning count to warning system
     check_interval = config_data.get("check_interval", 60)
     max_warning_count = config_data.get("max_warning_count", 3)
@@ -913,7 +865,6 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # This is critical for warning system to work correctly
     all_users_actual_ips = {}  # Maps username to set of actual unique IPs
     all_users_data = {}  # Maps username to UserType with full data
-    all_ips_for_isp_lookup = set()  # Collect all IPs for batch ISP lookup
 
     for email in list(active_users_snapshot.keys()):
         data = active_users_snapshot[email]
@@ -922,15 +873,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         all_users_actual_ips[email] = unique_ips
         all_users_data[email] = data
 
-        # Add to ISP lookup set
-        all_ips_for_isp_lookup.update(unique_ips)
-
-    logger.info(f"📊 Found {len(all_users_actual_ips)} active users with {len(all_ips_for_isp_lookup)} unique IPs")
-
-    # Batch fetch ISP info for all IPs
-    logger.info(f"🔍 Looking up ISP info for {len(all_ips_for_isp_lookup)} IPs...")
-    isp_info_batch = await isp_detector.get_multiple_isp_info(list(all_ips_for_isp_lookup))
-    logger.info(f"✅ ISP lookup complete")
+    logger.info("📊 Found %s active users", len(all_users_actual_ips))
 
     # Record IPs to history for the long-term reports (one statement per cycle)
     logger.debug("📝 Recording IPs to history tracker...")
@@ -979,17 +922,15 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     for _u_name, _u_ips in all_users_actual_ips.items():
         _u_data = all_users_data.get(_u_name)
         _w_curr = warning_system.warnings.get(_u_name)
-        _u_isp = {ip: isp_info_batch.get(ip, {}) for ip in _u_ips if ip in isp_info_batch}
         all_users_device_counts[_u_name] = count_devices(
             _u_data,
             device_config,
             trust_score=_w_curr.trust_score if _w_curr else 0.0,
-            isp_info=_u_isp,
             # No connection detail for this user, so the addresses are all there
             # is. This used to pass len(_u_ips) - the raw IP count - which ignores
             # subnet grouping and would read a single /24 as N separate devices,
             # exactly the measure that caused the earlier wave of false bans.
-            fallback_count=count_devices_from_ips(_u_ips, device_config, _u_isp),
+            fallback_count=count_devices_from_ips(_u_ips, device_config),
         )
 
     total_devices_cycle = sum(all_users_device_counts.values())
@@ -1017,7 +958,10 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # is whitelisted, and whose limit is actually known this cycle.
     from utils.user_sync import USER_METADATA_CACHE as _metadata_cache
     disabled_users, warned_users = await warning_system.check_persistent_violations(
-        panel_data, all_users_actual_ips, config_data, batched_group_limits,
+        panel_data,
+        all_users_actual_ips,
+        config_data,
+        batched_group_limits,
         device_counts=all_users_device_counts,
         sample_is_trustworthy=counters_are_trustworthy,
         except_users=except_users,
@@ -1099,7 +1043,6 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
 
             # Get user data and ISP info for this user
             user_data = all_users_data.get(user_name)
-            user_isp_info = {ip: isp_info_batch.get(ip, {}) for ip in unique_ips if ip in isp_info_batch}
 
             # Effective device count comes from the cycle-wide precompute so
             # that warn / ban / clear all agree on the same number.
@@ -1112,9 +1055,13 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                 was_monitored = user_name in warning_system.warnings
 
                 result = await warning_system.add_warning(
-                    user_name, effective_device_count, unique_ips, user_limit_number,
-                    user_data=user_data, isp_info=user_isp_info, panel_data=panel_data,
-                    send_telegram_notification=False
+                    user_name,
+                    effective_device_count,
+                    unique_ips,
+                    user_limit_number,
+                    user_data=user_data,
+                    panel_data=panel_data,
+                    send_telegram_notification=False,
                 )
 
                 if was_monitored:
@@ -1148,19 +1095,26 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     activity_summary = w_obj.get_ip_activity_summary() if w_obj else ""
 
                     ban_action = str(punishment_result.get("action") or "")
+                    # Clear the incident before optional network enrichment or Telegram.
+                    # A provider failure must never repeat an applied punishment.
+                    await warning_system.clear_user_trust_data(user_name)
+                    if ban_action in ("disabled", "revoked") and w_obj is not None:
+                        from utils.warning_system.helpers import get_disable_ip_activity
+
+                        activity_summary = await get_disable_ip_activity(w_obj, config_data)
                     if ban_action == "revoked":
                         revoke_note = "✅ Sub revoked" if punishment_result.get("revoke_success", False) else "⚠️ Revoke failed"
                         uuid_note = "✅ UUID reset" if punishment_result.get("uuid_reset_success", False) else "⚠️ UUID failed"
                         msg = (
                             f"🔄 <b>SUBSCRIPTION REVOKED + DISABLED</b> - {time_str}\n\n"
-                            f"User: <code>{user_name}</code>\n"
+                            f"User: <code>{html.escape(user_name)}</code>\n"
                             f"Active Devices: <code>{effective_device_count}</code> ({len(unique_ips)} IPs)\n"
                             f"User limit: <code>{user_limit_number}</code>\n"
                             f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                             f"📊 Violation #{punishment_result.get('violation_count', 1)} (Step {punishment_result.get('step_index', 0) + 1})\n"
                             f"{revoke_note}, {uuid_note}\n"
                             f"Duration: <code>Until manual enable</code>\n"
-                            f"📊 IP Activity:\n<code>{activity_summary}</code>"
+                            f"📊 IP Activity:\n<code>{html.escape(activity_summary)}</code>"
                         )
                     elif ban_action in ("error", "skipped"):
                         # No punishment was applied. This used to fall into the
@@ -1172,7 +1126,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         reason = _esc(str(punishment_result.get("message") or ban_action))
                         msg = (
                             f"❗️ <b>BAN FAILED</b> - {time_str}\n\n"
-                            f"User: <code>{user_name}</code>\n"
+                            f"User: <code>{html.escape(user_name)}</code>\n"
                             f"Active Devices: <code>{effective_device_count}</code> ({len(unique_ips)} IPs)\n"
                             f"User limit: <code>{user_limit_number}</code>\n"
                             f"Outcome: <code>{ban_action}</code>\n"
@@ -1183,7 +1137,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     elif ban_action == "warning":
                         msg = (
                             f"⚠️ <b>WARNING STEP APPLIED</b> - {time_str}\n\n"
-                            f"User: <code>{user_name}</code>\n"
+                            f"User: <code>{html.escape(user_name)}</code>\n"
                             f"Active Devices: <code>{effective_device_count}</code> ({len(unique_ips)} IPs)\n"
                             f"User limit: <code>{user_limit_number}</code>\n\n"
                             f"📊 Violation #{punishment_result.get('violation_count', 1)} (Step {punishment_result.get('step_index', 0) + 1})\n"
@@ -1192,21 +1146,14 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     else:
                         msg = (
                             f"🚫 <b>USER DISABLED</b> - {time_str}\n\n"
-                            f"User: <code>{user_name}</code>\n"
+                            f"User: <code>{html.escape(user_name)}</code>\n"
                             f"Active Devices: <code>{effective_device_count}</code> ({len(unique_ips)} IPs)\n"
                             f"User limit: <code>{user_limit_number}</code>\n"
                             f"Trust Level: {trust_level} (<code>{trust_score:.0f}</code>)\n\n"
                             f"📊 Violation #{punishment_result.get('violation_count', 1)} (Step {punishment_result.get('step_index', 0) + 1})\n"
                             f"{duration_text}"
-                            f"📊 IP Activity:\n<code>{activity_summary}</code>"
+                            f"📊 IP Activity:\n<code>{html.escape(activity_summary)}</code>"
                         )
-                    # Clear the record BEFORE notifying, and never let a Telegram
-                    # failure propagate. The old order was notify-then-clear with the
-                    # raw sender, so an unreachable chat left consecutive_violations at
-                    # the threshold: the next cycle returned "violation_limit_reached"
-                    # again and record_violation advanced the escalation a second time,
-                    # jumping the user a punishment step for a single offence.
-                    await warning_system.clear_user_trust_data(user_name)
                     await safe_send_disable_notification(msg, user_name)
                     if ban_action in ("error", "skipped"):
                         logger.error(

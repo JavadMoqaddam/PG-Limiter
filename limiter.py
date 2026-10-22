@@ -152,14 +152,16 @@ async def main():
         # Start Telegram bot and message dispatcher in background tasks (keep strong references)
         main_logger.debug("Starting Telegram bot and dispatcher tasks...")
         from telegram_bot.dispatcher import get_dispatcher
+
         dispatcher = get_dispatcher()
         dispatcher_task = asyncio.create_task(
             _supervise("dispatcher_worker", dispatcher.start_worker), name="dispatcher_worker"
         )
         bot_task = asyncio.create_task(run_telegram_bot(), name="telegram_bot_runner")
-        # Supervised retention: prune old violation history and ISP cache, which
-        # otherwise grew without bound because their cleanup had no live caller.
+        # Supervised retention: prune old violation history, which otherwise
+        # grew without bound because its cleanup had no live caller.
         from utils.maintenance import retention_maintenance_loop
+
         retention_task = asyncio.create_task(
             _supervise("retention_maintenance", retention_maintenance_loop),
             name="retention_maintenance",

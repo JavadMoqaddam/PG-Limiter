@@ -19,7 +19,6 @@ from utils.device_count import (
     count_devices_from_ips,
     group_ips_by_subnet,
     subnet_key,
-    wide_subnet_key,
 )
 from utils.types import ConnectionInfo, DeviceInfo, EnhancedUserInfo, UserType
 
@@ -274,39 +273,25 @@ class TestSubnetGrouping:
         user = make_user([("5.6.7.10", "Vless", 1), ("5.6.7.99", "Vmess", 2)])
         assert count_devices(user, config) == 1
 
-    def test_wide_mode_groups_a_16_when_the_isp_matches(self):
-        config = DeviceCountingConfig(subnet_ip_grouping=True, subnet_grouping_mode="/16")
-        user = make_user([("5.6.7.10", "Vless", 1), ("5.6.200.4", "Vless", 1)])
-        isp_info = {
-            "5.6.7.10": {"isp": "Irancell"},
-            "5.6.200.4": {"isp": "Irancell"},
-        }
-        assert count_devices(user, config, isp_info=isp_info) == 1
-
-    def test_wide_mode_keeps_different_isps_apart(self):
-        config = DeviceCountingConfig(subnet_ip_grouping=True, subnet_grouping_mode="/16")
-        user = make_user([("5.6.7.10", "Vless", 1), ("5.6.200.4", "Vless", 1)])
-        isp_info = {
-            "5.6.7.10": {"isp": "Irancell"},
-            "5.6.200.4": {"isp": "Mobinnet"},
-        }
-        assert count_devices(user, config, isp_info=isp_info) == 2
-
-    def test_wide_mode_without_isp_info_falls_back_to_24(self):
-        # Grouping a whole /16 of unrelated customers would hide real sharing,
-        # so an unknown ISP narrows the key instead of widening it.
+    def test_legacy_wide_mode_keeps_different_24s_separate(self):
         config = DeviceCountingConfig(subnet_ip_grouping=True, subnet_grouping_mode="/16")
         user = make_user([("5.6.7.10", "Vless", 1), ("5.6.200.4", "Vless", 1)])
         assert count_devices(user, config) == 2
 
-    def test_org_is_used_when_isp_is_missing(self):
+    def test_legacy_wide_mode_groups_same_24_without_isp_dependency(self):
         config = DeviceCountingConfig(subnet_ip_grouping=True, subnet_grouping_mode="/16")
+        user = make_user([("5.6.7.10", "Vless", 1), ("5.6.7.20", "Vless", 1)])
+        assert count_devices(user, config) == 1
+
+    def test_legacy_wide_mode_in_ip_mode_keeps_different_24s_separate(self):
+        config = DeviceCountingConfig(count_mode=COUNT_MODE_IP, subnet_ip_grouping=True, subnet_grouping_mode="/16")
         user = make_user([("5.6.7.10", "Vless", 1), ("5.6.200.4", "Vless", 1)])
-        isp_info = {
-            "5.6.7.10": {"org": "AS44244 Irancell"},
-            "5.6.200.4": {"isp": "", "org": "AS44244 Irancell"},
-        }
-        assert count_devices(user, config, isp_info=isp_info) == 1
+        assert count_devices(user, config) == 2
+
+    def test_legacy_wide_mode_still_splits_different_inbounds_inside_one_24(self):
+        config = DeviceCountingConfig(subnet_ip_grouping=True, subnet_grouping_mode="/16")
+        user = make_user([("5.6.7.10", "Vless", 1), ("5.6.7.20", "Vmess", 1)])
+        assert count_devices(user, config) == 2
 
 
 class TestHighTrustGrouping:
@@ -396,10 +381,9 @@ class TestCountDevicesFromIps:
         config = DeviceCountingConfig(subnet_ip_grouping=True)
         assert count_devices_from_ips(["5.6.7.10", "5.6.9.10"], config) == 2
 
-    def test_wide_mode_uses_the_isp(self):
+    def test_legacy_wide_mode_fallback_keeps_different_24s_separate(self):
         config = DeviceCountingConfig(subnet_ip_grouping=True, subnet_grouping_mode="/16")
-        isp_info = {"5.6.7.10": {"isp": "Irancell"}, "5.6.200.4": {"isp": "Irancell"}}
-        assert count_devices_from_ips(["5.6.7.10", "5.6.200.4"], config, isp_info) == 1
+        assert count_devices_from_ips(["5.6.7.10", "5.6.200.4"], config) == 2
 
     def test_count_mode_makes_no_difference(self):
         # The inbound is unknown here, so "device" mode has nothing extra to split
@@ -475,7 +459,7 @@ class TestFromConfig:
         assert config.cdn_inbounds == ["CDN_WS"]
         assert config.cdn_nodes == [5]
         assert config.disabled_nodes == [9]
-        assert config.subnet_grouping_mode == "/16"
+        assert config.subnet_grouping_mode == "/24"
         assert config.high_trust_threshold == 35
 
     def test_null_lists_become_empty_lists(self):
@@ -486,22 +470,17 @@ class TestFromConfig:
 
 
 class TestSubnetKeys:
-    """The two subnet widths used by the grouping rules."""
+    """The /24 subnet keys used by the grouping rules."""
 
     def test_24_key_drops_the_last_octet(self):
         assert subnet_key("5.6.7.8") == "5.6.7"
 
-    def test_16_key_keeps_two_octets(self):
-        assert wide_subnet_key("5.6.7.8") == "5.6"
-
     def test_malformed_address_is_its_own_key(self):
         assert subnet_key("not-an-ip") == "not-an-ip"
-        assert wide_subnet_key("not-an-ip") == "not-an-ip"
 
     def test_ipv6_is_never_truncated(self):
         address = "2a01:5ec0:5011:9962:d8ed:c723:c32:ac2a"
         assert subnet_key(address) == address
-        assert wide_subnet_key(address) == address
 
 
 class TestGroupIpsBySubnet:

@@ -160,44 +160,9 @@ class DisabledUser(Base):
     original_groups = Column(JSON, default=list)
     reason = Column(Text, nullable=True)
     punishment_step = Column(Integer, default=0)
-    
+
     def __repr__(self):
         return f"<DisabledUser(username='{self.username}', disabled_at={self.disabled_at})>"
-
-
-class SubnetISP(Base):
-    """
-    ISP cache for IP subnets.
-    Stores ISP info for /24 subnets to avoid repeated API calls.
-    e.g., for IP 192.168.1.100, subnet would be "192.168.1"
-    """
-    __tablename__ = "subnet_isp"
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    subnet = Column(String(50), unique=True, nullable=False, index=True)  # e.g., "192.168.1"
-    
-    # ISP information
-    isp = Column(String(255), nullable=True)
-    country = Column(String(10), nullable=True)  # Country code
-    city = Column(String(100), nullable=True)
-    region = Column(String(100), nullable=True)
-    
-    # ASN info
-    asn = Column(String(50), nullable=True)  # e.g., "AS12345"
-    as_name = Column(String(255), nullable=True)
-    
-    # Cache metadata
-    cached_at = Column(DateTime, default=utc_now)
-    hit_count = Column(Integer, default=1)  # How many times this cache was used
-    
-    __table_args__ = (
-        Index("ix_subnet_isp_country", "country"),
-        Index("ix_subnet_isp_isp", "isp"),
-        Index("ix_subnet_isp_cached_at", "cached_at"),
-    )
-    
-    def __repr__(self):
-        return f"<SubnetISP(subnet='{self.subnet}', isp='{self.isp}', country='{self.country}')>"
 
 
 class ViolationHistory(Base):
@@ -205,11 +170,12 @@ class ViolationHistory(Base):
     Violation history for the smart punishment system.
     Tracks when users violated IP limits and what punishment was applied.
     """
+
     __tablename__ = "violation_history"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(255), nullable=False, index=True)
-    
+
     # Violation details
     timestamp = Column(Float, nullable=False)  # Unix timestamp
     step_applied = Column(Integer, nullable=False)  # Which punishment step was applied

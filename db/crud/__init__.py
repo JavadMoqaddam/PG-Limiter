@@ -17,9 +17,6 @@ from db.crud.except_users import ExceptUserCRUD
 # Disabled user operations
 from db.crud.disabled_users import DisabledUserCRUD
 
-# Subnet ISP cache operations
-from db.crud.subnet_isp import SubnetISPCRUD
-
 # Violation history operations
 from db.crud.violations import ViolationHistoryCRUD
 
@@ -34,7 +31,6 @@ __all__ = [
     "UserLimitCRUD",
     "ExceptUserCRUD",
     "DisabledUserCRUD",
-    "SubnetISPCRUD",
     "ViolationHistoryCRUD",
     "ConfigCRUD",
     "IPHistoryCRUD",

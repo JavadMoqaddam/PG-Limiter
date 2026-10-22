@@ -40,7 +40,7 @@ def _build_device_count_text(config_data: dict) -> str:
     current_mode = str(config_data.get("device_count_mode") or "device")
     ip_source = str(config_data.get("ip_source") or "logs")
     subnet_on = "✅ on" if config_data.get("subnet_ip_grouping") else "❌ off"
-    subnet_mode = str(config_data.get("subnet_grouping_mode") or "/24")
+    subnet_mode = "/24"
     high_trust_on = "✅ on" if config_data.get("high_trust_ip_grouping") else "❌ off"
 
     if current_mode == COUNT_MODE_INBOUND:

@@ -1,265 +1,137 @@
-#!/usr/bin/env python3
-"""
-Tests for ISP Detection functionality
-Tests IP to ISP lookup, caching, and subnet detection.
-"""
+"""Provider contracts for fresh per-IP disable-notice lookups."""
 
+import asyncio
+
+import httpx
 import pytest
-from unittest.mock import patch, AsyncMock, MagicMock
+
+from utils.isp_detector import ISPDetector
 
 
-class TestISPDetector:
-    """Tests for ISPDetector class"""
-    
-    def test_initialization_no_token(self):
-        """Test initialization without API token"""
-        from utils.isp_detector import ISPDetector
-        
-        detector = ISPDetector()
-        
-        # Should use fallback mode without token
-        assert detector.use_fallback_only is True
-    
-    def test_initialization_with_token(self):
-        """Test initialization with API token"""
-        from utils.isp_detector import ISPDetector
-        
-        detector = ISPDetector(token="test_token_12345")
-        
-        assert detector.token == "test_token_12345"
-    
-    def test_cache_initialization(self):
-        """Test cache is initialized"""
-        from utils.isp_detector import ISPDetector
-        
-        detector = ISPDetector()
-        
-        assert isinstance(detector.cache, dict)
-        assert len(detector.cache) == 0
-    
-    def test_default_isp_info(self):
-        """Test default ISP info generation"""
-        from utils.isp_detector import _default_isp_info
-        
-        result = _default_isp_info("1.2.3.4")
-        
-        assert result["ip"] == "1.2.3.4"
-        assert result["isp"] == "Unknown ISP"
-        assert result["country"] == "Unknown"
-    
-    def test_rate_limit_delay(self):
-        """Test rate limit delay is set"""
-        from utils.isp_detector import ISPDetector
-        
-        detector = ISPDetector()
-        
-        assert detector.rate_limit_delay > 0
-    
-    @pytest.mark.asyncio
-    async def test_close_session(self):
-        """Test closing HTTP session"""
-        from utils.isp_detector import ISPDetector
-        
-        detector = ISPDetector()
-        
-        # Should not raise even if no session exists
+@pytest.mark.parametrize(
+    "token,fallback,host", [("tok", False, "ipinfo.io"), (None, False, "ip-api.com"), ("tok", True, "ip-api.com")]
+)
+async def test_selected_provider_receives_each_fresh_lookup(token, fallback, host):
+    requests = []
+
+    def transport(request):
+        requests.append(request)
+        if request.url.host == "ip-api.com":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "asname": "Example ISP",
+                    "countryCode": "IR",
+                    "regionName": "Tehran",
+                    "city": "Tehran",
+                },
+            )
+        return httpx.Response(200, json={"org": "Example ISP", "country": "IR", "region": "Tehran", "city": "Tehran"})
+
+    detector = ISPDetector(token=token, use_fallback_only=fallback)
+    detector._client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+    try:
+        first = await detector.get_isp_info("5.6.7.10")
+        second = await detector.get_isp_info("5.6.7.10")
+        assert len(requests) == 2
+        assert {request.url.host for request in requests} == {host}
+        assert (
+            first
+            == second
+            == {"ip": "5.6.7.10", "isp": "Example ISP", "country": "IR", "region": "Tehran", "city": "Tehran"}
+        )
+        if host == "ipinfo.io":
+            assert requests[0].headers["Authorization"] == "Bearer tok"
+        else:
+            assert "Authorization" not in requests[0].headers
+    finally:
         await detector.close()
 
 
-class TestISPCaching:
-    """Tests for ISP caching functionality"""
-    
-    @pytest.mark.asyncio
-    async def test_cache_hit(self):
-        """Test cached ISP info is returned"""
-        from utils.isp_detector import ISPDetector
-        
-        detector = ISPDetector()
-        
-        # Pre-populate cache
-        cached_info = {
-            "ip": "8.8.8.8",
-            "isp": "Google LLC",
-            "country": "US",
-            "city": "Mountain View",
-            "region": "California"
-        }
-        detector.cache["8.8.8.8"] = cached_info
-        
-        # Should return cached value without API call
-        result = await detector.get_isp_info("8.8.8.8")
-        
-        assert result["isp"] == "Google LLC"
-        assert result["country"] == "US"
-    
-    def test_cache_storage(self):
-        """Test ISP info is stored in cache"""
-        from utils.isp_detector import ISPDetector
-        
-        detector = ISPDetector()
-        
-        # Store in cache
-        detector.cache["1.1.1.1"] = {
-            "ip": "1.1.1.1",
-            "isp": "Cloudflare",
-            "country": "US"
-        }
-        
-        assert "1.1.1.1" in detector.cache
-        assert detector.cache["1.1.1.1"]["isp"] == "Cloudflare"
+async def test_token_removal_switches_provider_and_discards_previous_auth():
+    requests = []
+
+    def transport(request):
+        requests.append(request)
+        return httpx.Response(200, json={"status": "success", "isp": "Fallback ISP", "countryCode": "IR"})
+
+    detector = ISPDetector(token="old-token")
+    old_client = await detector._get_client()
+    await detector.reconfigure(token=None)
+    assert old_client.is_closed
+    detector._client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+    try:
+        info = await detector.get_isp_info("5.6.7.10")
+        assert requests[0].url.host == "ip-api.com"
+        assert "Authorization" not in requests[0].headers
+        assert info["isp"] == "Fallback ISP"
+    finally:
+        await detector.close()
 
 
-class TestSubnetDetection:
-    """Tests for subnet-based ISP detection"""
-    
-    def test_same_subnet_ips(self):
-        """Test IPs in same subnet"""
-        import ipaddress
-        
-        ip1 = ipaddress.ip_address("192.168.1.1")
-        ip2 = ipaddress.ip_address("192.168.1.100")
-        
-        # Get /24 networks
-        net1 = ipaddress.ip_network(f"{ip1}/24", strict=False)
-        net2 = ipaddress.ip_network(f"{ip2}/24", strict=False)
-        
-        # Should be same network
-        assert net1 == net2
-    
-    def test_different_subnet_ips(self):
-        """Test IPs in different subnets"""
-        import ipaddress
-        
-        ip1 = ipaddress.ip_address("192.168.1.1")
-        ip2 = ipaddress.ip_address("10.0.0.1")
-        
-        net1 = ipaddress.ip_network(f"{ip1}/24", strict=False)
-        net2 = ipaddress.ip_network(f"{ip2}/24", strict=False)
-        
-        assert net1 != net2
+@pytest.mark.parametrize("payload", [{}, [], {"org": None}, {"org": "", "country": "IR"}])
+async def test_missing_provider_isp_is_explicitly_unknown(payload):
+    detector = ISPDetector(token="tok")
+    detector._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=payload))
+    )
+    try:
+        info = await detector.get_isp_info("5.6.7.10")
+        assert info["isp"] == "Unknown ISP"
+        assert "Unknown ISP" in detector.format_ip_with_isp("5.6.7.10", info)
+    finally:
+        await detector.close()
 
 
-class TestISPFormatting:
-    """Tests for ISP info formatting"""
-    
-    def test_format_ip_with_isp(self):
-        """Test formatting IP with ISP info"""
-        from utils.isp_detector import ISPDetector
-        
-        detector = ISPDetector()
-        
-        isp_info = {
-            "ip": "8.8.8.8",
-            "isp": "Google LLC",
-            "country": "US"
-        }
-        
-        formatted = detector.format_ip_with_isp("8.8.8.8", isp_info)
-        
-        assert "8.8.8.8" in formatted
-        assert "Google" in formatted
-        assert "US" in formatted
-    
-    def test_format_unknown_isp(self):
-        """Test formatting with unknown ISP"""
-        from utils.isp_detector import ISPDetector
-        
-        detector = ISPDetector()
-        
-        isp_info = {
-            "ip": "1.2.3.4",
-            "isp": "Unknown ISP",
-            "country": "Unknown"
-        }
-        
-        formatted = detector.format_ip_with_isp("1.2.3.4", isp_info)
-        
-        assert "1.2.3.4" in formatted
-    
-    def test_format_as_prefixed_isp(self):
-        """Test formatting ISP with AS prefix removal"""
-        from utils.isp_detector import ISPDetector
-        
-        detector = ISPDetector()
-        
-        isp_info = {
-            "ip": "1.1.1.1",
-            "isp": "AS13335 Cloudflare Inc",
-            "country": "US"
-        }
-        
-        formatted = detector.format_ip_with_isp("1.1.1.1", isp_info)
-        
-        # AS prefix should be removed or cleaned
-        assert "1.1.1.1" in formatted
+@pytest.mark.parametrize("status", [403, 429, 500])
+async def test_failed_response_does_not_prevent_a_fresh_later_request(status):
+    requests = []
+
+    def transport(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(status, json={"error": "unavailable"})
+        return httpx.Response(200, json={"org": "Recovered ISP", "country": "IR"})
+
+    detector = ISPDetector(token="tok")
+    detector._client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+    try:
+        assert (await detector.get_isp_info("5.6.7.10"))["isp"] == "Unknown ISP"
+        assert (await detector.get_isp_info("5.6.7.10"))["isp"] == "Recovered ISP"
+        assert len(requests) == 2
+    finally:
+        await detector.close()
 
 
-class TestIPAPIEndpoints:
-    """Tests for IP API endpoint handling"""
-    
-    def test_fallback_mode(self):
-        """Test fallback to ip-api.com"""
-        from utils.isp_detector import ISPDetector
-        
-        detector = ISPDetector(use_fallback_only=True)
-        
-        assert detector.use_fallback_only is True
-    
-    def test_rate_limited_flag(self):
-        """Test rate limited flag initialization"""
-        from utils.isp_detector import ISPDetector
-        
-        detector = ISPDetector()
-        
-        assert detector.rate_limited is False
+async def test_notice_deadline_keeps_completed_results_and_marks_slow_ip_unknown():
+    async def transport(request):
+        if request.url.path == "/5.6.7.20/json":
+            await asyncio.sleep(1)
+        return httpx.Response(200, json={"org": "Fast ISP", "country": "IR"})
+
+    detector = ISPDetector(token="tok")
+    detector._client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+    try:
+        results = await detector.get_multiple_isp_info(["5.6.7.10", "5.6.7.20"], timeout=0.02)
+        assert results["5.6.7.10"]["isp"] == "Fast ISP"
+        assert results["5.6.7.20"]["isp"] == "Unknown ISP"
+    finally:
+        await detector.close()
 
 
-async def test_removing_token_clears_secret_and_enables_fallback():
-    """Emptying the token must drop the secret and fall back, not keep the old auth."""
-    import asyncio  # noqa: F401
-    from utils.isp_detector import ISPDetector
+async def test_lookup_quotes_user_controlled_url_path():
+    requests = []
 
-    detector = ISPDetector(token="secret_token_value", use_fallback_only=False, use_db_cache=False)
-    assert detector.token == "secret_token_value"
-    assert detector.use_fallback_only is False
+    def transport(request):
+        requests.append(request)
+        return httpx.Response(200, json={"org": "Example ISP", "country": "IR"})
 
-    await detector.reconfigure(token=None, fallback=False)
-
-    assert detector.token is None
-    assert detector.use_fallback_only is True
-    assert detector.config_signature == (None, False)
-    await detector.close()
-
-
-async def test_reconfigure_updates_fallback_mode():
-    from utils.isp_detector import ISPDetector
-
-    detector = ISPDetector(token="tok", use_fallback_only=False, use_db_cache=False)
-    assert detector.use_fallback_only is False
-
-    await detector.reconfigure(token="tok", fallback=True)
-
-    assert detector.use_fallback_only is True
-    assert detector.config_signature == ("tok", True)
-    await detector.close()
-
-
-async def test_close_cancels_background_tasks_and_closes_client():
-    import asyncio
-    from utils.isp_detector import ISPDetector
-
-    detector = ISPDetector(token=None, use_fallback_only=True, use_db_cache=False)
-    client = await detector._get_client()
-    assert client.is_closed is False
-
-    async def _never_finishes():
-        await asyncio.sleep(3600)
-
-    task = detector._create_background_task(_never_finishes())
-    await asyncio.sleep(0)  # let the task start
-
-    await detector.close()
-
-    assert task.cancelled() or task.done()
-    assert detector._client is None
-    assert not detector._background_tasks
+    detector = ISPDetector(token="tok")
+    detector._client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+    try:
+        await detector.get_isp_info("5.6.7.10?token=other/fragment")
+        assert requests[0].url.query == b""
+        assert requests[0].url.raw_path == b"/5.6.7.10%3Ftoken%3Dother%2Ffragment/json"
+    finally:
+        await detector.close()

@@ -32,14 +32,12 @@ class UserLimitWarning:
     # Trust score fields
     trust_score: float = 0.0  # Higher = more trustworthy, Lower = more suspicious
     inbound_protocols: Set[str] = None
-    isp_names: Set[str] = None
     ip_subnets: Set[str] = None
     previous_warnings_12h: int = 0  # Count of disables in last 12 hours
     previous_warnings_24h: int = 0  # Count of disables in last 24 hours
     # Enhanced detection fields
     ip_to_inbounds: Dict = None  # Maps IP -> set of inbounds used
     same_ip_multiple_inbounds: bool = False  # True if same IP uses different inbounds (likely 1 device)
-    isp_change_pattern: str = None  # "sim_swap" or "multi_device" or None
     connection_details: list = None  # List of connection info for analysis
     user_limit: int = 1  # The user's effective limit
     consecutive_violations: int = 1  # Number of consecutive scan cycles user has violated
@@ -71,8 +69,6 @@ class UserLimitWarning:
             self.ip_seen_count = {}
         if self.inbound_protocols is None:
             self.inbound_protocols = set()
-        if self.isp_names is None:
-            self.isp_names = set()
         if self.ip_subnets is None:
             self.ip_subnets = set()
         if self.ip_to_inbounds is None:
@@ -138,7 +134,7 @@ class UserLimitWarning:
         """Get the count of confirmed devices (active IPs)."""
         return len(self.get_persistent_devices(min_duration_seconds))
     
-    def get_ip_activity_summary(self) -> str:
+    def get_ip_activity_summary(self, formatted_ips: Dict[str, str] = None) -> str:
         """Get a summary of IP activity for debugging/display."""
         lines = []
         current_time = time.time()
@@ -153,7 +149,8 @@ class UserLimitWarning:
             if not is_recent:
                 status = "❌"
             
-            lines.append(f"{status} {ip}: {duration:.0f}s active, seen {seen_count}x")
+            display_ip = (formatted_ips or {}).get(ip, ip)
+            lines.append(f"{status} {display_ip}: {duration:.0f}s active, seen {seen_count}x")
         
         return "\n".join(lines) if lines else "No IP activity recorded"
     
@@ -165,10 +162,10 @@ class UserLimitWarning:
             dict with analysis results
         """
         analysis = {
-            'same_ip_multi_inbound': False,
-            'multi_ip_same_inbound': False,
-            'pattern_type': 'unknown',
-            'details': []
+            "same_ip_multi_inbound": False,
+            "multi_ip_same_inbound": False,
+            "pattern_type": "unknown",
+            "details": [],
         }
         
         if not self.ip_to_inbounds:
@@ -200,27 +197,6 @@ class UserLimitWarning:
         
         return analysis
     
-    def detect_isp_change_pattern(self) -> str:
-        """
-        Detect ISP change patterns to identify SIM card swap vs multi-device.
-        
-        Returns:
-            str: "sim_swap", "multi_device", "single_isp", or "unknown"
-        """
-        if len(self.isp_names) <= 1:
-            return "single_isp"
-        
-        if len(self.ip_subnets) == len(self.ips) and len(self.isp_names) <= 2:
-            if self.connection_details:
-                if len(self.ips) == 2 and len(self.isp_names) == 2:
-                    return "sim_swap"
-            return "possible_sim_swap"
-        
-        if len(self.ip_subnets) < len(self.ips):
-            return "multi_device"
-        
-        return "unknown"
-    
     def calculate_trust_score(self) -> float:
         """
         Calculate trust score based on multiple behavioral factors.
@@ -235,59 +211,19 @@ class UserLimitWarning:
         # Factor 1: IP-Inbound Pattern Analysis
         ip_pattern = self.analyze_ip_inbound_pattern()
         
-        if ip_pattern['same_ip_multi_inbound']:
+        if ip_pattern["same_ip_multi_inbound"]:
             score += 20
             trust_logger.debug(f"Trust [{self.username}]: +20 (same IP, multiple inbounds)")
         
-        if ip_pattern['multi_ip_same_inbound']:
+        if ip_pattern["multi_ip_same_inbound"]:
             score -= 30
             trust_logger.debug(f"Trust [{self.username}]: -30 (multiple IPs, same inbound)")
         
         inbound_count = len(self.inbound_protocols)
-        if inbound_count > 1 and ip_count > 1 and not ip_pattern['same_ip_multi_inbound']:
+        if inbound_count > 1 and ip_count > 1 and not ip_pattern["same_ip_multi_inbound"]:
             penalty = min(inbound_count, ip_count) * 15
             score -= penalty
             trust_logger.debug(f"Trust [{self.username}]: -{penalty} ({inbound_count} inbounds, {ip_count} IPs)")
-        
-        # Factor 2: ISP/Network Pattern
-        isp_pattern = self.detect_isp_change_pattern()
-        self.isp_change_pattern = isp_pattern
-        
-        subnet_count = len(self.ip_subnets)
-        isp_count = len(self.isp_names)
-        
-        # when multiple /24 subnets are seen but they all belong to the
-        # same /16 range and come from the same ISP, we should treat them
-        # as a single network for the purpose of trust penalties.  this was
-        # requested by users who saw scores drop simply because their ips
-        # covered different /24s inside the same /16 (for example
-        # 173.135.1.x and 173.135.2.x).  the old logic counted each /24 as a
-        # separate subnet and applied a -15 penalty per subnet, which made
-        # high‑trust users look suspicious.  we now collapse by the first two
-        # octets when isp_count==1.
-        
-        if subnet_count > 1 and isp_count == 1:
-            # group subnets by /16 prefix
-            grouped_16 = set()
-            for s in self.ip_subnets:
-                parts = s.split('.')
-                if len(parts) >= 2:
-                    grouped_16.add(f"{parts[0]}.{parts[1]}")
-                else:
-                    grouped_16.add(s)
-            group_count = len(grouped_16)
-            penalty = (group_count - 1) * 15
-            score -= penalty
-            trust_logger.debug(
-                f"Trust [{self.username}]: -{penalty} ({group_count} /16 groups, same ISP)"
-            )
-        
-        if isp_pattern in ("sim_swap", "possible_sim_swap"):
-            score -= 8
-            trust_logger.debug(f"Trust [{self.username}]: -8 (possible SIM swap)")
-        elif isp_pattern == "multi_device":
-            score -= 25
-            trust_logger.debug(f"Trust [{self.username}]: -25 (multi-device ISP pattern)")
         
         # Factor 3: Warning History
         if self.previous_warnings_12h > 0:
@@ -332,17 +268,12 @@ class UserLimitWarning:
         patterns = []
         
         ip_pattern = self.analyze_ip_inbound_pattern()
-        if ip_pattern['pattern_type'] == 'single_device_switching':
+        if ip_pattern["pattern_type"] == "single_device_switching":
             patterns.append("📱 Single device switching protocols")
-        elif ip_pattern['pattern_type'] == 'multi_device':
+        elif ip_pattern["pattern_type"] == "multi_device":
             patterns.append("📲📲 Multiple devices detected")
-        elif ip_pattern['pattern_type'] == 'mixed':
+        elif ip_pattern["pattern_type"] == "mixed":
             patterns.append("🔀 Mixed device pattern")
-        
-        if self.isp_change_pattern == "sim_swap" or self.isp_change_pattern == "possible_sim_swap":
-            patterns.append("📶 Possible SIM card change")
-        elif self.isp_change_pattern == "multi_device":
-            patterns.append("🌐 Multiple ISPs (different locations)")
         
         if self.previous_warnings_12h > 0:
             patterns.append(f"⚠️ {self.previous_warnings_12h} disables in 12h")
