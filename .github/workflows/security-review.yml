@@ -22,10 +22,16 @@ permissions:
 jobs:
   security-review:
     name: Claude Code Security Review
+    # Dependabot and fork PRs have no repository secrets. Their ordinary tests,
+    # Bandit and CodeQL still run; the API-backed reviewer needs a trusted event.
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           # Check out the PR head and enough history for the action to diff the
           # change against its base.
@@ -33,7 +39,9 @@ jobs:
           fetch-depth: 2
 
       - name: Run Claude Code Security Review
-        uses: anthropics/claude-code-security-review@main
+        # No release tags are published. Keep a reviewed commit; Dependabot cannot
+        # update this pin until upstream publishes version tags.
+        uses: anthropics/claude-code-security-review@0c6a49f1fa56a1d472575da86a94dbc1edb78eda
         env:
           # Route Claude API traffic through the self-hosted gateway. The
           # underlying Claude Code process reads this from the environment.
