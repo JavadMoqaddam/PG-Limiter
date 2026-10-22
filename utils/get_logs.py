@@ -8,6 +8,7 @@ import time
 from asyncio import Task
 from datetime import datetime
 
+from utils.device_count import COUNT_MODE_INBOUND
 from utils.parse_logs import INVALID_IPS
 
 try:
@@ -351,7 +352,16 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
                                     f"🛰️ IP source switched to API, closing SSE stream "
                                     f"for node {node.node_id} ({node.node_name})"
                                 )
-                                await clear_node_active_connections(node.node_id)
+                                from utils.read_config import read_config_scalar
+
+                                # API cannot supply inbound tags. Preserve this
+                                # unevaluated sample while that combination pauses
+                                # enforcement instead of discarding it on shutdown.
+                                count_mode = (
+                                    str(await read_config_scalar("device_count_mode", "device")).strip().lower()
+                                )
+                                if count_mode != COUNT_MODE_INBOUND:
+                                    await clear_node_active_connections(node.node_id)
                                 forget_node_event(node.node_id)
                                 break
 
