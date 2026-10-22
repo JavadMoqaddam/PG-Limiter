@@ -1,0 +1,6 @@
+# Shared development and CI tools; Dependabot tracks these alongside runtime pins.
+ruff==0.17.1
+pytest>=8.4.2,<9
+pytest-asyncio>=1.4.0,<2
+pytest-cov>=7.1.0,<8
+bandit==1.9.4

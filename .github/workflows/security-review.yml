@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           # Check out the PR head and enough history for the action to diff the
           # change against its base.
@@ -33,7 +33,8 @@ jobs:
           fetch-depth: 2
 
       - name: Run Claude Code Security Review
-        uses: anthropics/claude-code-security-review@main
+        # No release tags are published; pin a commit so Dependabot can propose updates.
+        uses: anthropics/claude-code-security-review@0c6a49f1fa56a1d472575da86a94dbc1edb78eda
         env:
           # Route Claude API traffic through the self-hosted gateway. The
           # underlying Claude Code process reads this from the environment.
