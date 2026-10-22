@@ -123,7 +123,7 @@ class TestInboundCounting:
             high_trust_ip_grouping=True,
         )
         user = make_user([("5.6.7.8", "Vless", 1), ("9.9.9.9", "Vless", 3), ("5.6.8.8", "Vmess", 2)])
-        assert count_devices(user, config, trust_score=90, isp_info={"5.6.7.8": {"isp": "A"}}) == 2
+        assert count_devices(user, config, trust_score=90) == 2
 
     def test_disabled_nodes_do_not_add_inbounds(self):
         config = DeviceCountingConfig(count_mode="inbound", disabled_nodes=[9])
