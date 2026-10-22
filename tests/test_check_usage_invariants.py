@@ -51,3 +51,20 @@ async def test_requeue_is_noop_when_every_user_has_a_newer_event():
 
     assert restored == 0
     assert ACTIVE_USERS["carol"].ip == ["5.5.5.5"]
+
+
+async def test_api_batch_is_never_merged_back_after_failed_preparation():
+    from utils.read_config import get_config_revision
+    from utils.shared_state import APISampleEvidence, begin_api_collection, pop_api_users_snapshot, publish_api_snapshot
+    from utils.types import ConnectionInfo
+
+    ACTIVE_USERS.clear()
+    user = UserType(name="alice", ip=["5.6.7.8"])
+    user.device_info.connections = [ConnectionInfo("5.6.7.8", 1, "node", "API", 1_800_000_000)]
+    evidence = APISampleEvidence(begin_api_collection(), get_config_revision(), 90)
+    assert await publish_api_snapshot({"alice": user}, evidence)
+    batch = await pop_api_users_snapshot()
+    assert batch["alice"].device_info.connections[0].last_seen == 1_800_000_000
+    assert batch["alice"] is not user
+    assert await merge_active_users_snapshot(batch) == 0
+    assert ACTIVE_USERS == {}

@@ -17,6 +17,61 @@ which skips the copy for immutable values and refuses to hand out a container.
 import pytest
 
 
+async def test_api_freshness_env_default_and_db_precedence(config_module, db_half, monkeypatch):
+    db_half["db_config"].pop("api_ip_freshness")
+    monkeypatch.setenv("API_IP_FRESHNESS", "10")
+    assert (await config_module.read_config())["api_ip_freshness"] == 10
+    db_half["db_config"]["api_ip_freshness"] = "90"
+    await config_module.invalidate_config_cache()
+    assert (await config_module.read_config())["api_ip_freshness"] == 90
+
+
+async def test_legacy_auto_is_materialized_once(config_module, db_half, monkeypatch):
+    db_half["db_config"]["api_ip_freshness"] = "0"
+    saved = []
+
+    async def save(key, value):
+        saved.append((key, value))
+        db_half["db_config"][key] = str(value)
+        return True
+
+    monkeypatch.setattr(config_module, "save_config_value", save)
+    assert (await config_module.read_config())["api_ip_freshness"] == 180
+    assert saved == [("api_ip_freshness", 180)]
+    db_half["db_config"]["check_interval"] = "900"
+    await config_module.invalidate_config_cache()
+    assert (await config_module.read_config())["api_ip_freshness"] == 180
+    assert len(saved) == 1
+
+
+async def test_legacy_auto_failed_materialization_is_not_enforceable(config_module, db_half, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    db_half["db_config"]["api_ip_freshness"] = "0"
+    monkeypatch.setattr(config_module, "save_config_value", AsyncMock(return_value=False))
+    config = await config_module.read_config()
+    assert config["config_degraded"] is True
+    assert config_module._config_cache is None
+
+
+async def test_concurrent_config_reads_materialize_auto_only_once(config_module, db_half, monkeypatch):
+    import asyncio
+
+    db_half["db_config"]["api_ip_freshness"] = "0"
+    saved = []
+
+    async def save(key, value):
+        await asyncio.sleep(0)
+        saved.append(value)
+        db_half["db_config"][key] = str(value)
+        return True
+
+    monkeypatch.setattr(config_module, "save_config_value", save)
+    configs = await asyncio.gather(config_module.read_config(), config_module.read_config())
+    assert [config["api_ip_freshness"] for config in configs] == [180, 180]
+    assert saved == [180]
+
+
 @pytest.fixture
 def db_half():
     """The database half of the configuration, with every nested container non-empty."""
@@ -25,6 +80,7 @@ def db_half():
             "general_limit": "4",
             "check_interval": "180",
             "ip_source": "api",
+            "api_ip_freshness": "60",
             "group_limits": '{"7": 4, "9": 6}',
             "punishment_steps": '[{"type":"disable","duration":30}]',
             "cdn_nodes": "3,4",
@@ -63,9 +119,9 @@ class TestReadConfigIsolation:
     @pytest.mark.asyncio
     async def test_neither_exit_returns_the_cache(self, config_module):
         """Both the fresh-build exit and the cached exit must copy."""
-        cold = await config_module.read_config()      # builds and caches
+        cold = await config_module.read_config()  # builds and caches
         assert cold is not config_module._config_cache
-        warm = await config_module.read_config()      # serves the cache
+        warm = await config_module.read_config()  # serves the cache
         assert warm is not config_module._config_cache
         assert cold is not warm
 
@@ -75,9 +131,21 @@ class TestReadConfigIsolation:
         first = await config_module.read_config()
         second = await config_module.read_config()
 
-        for key in ("panel", "telegram", "limits", "monitoring", "punishment",
-                    "group_filter", "admin_filter", "group_limits", "api",
-                    "except_users", "cdn_nodes", "cdn_inbounds", "disabled_nodes"):
+        for key in (
+            "panel",
+            "telegram",
+            "limits",
+            "monitoring",
+            "punishment",
+            "group_filter",
+            "admin_filter",
+            "group_limits",
+            "api",
+            "except_users",
+            "cdn_nodes",
+            "cdn_inbounds",
+            "disabled_nodes",
+        ):
             assert first[key] is not second[key], f"{key} is shared between reads"
 
         assert first["limits"]["special"] is not second["limits"]["special"]
@@ -96,15 +164,15 @@ class TestReadConfigIsolation:
         the cache for the life of the process.
         """
         victim = await config_module.read_config()
-        victim["disabled_nodes"].remove(11)                     # settings_nodes
+        victim["disabled_nodes"].remove(11)  # settings_nodes
         victim["disabled_nodes"].append(99)
         victim["cdn_nodes"].append(98)
-        victim["cdn_inbounds"].append("ss-ws")                  # settings_cdn
-        del victim["group_limits"][7]                            # group_filter
+        victim["cdn_inbounds"].append("ss-ws")  # settings_cdn
+        del victim["group_limits"][7]  # group_filter
         victim["group_filter"]["group_ids"].append(555)
         victim["admin_filter"]["admin_usernames"].append("evil")  # admin_filter
         victim["punishment"]["steps"].append({"type": "disable", "duration": 1})
-        victim["punishment"]["steps"][0]["duration"] = 999       # punishment
+        victim["punishment"]["steps"][0]["duration"] = 999  # punishment
         victim["limits"]["special"]["alice"] = 1
         victim["limits"]["general"] = 1
         victim["except_users"].clear()
@@ -159,7 +227,7 @@ class TestReadConfigScalar:
         a 49-node fleet with a 180s interval that is ~588 reads per cycle for one
         string. A deep copy per read would be pure waste.
         """
-        await config_module.read_config()          # warm the cache
+        await config_module.read_config()  # warm the cache
         copies = []
         real_deepcopy = config_module.copy.deepcopy
 
@@ -175,9 +243,7 @@ class TestReadConfigScalar:
         assert copies == []
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "key", ["cdn_nodes", "except_users", "limits", "punishment", "group_limits"]
-    )
+    @pytest.mark.parametrize("key", ["cdn_nodes", "except_users", "limits", "punishment", "group_limits"])
     async def test_containers_are_refused(self, config_module, key):
         """Handing out a list or dict from the cache is the bug the copy prevents."""
         with pytest.raises(TypeError, match="may only be used for immutable"):

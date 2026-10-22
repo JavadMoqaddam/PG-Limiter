@@ -10,6 +10,7 @@ edits what it got cannot reach the shared configuration every other task is
 reading - see the note on the cache below.
 """
 
+import asyncio
 import copy
 import math
 import os
@@ -24,6 +25,7 @@ config_logger = get_logger("read_config")
 # Try to import database module
 try:
     from db import get_db, ConfigCRUD, UserCRUD
+
     DB_AVAILABLE = True
 except ImportError:
     DB_AVAILABLE = False
@@ -38,6 +40,14 @@ except ImportError:
 # instead: ``read_config`` deep-copies on the way out. Read
 # ``read_config_scalar`` for the one case that does not need a copy.
 _config_cache: Optional[Dict[str, Any]] = None
+_config_revision = 0
+_config_read_lock = asyncio.Lock()
+
+
+def get_config_revision() -> int:
+    """Identify settings changes across asynchronous collection and preparation."""
+    return _config_revision
+
 
 # Throttle for the database-failure traceback below. A degraded configuration is never
 # cached, so while the database is down every read retries and would log again.
@@ -47,8 +57,9 @@ _db_failure_logged_at = -DB_FAILURE_LOG_INTERVAL
 
 async def invalidate_config_cache():
     """Drop the cached configuration so the next read rebuilds it from ENV + DB."""
-    global _config_cache
+    global _config_cache, _config_revision
 
+    _config_revision += 1
     _config_cache = None
     config_logger.info("🔧 Configuration cache invalidated")
 
@@ -68,7 +79,7 @@ def _get_env(key: str, default: Any = None, cast_type: type = str) -> Any:
     value = os.environ.get(key, default)
     if value is None or value == "":
         return default
-    
+
     if cast_type == bool:
         return str(value).lower() in ("true", "1", "yes", "on")
     elif cast_type == int:
@@ -81,13 +92,24 @@ def _get_env(key: str, default: Any = None, cast_type: type = str) -> Any:
             return float(value)
         except (ValueError, TypeError):
             return default
-    
+
     return value
 
 
 # The coverage floor for API mode, as a fraction. This is the one place the default
 # lives; ip_source_api and the settings screen import it rather than repeating 0.8.
 DEFAULT_API_IP_MIN_COVERAGE = 0.8
+DEFAULT_API_IP_FRESHNESS = 60
+
+
+def normalize_api_ip_freshness(raw: Any, default: int = DEFAULT_API_IP_FRESHNESS) -> int:
+    """Accept exact positive integer seconds, with no interval or minimum clamp."""
+    text = str(raw).strip()
+    if text.isascii() and text.isdecimal() and int(text) > 0:
+        return int(text)
+    if raw is not None:
+        config_logger.error(f"Invalid API IP freshness {raw!r}; using {default}s")
+    return default
 
 
 def normalize_min_coverage(raw: Any, default: float = DEFAULT_API_IP_MIN_COVERAGE) -> float:
@@ -139,9 +161,7 @@ def normalize_min_coverage(raw: Any, default: float = DEFAULT_API_IP_MIN_COVERAG
 DEFAULT_GENERAL_LIMIT = 2
 
 
-def normalize_general_limit(
-    raw: Any, source: str, default: int = DEFAULT_GENERAL_LIMIT
-) -> int:
+def normalize_general_limit(raw: Any, source: str, default: int = DEFAULT_GENERAL_LIMIT) -> int:
     """
     Coerce a configured general limit, falling back to ``default`` when unusable.
 
@@ -153,9 +173,7 @@ def normalize_general_limit(
     try:
         value = int(raw)
     except (ValueError, TypeError):
-        config_logger.error(
-            f"⚠️ Ignoring {source} value {raw!r}: not a whole number - using {default}"
-        )
+        config_logger.error(f"⚠️ Ignoring {source} value {raw!r}: not a whole number - using {default}")
         return default
     if value >= 1:
         return value
@@ -183,9 +201,7 @@ def load_env_config() -> Dict[str, Any]:
         },
         # Limiter settings (from ENV - defaults)
         "limits": {
-            "general": normalize_general_limit(
-                os.environ.get("GENERAL_LIMIT"), "GENERAL_LIMIT"
-            ),
+            "general": normalize_general_limit(os.environ.get("GENERAL_LIMIT"), "GENERAL_LIMIT"),
             "special": {},  # Loaded from DB
         },
         "except_users": [],  # Loaded from DB
@@ -204,16 +220,13 @@ def load_env_config() -> Dict[str, Any]:
         "user_sync_interval": _get_env("USER_SYNC_INTERVAL", 5, int),  # Minutes
         # Minimum share of candidates that must answer before an API-mode cycle is
         # allowed to enforce. Set as a percentage; see normalize_min_coverage.
-        "api_ip_min_coverage": normalize_min_coverage(
-            os.environ.get("API_IP_MIN_COVERAGE")
-        ),
+        "api_ip_min_coverage": normalize_min_coverage(os.environ.get("API_IP_MIN_COVERAGE")),
         # Share of the connected node fleet that must report before an API-mode cycle
         # enforces, as a percentage. 0 (the default) switches the gate off; a genuinely
         # quiet node reports nothing, so the right floor has to be observed on a real
         # fleet before it is enforced.
-        "api_ip_min_node_coverage": normalize_min_coverage(
-            os.environ.get("API_IP_MIN_NODE_COVERAGE"), default=0.0
-        ),
+        "api_ip_min_node_coverage": normalize_min_coverage(os.environ.get("API_IP_MIN_NODE_COVERAGE"), default=0.0),
+        "api_ip_freshness": normalize_api_ip_freshness(os.environ.get("API_IP_FRESHNESS")),
         # API settings (from ENV)
         "api": {
             "enabled": _get_env("API_ENABLED", False, bool),
@@ -223,10 +236,7 @@ def load_env_config() -> Dict[str, Any]:
             "password": _get_env("API_PASSWORD", ""),
         },
         # Database
-        "database_url": _get_env(
-            "DATABASE_URL",
-            "sqlite+aiosqlite:///./data/pg_limiter.db"
-        ),
+        "database_url": _get_env("DATABASE_URL", "sqlite+aiosqlite:///./data/pg_limiter.db"),
     }
 
 
@@ -234,18 +244,18 @@ async def load_db_config() -> Dict[str, Any]:
     """Load dynamic configuration from database."""
     if not DB_AVAILABLE:
         return {}
-    
+
     try:
         async with get_db() as session:
             # Load all config from database
             db_config = await ConfigCRUD.get_all(session)
-            
+
             # Load special limits
             special_limits = await UserCRUD.get_all_special_limits(session)
-            
+
             # Load except users
             except_users = await UserCRUD.get_all_excepted(session)
-        
+
         return {
             "db_config": db_config,
             "special_limits": special_limits,
@@ -287,6 +297,12 @@ def get_config_sync() -> Dict[str, Any]:
 
 
 async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
+    """Read an isolated configuration, serializing one-time legacy migration."""
+    async with _config_read_lock:
+        return await _load_config(check_required_elements)
+
+
+async def _load_config(check_required_elements: bool = False) -> Dict[str, Any]:
     """
     Read and return the merged configuration from ENV and the database.
 
@@ -303,32 +319,33 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     if _config_cache is not None and not check_required_elements:
         return copy.deepcopy(_config_cache)
 
+    loaded_revision = get_config_revision()
     config_logger.debug("🔧 Loading fresh configuration...")
-    
+
     # Load ENV config
     env_config = load_env_config()
-    
+
     # Load DB config
     db_data = await load_db_config()
-    
+
     # Merge configurations
     config = env_config.copy()
 
     # Propagate a failed database read (see load_db_config) so the enforcement loop can
     # refuse to act on a configuration that has no whitelist and no group limits.
     config["config_degraded"] = bool(db_data.get("_load_failed"))
-    
+
     # Add special limits from DB
     if "special_limits" in db_data:
         config["limits"]["special"] = db_data["special_limits"]
-    
+
     # Add except users from DB
     if "except_users" in db_data:
         config["except_users"] = db_data["except_users"]
-    
+
     # Merge DB config (dynamic settings changeable via Telegram)
     db_config = db_data.get("db_config", {})
-    
+
     # Merge monitoring and timing settings from DB
     if "check_interval" in db_config:
         try:
@@ -347,7 +364,7 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
             pass
     if "country_code" in db_config:
         config["country_code"] = str(db_config["country_code"])
-        
+
     # Synchronize monitoring sub-dictionary
     config["monitoring"] = {
         "check_interval": config["check_interval"],
@@ -355,14 +372,14 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
         "time_to_active_users": config["time_to_active_users"],
         "country_code": config["country_code"],
     }
-    
+
     if "general_limit" in db_config:
         config["limits"]["general"] = normalize_general_limit(
             db_config["general_limit"],
             "general_limit",
             default=config["limits"]["general"],
         )
-    
+
     config["disable_method"] = db_config.get("disable_method", "status")
     config["disabled_group_id"] = db_config.get("disabled_group_id")
     if config["disabled_group_id"]:
@@ -370,18 +387,18 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
             config["disabled_group_id"] = int(config["disabled_group_id"])
         except (ValueError, TypeError):
             config["disabled_group_id"] = None
-    
+
     config["fallback_group_id"] = db_config.get("fallback_group_id")
     if config["fallback_group_id"]:
         try:
             config["fallback_group_id"] = int(config["fallback_group_id"])
         except (ValueError, TypeError):
             config["fallback_group_id"] = None
-    
+
     config["enhanced_details"] = db_config.get("enhanced_details", "true").lower() == "true"
     config["show_single_ip_users"] = db_config.get("show_single_ip_users", "false").lower() == "true"
     config["ipinfo_token"] = db_config.get("ipinfo_token", "")
-    
+
     # Punishment system settings
     config["punishment"] = {
         "enabled": db_config.get("punishment_enabled", "true").lower() == "true",
@@ -393,10 +410,11 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     if punishment_steps_str:
         try:
             import json
+
             config["punishment"]["steps"] = json.loads(punishment_steps_str)
         except (json.JSONDecodeError, ValueError):
             pass
-    
+
     # Group filter settings
     config["group_filter"] = {
         "enabled": db_config.get("group_filter_enabled", "false").lower() == "true",
@@ -406,12 +424,10 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     group_ids_str = db_config.get("group_filter_ids", "")
     if group_ids_str:
         try:
-            config["group_filter"]["group_ids"] = [
-                int(x.strip()) for x in group_ids_str.split(",") if x.strip()
-            ]
+            config["group_filter"]["group_ids"] = [int(x.strip()) for x in group_ids_str.split(",") if x.strip()]
         except ValueError:
             pass
-    
+
     # Admin filter settings
     config["admin_filter"] = {
         "enabled": db_config.get("admin_filter_enabled", "false").lower() == "true",
@@ -420,16 +436,15 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     }
     admin_usernames_str = db_config.get("admin_filter_usernames", "")
     if admin_usernames_str:
-        config["admin_filter"]["admin_usernames"] = [
-            x.strip() for x in admin_usernames_str.split(",") if x.strip()
-        ]
-    
+        config["admin_filter"]["admin_usernames"] = [x.strip() for x in admin_usernames_str.split(",") if x.strip()]
+
     # Group limits settings - mapping of group IDs to connection limits
     config["group_limits"] = {}
     group_limits_str = db_config.get("group_limits", "")
     if group_limits_str:
         try:
             import json
+
             parsed_limits = json.loads(group_limits_str)
             if isinstance(parsed_limits, dict):
                 normalized_limits = {}
@@ -441,52 +456,48 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
                 config["group_limits"] = normalized_limits
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
-    
+
     # CDN mode settings - list of inbound protocols that should be treated as CDN
     # When an inbound is in CDN mode, all IPs from that inbound count as 1 device
     config["cdn_inbounds"] = []
     cdn_inbounds_str = db_config.get("cdn_inbounds", "")
     if cdn_inbounds_str:
-        config["cdn_inbounds"] = [
-            x.strip() for x in cdn_inbounds_str.split(",") if x.strip()
-        ]
-    
+        config["cdn_inbounds"] = [x.strip() for x in cdn_inbounds_str.split(",") if x.strip()]
+
     # CDN provider type (cloudflare, custom)
     config["cdn_provider"] = db_config.get("cdn_provider", "cloudflare")
-    
+
     # Whether to use X-Forwarded-For to extract real IP for CDN inbounds
     config["cdn_use_xff"] = db_config.get("cdn_use_xff", "true").lower() == "true"
-    
+
     # CDN nodes - list of node IDs that are behind CDN
     # All IPs from CDN nodes count as 1 device (similar to cdn_inbounds but per-node)
     config["cdn_nodes"] = []
     cdn_nodes_str = db_config.get("cdn_nodes", "")
     if cdn_nodes_str:
         try:
-            config["cdn_nodes"] = [
-                int(x.strip()) for x in cdn_nodes_str.split(",") if x.strip()
-            ]
+            config["cdn_nodes"] = [int(x.strip()) for x in cdn_nodes_str.split(",") if x.strip()]
         except ValueError:
             pass
-    
+
     # Subnet IP Grouping - relaxed mode where IPs in the same /24 or /16 subnet
     # that use the same node AND inbound are counted as a single device
     config["subnet_ip_grouping"] = db_config.get("subnet_ip_grouping", "false").lower() == "true"
     config["subnet_grouping_mode"] = db_config.get("subnet_grouping_mode", "/24")
     if config["subnet_grouping_mode"] not in ["/24", "/16"]:
         config["subnet_grouping_mode"] = "/24"
-    
+
     # High Trust IP Grouping - for users with high trust score, multiple IPs
     # using the SAME node AND inbound are counted as one device
     # (detects WiFi/Mobile switching on same device)
     config["high_trust_ip_grouping"] = db_config.get("high_trust_ip_grouping", "false").lower() == "true"
-    
+
     # Minimum trust score required for high_trust_ip_grouping to apply
     try:
         config["high_trust_threshold"] = int(db_config.get("high_trust_threshold", "20"))
     except (ValueError, TypeError):
         config["high_trust_threshold"] = 20
-    
+
     # Device counting mode. node_id is never part of the device key: several
     # nodes can serve the same core config, so one client is registered on all
     # of them simultaneously.
@@ -497,9 +508,7 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     #               device. Subnet grouping still applies when enabled; High
     #               Trust grouping has no effect (IP counting is already the
     #               most lenient key).
-    config["device_count_mode"] = str(
-        db_config.get("device_count_mode", "device")
-    ).strip().lower()
+    config["device_count_mode"] = str(db_config.get("device_count_mode", "device")).strip().lower()
     if config["device_count_mode"] not in ("device", "ip"):
         config["device_count_mode"] = "device"
 
@@ -509,12 +518,10 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     disabled_nodes_str = db_config.get("disabled_nodes", "")
     if disabled_nodes_str:
         try:
-            config["disabled_nodes"] = [
-                int(x.strip()) for x in disabled_nodes_str.split(",") if x.strip()
-            ]
+            config["disabled_nodes"] = [int(x.strip()) for x in disabled_nodes_str.split(",") if x.strip()]
         except ValueError:
             pass
-    
+
     # User sync interval (in minutes)
     if "user_sync_interval" in db_config:
         try:
@@ -540,16 +547,13 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
         config["api_ip_concurrency"] = 20
     config["api_ip_concurrency"] = max(1, min(40, config["api_ip_concurrency"]))
 
-    # Candidate selection strategy:
-    #   "online"         -> only users the panel reports as recently online
-    #   "all_monitored"  -> every monitored user (heavier, no freshness window)
-    config["api_ip_candidate_mode"] = str(
-        db_config.get("api_ip_candidate_mode", "online")
-    ).strip().lower()
+    # Legacy keys retained for backup compatibility. The collector always uses
+    # online=true; neither these keys nor CHECK_INTERVAL widen its candidates.
+    config["api_ip_candidate_mode"] = str(db_config.get("api_ip_candidate_mode", "online")).strip().lower()
     if config["api_ip_candidate_mode"] not in ("online", "all_monitored"):
         config["api_ip_candidate_mode"] = "online"
 
-    # Online freshness window in seconds. 0 = auto (check_interval + 30s).
+    # Legacy online-window value; no longer used by API collection.
     try:
         config["api_ip_online_window"] = int(db_config.get("api_ip_online_window", "0"))
     except (ValueError, TypeError):
@@ -557,16 +561,19 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
     if config["api_ip_online_window"] < 0:
         config["api_ip_online_window"] = 0
 
-    # Max age of a reported IP, in seconds. The panel's online-stats map keeps an
-    # IP with its last-seen timestamp long after the client left, so anything
-    # older than this is not a currently connected device.
-    # 0 = auto (check_interval), which matches log mode's sample width.
-    try:
-        config["api_ip_freshness"] = int(db_config.get("api_ip_freshness", "0"))
-    except (ValueError, TypeError):
-        config["api_ip_freshness"] = 0
-    if config["api_ip_freshness"] < 0:
-        config["api_ip_freshness"] = 0
+    # Stored positive values override ENV. Legacy Auto becomes a durable value
+    # once, so changing the collection interval cannot change the acceptance age.
+    freshness_raw = db_config.get("api_ip_freshness")
+    legacy_auto = str(freshness_raw).strip().lower() in ("0", "auto")
+    legacy_auto = legacy_auto or (
+        freshness_raw is None and "ip_source" in db_config and not os.environ.get("API_IP_FRESHNESS")
+    )
+    if legacy_auto and not config.get("config_degraded"):
+        config["api_ip_freshness"] = max(60, int(config.get("check_interval") or 60))
+        if not await save_config_value("api_ip_freshness", config["api_ip_freshness"]):
+            config["config_degraded"] = True
+    else:
+        config["api_ip_freshness"] = normalize_api_ip_freshness(freshness_raw, default=config["api_ip_freshness"])
 
     # Page size for the candidate /api/users query
     try:
@@ -582,12 +589,10 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
         config["api_ip_timeout"] = 8.0
     config["api_ip_timeout"] = max(2.0, min(60.0, config["api_ip_timeout"]))
 
-    # Placeholder inbound protocol name: the panel API returns {ip: count}
+    # Placeholder inbound protocol name: the panel API returns {ip: timestamp}
     # per node without any inbound information, so a sentinel is used to
     # keep the (ip, inbound) device-counting key shape intact.
-    config["api_ip_sentinel_inbound"] = str(
-        db_config.get("api_ip_sentinel_inbound", "API")
-    ).strip() or "API"
+    config["api_ip_sentinel_inbound"] = str(db_config.get("api_ip_sentinel_inbound", "API")).strip() or "API"
 
     # Minimum successful-fetch ratio required to run enforcement for a cycle.
     # Below this the cycle is skipped entirely so that a flaky panel cannot
@@ -617,10 +622,8 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
 
     # Automatically fall back to log mode after repeated total failures
     # (e.g. the panel account is missing the nodes:stats permission).
-    config["api_ip_auto_fallback"] = db_config.get(
-        "api_ip_auto_fallback", "true"
-    ).lower() == "true"
-    
+    config["api_ip_auto_fallback"] = db_config.get("api_ip_auto_fallback", "true").lower() == "true"
+
     # Validate required elements
     if check_required_elements:
         if not config["panel"]["domain"]:
@@ -631,7 +634,7 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
             raise ValueError("BOT_TOKEN is not set in environment")
         if not config["telegram"]["admins"]:
             raise ValueError("ADMIN_IDS is not set in environment")
-    
+
     # A configuration whose database half could not be read is missing the whitelist,
     # the special limits and the group limits. It is served (so the bot and the CLI
     # keep working) but flagged and never cached, so the next call retries instead of
@@ -646,6 +649,11 @@ async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
         # private to this caller and nobody else holds a reference to it.
         return config
 
+    if loaded_revision != get_config_revision():
+        # A setting changed while the DB was being read (including materializing
+        # Auto). Re-read before publishing a configuration with a newer revision.
+        return await _load_config(check_required_elements)
+    config["_revision"] = loaded_revision
     _config_cache = config
     # The dict just built becomes the cache, so this exit has to copy as well. Missing
     # it would leave the shared object exposed to the first caller after every
@@ -698,9 +706,7 @@ async def save_config_value(key: str, value: Any) -> bool:
     to find later. The write is still best-effort, but it is no longer silent.
     """
     if not DB_AVAILABLE:
-        config_logger.error(
-            f"❌ Cannot save configuration {key!r}: the database module is unavailable"
-        )
+        config_logger.error(f"❌ Cannot save configuration {key!r}: the database module is unavailable")
         return False
 
     try:
@@ -709,8 +715,7 @@ async def save_config_value(key: str, value: Any) -> bool:
         return True
     except Exception as error:  # pylint: disable=broad-except
         config_logger.exception(
-            f"❌ Failed to save configuration {key!r}: {error}. The previous value is "
-            f"still in effect."
+            f"❌ Failed to save configuration {key!r}: {error}. The previous value is still in effect."
         )
         return False
     finally:
@@ -724,9 +729,7 @@ async def save_config_value(key: str, value: Any) -> bool:
 async def delete_config_value(key: str) -> bool:
     """Delete a configuration value from the database."""
     if not DB_AVAILABLE:
-        config_logger.error(
-            f"❌ Cannot delete configuration {key!r}: the database module is unavailable"
-        )
+        config_logger.error(f"❌ Cannot delete configuration {key!r}: the database module is unavailable")
         return False
 
     try:
@@ -735,8 +738,7 @@ async def delete_config_value(key: str) -> bool:
         return True
     except Exception as error:  # pylint: disable=broad-except
         config_logger.exception(
-            f"❌ Failed to delete configuration {key!r}: {error}. The previous value is "
-            f"still in effect."
+            f"❌ Failed to delete configuration {key!r}: {error}. The previous value is still in effect."
         )
         return False
     finally:
@@ -794,11 +796,11 @@ def get_config_value(config: dict, key: str, default: Any = None) -> Any:
         "IP_SOURCE": lambda c: c.get("ip_source"),
         "DEVICE_COUNT_MODE": lambda c: c.get("device_count_mode"),
     }
-    
+
     if key in key_map:
         value = key_map[key](config)
         return value if value is not None else default
-    
+
     return config.get(key, default)
 
 
