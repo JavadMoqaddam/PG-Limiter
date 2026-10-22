@@ -36,6 +36,8 @@ Dependabot checks Python dependencies each weekday at 09:00 Asia/Tehran and GitH
 Actions and Docker images weekly on Monday at 09:00. It opens grouped minor/patch update
 PRs; major updates stay separate for review. Python test tools retain their
 supported major ranges in `requirements-dev.txt`.
+The Claude security reviewer is pinned to a reviewed commit and needs manual updates
+until upstream publishes version tags that Dependabot can track.
 
 ### Code Style
 

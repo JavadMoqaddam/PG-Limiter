@@ -39,7 +39,8 @@ jobs:
           fetch-depth: 2
 
       - name: Run Claude Code Security Review
-        # No release tags are published; pin a commit so Dependabot can propose updates.
+        # No release tags are published. Keep a reviewed commit; Dependabot cannot
+        # update this pin until upstream publishes version tags.
         uses: anthropics/claude-code-security-review@0c6a49f1fa56a1d472575da86a94dbc1edb78eda
         env:
           # Route Claude API traffic through the self-hosted gateway. The
