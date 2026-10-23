@@ -126,10 +126,12 @@ pg-limiter status     # Show service & container status
 pg-limiter logs       # View live logs (follow mode)
 pg-limiter update     # Update to the latest release & migrate DB automatically
 pg-limiter backup     # Create a manual backup zip
-pg-limiter restore    # Restore configuration & database from backup
+pg-limiter restore FILE  # Validate, stop service, and apply a backup offline
 pg-limiter config     # Edit environment configuration (.env)
 pg-limiter uninstall  # Remove PG-Limiter
 ```
+
+Telegram `/restore` validates and stages uploads; it does not change live data. See [backup and offline restore](docs/BACKUP_RESTORE.md) for the snapshot guarantee, database path selection, and legacy compatibility.
 
 ---
 
