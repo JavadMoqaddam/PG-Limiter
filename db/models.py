@@ -37,34 +37,35 @@ class User(Base):
     - Special IP limits
     - Disable status and punishment info
     """
+
     __tablename__ = "users"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(255), unique=True, nullable=False, index=True)
     panel_id = Column(Integer, unique=True, nullable=True, index=True)  # Numeric ID from panel
-    
+
     # User status from panel
     status = Column(String(50), default="active")  # active, disabled, limited, expired
-    
+
     # Owner/admin info
     owner_id = Column(Integer, nullable=True)  # Admin/owner ID in panel
     owner_username = Column(String(255), nullable=True)  # Admin/owner username
-    
+
     # Group info (stored as JSON array of group IDs)
     group_ids = Column(JSON, default=list)  # [1, 2, 3]
-    
+
     # Data traffic
     data_limit = Column(Float, nullable=True)  # GB
     used_traffic = Column(Float, default=0)  # GB
-    
+
     # Timestamps (ISO datetime objects)
     created_at = Column(DateTime, default=utc_now)
     expire_at = Column(DateTime, nullable=True)
     last_synced_at = Column(DateTime, default=utc_now)
-    
+
     # Extra data from panel
     note = Column(Text, nullable=True)
-    
+
     # ===== Pre-computed Group Filter & Limit fields =====
     is_monitored = Column(Boolean, default=True)  # False = user excluded by group_filter
     effective_ip_limit = Column(Integer, nullable=True)  # Pre-computed effective IP limit
@@ -74,19 +75,20 @@ class User(Base):
     exception_reason = Column(Text, nullable=True)
     excepted_by = Column(String(255), nullable=True)  # Admin who added exception
     excepted_at = Column(DateTime, nullable=True)
-    
+
     # ===== Special IP limit (from user_limits) =====
     special_limit = Column(Integer, nullable=True)  # None = use general limit
     special_limit_updated_at = Column(DateTime, nullable=True)
-    
+
     # ===== Disable status (from disabled_users) =====
     is_disabled_by_limiter = Column(Boolean, default=False)  # True = disabled by PG-Limiter
     disabled_at = Column(Float, nullable=True)  # Unix timestamp when disabled
     enable_at = Column(Float, nullable=True)  # Unix timestamp when to re-enable
     original_groups = Column(JSON, default=list)  # Groups before disabling
+    disable_provenance = Column(JSON, nullable=True)  # Exact inverse of a limiter incident
     disable_reason = Column(Text, nullable=True)  # e.g., "IP limit exceeded (3/2)"
     punishment_step = Column(Integer, default=0)  # Current punishment step
-    
+
     # Relationships - no FK, uses username matching
     violations = relationship(
         "ViolationHistory",
@@ -94,7 +96,7 @@ class User(Base):
         primaryjoin="User.username == foreign(ViolationHistory.username)",
         viewonly=True,
     )
-    
+
     __table_args__ = (
         Index("ix_users_owner_id", "owner_id"),
         Index("ix_users_owner_username", "owner_username"),
@@ -104,7 +106,7 @@ class User(Base):
         Index("ix_users_is_disabled_by_limiter", "is_disabled_by_limiter"),
         Index("ix_users_status_disabled", "status", "is_disabled_by_limiter"),
     )
-    
+
     def __repr__(self):
         return f"<User(username='{self.username}', status='{self.status}', owner='{self.owner_username}')>"
 
@@ -114,15 +116,16 @@ class UserLimit(Base):
     DEPRECATED - Special limits are now stored in User.special_limit
     This table is kept for backward compatibility during migration.
     """
+
     __tablename__ = "user_limits"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(255), unique=True, nullable=False, index=True)
     limit = Column(Integer, nullable=False, default=2)
-    
+
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
-    
+
     def __repr__(self):
         return f"<UserLimit(username='{self.username}', limit={self.limit})>"
 
@@ -132,15 +135,16 @@ class ExceptUser(Base):
     DEPRECATED - Exception status is now stored in User.is_excepted
     This table is kept for backward compatibility during migration.
     """
+
     __tablename__ = "except_users"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(255), unique=True, nullable=False, index=True)
     reason = Column(Text, nullable=True)
-    
+
     created_at = Column(DateTime, default=utc_now)
     created_by = Column(String(255), nullable=True)
-    
+
     def __repr__(self):
         return f"<ExceptUser(username='{self.username}')>"
 
@@ -150,11 +154,12 @@ class DisabledUser(Base):
     DEPRECATED - Disable status is now stored in User.is_disabled_by_limiter
     This table is kept for backward compatibility during migration.
     """
+
     __tablename__ = "disabled_users"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(255), unique=True, nullable=False, index=True)
-    
+
     disabled_at = Column(Float, nullable=False)
     enable_at = Column(Float, nullable=True)
     original_groups = Column(JSON, default=list)
@@ -180,14 +185,14 @@ class ViolationHistory(Base):
     timestamp = Column(Float, nullable=False)  # Unix timestamp
     step_applied = Column(Integer, nullable=False)  # Which punishment step was applied
     disable_duration = Column(Integer, nullable=False)  # Duration in minutes
-    
+
     # When the user was re-enabled
     enabled_at = Column(Float, nullable=True)
-    
+
     # Additional info
     ip_count = Column(Integer, nullable=True)
     ips = Column(JSON, nullable=True)
-    
+
     # Relationship - no FK, uses username matching
     user = relationship(
         "User",
@@ -195,12 +200,12 @@ class ViolationHistory(Base):
         primaryjoin="foreign(ViolationHistory.username) == User.username",
         viewonly=True,
     )
-    
+
     __table_args__ = (
         Index("ix_violation_username_timestamp", "username", "timestamp"),
         Index("ix_violation_history_timestamp", "timestamp"),
     )
-    
+
     def __repr__(self):
         return f"<ViolationHistory(username='{self.username}', step={self.step_applied}, duration={self.disable_duration}m)>"
 
@@ -210,14 +215,15 @@ class Config(Base):
     Configuration storage in database.
     Key-value store for settings that can be changed at runtime.
     """
+
     __tablename__ = "config"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
     key = Column(String(255), unique=True, nullable=False, index=True)
     value = Column(JSON, nullable=True)  # Can store any JSON-serializable value
-    
+
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
-    
+
     def __repr__(self):
         return f"<Config(key='{self.key}')>"
 
@@ -227,29 +233,30 @@ class IPHistory(Base):
     IP history for users - tracks which IPs each user has used.
     Useful for reporting and analysis.
     """
+
     __tablename__ = "ip_history"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(255), index=True, nullable=False)
     ip = Column(String(45), nullable=False)  # IPv4 or IPv6
-    
+
     # Connection info
     node_name = Column(String(255), nullable=True)
     inbound_protocol = Column(String(100), nullable=True)
-    
+
     # Timestamps
     first_seen = Column(DateTime, default=utc_now)
     last_seen = Column(DateTime, default=utc_now)
-    
+
     # Connection count
     connection_count = Column(Integer, default=1)
-    
+
     __table_args__ = (
         UniqueConstraint("username", "ip", name="uq_ip_history_username_ip"),
         Index("ix_ip_history_username_ip", "username", "ip"),
         Index("ix_ip_history_username_last_seen", "username", "last_seen"),
         Index("ix_ip_history_last_seen", "last_seen"),
     )
-    
+
     def __repr__(self):
         return f"<IPHistory(username='{self.username}', ip='{self.ip}')>"
