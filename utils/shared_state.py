@@ -144,7 +144,7 @@ def node_silence_window(check_interval: float) -> float:
 
 def note_node_event(node_id: int | None, when: float | None = None) -> None:
     """Record that ``node_id`` produced a log event."""
-    if node_id is None:
+    if node_id is None or not LOG_OBSERVATIONS.monitors(node_id):
         return
     now = time.time() if when is None else when
     previous = NODE_LAST_EVENT.get(node_id)
@@ -159,13 +159,13 @@ def forget_node_event(node_id: int | None) -> None:
     """Drop a node's heartbeat when its task is cancelled or the node disappears."""
     if node_id is None:
         return
-    if NODE_LAST_EVENT.pop(node_id, None) is not None:
+    if NODE_LAST_EVENT.pop(node_id, None) is not None and LOG_OBSERVATIONS.monitors(node_id):
         LOG_OBSERVATIONS.note_transport_gap(time.time())
 
 
 def clear_node_events() -> None:
     """Forget every heartbeat, for the periodic full rebuild of the node tasks."""
-    if NODE_LAST_EVENT:
+    if any(LOG_OBSERVATIONS.monitors(node_id) for node_id in NODE_LAST_EVENT):
         LOG_OBSERVATIONS.note_transport_gap(time.time())
     NODE_LAST_EVENT.clear()
 
@@ -288,9 +288,13 @@ async def merge_active_users_snapshot(batch: dict[str, UserType]) -> int:
 
 
 def retain_log_interval(users: dict[str, UserType], start: float, end: float) -> None:
-    """Expire observations using their original printed time, not arrival time."""
+    """Retain original-time observations only from the current monitoring scope."""
     for name, user in list(users.items()):
-        connections = [c for c in user.device_info.connections if start < c.last_seen <= end]
+        connections = [
+            c
+            for c in user.device_info.connections
+            if start < c.last_seen <= end and LOG_OBSERVATIONS.monitors(c.node_id)
+        ]
         user.device_info.connections = connections
         user.ip = sorted({c.ip for c in connections})
         user.device_info.unique_ips = set(user.ip)
