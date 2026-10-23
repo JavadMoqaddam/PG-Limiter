@@ -172,32 +172,35 @@ class EnhancedWarningSystem:
         # Clear warning history
         self.warning_history.clear()
         await self.save_warning_history()
-        
+
         warning_logger.info(f"🗑️ Cleared all trust data: {warnings_count} warnings, {history_count} history entries")
         return warnings_count, history_count
-    
+
+    async def clear_user_warning(self, username: str) -> bool:
+        """Consume a monitoring streak without erasing recent disable history."""
+        if username not in self.warnings:
+            return False
+        self.warnings.pop(username)
+        await self.save_warnings()
+        return True
+
     async def clear_user_trust_data(self, username: str) -> bool:
         """
         Clear trust data for a specific user.
-        
+
         Args:
             username: The username to clear data for
-            
+
         Returns:
             bool: True if user had data to clear
         """
-        had_data = False
-        
-        if username in self.warnings:
-            del self.warnings[username]
-            await self.save_warnings()
-            had_data = True
-        
+        had_data = await self.clear_user_warning(username)
+
         if username in self.warning_history:
             del self.warning_history[username]
             await self.save_warning_history()
             had_data = True
-        
+
         if had_data:
             warning_logger.info(f"🗑️ Cleared trust data for user: {username}")
 
@@ -807,8 +810,7 @@ class EnhancedWarningSystem:
 
                             # Remove the applied incident before optional lookup or
                             # notification I/O can fail or be cancelled.
-                            self.warnings.pop(username, None)
-                            await self.save_warnings()
+                            await self.clear_user_warning(username)
 
                             if punishment_result.get("action") in ("reconciled", "deduplicated") or (
                                 punishment_result.get("action") == "applied_unrecorded"

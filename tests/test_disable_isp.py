@@ -123,6 +123,52 @@ async def run_cycle(case):
     await usage.check_users_usage(PanelType("admin", "secret", "panel.example"), case["config"])
 
 
+@pytest.mark.parametrize("action", ["disabled", "revoked", "warning", "error"])
+async def test_scan_consumes_warning_without_erasing_prior_disable_history(notice_cycle, action):
+    case = notice_cycle
+    await case["system"].add_warning("alice", 2, set(case["users"]["alice"].ip), 1, send_telegram_notification=False)
+    case["system"].warnings["alice"].consecutive_violations = 2
+    case["system"].warning_history["alice"] = [900.0]
+    case["action"][0] = action
+    case["now"][0] += 60
+    try:
+        await run_cycle(case)
+        expected = [900.0, 1060.0] if action in ("disabled", "revoked") else [900.0]
+        assert case["system"].warning_history["alice"] == expected
+    finally:
+        await case["detector"].close()
+
+
+@pytest.mark.parametrize("active", [True, False])
+async def test_ordinary_warning_cleanup_preserves_disable_history(notice_cycle, active):
+    case = notice_cycle
+    await case["system"].add_warning("alice", 2, set(case["users"]["alice"].ip), 1, send_telegram_notification=False)
+    case["system"].warning_history["alice"] = [900.0]
+    if active:
+        case["users"]["alice"].ip = ["5.6.7.10"]
+    else:
+        case["users"].clear()
+    case["now"][0] += 60
+    try:
+        await run_cycle(case)
+        assert "alice" not in case["system"].warnings
+        assert case["system"].warning_history["alice"] == [900.0]
+    finally:
+        await case["detector"].close()
+
+
+async def test_operator_trust_reset_still_clears_warning_and_disable_history(notice_cycle):
+    case = notice_cycle
+    await case["system"].add_warning("alice", 2, set(case["users"]["alice"].ip), 1, send_telegram_notification=False)
+    case["system"].warning_history["alice"] = [900.0]
+    try:
+        assert await case["system"].clear_user_trust_data("alice")
+        assert "alice" not in case["system"].warnings
+        assert "alice" not in case["system"].warning_history
+    finally:
+        await case["detector"].close()
+
+
 async def test_warning_scans_make_no_isp_requests(notice_cycle):
     case = notice_cycle
     try:
@@ -309,8 +355,7 @@ async def test_applied_disable_with_failed_record_still_enriches_and_notifies(
         assert "5.6.7.10" in message and "5.6.7.20" in message
         assert len(case["requests"]) == 2
         assert case["request_states"] == [False, False]
-        if path == "expired":
-            assert case["system"].warning_history["alice"] == [1060.0]
+        assert case["system"].warning_history["alice"] == [1060.0]
 
         # A still-failing ledger retry applies no new punishment and must not
         # produce another disable notice, lookup, or trust-history entry.
