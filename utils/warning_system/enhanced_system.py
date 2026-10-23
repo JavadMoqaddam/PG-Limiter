@@ -997,6 +997,15 @@ class EnhancedWarningSystem:
                 users_to_remove.append(username)
 
         for username in users_to_remove:
+            # Earlier absence/normalization decisions may have waited behind a
+            # later user's preparation. Preserve them if the sample was retired.
+            # Already-applied punishments still consume their warning record.
+            if (
+                refresh_user_evidence is not None
+                and username not in disabled_users | warned_users
+                and not refresh_user_evidence(username)
+            ):
+                continue
             # pop, not del: clear_user_trust_data may already have removed the key
             # while this function was awaiting a panel call or a Telegram send.
             self.warnings.pop(username, None)

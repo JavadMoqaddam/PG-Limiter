@@ -20,6 +20,7 @@ from utils.device_count import (
     count_devices_from_ips,
     group_ips_by_subnet,
 )
+from utils.log_observations import LOG_OBSERVATIONS
 from utils.warning_system import warning_system  # global shared instance
 from utils.isp_detector import ISPDetector
 from utils.ip_history_tracker import ip_history_tracker
@@ -871,10 +872,19 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     if config_data is None:
         config_data = await read_config()
     api_mode = config_data.get("ip_source") == "api"
-    active_users_snapshot = await pop_api_users_snapshot() if api_mode else await pop_active_users_snapshot()
+    active_users_snapshot = await pop_api_users_snapshot() if api_mode else await pop_active_users_snapshot(config_data)
     if active_users_snapshot is None:
         return
     api_evidence = getattr(active_users_snapshot, "api_evidence", None)
+    log_evidence = getattr(active_users_snapshot, "log_evidence", None)
+    if not api_mode and not LOG_OBSERVATIONS.is_current(log_evidence):
+        reason = log_evidence.unavailable_reason if log_evidence else "missing Logs evidence"
+        logger.warning(f"Logs enforcement waiting: {reason}")
+        return
+
+    def cycle_is_current():
+        return api_evidence_is_current(api_evidence) if api_evidence else LOG_OBSERVATIONS.is_current(log_evidence)
+
     protected_users = set(api_evidence.unknown_users) if api_evidence else set()
     all_users_log = await check_ip_used(config_data=config_data, active_users_snapshot=active_users_snapshot)
 
@@ -957,6 +967,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         await merge_active_users_snapshot(active_users_snapshot)
         raise
 
+    if not cycle_is_current():
+        return
     if api_evidence:
         if not api_evidence_is_current(api_evidence):
             logger.info("🛰️ Discarding API evidence after a source/settings change")
@@ -999,8 +1011,10 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     def refresh_user_evidence(username: str) -> bool:
         # Later users may wait behind warning persistence or a panel punishment.
         # This is a local age/configuration check, with no network refetch.
-        if not api_evidence_is_current(api_evidence) or username in protected_users:
+        if not cycle_is_current() or username in protected_users:
             return False
+        if log_evidence:
+            return True
         user = active_users_snapshot.get(username)
         if user is None:
             return True
@@ -1036,7 +1050,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # ~200 lines below, after check_persistent_violations had already deleted every
     # expired record - so the guard meant to stop a partial view from wiping counters
     # ran too late to protect the records that path touches.
-    counters_are_trustworthy = bool(api_evidence) or _sample_is_trustworthy(all_users_actual_ips, check_interval)
+    counters_are_trustworthy = cycle_is_current()
 
     # Check for users who still violate limits after warning period.
     # Pass the actual IPs, group limits and the cycle's unified device counts, plus
@@ -1060,9 +1074,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         # synced user, so an offline user is resolvable and gets judged normally - with
         # no IPs their device count is 0, so the record is dropped without a ban.
         known_users=set(users_metadata_usage) | set(_metadata_cache),
-        **(
-            {"protected_users": protected_users, "refresh_user_evidence": refresh_user_evidence} if api_evidence else {}
-        ),
+        protected_users=protected_users,
+        refresh_user_evidence=refresh_user_evidence,
     )
 
     # Combine disabled and warned users to skip them in the loop
@@ -1087,7 +1100,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     cycle_new_warnings = []
 
     for user_name, unique_ips in all_users_actual_ips.items():
-        if api_evidence and not api_evidence_is_current(api_evidence):
+        if not cycle_is_current():
             return
         # Inverted from `if not except and not processed:` to an early continue so
         # that the `try` below sits at the indentation the old `if` had. The body is
@@ -1133,7 +1146,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                 group_limits=batched_group_limits,
             )
 
-            if api_evidence:
+            if api_evidence or log_evidence:
                 if not refresh_user_evidence(user_name):
                     continue
                 unique_ips = all_users_actual_ips[user_name]
@@ -1169,8 +1182,10 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         f"({len(unique_ips)} IPs, limit={user_limit_number}) (result={result})"
                     )
 
+                if not cycle_is_current():
+                    return
                 if result == "violation_limit_reached":
-                    if api_evidence and (
+                    if (api_evidence or log_evidence) and (
                         not refresh_user_evidence(user_name) or all_users_device_counts[user_name] <= user_limit_number
                     ):
                         continue
@@ -1341,7 +1356,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     for monitored_user in list(warning_system.warnings.keys()):
         if not counters_are_trustworthy:
             break
-        if api_evidence and not api_evidence_is_current(api_evidence):
+        if not cycle_is_current():
             return
         if api_evidence and not refresh_user_evidence(monitored_user):
             continue
@@ -1370,6 +1385,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
             # Use the same unified device count the warning path used, so a
             # warning issued this cycle cannot be cleared in the same cycle.
             user_device_count = all_users_device_counts.get(monitored_user, len(user_current_ips))
+            if not cycle_is_current():
+                return
             if user_device_count <= u_lim:
                 await warning_system.clear_user_trust_data(monitored_user)
                 logger.info(
@@ -1418,7 +1435,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # Clean up expired warnings. Gated on the same trustworthiness verdict as
     # check_persistent_violations: unconditional cleanup deleted exactly the records
     # that function had just preserved.
-    if api_evidence and not api_evidence_is_current(api_evidence):
+    if not cycle_is_current():
         return
     await warning_system.cleanup_expired_warnings(
         sample_is_trustworthy=counters_are_trustworthy,
