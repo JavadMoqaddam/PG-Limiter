@@ -119,7 +119,9 @@ async def handle_ip_source_set_logs_callback(query, context: ContextTypes.DEFAUL
         await query.answer("Already using node logs")
         return
 
-    await save_config_value("ip_source", "logs")
+    if not await save_config_value("ip_source", "logs"):
+        await query.answer("❌ Could not save the IP source. Please try again.", show_alert=True)
+        return
     await query.answer("✅ IP source: node logs (SSE)")
     await handle_ip_source_menu_callback(query, context)
 
@@ -205,7 +207,9 @@ async def handle_ip_source_set_api_callback(query, context: ContextTypes.DEFAULT
         )
         return
 
-    await save_config_value("ip_source", "api")
+    if not await save_config_value("ip_source", "api"):
+        await query.answer("❌ Could not save the IP source. Please try again.", show_alert=True)
+        return
     await query.answer("✅ IP source: panel API")
     await handle_ip_source_menu_callback(query, context)
 

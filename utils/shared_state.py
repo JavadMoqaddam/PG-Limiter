@@ -48,6 +48,15 @@ def begin_api_collection() -> int:
     return _api_generation
 
 
+async def discard_source_observations() -> None:
+    """Discard previous-source samples without touching user warning history."""
+    global _api_generation, _api_snapshot
+    async with ACTIVE_USERS_LOCK:
+        _api_generation += 1
+        _api_snapshot = None
+        ACTIVE_USERS.clear()
+
+
 def api_evidence_is_current(evidence: APISampleEvidence) -> bool:
     """A newer collection or configuration write invalidates an older sample."""
     from utils.read_config import get_config_revision

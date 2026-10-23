@@ -30,6 +30,9 @@ async def api_cycle(tmp_path, monkeypatch):
     monkeypatch.setattr(
         database, "AsyncSessionLocal", async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     )
+    import asyncio
+
+    monkeypatch.setattr(api, "_collection_lock", asyncio.Lock())
     state.ACTIVE_USERS.clear()
     sync.USER_METADATA_CACHE.clear()
     async with database.get_db() as db:
@@ -232,7 +235,7 @@ async def test_deleted_user_is_valid_absence(api_cycle, monkeypatch):
     assert api_cycle.warning.warnings == {}
 
 
-async def test_older_collection_cannot_replace_newer_snapshot(api_cycle, monkeypatch):
+async def test_concurrent_collections_publish_in_order(api_cycle, monkeypatch):
     import asyncio
     import utils.ip_source_api as api
     import utils.panel_api.request_helper as requests
@@ -249,16 +252,20 @@ async def test_older_collection_cannot_replace_newer_snapshot(api_cycle, monkeyp
         if calls <= 2:
             waiting.set()
             await release.wait()
-        return await original(*args, **kwargs)
+            return await original(*args, **kwargs)
+        return SimpleNamespace(status_code=200, json=lambda: {"nodes": {"1": {"ips": {}}}}), None
 
     monkeypatch.setattr(requests, "panel_request", request)
     old = asyncio.create_task(api.collect_active_users_from_api(api_cycle.panel, api_cycle.config))
     await waiting.wait()
-    assert await api.collect_active_users_from_api(api_cycle.panel, api_cycle.config)
-    accepted = {name: user for name, user in ACTIVE_USERS.items()}
+    newer = asyncio.create_task(api.collect_active_users_from_api(api_cycle.panel, api_cycle.config))
+    await asyncio.sleep(0)
+    pending_calls = calls
     release.set()
-    assert await old is False
-    assert all(ACTIVE_USERS[name] is user for name, user in accepted.items())
+    assert await old is True
+    assert await newer is True
+    assert pending_calls == 2
+    assert ACTIVE_USERS == {}
 
 
 async def test_stale_config_argument_cannot_start_a_new_api_batch(api_cycle):

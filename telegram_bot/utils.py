@@ -9,7 +9,7 @@ import os
 import sys
 
 from utils.types import PanelType
-from utils.read_config import invalidate_config_cache
+from utils.read_config import config_write_transaction, invalidate_config_cache
 from utils.atomic_io import atomic_write_json
 
 try:
@@ -21,6 +21,7 @@ except ImportError:
 # Import database utilities
 try:
     from db import get_db, UserCRUD, ConfigCRUD
+
     DB_AVAILABLE = True
 except ImportError:
     DB_AVAILABLE = False
@@ -32,6 +33,7 @@ _config_write_lock = asyncio.Lock()
 async def get_token(panel_data: PanelType) -> PanelType:
     """Canonical token fetcher delegating to panel_api.auth module."""
     from utils.panel_api.auth import get_token as auth_get_token
+
     return await auth_get_token(panel_data)
 
 
@@ -41,6 +43,7 @@ async def send_response(update, text: str, reply_markup=None, parse_mode: str = 
     Gracefully handles Telegram 'Message is not modified' error.
     """
     from telegram.error import BadRequest
+
     if getattr(update, "callback_query", None):
         try:
             await update.callback_query.answer()
@@ -83,6 +86,7 @@ async def send_response(update, text: str, reply_markup=None, parse_mode: str = 
 async def safe_edit_message_text(query, text: str, **kwargs):
     """Safely edit message text ignoring 'Message is not modified' errors."""
     from telegram.error import BadRequest
+
     try:
         await query.edit_message_text(text, **kwargs)
     except BadRequest as e:
@@ -149,7 +153,7 @@ async def add_admin_to_config(new_admin_id: int) -> int | None:
         # Return None since we can't add to env var dynamically
         # User needs to update ADMIN_IDS env var
         return None
-    
+
     # Fall back to config.json for non-Docker deployments
     if os.path.exists("config.json"):
         data = await read_json_file()
@@ -183,12 +187,12 @@ async def check_admin() -> list[int] | None:
             return [int(id.strip()) for id in admin_ids_env.split(",") if id.strip()]
         except ValueError:
             pass
-    
+
     # Fall back to config.json for non-Docker deployments
     if os.path.exists("config.json"):
         data = await read_json_file()
         return data.get("telegram", {}).get("admins", [])
-    
+
     return []
 
 
@@ -251,7 +255,7 @@ async def handle_special_limit(username: str, limit: int) -> list:
         and the second element is the new limit.
     """
     if DB_AVAILABLE:
-        async with get_db() as db:
+        async with config_write_transaction(), get_db() as db:
             # Check if limit was set before
             existing_limit = await UserCRUD.get_special_limit(db, username)
             set_before = 1 if existing_limit is not None else 0
@@ -259,13 +263,8 @@ async def handle_special_limit(username: str, limit: int) -> list:
             # Set the new limit
             await UserCRUD.set_special_limit(db, username, limit)
             await db.commit()
-        # The enforcement loop re-reads special limits straight from the database, so it
-        # sees this immediately - but every other reader goes through the config cache,
-        # which has no expiry. Without this, /backup captures the previous limit and the
-        # status screens keep reporting it until some unrelated setting is written.
-        await invalidate_config_cache()
         return [set_before, limit]
-    
+
     # Fallback to config.json
     set_before = 0
     if os.path.exists("config.json"):
@@ -311,9 +310,7 @@ async def remove_admin_from_config(admin_id: int) -> bool:
     admins = data.get("telegram", {}).get("admins", [])
     if admin_id in admins:
         if len(admins) <= 1:
-            raise LastAdminError(
-                "Refusing to remove the last administrator; add another admin first."
-            )
+            raise LastAdminError("Refusing to remove the last administrator; add another admin first.")
         admins.remove(admin_id)
         data["telegram"]["admins"] = admins
         await write_json_file(data)
@@ -333,9 +330,7 @@ async def add_base_information(domain: str, password: str, username: str):
     Returns:
         None
     """
-    await get_token(
-        PanelType(panel_domain=domain, panel_password=password, panel_username=username)
-    )
+    await get_token(PanelType(panel_domain=domain, panel_password=password, panel_username=username))
     if os.path.exists("config.json"):
         data = await read_json_file()
     else:
@@ -359,7 +354,7 @@ async def get_special_limits_dict() -> dict:
         async with get_db() as db:
             special_limits = await UserCRUD.get_all_special_limits(db)
             return special_limits or {}
-    
+
     # Fallback to config.json
     if os.path.exists("config.json"):
         data = await read_json_file()
@@ -380,28 +375,20 @@ async def get_special_limit_list() -> list | None:
             special_limits = await UserCRUD.get_all_special_limits(db)
             if not special_limits:
                 return None
-            special_list = "\n".join(
-                [f"{key} : {value}" for key, value in special_limits.items()]
-            )
+            special_list = "\n".join([f"{key} : {value}" for key, value in special_limits.items()])
             messages = special_list.split("\n")
-            shorter_messages = [
-                "\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)
-            ]
+            shorter_messages = ["\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)]
             return shorter_messages
-    
+
     # Fallback to config.json
     if os.path.exists("config.json"):
         data = await read_json_file()
         special_list = data.get("limits", {}).get("special", None)
         if not special_list:
             return None
-        special_list = "\n".join(
-            [f"{key} : {value}" for key, value in special_list.items()]
-        )
+        special_list = "\n".join([f"{key} : {value}" for key, value in special_list.items()])
         messages = special_list.split("\n")
-        shorter_messages = [
-            "\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)
-        ]
+        shorter_messages = ["\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)]
         return shorter_messages
     return None
 
@@ -412,16 +399,11 @@ async def add_except_user(except_user: str) -> str | None:
     Falls back to config.json if database is not available.
     """
     if DB_AVAILABLE:
-        async with get_db() as db:
+        async with config_write_transaction(), get_db() as db:
             await UserCRUD.set_excepted(db, except_user, True)
             await db.commit()
-        # The enforcement loop's only whitelist gate in the warn/ban path reads
-        # config["except_users"] out of the process-wide config cache. Without this
-        # invalidation the freshly excepted user keeps accruing violation scans and is
-        # banned anyway, until some other setting is written or the process restarts.
-        await invalidate_config_cache()
         return except_user
-    
+
     # Fallback to config.json
     if os.path.exists("config.json"):
         data = await read_json_file()
@@ -443,7 +425,7 @@ async def add_except_user(except_user: str) -> str | None:
 async def get_except_users_list() -> list:
     """
     Retrieve the list of exception users from the database as a list.
-    
+
     Returns:
         list: List of usernames in the whitelist
     """
@@ -451,7 +433,7 @@ async def get_except_users_list() -> list:
         async with get_db() as db:
             except_users = await UserCRUD.get_all_excepted(db)
             return except_users or []
-    
+
     # Fallback to config.json
     if os.path.exists("config.json"):
         data = await read_json_file()
@@ -471,11 +453,9 @@ async def show_except_users_handler() -> list | None:
                 return None
             except_users_str = "\n".join([f"{user}" for user in except_users])
             messages = except_users_str.split("\n")
-            shorter_messages = [
-                "\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)
-            ]
+            shorter_messages = ["\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)]
             return shorter_messages
-    
+
     # Fallback to config.json
     if os.path.exists("config.json"):
         data = await read_json_file()
@@ -484,9 +464,7 @@ async def show_except_users_handler() -> list | None:
             return None
         except_users = "\n".join([f"{key}" for key in except_users])
         messages = except_users.split("\n")
-        shorter_messages = [
-            "\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)
-        ]
+        shorter_messages = ["\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)]
         return shorter_messages
     return None
 
@@ -496,14 +474,11 @@ async def remove_except_user_from_config(user: str) -> str | None:
     Remove a user from the exception list using database.
     """
     if DB_AVAILABLE:
-        async with get_db() as db:
+        async with config_write_transaction(), get_db() as db:
             result = await UserCRUD.set_excepted(db, user, False)
             await db.commit()
-        # Same reason as add_except_user: without this the cached except_users list
-        # keeps shielding a user the operator just removed from the whitelist.
-        await invalidate_config_cache()
         return user if result is not None else None
-    
+
     # Fallback to config.json
     if not os.path.exists("config.json"):
         return None
@@ -530,10 +505,9 @@ async def save_general_limit(limit: int) -> int:
     from the bot did not stop the old one from banning people.
     """
     if DB_AVAILABLE:
-        async with get_db() as db:
+        async with config_write_transaction(), get_db() as db:
             await ConfigCRUD.set(db, "general_limit", limit)
             await db.commit()
-        await invalidate_config_cache()
         return limit
 
     # Fallback to config.json

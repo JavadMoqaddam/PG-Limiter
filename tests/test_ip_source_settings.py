@@ -114,3 +114,23 @@ async def test_cancel_button_clears_freshness_waiting_state(monkeypatch):
     assert not context.user_data.get("waiting_for")
     keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
     assert any(button.text == "🕒 Last seen: 10s" for row in keyboard.inline_keyboard for button in row)
+
+
+@pytest.mark.parametrize("target", ["api", "logs"])
+async def test_manual_source_save_failure_never_announces_success(monkeypatch, target):
+    import telegram_bot.handlers.settings_ip_source as settings
+    import utils.panel_api.online_ips as online
+
+    monkeypatch.setattr(
+        settings,
+        "read_config",
+        AsyncMock(return_value={"ip_source": "logs" if target == "api" else "api", "api_ip_freshness": 60}),
+    )
+    monkeypatch.setattr(settings, "save_config_value", AsyncMock(return_value=False))
+    monkeypatch.setattr(settings, "_find_preflight_user_id", AsyncMock(return_value=(1, "")))
+    monkeypatch.setattr(settings, "_build_panel_data", lambda config: object())
+    monkeypatch.setattr(online, "check_online_stats_permission", AsyncMock(return_value=(True, "")))
+    query = SimpleNamespace(answer=AsyncMock(), edit_message_text=AsyncMock())
+    await getattr(settings, f"handle_ip_source_set_{target}_callback")(query, SimpleNamespace(user_data={}))
+    assert "❌" in query.answer.call_args.args[0]
+    assert not any("✅" in str(call) for call in query.answer.call_args_list)
