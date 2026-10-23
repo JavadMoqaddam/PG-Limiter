@@ -48,6 +48,34 @@ with earlier cycles or Logs, and a settings change invalidates an in-flight
 batch without resetting warnings. **Last API Cycle** shows whether the sample
 was complete, partially usable, or skipped.
 
+## Automatic fallback and recovery
+
+With `api_ip_auto_fallback` enabled (the default), two consecutive unsuccessful
+API collection cycles switch the source to Logs. Each cycle counts once,
+regardless of the number of failed user requests. Both failed and partial
+collections count, including unreachable panels, incomplete candidate or node
+queries, malformed responses and missing user evidence. Known users may still
+be evaluated on the first partial cycle when the coverage gates allow it.
+
+A complete collection resets the failure streak. Valid empty results, all-valid
+expired timestamps and confirmed deleted users count as success. Only the
+panel's explicit `{"detail": "User not found"}` response confirms deletion;
+a generic route or proxy HTTP 404 remains unknown evidence. Cancellation,
+degraded local configuration and superseded settings do not count as outages.
+
+Logs must be saved successfully before the switch takes effect. A failed save
+keeps API selected and retries on the next unsuccessful cycle. A manual source
+or settings change starts a new failure streak and prevents an older collection
+from overwriting that choice. Successful source writes discard previous-source
+observations, including pending API batches, while preserving warning history.
+The second failed cycle cannot enforce its old API sample after switching.
+
+A committed fallback attempts one Telegram notification. Delivery failure does
+not undo or repeat the switch. Logs remains selected until you choose Panel API
+again in Settings; that manual choice runs the existing permission preflight.
+When automatic fallback is disabled, API remains selected and the existing
+coverage diagnostics continue to report skipped enforcement.
+
 ## Configuration and upgrades
 
 `API_IP_FRESHNESS=60` supplies the default for new installations. Set any positive

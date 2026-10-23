@@ -22,6 +22,7 @@ Collection is a two-stage process:
 import asyncio
 import copy
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 from utils.logs import get_logger
@@ -71,20 +72,19 @@ LAST_CYCLE_STATS: dict = {
     "unknown_users": 0,
 }
 
-# Consecutive cycles that produced no usable data at all. Used to fall back to
-# log mode when the panel account cannot serve the online-stats endpoint.
+# Unsuccessful collection cycles, scoped to the configuration that produced them.
 _consecutive_dead_cycles = 0
+_failure_revision: int | None = None
+_collection_lock = asyncio.Lock()
 _forbidden_alert_sent = False
 
-# Consecutive cycles skipped because the sample was too incomplete to act on. Kept
-# apart from the dead-cycle streak: a dead cycle means the panel gave us nothing and
-# log mode is the remedy, while these mean the panel answered incompletely and the
-# remedy is for the operator to look at why.
+# Separate diagnostics for repeated enforcement skips, including when automatic
+# fallback is disabled or cannot be persisted.
 _consecutive_coverage_skips = 0
 _coverage_alert_sent = False
 
 # Consecutive dead cycles tolerated before reverting to log mode
-DEAD_CYCLE_FALLBACK_THRESHOLD = 3
+DEAD_CYCLE_FALLBACK_THRESHOLD = 2
 
 # Consecutive coverage skips tolerated before saying enforcement has stopped
 COVERAGE_SKIP_ALERT_THRESHOLD = 3
@@ -271,6 +271,8 @@ async def _validate_ips(raw_ips: set[str], config_data: dict) -> tuple[set[str],
     accepted: set[str] = set()
     results = await asyncio.gather(*[_decide(ip) for ip in raw_ips], return_exceptions=True)
     for item in results:
+        if isinstance(item, asyncio.CancelledError):
+            raise item
         if isinstance(item, tuple) and item[1]:
             accepted.add(item[0])
 
@@ -335,6 +337,8 @@ async def _fetch_all_online_ips(
             return_exceptions=True,
         )
         for item in results:
+            if isinstance(item, asyncio.CancelledError):
+                raise item
             if not isinstance(item, tuple):
                 counters["failed"] += 1
                 continue
@@ -511,37 +515,57 @@ def _reset_cycle_stats() -> None:
     LAST_CYCLE_STATS["collection_outcome"] = "failure"
 
 
-async def _handle_dead_cycle(config_data: dict, reason: str) -> None:
-    """
-    Track cycles that produced nothing and revert to log mode if they persist.
+@dataclass(frozen=True)
+class _CollectionResult:
+    """A cycle owns its health outcome independently of the diagnostic stats."""
 
-    One dead cycle can be a transient panel hiccup, so the fallback only trips
-    after ``DEAD_CYCLE_FALLBACK_THRESHOLD`` in a row, and only when
-    ``api_ip_auto_fallback`` is enabled.
-    """
-    global _consecutive_dead_cycles
+    outcome: str
+    enforcement_ready: bool
+    reason: str
+    evidence: APISampleEvidence
+
+
+async def _account_collection_cycle(config_data: dict, result: _CollectionResult) -> bool:
+    """Account once and commit fallback without overwriting newer settings."""
+    global _consecutive_dead_cycles, _failure_revision
+
+    revision = result.evidence.config_revision
+    if _failure_revision != revision:
+        _consecutive_dead_cycles = 0
+        _failure_revision = revision
+    if result.outcome == "success":
+        _consecutive_dead_cycles = 0
+        return result.enforcement_ready
 
     _consecutive_dead_cycles += 1
     api_ip_logger.warning(
-        f"🛰️ API IP collection produced no data ({reason}) — dead cycle "
+        f"🛰️ API IP collection incomplete ({result.reason}) — unsuccessful cycle "
         f"{_consecutive_dead_cycles}/{DEAD_CYCLE_FALLBACK_THRESHOLD}"
     )
-    if _consecutive_dead_cycles < DEAD_CYCLE_FALLBACK_THRESHOLD:
-        return
-    if not config_data.get("api_ip_auto_fallback", True):
-        return
+    if _consecutive_dead_cycles < DEAD_CYCLE_FALLBACK_THRESHOLD or not config_data.get("api_ip_auto_fallback", True):
+        return result.enforcement_ready
 
     from utils.read_config import save_config_value
 
-    if await save_config_value("ip_source", "logs"):
-        _consecutive_dead_cycles = 0
-        api_ip_logger.error("🛰️ Reverted IP source to log mode after repeated failures")
-        await _notify(
-            "🛰️ <b>IP Source reverted to Logs</b>\n\n"
-            f"API mode returned no usable data for {DEAD_CYCLE_FALLBACK_THRESHOLD} "
-            f"consecutive cycles (<code>{reason}</code>).\n"
-            "Log streaming has been restored automatically."
-        )
+    saved = await save_config_value("ip_source", "logs", expected_revision=revision)
+    if saved is False:
+        # Failed attempts also invalidate config. Preserve this attempt's streak,
+        # but never transfer it across a later manual settings/source write.
+        _failure_revision = get_config_revision()
+        return result.enforcement_ready
+    _consecutive_dead_cycles = 0
+    _failure_revision = None
+    if saved is None:
+        return False
+
+    api_ip_logger.error("🛰️ Reverted IP source to log mode after repeated failures")
+    await _notify(
+        "🛰️ <b>IP Source reverted to Logs</b>\n\n"
+        f"API collection was unsuccessful for {DEAD_CYCLE_FALLBACK_THRESHOLD} "
+        f"consecutive cycles (<code>{result.reason}</code>).\n"
+        "Log streaming has been restored automatically."
+    )
+    return False
 
 
 async def _handle_coverage_skip(reason: str) -> None:
@@ -551,9 +575,8 @@ async def _handle_coverage_skip(reason: str) -> None:
     A coverage skip is the safe outcome for one cycle - a partial sample would
     clear real offenders' counters. A *run* of them is a different thing: nobody is
     being escalated or banned at all, and the only trace used to be one WARNING per
-    cycle that looks identical to the previous one. Reverting to log mode is not the
-    remedy (the panel is answering, it is just answering incompletely), so this
-    raises an alarm instead of changing the IP source.
+    cycle that looks identical to the previous one. This diagnostic remains useful
+    when automatic fallback is disabled or its configuration write fails.
     """
     global _consecutive_coverage_skips, _coverage_alert_sent
 
@@ -596,52 +619,62 @@ async def _alert_forbidden_once() -> None:
 
 
 async def collect_active_users_from_api(panel_data: PanelType, config_data: dict) -> bool:
-    """
-    Collect the connected IPs of monitored users into ``ACTIVE_USERS``.
+    """Collect one API sample and account its outcome once before enforcement.
 
-    This is the API-mode counterpart of the SSE log pipeline and the only
-    function ``check_usage`` needs to call. Everything downstream reads the
-    same user/connection structure. A separately cloned API snapshot prevents
-    log tasks winding down from changing that cycle's evidence. Device counting,
-    warning thresholds and the punishment policy remain unchanged.
-
-    Returns:
-        ``True`` when the sample is trustworthy enough for enforcement to run
-        this cycle, ``False`` when the cycle must be skipped. The sample carries
-        unknown users so none of their warning, ban or clearing paths can run.
-        LAST_CYCLE_STATS.collection_outcome separately records whether every
-        candidate answered completely, for source-recovery accounting.
+    Partial samples can still enforce known users while API remains selected.
+    A committed fallback discards the sample and returns False. Cancellation,
+    degraded local settings and superseded evidence never count as API outages.
     """
-    global _consecutive_dead_cycles, _forbidden_alert_sent
-    global _consecutive_coverage_skips, _coverage_alert_sent
+    async with _collection_lock:
+        source_config = config_data
+        config_data = copy.deepcopy(config_data)
+        if config_data.get("config_degraded") or config_data.get("ip_source", "api") != "api":
+            _reset_cycle_stats()
+            LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="API configuration unavailable")
+            return False
+        evidence = APISampleEvidence(
+            begin_api_collection(),
+            config_data.get("_revision", get_config_revision()),
+            _resolve_freshness_window(config_data),
+        )
+        result = await _collect_api_cycle(panel_data, config_data, source_config, evidence)
+        if not api_evidence_is_current(result.evidence) or source_config != config_data:
+            LAST_CYCLE_STATS.update(
+                collection_outcome="superseded", skipped_reason="configuration or collection changed"
+            )
+            return False
+        LAST_CYCLE_STATS["collection_outcome"] = result.outcome
+        if result.outcome == "superseded":
+            return False
+        return await _account_collection_cycle(config_data, result)
+
+
+async def _collect_api_cycle(
+    panel_data: PanelType, config_data: dict, source_config: dict, evidence: APISampleEvidence
+) -> _CollectionResult:
+    """Build a cycle-owned result; global stats are only for diagnostics."""
+    global _forbidden_alert_sent, _consecutive_coverage_skips, _coverage_alert_sent
 
     from utils.panel_api.online_ips import fetch_online_candidates
     from utils.panel_api.request_helper import is_panel_available
 
-    source_config = config_data
-    config_data = copy.deepcopy(config_data)
-    evidence = APISampleEvidence(
-        begin_api_collection(),
-        config_data.get("_revision", get_config_revision()),
-        _resolve_freshness_window(config_data),
-    )
     started = time.perf_counter()
     _reset_cycle_stats()
     if not api_evidence_is_current(evidence):
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration changed")
-        return False
+        return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
 
     if not is_panel_available():
         LAST_CYCLE_STATS["skipped_reason"] = "panel unavailable"
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         api_ip_logger.warning("🛰️ Skipping API IP collection: panel marked unavailable")
-        return False
+        return _CollectionResult("failure", False, "panel unavailable", evidence)
 
     try:
         node_name_map, disabled_nodes, expected_node_ids = await _resolve_node_context(panel_data, config_data)
     except ValueError:
         LAST_CYCLE_STATS["skipped_reason"] = "node availability unknown"
-        return False
+        return _CollectionResult("failure", False, "node availability unknown", evidence)
 
     online_window = _resolve_online_window(config_data)
 
@@ -655,14 +688,13 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
     )
     if not api_evidence_is_current(evidence) or source_config != config_data:
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
-        return False
+        return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
     # None means the candidate query itself failed. Treating that as "nobody is
     # online" would wipe every pending warning, so the cycle is abandoned.
     if candidates is None:
         LAST_CYCLE_STATS["skipped_reason"] = "candidate query failed"
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
-        await _handle_dead_cycle(config_data, "candidate query failed")
-        return False
+        return _CollectionResult("failure", False, "candidate query failed", evidence)
 
     LAST_CYCLE_STATS["candidates"] = len(candidates)
     targets = _prefilter_candidates(candidates)
@@ -676,24 +708,14 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
     LAST_CYCLE_STATS["prefiltered"] = len(targets)
 
     if not targets:
-        # A genuinely empty candidate set is a valid result, not a failure:
-        # enforcement still has to run so normalized users get cleared.
-        #
-        # The dead-cycle streak is reset because the candidate query answered, so
-        # falling back to log mode is not the remedy. The coverage-skip streak is
-        # deliberately left alone: the per-user fan-out never ran this cycle, so it
-        # produced no evidence about whether the sample is usable. Clearing it here let
-        # an alternating pattern - empty cycle, low-coverage skip, empty cycle - hold
-        # the streak at 1 forever, so the "enforcement has stopped" alert could never
-        # fire no matter how long enforcement stayed down.
+        # Valid absence still runs enforcement so normalized users can clear.
         if not await publish_api_snapshot({}, evidence):
-            return False
+            return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
         LAST_CYCLE_STATS["collection_outcome"] = "success"
         LAST_CYCLE_STATS["coverage"] = 1.0
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
-        _consecutive_dead_cycles = 0
         api_ip_logger.info("🛰️ No online candidates this cycle")
-        return True
+        return _CollectionResult("success", True, "", evidence)
 
     payloads, counters, fetch_times = await _fetch_all_online_ips(
         panel_data,
@@ -704,7 +726,7 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
 
     if not api_evidence_is_current(evidence) or source_config != config_data:
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
-        return False
+        return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
 
     # A 404 is a definitive answer (the user vanished from the panel), so it
     # counts as covered; 403/timeouts/5xx leave the user's state unknown.
@@ -727,8 +749,7 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
     if answered == 0:
         LAST_CYCLE_STATS["skipped_reason"] = "no successful lookups"
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
-        await _handle_dead_cycle(config_data, "no successful lookups")
-        return False
+        return _CollectionResult("failure", False, "no successful lookups", evidence)
 
     # An absent key means "use the documented default", not "no floor at all".
     # `or 0.0` silently disabled the guard for any caller that assembled
@@ -745,18 +766,10 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
             f"🛰️ Skipping enforcement: coverage {coverage:.1%} < {min_coverage:.0%} "
             f"({counters['ok']} ok, {counters['failed']} failed of {len(targets)})"
         )
-        # The dead-cycle streak is deliberately NOT advanced here: the panel did
-        # answer, so reverting to log mode is not the right remedy and would thrash
-        # the IP source over a slow panel.
-        #
-        # But a run of these means enforcement has silently stopped - nobody is
-        # escalated, nobody is banned - so it gets its own counter and its own
-        # alarm rather than being invisible.
-        _consecutive_dead_cycles = 0
-        await _handle_coverage_skip(LAST_CYCLE_STATS["skipped_reason"])
-        return False
+        reason = f"coverage {coverage:.0%} below {min_coverage:.0%}"
+        await _handle_coverage_skip(reason)
+        return _CollectionResult("partial", False, reason, evidence)
 
-    _consecutive_dead_cycles = 0
     _forbidden_alert_sent = False
 
     raw_by_name = {name: raw for name, _, raw in targets}
@@ -787,14 +800,14 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
     unknown_users = (set(raw_by_name) - answered_users) | set(new_users.unknown_users)
     if not api_evidence_is_current(evidence) or source_config != config_data:
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
-        return False
+        return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
     LAST_CYCLE_STATS["unknown_users"] = len(unknown_users)
     if unknown_users == set(raw_by_name):
         LAST_CYCLE_STATS["collection_outcome"] = "partial"
         LAST_CYCLE_STATS.update(build_stats)
         LAST_CYCLE_STATS["skipped_reason"] = "all user evidence unknown"
-        await _handle_coverage_skip(LAST_CYCLE_STATS["skipped_reason"])
-        return False
+        await _handle_coverage_skip("all user evidence unknown")
+        return _CollectionResult("partial", False, "all user evidence unknown", evidence)
 
     # Preserve the optional aggregate gate. It never makes an individual user's
     # missing-node evidence complete, even when the configured floor is zero.
@@ -813,15 +826,16 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
             f"{nodes_expected} connected nodes returned an IP map "
             f"({node_coverage:.1%} < {min_node_coverage:.0%})"
         )
-        await _handle_coverage_skip(LAST_CYCLE_STATS["skipped_reason"])
-        return False
+        reason = f"node coverage {node_coverage:.0%} below {min_node_coverage:.0%}"
+        await _handle_coverage_skip(reason)
+        return _CollectionResult("partial", False, reason, evidence)
 
     evidence = APISampleEvidence(
         evidence.generation, evidence.config_revision, evidence.freshness_seconds, frozenset(unknown_users)
     )
     if not await publish_api_snapshot(new_users, evidence):
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
-        return False
+        return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
 
     # Only here, past every gate: the streak means "cycles skipped since enforcement
     # last actually ran". Clearing it as soon as the fan-out looked healthy meant the
@@ -843,4 +857,6 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
         f"{build_stats['stale_ips']} stale IPs dropped, "
         f"{LAST_CYCLE_STATS['duration_ms']}ms)"
     )
-    return True
+    return _CollectionResult(
+        "partial" if unknown_users else "success", True, "incomplete user evidence" if unknown_users else "", evidence
+    )

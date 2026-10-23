@@ -15,7 +15,8 @@ import copy
 import math
 import os
 import time
-from typing import Any, Dict, List, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from utils.logs import get_logger
 
@@ -42,6 +43,7 @@ except ImportError:
 _config_cache: Optional[Dict[str, Any]] = None
 _config_revision = 0
 _config_read_lock = asyncio.Lock()
+_config_write_lock = asyncio.Lock()
 
 
 def get_config_revision() -> int:
@@ -693,56 +695,94 @@ async def read_config_scalar(key: str, default: Any = None) -> Any:
     return value
 
 
-async def save_config_value(key: str, value: Any) -> bool:
+@asynccontextmanager
+async def config_write_transaction() -> AsyncIterator[None]:
+    """Serialize a caller-owned settings transaction through cache invalidation.
+
+    Enter this before opening the database transaction and leave it after commit.
+    Keep reads of merged config and notifications outside this context. Source
+    selection itself uses save_config_value/delete_config_value for observation
+    cleanup as well as serialization.
     """
-    Save a dynamic configuration value to the database.
+    async with _config_write_lock:
+        try:
+            yield
+        finally:
+            # Failed transactions can leave commit status uncertain too.
+            await invalidate_config_cache()
 
-    Returns:
-        True if the write committed.
 
-    A failure used to return ``False`` with nothing in the log, and almost every
-    caller is a Telegram handler that reports success without reading the result - so
-    the operator saw a green tick, the setting was not stored, and there was no trace
-    to find later. The write is still best-effort, but it is no longer silent.
+async def _finish_source_change() -> None:
+    """Finish committed source cleanup before another writer can proceed.
+
+    Cancellation may arrive while the active-user lock is held by a reader.
+    Keep the writer lock until cleanup finishes, then propagate cancellation.
     """
-    if not DB_AVAILABLE:
-        config_logger.error(f"❌ Cannot save configuration {key!r}: the database module is unavailable")
-        return False
+    from utils.shared_state import discard_source_observations
 
-    try:
-        async with get_db() as session:
-            await ConfigCRUD.set(session, key, str(value))
+    cleanup = asyncio.create_task(discard_source_observations())
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+    cleanup.result()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+async def save_config_value(key: str, value: Any, *, expected_revision: int | None = None) -> bool | None:
+    """Save a setting, optionally rejecting a superseded collection's write.
+
+    Ordinary callers receive True for a committed write or False for failure.
+    Guarded callers also receive None if newer settings prevented the attempt.
+    Successful source writes discard old observations before another writer runs.
+    """
+    async with _config_write_lock:
+        if expected_revision is not None and expected_revision != get_config_revision():
+            return None
+        if not DB_AVAILABLE:
+            config_logger.error(f"❌ Cannot save configuration {key!r}: the database module is unavailable")
+            return False
+
+        try:
+            async with get_db() as session:
+                await ConfigCRUD.set(session, key, str(value))
+        except Exception as error:  # pylint: disable=broad-except
+            config_logger.exception(
+                f"❌ Failed to save configuration {key!r}: {error}. The previous value is still in effect."
+            )
+            return False
+        finally:
+            # A failed or cancelled database operation can have an uncertain commit
+            # outcome. Reload rather than continuing to serve potentially stale data.
+            await invalidate_config_cache()
+        if key == "ip_source":
+            await _finish_source_change()
         return True
-    except Exception as error:  # pylint: disable=broad-except
-        config_logger.exception(
-            f"❌ Failed to save configuration {key!r}: {error}. The previous value is still in effect."
-        )
-        return False
-    finally:
-        # Unconditionally, including on failure. If the write really did not land, the
-        # cache already matches the database and the rebuild is a no-op; if it landed
-        # and something after it raised, dropping the cache is the only thing that
-        # stops the process from serving the old value for the rest of its life.
-        await invalidate_config_cache()
 
 
 async def delete_config_value(key: str) -> bool:
-    """Delete a configuration value from the database."""
-    if not DB_AVAILABLE:
-        config_logger.error(f"❌ Cannot delete configuration {key!r}: the database module is unavailable")
-        return False
+    """Delete a setting under the same serialization as configuration saves."""
+    async with _config_write_lock:
+        if not DB_AVAILABLE:
+            config_logger.error(f"❌ Cannot delete configuration {key!r}: the database module is unavailable")
+            return False
 
-    try:
-        async with get_db() as session:
-            await ConfigCRUD.delete(session, key)
+        try:
+            async with get_db() as session:
+                await ConfigCRUD.delete(session, key)
+        except Exception as error:  # pylint: disable=broad-except
+            config_logger.exception(
+                f"❌ Failed to delete configuration {key!r}: {error}. The previous value is still in effect."
+            )
+            return False
+        finally:
+            await invalidate_config_cache()
+        if key == "ip_source":
+            await _finish_source_change()
         return True
-    except Exception as error:  # pylint: disable=broad-except
-        config_logger.exception(
-            f"❌ Failed to delete configuration {key!r}: {error}. The previous value is still in effect."
-        )
-        return False
-    finally:
-        await invalidate_config_cache()
 
 
 async def get_config_value_from_db(key: str, default: Any = None) -> Any:
