@@ -1449,7 +1449,7 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
     """run check_ip_used() function and then run check_users_usage()"""
     while True:
         cycle_start = time.monotonic()
-        config_data = await read_config()
+        config_data = await read_config(refresh=True)
 
         # In API mode the connected IPs are collected right here, immediately
         # before enforcement, instead of being streamed in continuously by the
