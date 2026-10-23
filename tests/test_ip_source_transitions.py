@@ -262,13 +262,13 @@ async def test_failed_fallback_write_retries_after_its_own_invalidation(source_r
     original = r.config.ConfigCRUD.set
     attempts = 0
 
-    async def write(session, key, value):
+    async def write(session, key, value, **kwargs):
         nonlocal attempts
         if key == "ip_source" and value == "logs":
             attempts += 1
             if attempts == 1:
                 raise RuntimeError("disk unavailable")
-        return await original(session, key, value)
+        return await original(session, key, value, **kwargs)
 
     monkeypatch.setattr(r.config.ConfigCRUD, "set", write)
     await r.collect("partial")
@@ -385,12 +385,12 @@ async def test_new_manual_source_waits_for_committed_cleanup(source_runtime, mon
     original = r.config.ConfigCRUD.set
     writes = []
 
-    async def set_value(session, key, value):
+    async def set_value(session, key, value, **kwargs):
         writes.append(value)
         if value == "logs":
             entered.set()
             await proceed.wait()
-        return await original(session, key, value)
+        return await original(session, key, value, **kwargs)
 
     monkeypatch.setattr(r.config.ConfigCRUD, "set", set_value)
     fallback = asyncio.create_task(r.config.save_config_value("ip_source", "logs"))
@@ -416,10 +416,10 @@ async def test_config_deletion_serializes_with_source_writes(source_runtime, mon
     deleted = []
     original_delete = r.config.ConfigCRUD.delete
 
-    async def write(session, key, value):
+    async def write(session, key, value, **kwargs):
         entered.set()
         await proceed.wait()
-        return await original(session, key, value)
+        return await original(session, key, value, **kwargs)
 
     async def delete(session, key):
         deleted.append(key)
@@ -535,11 +535,11 @@ async def test_guard_checks_revision_after_waiting_for_writer(source_runtime, mo
     proceed = asyncio.Event()
     original = r.config.ConfigCRUD.set
 
-    async def write(session, key, value):
+    async def write(session, key, value, **kwargs):
         if key == "api_ip_freshness":
             entered.set()
             await proceed.wait()
-        return await original(session, key, value)
+        return await original(session, key, value, **kwargs)
 
     monkeypatch.setattr(r.config.ConfigCRUD, "set", write)
     revision = r.config.get_config_revision()
@@ -651,7 +651,7 @@ async def test_live_punishment_edit_cannot_overtake_fallback_or_inherit_its_retr
     manual_writes = []
     paused = False
 
-    async def write(session, key, value):
+    async def write(session, key, value, **kwargs):
         nonlocal paused
         if key == "ip_source" and value == "logs" and not paused:
             paused = True
@@ -661,7 +661,7 @@ async def test_live_punishment_edit_cannot_overtake_fallback_or_inherit_its_retr
                 raise RuntimeError("controlled persistence failure")
         elif key == "punishment_enabled":
             manual_writes.append(key)
-        return await original(session, key, value)
+        return await original(session, key, value, **kwargs)
 
     monkeypatch.setattr(r.config.ConfigCRUD, "set", write)
     fallback = asyncio.create_task(r.collect("failure"))
@@ -720,12 +720,12 @@ async def test_backup_config_batch_rolls_back_and_invalidates_on_failure(
     original = r.config.ConfigCRUD.set
     writes = 0
 
-    async def write(session, key, value):
+    async def write(session, key, value, **kwargs):
         nonlocal writes
         writes += 1
         if writes == 2:
             raise RuntimeError("cannot persist second setting")
-        return await original(session, key, value)
+        return await original(session, key, value, **kwargs)
 
     monkeypatch.setattr(r.config.ConfigCRUD, "set", write)
     await live_config_writer()

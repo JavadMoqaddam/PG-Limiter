@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 from sqlalchemy import event
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -11,14 +12,12 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from db.models import Base
+from db.crud.config_revision import ConfigRevisionCRUD, PENDING_CONFIG_INVALIDATIONS
 from utils.logs import get_logger
 
 db_logger = get_logger("database")
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "sqlite+aiosqlite:///./data/pg_limiter.db"
-)
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./data/pg_limiter.db")
 
 # Flag indicating database availability
 DB_AVAILABLE: bool = True
@@ -43,7 +42,7 @@ if DATABASE_URL.startswith("sqlite"):
         pool_size=5,
         max_overflow=10,
     )
-    
+
     @event.listens_for(engine.sync_engine, "connect")
     def set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
@@ -79,6 +78,18 @@ def _current_session_transaction(session):
     return session.get_nested_transaction() or session.get_transaction()
 
 
+@event.listens_for(Engine, "savepoint")
+def _ensure_sqlite_outer_transaction(connection: Connection, _name: str) -> None:
+    """Keep a first SQLite SAVEPOINT inside a physical root transaction.
+
+    Legacy sqlite3 transaction control starts DML transactions but lets a first
+    SAVEPOINT become the root itself. Releasing it would commit before the
+    SQLAlchemy root resolves. Existing BEGIN/BEGIN IMMEDIATE owners stay intact.
+    """
+    if connection.dialect.name == "sqlite" and not connection.connection.driver_connection.in_transaction:
+        connection.exec_driver_sql("BEGIN")
+
+
 @event.listens_for(AsyncSession.sync_session_class, "after_commit")
 def _record_user_invalidation_commit(session) -> None:
     """Record which transaction level committed; resolution follows on end."""
@@ -103,13 +114,23 @@ def _resolve_user_cache_invalidations(session, transaction) -> None:
     outcome = outcomes.pop(transaction, None)
     usernames = pending_by_transaction.pop(transaction, set())
     parent = transaction.parent
+    config_pending = session.info.get(PENDING_CONFIG_INVALIDATIONS, set())
+    config_changed = transaction in config_pending
+    config_pending.discard(transaction)
 
     if parent is not None and outcome is True and usernames:
         pending_by_transaction.setdefault(parent, set()).update(usernames)
 
     if parent is not None:
+        if outcome is True and config_changed:
+            config_pending.add(parent)
         return
 
+    session.info.pop(PENDING_CONFIG_INVALIDATIONS, None)
+    if outcome is True and config_changed:
+        from utils.read_config import _invalidate_config_cache
+
+        _invalidate_config_cache()
     session.info.pop(_PENDING_USER_INVALIDATIONS, None)
     session.info.pop(_USER_INVALIDATION_OUTCOMES, None)
     if outcome is not True or not usernames:
@@ -132,29 +153,35 @@ def _sync_deprecated_legacy_tables_sync(sync_conn):
     if any exist.
     """
     from sqlalchemy import text, inspect
+
     inspector = inspect(sync_conn)
     existing_tables = set(inspector.get_table_names())
-    
+
     if "users" not in existing_tables:
         return
-        
+
+    policy_changed = False
     # 1. Migrate user_limits -> users.special_limit
     if "user_limits" in existing_tables:
         try:
-            sync_conn.execute(text("""
+            result = sync_conn.execute(
+                text("""
                 INSERT INTO users (username, special_limit, is_excepted, is_disabled_by_limiter, status)
                 SELECT username, "limit", 0, 0, 'active' FROM user_limits WHERE username IS NOT NULL
                 ON CONFLICT(username) DO UPDATE SET
                     special_limit = excluded.special_limit
                 WHERE users.special_limit IS NULL;
-            """))
+            """)
+            )
+            policy_changed |= result.rowcount > 0
         except Exception as e:
             db_logger.debug(f"Legacy user_limits sync note: {e}")
 
     # 2. Migrate except_users -> users.is_excepted
     if "except_users" in existing_tables:
         try:
-            sync_conn.execute(text("""
+            result = sync_conn.execute(
+                text("""
                 INSERT INTO users (username, is_excepted, exception_reason, excepted_by, is_disabled_by_limiter, status)
                 SELECT username, 1, reason, created_by, 0, 'active' FROM except_users WHERE username IS NOT NULL
                 ON CONFLICT(username) DO UPDATE SET
@@ -162,14 +189,17 @@ def _sync_deprecated_legacy_tables_sync(sync_conn):
                     exception_reason = COALESCE(users.exception_reason, excluded.exception_reason),
                     excepted_by = COALESCE(users.excepted_by, excluded.excepted_by)
                 WHERE users.is_excepted = 0 OR users.is_excepted IS NULL;
-            """))
+            """)
+            )
+            policy_changed |= result.rowcount > 0
         except Exception as e:
             db_logger.debug(f"Legacy except_users sync note: {e}")
 
     # 3. Migrate disabled_users -> users.is_disabled_by_limiter
     if "disabled_users" in existing_tables:
         try:
-            sync_conn.execute(text("""
+            sync_conn.execute(
+                text("""
                 INSERT INTO users (username, is_disabled_by_limiter, disabled_at, enable_at, original_groups, disable_reason, punishment_step, status)
                 SELECT username, 1, disabled_at, enable_at, original_groups, reason, punishment_step, 'active' FROM disabled_users WHERE username IS NOT NULL
                 ON CONFLICT(username) DO UPDATE SET
@@ -180,9 +210,13 @@ def _sync_deprecated_legacy_tables_sync(sync_conn):
                     disable_reason = COALESCE(users.disable_reason, excluded.disable_reason),
                     punishment_step = COALESCE(users.punishment_step, excluded.punishment_step)
                 WHERE users.is_disabled_by_limiter = 0 OR users.is_disabled_by_limiter IS NULL;
-            """))
+            """)
+            )
         except Exception as e:
             db_logger.debug(f"Legacy disabled_users sync note: {e}")
+
+    if policy_changed:
+        ConfigRevisionCRUD.advance_connection(sync_conn)
 
 
 async def init_db():
@@ -204,14 +238,14 @@ async def init_db():
         if db_dir and not os.path.exists(db_dir):
             os.makedirs(db_dir, exist_ok=True)
             db_logger.info(f"📁 Created database directory: {db_dir}")
-        
+
         db_logger.debug("🔄 Initializing database schema...")
-        
+
         # Create all tables and indexes via SQLAlchemy declarative metadata
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(_sync_deprecated_legacy_tables_sync)
-        
+
         _DB_INITIALIZED = True
         db_logger.info(f"✅ Database initialized: {DATABASE_URL}")
 
@@ -227,7 +261,7 @@ async def close_db():
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """
     Async context manager for database sessions.
-    
+
     Usage:
         async with get_db() as db:
             result = await db.execute(select(User))
@@ -264,7 +298,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     """
     Async generator for FastAPI dependency injection.
-    
+
     Usage:
         @app.get("/users")
         async def get_users(db: AsyncSession = Depends(get_db_session)):
