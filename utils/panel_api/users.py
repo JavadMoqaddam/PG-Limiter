@@ -1083,40 +1083,12 @@ async def disable_user_with_punishment(panel_data: PanelType, username: UserType
     if not user_exists:
         message = f"User {username.name} not found in panel (deleted?), skipping"
         users_logger.warning(message)
-        return {
-            "action": "skipped",
-            "step_index": 0,
-            "violation_count": 0,
-            "duration_minutes": 0,
-            "message": message
-        }
+        return {"action": "skipped", "step_index": 0, "violation_count": 0, "duration_minutes": 0, "message": message}
 
     system = get_punishment_system()
 
-    # A panel action applied earlier whose violation could not be recorded is
-    # reconciled here - retry the record only, never re-apply the side effect.
-    if system.has_unrecorded_incident(username.name):
-        step_index, duration_minutes = system.pop_unrecorded_incident(username.name)
-        try:
-            await record_user_violation(username.name, step_index, duration_minutes)
-            return {
-                "action": "reconciled",
-                "step_index": step_index,
-                "violation_count": 0,
-                "duration_minutes": duration_minutes,
-                "message": f"Reconciled a previously unrecorded punishment for {username.name}",
-            }
-        except ViolationRecordError:
-            system.mark_unrecorded(username.name, step_index, duration_minutes)
-            return {
-                "action": "applied_unrecorded",
-                "step_index": step_index,
-                "violation_count": 0,
-                "duration_minutes": duration_minutes,
-                "message": f"Punishment for {username.name} was applied but is still unrecorded",
-            }
-
-    # Deduplicate a concurrent application for the same user: apply once, not twice.
+    # Reconciliation owns the same claim as a new panel action. Keep its pending
+    # record until persistence succeeds, including across errors or cancellation.
     if not system.begin_incident(username.name):
         return {
             "action": "deduplicated",
@@ -1126,6 +1098,27 @@ async def disable_user_with_punishment(panel_data: PanelType, username: UserType
             "message": f"Punishment for {username.name} is already being applied",
         }
     try:
+        pending = system.get_unrecorded_incident(username.name)
+        if pending is not None:
+            step_index, duration_minutes = pending
+            try:
+                await record_user_violation(username.name, step_index, duration_minutes)
+            except ViolationRecordError:
+                return {
+                    "action": "applied_unrecorded",
+                    "step_index": step_index,
+                    "violation_count": 0,
+                    "duration_minutes": duration_minutes,
+                    "message": f"Punishment for {username.name} was applied but is still unrecorded",
+                }
+            system.pop_unrecorded_incident(username.name)
+            return {
+                "action": "reconciled",
+                "step_index": step_index,
+                "violation_count": 0,
+                "duration_minutes": duration_minutes,
+                "message": f"Reconciled a previously unrecorded punishment for {username.name}",
+            }
         return await _apply_punishment_locked(panel_data, username, system)
     finally:
         system.end_incident(username.name)

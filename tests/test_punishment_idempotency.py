@@ -8,6 +8,8 @@ the panel action to be repeated.
 import asyncio
 from unittest.mock import AsyncMock
 
+import pytest
+
 import utils.panel_api.users as users_mod
 import utils.punishment_system as ps_mod
 from utils.punishment_system import PunishmentStep, PunishmentSystem, ViolationRecordError
@@ -90,3 +92,63 @@ async def test_concurrent_incident_applies_once(tmp_path, monkeypatch):
 
     assert disable_calls == ["dup"]  # applied exactly once
     assert "deduplicated" in {first["action"], second["action"]}
+
+
+async def test_reconciliation_claim_blocks_overlapping_panel_action(tmp_path, monkeypatch):
+    system = PunishmentSystem(filename=str(tmp_path / "violations.json"))
+    system.mark_unrecorded("victim", 1, 15)
+    monkeypatch.setattr(ps_mod, "get_punishment_system", lambda: system)
+    monkeypatch.setattr(users_mod, "check_user_exists", AsyncMock(return_value=True))
+    apply = AsyncMock(return_value={"action": "disabled"})
+    monkeypatch.setattr(users_mod, "_apply_punishment_locked", apply)
+    recording = asyncio.Event()
+    release = asyncio.Event()
+
+    async def record(username, step_index, duration):
+        recording.set()
+        await release.wait()
+
+    monkeypatch.setattr(ps_mod, "record_user_violation", record)
+    user = UserType(name="victim", ip=[])
+    first = asyncio.create_task(users_mod.disable_user_with_punishment(_panel(), user))
+    try:
+        await asyncio.wait_for(recording.wait(), timeout=1)
+        duplicate = await users_mod.disable_user_with_punishment(_panel(), user)
+        assert duplicate["action"] == "deduplicated"
+        apply.assert_not_awaited()
+    finally:
+        release.set()
+        result = await first
+    assert result["action"] == "reconciled"
+    assert not system.has_unrecorded_incident("victim")
+    assert system.begin_incident("victim")
+    system.end_incident("victim")
+
+
+@pytest.mark.parametrize("failure", [asyncio.CancelledError, RuntimeError, ViolationRecordError])
+async def test_interrupted_reconciliation_preserves_pending_record(tmp_path, monkeypatch, failure):
+    system = PunishmentSystem(filename=str(tmp_path / "violations.json"))
+    system.mark_unrecorded("victim", 2, 60)
+    monkeypatch.setattr(ps_mod, "get_punishment_system", lambda: system)
+    monkeypatch.setattr(users_mod, "check_user_exists", AsyncMock(return_value=True))
+    apply = AsyncMock(return_value={"action": "disabled"})
+    monkeypatch.setattr(users_mod, "_apply_punishment_locked", apply)
+    monkeypatch.setattr(ps_mod, "record_user_violation", AsyncMock(side_effect=failure("interrupted")))
+    user = UserType(name="victim", ip=[])
+
+    if failure is ViolationRecordError:
+        result = await users_mod.disable_user_with_punishment(_panel(), user)
+        assert result["action"] == "applied_unrecorded"
+    else:
+        with pytest.raises(failure):
+            await users_mod.disable_user_with_punishment(_panel(), user)
+
+    assert system.has_unrecorded_incident("victim")
+    assert system.begin_incident("victim")
+    system.end_incident("victim")
+    record = AsyncMock()
+    monkeypatch.setattr(ps_mod, "record_user_violation", record)
+    result = await users_mod.disable_user_with_punishment(_panel(), user)
+    assert result["action"] == "reconciled"
+    record.assert_awaited_once_with("victim", 2, 60)
+    apply.assert_not_awaited()

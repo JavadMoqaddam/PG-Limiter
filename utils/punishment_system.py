@@ -524,6 +524,10 @@ class PunishmentSystem:
     def has_unrecorded_incident(self, username: str) -> bool:
         return username in self._applied_unrecorded
 
+    def get_unrecorded_incident(self, username: str) -> Optional[tuple[int, int]]:
+        """Read pending reconciliation without discarding it before persistence."""
+        return self._applied_unrecorded.get(username)
+
     def pop_unrecorded_incident(self, username: str) -> Optional[tuple[int, int]]:
         return self._applied_unrecorded.pop(username, None)
 
