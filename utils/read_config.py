@@ -215,6 +215,11 @@ def load_env_config() -> Dict[str, Any]:
             "country_code": _get_env("COUNTRY_CODE", ""),
         },
         "check_interval": _get_env("CHECK_INTERVAL", 60, int),
+        # These describe the Xray process/container clock, never the limiter host.
+        # Preserve invalid input so Logs readiness fails closed instead of guessing.
+        "log_timezone": os.environ.get("LOG_TIMEZONE"),
+        "log_node_timezones": os.environ.get("LOG_NODE_TIMEZONES", "{}"),
+        "log_replay_cache_size": os.environ.get("LOG_REPLAY_CACHE_SIZE", "10000"),
         "max_warning_count": _get_env("MAX_WARNING_COUNT", 3, int),
         "time_to_active_users": _get_env("TIME_TO_ACTIVE_USERS", 900, int),
         "country_code": _get_env("COUNTRY_CODE", ""),

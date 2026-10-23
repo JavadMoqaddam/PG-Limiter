@@ -57,14 +57,19 @@ async def source_runtime(monkeypatch, tmp_path):
         }.items():
             await config.ConfigCRUD.set(session, key, value)
     await config.invalidate_config_cache()
-    runtime = SimpleNamespace(api=api, config=config, state=state, mode="failure", notifications=[], requests=0)
+    runtime = SimpleNamespace(
+        api=api, config=config, state=state, mode="failure", node_status=None, notifications=[], requests=0
+    )
     monkeypatch.setattr(requests, "is_panel_available", lambda: runtime.mode != "unavailable")
     monkeypatch.setattr(online, "resolve_panel_token", AsyncMock(return_value="test-token"))
 
     async def get_nodes(_panel):
         if runtime.mode == "node_failure":
             return None
-        return [SimpleNamespace(node_id=1, node_name="node", node_ip="192.0.2.1", status="connected")]
+        fleet = [SimpleNamespace(node_id=1, node_name="node", node_ip="192.0.2.1", status="connected")]
+        if runtime.node_status is not None:
+            fleet.append(SimpleNamespace(node_id=2, node_name="other", node_ip="192.0.2.2", status=runtime.node_status))
+        return fleet
 
     async def panel_get(_panel, path, **kwargs):
         assert path == "/api/users"
@@ -94,6 +99,8 @@ async def source_runtime(monkeypatch, tmp_path):
             body = {}
         elif runtime.mode == "missing_node":
             body = {"nodes": {"1": None}}
+        if runtime.node_status == "connected" and "nodes" in body:
+            body["nodes"]["2"] = {"ips": {}}
         return SimpleNamespace(status_code=200, json=lambda: body), None
 
     async def notify(message, *args, **kwargs):
@@ -156,6 +163,42 @@ async def test_valid_success_breaks_failure_streak(source_runtime, success):
     assert r.notifications == []
     await r.collect("failure")
     assert (await r.config.read_config())["ip_source"] == "logs"
+
+
+@pytest.mark.parametrize("status", ["error", "connecting"])
+@pytest.mark.parametrize("sample", ["valid_empty", "success", "no_candidates"])
+async def test_two_completed_unavailable_fleet_cycles_commit_fallback(source_runtime, status, sample):
+    r = source_runtime
+    r.node_status = status
+    assert await r.collect(sample) is False
+    assert r.state.ACTIVE_USERS == {}
+    assert await r.state.pop_api_users_snapshot() is None
+    assert (await r.config.read_config())["ip_source"] == "api"
+    assert r.notifications == []
+    assert await r.collect(sample) is False
+    assert (await r.config.read_config())["ip_source"] == "logs"
+    assert len(r.notifications) == 1
+    assert "reverted to Logs" in r.notifications[0]
+    assert r.state.ACTIVE_USERS == {}
+    assert await r.state.pop_api_users_snapshot() is None
+
+
+@pytest.mark.parametrize("status", ["error", "connecting"])
+@pytest.mark.parametrize("success", ["valid_empty", "no_candidates", "all_expired", "not_found"])
+async def test_healthy_fleet_success_resets_unavailable_cycle_streak(source_runtime, status, success):
+    r = source_runtime
+    r.node_status = status
+    assert await r.collect("valid_empty") is False
+    r.node_status = "connected"
+    assert await r.collect(success) is True
+    assert r.api.get_last_cycle_stats()["collection_outcome"] == "success"
+    r.node_status = status
+    assert await r.collect("valid_empty") is False
+    assert (await r.config.read_config())["ip_source"] == "api"
+    assert r.notifications == []
+    assert await r.collect("valid_empty") is False
+    assert (await r.config.read_config())["ip_source"] == "logs"
+    assert len(r.notifications) == 1
 
 
 async def test_four_failed_http_requests_are_one_failed_cycle(source_runtime):

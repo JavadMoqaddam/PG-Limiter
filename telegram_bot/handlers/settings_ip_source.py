@@ -8,6 +8,9 @@ the only way to tell a healthy cycle from a skipped one.
 """
 
 import time
+from html import escape
+
+from utils.log_observations import LOG_OBSERVATIONS
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -67,12 +70,18 @@ def _build_ip_source_text(config_data: dict) -> str:
         )
     else:
         active = "📜 <b>Node Logs (SSE)</b>"
-        active_note = "IPs are streamed continuously from each node's log endpoint, which is the original behaviour."
+        active_note = "IPs use the original Xray log timestamp and explicit node process timezones."
+    logs_reason = LOG_OBSERVATIONS.unavailable_reason()
+    logs_readiness = escape(logs_reason) if logs_reason else "ready"
 
     return (
         "🛰️ <b>IP Source</b>\n\n"
         f"<b>Active:</b> {active}\n"
         f"<i>{active_note}</i>\n\n"
+        f"<b>Logs evidence:</b> {logs_readiness}\n"
+        "Set <code>LOG_NODE_TIMEZONES</code> (or explicit <code>LOG_TIMEZONE</code>) for Xray containers. "
+        "Missing zones, incomplete fleet or replay uncertainty preserve warning history. "
+        "A source/settings change requires one complete check interval.\n\n"
         "<b>API mode settings:</b>\n"
         f"• Check interval: <code>{interval}s</code>\n"
         "• Candidates: active users with <code>online=true</code> and Group Filter\n"

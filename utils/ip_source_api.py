@@ -120,12 +120,15 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
     the set that ought to show up in a healthy cycle. Without it there is no way
     to tell "users are concentrated on 16 nodes" from "33 nodes stopped
     reporting", and the two have opposite meanings for the device counts.
+    Every relevant enabled node must be connected before even an empty candidate
+    list can establish known absence; the panel IP producer omits unhealthy nodes.
     """
     from utils.ip_facts import register_node_ips
     from utils.panel_api.nodes import get_nodes
 
     node_name_map: dict[int, str] = {}
     connected_node_ids: set = set()
+    disabled_nodes = set(config_data.get("disabled_nodes") or [])
     try:
         nodes = await get_nodes(panel_data)
     except Exception as error:
@@ -138,10 +141,11 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
             node_name_map[node.node_id] = node.node_name
             if getattr(node, "status", None) == "connected":
                 connected_node_ids.add(node.node_id)
+            elif node.node_id not in disabled_nodes:
+                raise ValueError("Enabled node availability is unknown")
 
     if nodes is None or isinstance(nodes, ValueError):
         raise ValueError("Node availability is unknown")
-    disabled_nodes = set(config_data.get("disabled_nodes") or [])
     return node_name_map, disabled_nodes, connected_node_ids - disabled_nodes
 
 
