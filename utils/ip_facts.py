@@ -8,7 +8,7 @@ them from their own set of caches. Everything lives here now:
 * ``BLOCKED_IPS``   - the nodes' own addresses plus well-known resolvers; never
   counted as a user device.
 * ``COUNTRY_CACHE`` - geo lookup results, bounded and expiring.
-* ``VERDICT_CACHE`` - the final accept/reject decision per IP, bounded.
+* ``VERDICT_CACHE`` - the final decision per IP and monitored country, bounded.
 
 All three are bounded, so a long-running process cannot grow without limit.
 """
@@ -37,7 +37,7 @@ NODE_IPS = BLOCKED_IPS
 # a lookup, short enough that a reassigned address is re-checked.
 COUNTRY_CACHE: TTLCache = TTLCache(maxsize=100_000, ttl=43_200)
 
-# ip -> accepted?, 24 hours. Holds both verdicts so a rejected address is not
+# (ip, monitored country) -> accepted?, 24 hours. Holds both verdicts so a rejected address is not
 # geo-looked-up again on every single cycle.
 VERDICT_CACHE: TTLCache = TTLCache(maxsize=100_000, ttl=86_400)
 
@@ -79,14 +79,14 @@ def is_public_ip(ip: str) -> bool:
         return False
 
 
-def cached_verdict(ip: str) -> Optional[bool]:
-    """Return a previously decided verdict for an IP, or ``None`` if unknown."""
-    return VERDICT_CACHE.get(ip)
+def cached_verdict(ip: str, *, country_code: Optional[str] = None) -> Optional[bool]:
+    """Return a verdict for the same IP and country policy, or ``None``."""
+    return VERDICT_CACHE.get((ip, country_code))
 
 
-def remember_verdict(ip: str, accepted: bool) -> None:
-    """Record the accept/reject decision for an IP."""
-    VERDICT_CACHE[ip] = accepted
+def remember_verdict(ip: str, accepted: bool, *, country_code: Optional[str] = None) -> None:
+    """Record a verdict without sharing it with a different country policy."""
+    VERDICT_CACHE[(ip, country_code)] = accepted
 
 
 # Number of geo lookups that actually reached the network. Callers snapshot this
@@ -128,17 +128,17 @@ async def is_ip_accepted(ip: str, config_data: dict) -> bool:
     if is_blocked(ip):
         return False
 
-    verdict = VERDICT_CACHE.get(ip)
+    target = resolve_country_code(config_data)
+    verdict = cached_verdict(ip, country_code=target)
     if verdict is not None:
         return verdict
 
     if not is_public_ip(ip):
-        VERDICT_CACHE[ip] = False
+        remember_verdict(ip, False, country_code=target)
         return False
 
-    target = resolve_country_code(config_data)
     if target is None:
-        VERDICT_CACHE[ip] = True
+        remember_verdict(ip, True, country_code=target)
         return True
 
     country = await resolve_country(ip)
@@ -148,7 +148,7 @@ async def is_ip_accepted(ip: str, config_data: dict) -> bool:
         return True
 
     accepted = country.upper() == target
-    VERDICT_CACHE[ip] = accepted
+    remember_verdict(ip, accepted, country_code=target)
     return accepted
 
 
