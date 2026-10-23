@@ -12,6 +12,7 @@ Every test runs against a real throw-away SQLite file, so the SQL itself is
 covered rather than a mock of it.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -39,7 +40,12 @@ async def registry(tmp_path, monkeypatch):
     )
     # Never let a test touch the real /var/lib registry.
     monkeypatch.setattr(dis_registry, "LEGACY_JSON_PATH", str(tmp_path / "absent.json"))
+    # The old signature bound its default at import time. Keep baseline tests
+    # isolated too, before the automatic migration passes its path explicitly.
+    monkeypatch.setattr(dis_registry.import_legacy_json, "__defaults__", (str(tmp_path / "absent.json"),))
     monkeypatch.setattr(dis_registry, "_migrated", False)
+    monkeypatch.setattr(dis_registry, "_last_migration_attempt", 0.0)
+    monkeypatch.setattr(dis_registry, "_migration_lock", asyncio.Lock())
 
     yield dis_registry
 
@@ -232,6 +238,232 @@ class TestLegacyJsonImport:
 
     async def test_a_missing_file_is_not_an_error(self, registry, tmp_path):
         assert await registry.import_legacy_json(str(tmp_path / "nope.json")) == 0
+
+    async def test_automatic_import_under_the_guard_preserves_timers(self, registry, tmp_path, monkeypatch):
+        legacy = tmp_path / "disable_users.json"
+        self._write(
+            legacy,
+            {"disabled_users": {"timed": 100.0, "forever": 200.0}, "enable_at": {"timed": 900.0, "forever": -1}},
+        )
+        monkeypatch.setattr(registry, "LEGACY_JSON_PATH", str(legacy))
+        monkeypatch.setattr(registry.import_legacy_json, "__defaults__", (str(legacy),))
+
+        entries = await asyncio.wait_for(registry.entries(), timeout=1)
+
+        assert entries["timed"].disabled_at == 100.0
+        assert entries["timed"].enable_at == 900.0
+        assert entries["forever"].disabled_at == 200.0
+        assert entries["forever"].is_permanent is True
+        assert not legacy.exists()
+        assert legacy.with_suffix(".json.migrated").exists()
+
+    async def test_automatic_import_uses_the_configured_path(self, registry, tmp_path, monkeypatch):
+        legacy = tmp_path / "configured.json"
+        self._write(legacy, {"disabled_users": {"configured": 100.0}, "enable_at": {"configured": -1}})
+        monkeypatch.setattr(registry, "LEGACY_JSON_PATH", str(legacy))
+
+        entries = await asyncio.wait_for(registry.entries(), timeout=1)
+
+        assert set(entries) == {"configured"}
+        assert entries["configured"].is_permanent is True
+
+    @pytest.mark.parametrize("failure_stage", ["read", "write"])
+    async def test_record_failure_keeps_the_whole_source_retryable(
+        self, registry, tmp_path, monkeypatch, failure_stage
+    ):
+        from db.crud import UserCRUD
+
+        legacy = tmp_path / "disable_users.json"
+        self._write(legacy, {"disabled_users": {"first": 100.0, "retry": 200.0}, "enable_at": {"retry": -1}})
+        operation = "get_by_username" if failure_stage == "read" else "set_disabled"
+        original = getattr(UserCRUD, operation)
+
+        async def fail_second(session, username, **kwargs):
+            if username == "retry":
+                raise RuntimeError("temporary database failure")
+            return await original(session, username, **kwargs)
+
+        monkeypatch.setattr(UserCRUD, operation, fail_second)
+        with pytest.raises(RuntimeError, match="temporary database failure"):
+            await registry.import_legacy_json(str(legacy))
+
+        assert legacy.exists()
+        assert not legacy.with_suffix(".json.migrated").exists()
+        assert await registry.entries() == {}
+
+        monkeypatch.setattr(UserCRUD, operation, original)
+        assert await registry.import_legacy_json(str(legacy)) == 2
+        entries = await registry.entries()
+        assert entries["first"].disabled_at == 100.0
+        assert entries["retry"].is_permanent is True
+        assert not legacy.exists()
+
+    async def test_failed_completion_marker_rolls_back_the_import(self, registry, tmp_path, monkeypatch):
+        from db.crud import ConfigCRUD
+
+        legacy = tmp_path / "disable_users.json"
+        self._write(legacy, {"disabled_users": {"retry": 100.0}})
+        original = ConfigCRUD.set
+
+        async def fail_marker(*_args, **_kwargs):
+            raise RuntimeError("completion write failed")
+
+        monkeypatch.setattr(ConfigCRUD, "set", fail_marker)
+        with pytest.raises(RuntimeError, match="completion write failed"):
+            await registry.import_legacy_json(str(legacy))
+
+        assert legacy.exists()
+        assert await registry.entries() == {}
+        monkeypatch.setattr(ConfigCRUD, "set", original)
+        assert await registry.import_legacy_json(str(legacy)) == 1
+
+    async def test_commit_failure_keeps_the_source_and_rows_retryable(self, registry, tmp_path, monkeypatch):
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        legacy = tmp_path / "disable_users.json"
+        self._write(legacy, {"disabled_users": {"retry": 100.0}})
+
+        async def fail_commit(_session):
+            raise RuntimeError("commit failed")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(AsyncSession, "commit", fail_commit)
+            with pytest.raises(RuntimeError, match="commit failed"):
+                await registry.import_legacy_json(str(legacy))
+
+        assert legacy.exists()
+        assert await registry.entries() == {}
+        assert await registry.import_legacy_json(str(legacy)) == 1
+
+    async def test_cancellation_rolls_back_import_and_allows_retry(self, registry, tmp_path, monkeypatch):
+        from db.crud import UserCRUD
+
+        legacy = tmp_path / "disable_users.json"
+        self._write(legacy, {"disabled_users": {"first": 100.0, "paused": 200.0}, "enable_at": {"paused": -1}})
+        monkeypatch.setattr(registry, "LEGACY_JSON_PATH", str(legacy))
+        monkeypatch.setattr(registry.import_legacy_json, "__defaults__", (str(legacy),))
+        reached_write = asyncio.Event()
+        original = UserCRUD.set_disabled
+
+        async def pause_second(session, username, **kwargs):
+            if username == "paused":
+                reached_write.set()
+                await asyncio.Event().wait()
+            return await original(session, username, **kwargs)
+
+        monkeypatch.setattr(UserCRUD, "set_disabled", pause_second)
+        task = asyncio.create_task(registry.entries())
+        try:
+            await asyncio.wait_for(reached_write.wait(), timeout=1)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert legacy.exists()
+        assert registry._migrated is False
+        assert await registry.entries() == {}
+
+        monkeypatch.setattr(UserCRUD, "set_disabled", original)
+        monkeypatch.setattr(registry, "_last_migration_attempt", 0.0)
+        entries = await asyncio.wait_for(registry.entries(), timeout=1)
+        assert set(entries) == {"first", "paused"}
+        assert entries["paused"].is_permanent is True
+
+    async def test_rename_failure_cannot_resurrect_a_lifted_ban(self, registry, tmp_path, monkeypatch):
+        legacy = tmp_path / "disable_users.json"
+        self._write(legacy, {"disabled_users": {"lifted": 100.0}})
+        original = os.rename
+
+        def fail_rename(*_args):
+            raise OSError("archive destination unavailable")
+
+        monkeypatch.setattr(registry.os, "rename", fail_rename)
+        assert await registry.import_legacy_json(str(legacy)) == 1
+        assert legacy.exists()
+        assert await registry.enable("lifted") is True
+
+        monkeypatch.setattr(registry.os, "rename", original)
+        monkeypatch.setattr(registry, "_migrated", False)
+        monkeypatch.setattr(registry, "_last_migration_attempt", 0.0)
+        assert await registry.import_legacy_json(str(legacy)) == 0
+        assert await registry.is_disabled("lifted") is False
+        assert not legacy.exists()
+
+    async def test_a_completed_source_path_is_not_imported_again(self, registry, tmp_path):
+        legacy = tmp_path / "disable_users.json"
+        self._write(legacy, {"disabled_users": {"original": 100.0}})
+        assert await registry.import_legacy_json(str(legacy)) == 1
+        assert await registry.enable("original") is True
+
+        self._write(legacy, {"disabled_users": {"original": 100.0, "replacement": 200.0}})
+        assert await registry.import_legacy_json(str(legacy)) == 0
+        assert await registry.entries() == {}
+
+    async def test_overlapping_import_cannot_replay_after_manual_enable(self, registry, tmp_path, monkeypatch):
+        from db.crud import ConfigCRUD
+
+        legacy = tmp_path / "disable_users.json"
+        self._write(legacy, {"disabled_users": {"lifted": 100.0}})
+        first_read = asyncio.Event()
+        release_first = asyncio.Event()
+        original_get = ConfigCRUD.get
+        first_task = None
+
+        async def pause_first_read(session, key, default=None):
+            value = await original_get(session, key, default)
+            if asyncio.current_task() is first_task and key.startswith("migration.disabled_users_json."):
+                first_read.set()
+                await release_first.wait()
+            return value
+
+        def fail_rename(*_args):
+            raise OSError("archive destination unavailable")
+
+        monkeypatch.setattr(ConfigCRUD, "get", pause_first_read)
+        monkeypatch.setattr(registry.os, "rename", fail_rename)
+        first_task = asyncio.create_task(registry.import_legacy_json(str(legacy)))
+        second_task = None
+        try:
+            await asyncio.wait_for(first_read.wait(), timeout=1)
+            second_task = asyncio.create_task(registry.import_legacy_json(str(legacy)))
+            try:
+                # Independent sessions either serialize their marker check, or
+                # expose the stale-read replay when the second writer finishes.
+                await asyncio.wait_for(asyncio.shield(second_task), timeout=0.1)
+            except asyncio.TimeoutError:
+                release_first.set()
+                await first_task
+            assert await registry.enable("lifted") is True
+            release_first.set()
+            await asyncio.gather(first_task, second_task)
+            assert await registry.is_disabled("lifted") is False
+        finally:
+            release_first.set()
+            await asyncio.gather(first_task, *([second_task] if second_task else []), return_exceptions=True)
+
+    async def test_automatic_failure_retries_after_backoff(self, registry, tmp_path, monkeypatch):
+        from db.crud import UserCRUD
+
+        legacy = tmp_path / "disable_users.json"
+        self._write(legacy, {"disabled_users": {"retry": 100.0}, "enable_at": {"retry": -1}})
+        monkeypatch.setattr(registry, "LEGACY_JSON_PATH", str(legacy))
+        monkeypatch.setattr(registry.import_legacy_json, "__defaults__", (str(legacy),))
+        original = UserCRUD.set_disabled
+
+        async def fail_write(*_args, **_kwargs):
+            raise RuntimeError("database temporarily unavailable")
+
+        monkeypatch.setattr(UserCRUD, "set_disabled", fail_write)
+        assert await asyncio.wait_for(registry.entries(), timeout=1) == {}
+        assert legacy.exists()
+        assert registry._migrated is False
+
+        monkeypatch.setattr(UserCRUD, "set_disabled", original)
+        assert await registry.entries() == {}
+        monkeypatch.setattr(registry, "_last_migration_attempt", 0.0)
+        entries = await asyncio.wait_for(registry.entries(), timeout=1)
+        assert entries["retry"].is_permanent is True
 
 
 class TestDegradedDatabase:

@@ -16,6 +16,7 @@ mistake, only left waiting.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -42,6 +43,7 @@ class DisableStatus(str, Enum):
 @dataclass(slots=True)
 class RemainingTimeResult:
     """Structured result for user disabled remaining time."""
+
     status: DisableStatus
     seconds: int = 0
 
@@ -66,6 +68,7 @@ class DisabledUserEntry:
     ``enable_at``: ``None`` = use the default ``time_to_active_users`` window,
     ``-1`` = permanent (manual enable only), ``> 0`` = exact timestamp.
     """
+
     username: str
     disabled_at: float
     enable_at: float | None = None
@@ -106,7 +109,7 @@ async def _ensure_migrated() -> None:
             return
         _last_migration_attempt = now
         try:
-            imported = await import_legacy_json()
+            imported = await import_legacy_json(LEGACY_JSON_PATH)
             if imported:
                 logger.info(f"Imported {imported} disabled users from the retired JSON registry")
             _migrated = True
@@ -122,15 +125,24 @@ async def import_legacy_json(path: str = LEGACY_JSON_PATH) -> int:
     """
     Copy the old JSON registry into the ``users`` table and retire the file.
 
-    Users already marked disabled in the database are left alone, so this can
-    never resurrect a ban an operator has since lifted. The file is renamed to
-    ``.migrated`` when done.
+    Existing disables are preserved. The entire import and its completion marker
+    commit together, so an error or cancellation leaves the file retryable. The
+    marker is scoped to this source path and format version, not file contents:
+    replacing a completed source must not resurrect a ban an operator lifted.
+    The file is renamed to ``.migrated`` after the database commit.
 
     Returns:
         int: how many users were carried over.
     """
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return 0
+
+    from db.crud import ConfigCRUD, UserCRUD
+    from db.database import get_db
+    from sqlalchemy import text
+
+    source_id = hashlib.sha256(os.path.abspath(path).encode("utf-8")).hexdigest()
+    marker_key = f"migration.disabled_users_json.v1:{source_id}"
 
     def _read() -> tuple[dict, dict]:
         with open(path, "r", encoding="utf-8") as handle:
@@ -144,22 +156,35 @@ async def import_legacy_json(path: str = LEGACY_JSON_PATH) -> int:
         enable_at = data.get("enable_at")
         return raw, enable_at if isinstance(enable_at, dict) else {}
 
-    disabled, enable_at_map = await asyncio.to_thread(_read)
     imported = 0
-    for username, disabled_at in disabled.items():
-        try:
-            already = await is_disabled(username)
-            if already:
-                continue
-            stored = await disable(
-                username,
-                disabled_at=float(disabled_at),
-                enable_at=enable_at_map.get(username),
-            )
-            imported += 1 if stored else 0
-        except Exception as error:  # pylint: disable=broad-except
-            logger.error(f"Could not import disabled user {username}: {error}")
+    # Public disable() re-enters the migration guard. Import directly within
+    # one transaction instead; failed reads/writes must not look accounted for.
+    async with get_db() as session:
+        if session.bind.dialect.name == "sqlite":
+            # Own the writer slot before reading completion. Separate processes
+            # must not replay an old marker snapshot after an operator enables.
+            await session.execute(text("BEGIN IMMEDIATE"))
+        if not await ConfigCRUD.get(session, marker_key, False):
+            disabled, enable_at_map = await asyncio.to_thread(_read)
+            for username, disabled_at in disabled.items():
+                user = await _ensure_user_row(session, username)
+                if user.is_disabled_by_limiter:
+                    continue
+                enable_at = enable_at_map.get(username)
+                stored = await UserCRUD.set_disabled(
+                    session,
+                    username=username,
+                    disabled=True,
+                    disabled_at=float(disabled_at),
+                    enable_at=None if enable_at is None else float(enable_at),
+                    fetch_from_panel=False,
+                )
+                if stored is None:
+                    raise RuntimeError(f"Could not record legacy disabled user {username}")
+                imported += 1
+            await ConfigCRUD.set(session, marker_key, True)
 
+    # Archival failure cannot undo completion or replay a later manual enable.
     try:
         await asyncio.to_thread(os.rename, path, path + ".migrated")
     except OSError as error:
@@ -284,9 +309,7 @@ async def enable(username: str) -> bool:
     from db.crud import UserCRUD
 
     async def work(session) -> bool:
-        updated = await UserCRUD.set_disabled(
-            session, username=username, disabled=False, fetch_from_panel=False
-        )
+        updated = await UserCRUD.set_disabled(session, username=username, disabled=False, fetch_from_panel=False)
         return updated is not None
 
     return await _run(f"enable {username}", work, False)
@@ -300,9 +323,7 @@ async def clear_all() -> set[str]:
         rows = await UserCRUD.get_all_disabled(session)
         names = {row.username for row in rows}
         for name in names:
-            await UserCRUD.set_disabled(
-                session, username=name, disabled=False, fetch_from_panel=False
-            )
+            await UserCRUD.set_disabled(session, username=name, disabled=False, fetch_from_panel=False)
         return names
 
     return await _run("clear all", work, set())
