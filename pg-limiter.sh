@@ -855,123 +855,124 @@ ensure_zip_installed() {
     fi
 }
 
+run_backup_tool() {
+    local overrides=()
+    # The daemon keeps config read-only. Only the stopped-service apply helper
+    # needs write access to replace the validated archived environment file.
+    if [[ "$1" == "apply" ]]; then
+        overrides=(--volume "$CONFIG_DIR:$CONFIG_DIR:rw")
+    fi
+    $COMPOSE -f "$COMPOSE_FILE" run --rm --no-deps --entrypoint python \
+        "${overrides[@]}" "$SERVICE_NAME" -m utils.backup "$@"
+}
+
 cmd_backup() {
     check_running_as_root
-    detect_os
-    detect_and_update_package_manager
-    ensure_zip_installed
-    
+    check_docker
     if ! is_installed; then
         colorized_echo red "PG-Limiter is not installed"
-        exit 1
+        return 1
     fi
-    
-    local timestamp=$(date +%Y%m%d-%H%M%S)
-    local backup_name="pg-limiter-backup-$timestamp.zip"
-    local backup_path="${1:-$HOME/$backup_name}"
-    
-    colorized_echo blue "Creating backup..."
-    
-    # Create temp directory for backup
-    local temp_dir=$(mktemp -d)
-    
-    # Copy config files
-    mkdir -p "$temp_dir/config"
-    cp -r "$CONFIG_DIR"/* "$temp_dir/config/" 2>/dev/null || true
-    
-    # Copy data files
-    mkdir -p "$temp_dir/data"
-    cp -r "$DATA_DIR"/* "$temp_dir/data/" 2>/dev/null || true
-    
-    # Create backup info file
-    cat > "$temp_dir/backup_info.txt" <<EOF
-PG-Limiter Backup
-═════════════════════════════════════════
-Created: $(date)
-Hostname: $(hostname)
-Config Directory: $CONFIG_DIR
-Data Directory: $DATA_DIR
-
-To restore:
-  pg-limiter restore <this-file.zip>
-EOF
-    
-    # Create zip file
-    cd "$temp_dir"
-    zip -r "$backup_path" . -x "*.zip" >/dev/null
-    # The archive bundles .env (panel password + bot token); keep it owner-only.
-    chmod 600 "$backup_path"
-
-    # Cleanup
-    rm -rf "$temp_dir"
-    
+    local timestamp backup_path transfer staged
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    backup_path="${1:-$HOME/pg-limiter-backup-$timestamp.zip}"
+    mkdir -p "$DATA_DIR"
+    transfer=$(mktemp -d "$DATA_DIR/.backup-transfer.XXXXXXXX")
+    chmod 700 "$transfer"
+    staged="$transfer/backup.zip"
+    colorized_echo blue "Creating database-consistent backup..."
+    if is_running; then
+        if ! docker exec "$SERVICE_NAME" python -m utils.backup create "$staged"; then
+            rm -rf "$transfer"
+            return 1
+        fi
+    elif ! run_backup_tool create "$staged"; then
+        rm -rf "$transfer"
+        return 1
+    fi
+    if ! install -m 600 "$staged" "$backup_path"; then
+        rm -rf "$transfer"
+        return 1
+    fi
+    rm -rf "$transfer"
     colorized_echo green "✓ Backup created: $backup_path"
-    echo ""
-    echo "To restore: pg-limiter restore $backup_path"
+    printf 'To restore: pg-limiter restore %q\n' "$backup_path"
 }
 
 cmd_restore() {
     check_running_as_root
-    detect_os
-    detect_and_update_package_manager
-    ensure_zip_installed
-    
-    local backup_file="$1"
-    
-    if [[ -z "$backup_file" ]]; then
-        colorized_echo red "Usage: pg-limiter restore <backup-file.zip>"
-        exit 1
+    check_docker
+    local backup_file="${1:-}"
+    if [[ -z "$backup_file" || ! -f "$backup_file" ]]; then
+        colorized_echo red "Usage: pg-limiter restore <backup-file.zip-or-json>"
+        return 1
     fi
-    
-    if [[ ! -f "$backup_file" ]]; then
-        colorized_echo red "Backup file not found: $backup_file"
-        exit 1
+    if ! is_installed; then
+        colorized_echo red "PG-Limiter is not installed"
+        return 1
     fi
-    
-    colorized_echo red "⚠️  WARNING: This will overwrite current configuration and data!"
-    read -p "Are you sure? (y/N): " confirm
+    local transfer staged confirm containers_before containers_after container running start_confirm
+    mkdir -p "$DATA_DIR"
+    transfer=$(mktemp -d "$DATA_DIR/.restore-transfer.XXXXXXXX")
+    chmod 700 "$transfer"
+    staged="$transfer/upload"
+    if ! cp "$backup_file" "$staged"; then
+        rm -rf "$transfer"
+        return 1
+    fi
+    chmod 600 "$staged"
+    # Verify completeness, SQLite integrity and the configured destination while
+    # the service is still running. A rejected upload must not stop or alter it.
+    if ! run_backup_tool validate "$staged"; then
+        rm -rf "$transfer"
+        return 1
+    fi
+    colorized_echo red "⚠️ WARNING: Apply this validated backup to current configuration and data?"
+    read -r -p "Are you sure? (y/N): " confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        exit 0
+        rm -rf "$transfer"
+        return 0
     fi
-    
-    # Stop service if running
-    detect_compose 2>/dev/null || true
-    if is_running; then
-        colorized_echo blue "Stopping service..."
-        cmd_stop
+    # A failed status query is unknown, not proof of shutdown. Stop leaves the
+    # container available for inspection; the next start uses a fresh process.
+    if ! containers_before=$($COMPOSE -f "$COMPOSE_FILE" ps -a -q "$SERVICE_NAME"); then
+        colorized_echo red "Could not verify the service container; restore was not applied"
+        rm -rf "$transfer"
+        return 1
     fi
-    
-    colorized_echo blue "Restoring from backup..."
-    
-    # Create temp directory
-    local temp_dir=$(mktemp -d)
-    
-    # Extract backup
-    unzip -q "$backup_file" -d "$temp_dir"
-    
-    # Restore config
-    if [[ -d "$temp_dir/config" ]]; then
-        mkdir -p "$CONFIG_DIR"
-        cp -r "$temp_dir/config"/* "$CONFIG_DIR/"
-        colorized_echo green "✓ Configuration restored"
+    if ! $COMPOSE -f "$COMPOSE_FILE" stop "$SERVICE_NAME"; then
+        colorized_echo red "Service stop failed; restore was not applied"
+        rm -rf "$transfer"
+        return 1
     fi
-    
-    # Restore data
-    if [[ -d "$temp_dir/data" ]]; then
-        mkdir -p "$DATA_DIR"
-        cp -r "$temp_dir/data"/* "$DATA_DIR/"
-        colorized_echo green "✓ Data restored"
+    if ! containers_after=$($COMPOSE -f "$COMPOSE_FILE" ps -a -q "$SERVICE_NAME"); then
+        colorized_echo red "Could not discover service containers after stopping; restore was not applied"
+        rm -rf "$transfer"
+        return 1
     fi
-    
-    # Cleanup
-    rm -rf "$temp_dir"
-    
-    colorized_echo green "✓ Backup restored successfully!"
-    
-    # Start service
-    read -p "Start the service now? (Y/n): " start_confirm
+    # Compose service names need not match container_name. Inspect every ID seen
+    # before or after stop, including any extra service containers still present.
+    for container in $containers_before $containers_after; do
+        if ! running=$(docker inspect -f '{{.State.Running}}' "$container"); then
+            colorized_echo red "Could not verify service shutdown; restore was not applied"
+            rm -rf "$transfer"
+            return 1
+        fi
+        if [[ "$running" != "false" ]]; then
+            colorized_echo red "Service is still running; restore was not applied"
+            rm -rf "$transfer"
+            return 1
+        fi
+    done
+    if ! run_backup_tool apply "$staged" --service-stopped; then
+        colorized_echo red "Restore failed; service remains stopped"
+        rm -rf "$transfer"
+        return 1
+    fi
+    rm -rf "$transfer"
+    colorized_echo green "✓ Validated restore applied; service is stopped"
+    read -r -p "Start the service now? (Y/n): " start_confirm
     if [[ "$start_confirm" != "n" && "$start_confirm" != "N" ]]; then
-        check_docker
         cmd_start
     fi
 }
