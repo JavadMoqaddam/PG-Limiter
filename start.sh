@@ -337,6 +337,7 @@ import asyncio
 import sys
 import os
 import logging
+from telegram.error import BadRequest, InvalidToken, NetworkError, RetryAfter
 
 logging.disable(logging.CRITICAL)
 
@@ -350,6 +351,12 @@ async def check_bot():
 try:
     asyncio.run(check_bot())
     sys.exit(0)
+except (BadRequest, InvalidToken) as e:
+    print(f'ERROR: {e}')
+    sys.exit(1)
+except (NetworkError, RetryAfter) as e:
+    print(f'UNAVAILABLE: {e}')
+    sys.exit(2)
 except Exception as e:
     print(f'ERROR: {e}')
     sys.exit(1)
@@ -360,8 +367,10 @@ if [ $BOT_EXIT -eq 0 ] && echo "$BOT_OUTPUT" | grep -q "CONNECTED"; then
     BOT_USERNAME=$(echo "$BOT_OUTPUT" | grep "CONNECTED" | sed 's/CONNECTED: //')
     log_info "Telegram bot verified: $BOT_USERNAME"
 elif [ $BOT_EXIT -eq 124 ]; then
-    log_error "Telegram bot verification timed out"
-    exit 1
+    log_warn "Telegram bot verification timed out; starting the limiter with Telegram unavailable"
+elif [ $BOT_EXIT -eq 2 ]; then
+    # Runtime supervision retries Telegram independently of enforcement/autoenable.
+    log_warn "Telegram is temporarily unavailable; starting the limiter: $BOT_OUTPUT"
 else
     log_error "Telegram bot verification failed: $BOT_OUTPUT"
     log_error "Please check your BOT_TOKEN is correct"
