@@ -37,6 +37,9 @@ class LogObservations:
         self.zones: dict[str, ZoneInfo | None] = {}
         self.default_zone: ZoneInfo | None = None
         self.config_error = ""
+        self.disabled_nodes: frozenset[int] = frozenset()
+        self.panel_nodes: dict[int, str] | None = None
+        self.excluded_panel_nodes: frozenset[int] = frozenset()
         self.required_nodes: dict[int, bool] | None = None
         self.fleet_seen = 0.0
         self.fleet_floor = time.time()
@@ -69,12 +72,15 @@ class LogObservations:
             json.dumps(raw_zones, sort_keys=True),
             config.get("log_timezone"),
             config.get("log_replay_cache_size", 10000),
+            tuple(sorted(set(config.get("disabled_nodes", []) or []))),
         )
         if signature == self.signature:
             return False
         self.invalidate()
         self.signature = signature
         self.source = signature[0]
+        self.disabled_nodes = frozenset(signature[5])
+        self._refresh_required_nodes()
         self.config_error = ""
         try:
             self.interval = float(signature[1])
@@ -106,16 +112,41 @@ class LogObservations:
 
     def register_fleet(self, nodes) -> None:
         """Record an authoritative panel list before any access payload is read."""
+        self.panel_nodes = {node.node_id: node.status for node in nodes} if nodes is not None else None
+        if self.panel_nodes is not None:
+            self.excluded_panel_nodes = frozenset(
+                node_id for node_id, status in self.panel_nodes.items() if status in ("disabled", "limited")
+            )
+        self._refresh_required_nodes()
+        self.fleet_seen = time.time()
+
+    def monitors(self, node_id: int | None) -> bool:
+        """Use the same sampling scope for transport, access records and snapshots."""
+        return (
+            node_id not in self.disabled_nodes
+            and node_id not in self.excluded_panel_nodes
+            and (self.required_nodes is None or node_id in self.required_nodes)
+        )
+
+    def _refresh_required_nodes(self) -> None:
+        # Panel-disabled and limited nodes are outside the enabled fleet. Every
+        # other status stays required and must become connected for readiness.
         new = (
-            {node.node_id: node.status == "connected" for node in nodes if node.status != "disabled"}
-            if nodes is not None
+            {
+                node_id: status == "connected"
+                for node_id, status in self.panel_nodes.items()
+                if node_id not in self.disabled_nodes and status not in ("disabled", "limited")
+            }
+            if self.panel_nodes is not None
             else None
         )
         if new != self.required_nodes:
+            # A scope round trip must not revive a parser from an earlier fleet.
+            # Keep replay memory and settings signature while retiring its epoch.
+            self.generation += 1
             self.fault_version += 1
             self.fleet_floor = time.time()
         self.required_nodes = new
-        self.fleet_seen = time.time()
         if new is not None:
             # Removing a node bounds lifetime memory as well as per-node memory.
             for node_id in set(self.seen) - set(new):
@@ -184,7 +215,8 @@ class LogObservations:
             return "Logs source is inactive"
         if self.config_error:
             return self.config_error
-        if not self.required_nodes or now - self.fleet_seen > node_silence_window(self.interval):
+        # An authoritative empty scope is intentional zero; None is unknown.
+        if self.required_nodes is None or now - self.fleet_seen > node_silence_window(self.interval):
             return "waiting for the node fleet"
         for node_id, connected in self.required_nodes.items():
             if self.zone(node_id) is None:

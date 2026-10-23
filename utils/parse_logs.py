@@ -353,6 +353,10 @@ async def parse_logs(
             return ACTIVE_USERS
         if LOG_OBSERVATIONS.configure(data):
             ACTIVE_USERS.clear()
+        # An excluded stream may still finish a pending read. Reject its records
+        # before timezone conversion or any preparation can affect Logs evidence.
+        if not LOG_OBSERVATIONS.monitors(current_node_id):
+            return ACTIVE_USERS
         generation = LOG_OBSERVATIONS.generation
     if data.get("INVALID_IPS"):
         INVALID_IPS.update(data.get("INVALID_IPS"))
@@ -467,7 +471,11 @@ async def parse_logs(
         # Preparation may have awaited country or numeric-user resolution. Commit
         # the fingerprint only now, under the same lock as the observation.
         async with ACTIVE_USERS_LOCK:
-            if generation != LOG_OBSERVATIONS.generation or revision != get_config_revision():
+            if (
+                generation != LOG_OBSERVATIONS.generation
+                or revision != get_config_revision()
+                or not LOG_OBSERVATIONS.monitors(current_node_id)
+            ):
                 continue
             if observed_at is None:
                 LOG_OBSERVATIONS.mark_uncertain()
