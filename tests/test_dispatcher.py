@@ -32,6 +32,9 @@ def isolated_dispatcher(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatcher_mod, "PENDING_NOTIFICATIONS_FILE", str(tmp_path / "pending.json"))
     topics = MagicMock()
     topics.group_id = -100123456
+    topics.enabled = True
+    topics.monitoring_revision = 0
+    topics.destination_revision = 0
     topics.get_topic_id.return_value = 10
     topics.mark_message_sent = AsyncMock()
     monkeypatch.setattr(dispatcher_mod, "get_topics_manager", lambda: topics)
