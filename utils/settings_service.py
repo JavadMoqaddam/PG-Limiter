@@ -13,6 +13,7 @@ from db.crud.config import ConfigCRUD
 from db.crud.config_revision import REVISION_KEY
 from db.crud.users import UserCRUD
 from db.models import User
+from utils.user_policy import UserPolicy, evaluate_user_policy
 
 
 class SettingsUnavailable(RuntimeError):
@@ -30,6 +31,21 @@ async def read_settings() -> dict[str, Any]:
     if settings.get("config_degraded"):
         raise SettingsUnavailable("Canonical settings are unavailable")
     return settings
+
+
+async def read_user_policy(username: str, *, expected_db_revision: int | None = None) -> UserPolicy | None:
+    """Read current factual policy, rejecting a superseded configuration revision."""
+    if not configuration.DB_AVAILABLE:
+        raise SettingsUnavailable("The settings database is unavailable")
+    try:
+        snapshot = await configuration.read_config_snapshot(usernames=(username,))
+    except Exception as error:
+        raise SettingsUnavailable("Could not read current user policy") from error
+    if snapshot.config.get("config_degraded"):
+        raise SettingsUnavailable("Current user policy is unavailable")
+    if expected_db_revision is not None and snapshot.db_revision != expected_db_revision:
+        return None
+    return evaluate_user_policy(username=username, config=snapshot.config, facts=snapshot.user_facts.get(username))
 
 
 def _stored_value(value: Any) -> str:

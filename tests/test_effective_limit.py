@@ -29,25 +29,19 @@ class TestUnusableLimitsFallThrough:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("bad", [0, -1, -99])
     async def test_special_limit(self, bad):
-        got = await resolve_effective_limit(
-            username="bob", config=config_with(3), special_limit={"bob": bad}
-        )
+        got = await resolve_effective_limit(username="bob", config=config_with(3), special_limit={"bob": bad})
         assert got == 3
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("bad", [0, -1])
     async def test_precomputed_metadata_limit(self, bad):
-        got = await resolve_effective_limit(
-            username="bob", config=config_with(3), metadata={"effective_ip_limit": bad}
-        )
+        got = await resolve_effective_limit(username="bob", config=config_with(3), metadata={"effective_ip_limit": bad})
         assert got == 3
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("bad", [0, -4])
     async def test_batched_group_limit(self, bad):
-        got = await resolve_effective_limit(
-            username="bob", config=config_with(3), group_limits={"bob": bad}
-        )
+        got = await resolve_effective_limit(username="bob", config=config_with(3), group_limits={"bob": bad})
         assert got == 3
 
     @pytest.mark.asyncio
@@ -96,22 +90,17 @@ class TestUsableLimitsAreUntouched:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("general", [1, 2, 3, 10, 500])
     async def test_general_limit_passes_through(self, general):
-        assert await resolve_effective_limit(
-            username="bob", config=config_with(general)
-        ) == general
+        assert await resolve_effective_limit(username="bob", config=config_with(general)) == general
 
     @pytest.mark.asyncio
     async def test_priority_order_is_preserved(self):
-        # special > precomputed > batched group > config group > general
-        assert await resolve_effective_limit(
-            username="bob", config=config_with(9), special_limit={"bob": 1}
-        ) == 1
-        assert await resolve_effective_limit(
-            username="bob", config=config_with(9), metadata={"effective_ip_limit": 5}
-        ) == 5
-        assert await resolve_effective_limit(
-            username="bob", config=config_with(9), group_limits={"bob": 4}
-        ) == 4
+        # Cached effective=5 was the audited stale-policy defect; it has no priority.
+        assert await resolve_effective_limit(username="bob", config=config_with(9), special_limit={"bob": 1}) == 1
+        assert (
+            await resolve_effective_limit(username="bob", config=config_with(9), metadata={"effective_ip_limit": 5})
+            == 9
+        )
+        assert await resolve_effective_limit(username="bob", config=config_with(9), group_limits={"bob": 4}) == 4
 
     @pytest.mark.asyncio
     async def test_the_flat_general_limit_key_is_honoured(self):
@@ -120,13 +109,9 @@ class TestUsableLimitsAreUntouched:
         absent, `{}` is a dict, so the nested branch always won and resolved to the
         hardcoded default - ignoring a configured higher limit, the stricter direction.
         """
-        assert await resolve_effective_limit(
-            username="bob", config={"general_limit": 4}
-        ) == 4
+        assert await resolve_effective_limit(username="bob", config={"general_limit": 4}) == 4
         # The nested key still wins when both are present.
-        assert await resolve_effective_limit(
-            username="bob", config={"limits": {"general": 5}, "general_limit": 9}
-        ) == 5
+        assert await resolve_effective_limit(username="bob", config={"limits": {"general": 5}, "general_limit": 9}) == 5
 
 
 class TestNothingResolvesBelowTheFloor:
@@ -201,3 +186,26 @@ class TestBotRefusesItAtInput:
         from telegram_bot.utils import general_limit_rejection
 
         assert general_limit_rejection(good) is None
+
+
+@pytest.mark.parametrize("stale,general,groups,want", [(2, 5, {}, 5), (9, 2, {}, 2), (9, 5, {7: 3}, 3)])
+async def test_removed_override_cannot_return_through_persisted_effective_limit(stale, general, groups, want):
+    assert (
+        await resolve_effective_limit(
+            "alice",
+            config={"limits": {"general": general, "special": {}}, "group_limits": groups},
+            metadata={"group_ids": [7], "special_limit": stale, "effective_ip_limit": stale},
+            special_limit={},
+        )
+        == want
+    )
+
+
+async def test_current_group_limit_edits_replace_cached_effective_limit():
+    metadata = {"group_ids": [7], "effective_ip_limit": 9}
+    assert await resolve_effective_limit("alice", config=config_with(5, {"7": 3}), metadata=metadata) == 3
+    assert await resolve_effective_limit("alice", config=config_with(5, {"7": 0}), metadata=metadata) == 5
+
+
+async def test_canonical_special_limit_is_used_without_a_batched_mapping():
+    assert await resolve_effective_limit("alice", config={"limits": {"general": 5, "special": {"alice": 7}}}) == 7

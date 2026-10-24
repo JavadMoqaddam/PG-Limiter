@@ -24,6 +24,7 @@ from utils.log_observations import LOG_OBSERVATIONS
 from utils.warning_system import warning_system  # global shared instance
 from utils.isp_detector import ISPDetector
 from utils.ip_history_tracker import ip_history_tracker
+from utils.user_policy import DEFAULT_GENERAL_LIMIT, MIN_EFFECTIVE_LIMIT, _calculate_user_limit
 from utils.user_group_filter import should_limit_user, get_filter_status_text
 
 from utils.shared_state import (
@@ -83,38 +84,6 @@ async def _ensure_isp_detector(config_data: dict) -> ISPDetector:
     return isp_detector
 
 
-# A limit below this bans on the first device, so it is never a usable limit.
-MIN_EFFECTIVE_LIMIT = 1
-# What a broken general limit falls back to: the same value .env.example ships and
-# read_config already uses when GENERAL_LIMIT is absent or unparseable.
-DEFAULT_GENERAL_LIMIT = 2
-
-
-def _usable_limit(raw, username: str, source: str) -> int | None:
-    """
-    Coerce one configured limit, or return ``None`` if it cannot serve as a limit.
-
-    A value below 1 is not "unlimited". It makes the very first device a violation and
-    bans the user after the usual consecutive scans, so treating it as a limit is the
-    one failure mode this project refuses to ship. ``None`` sends the caller on to the
-    next, less specific limit - the safe direction, and what keeps
-    ``resolve_effective_limit``'s promise of returning >= 1. Exemption is the
-    whitelist, not a limit of zero.
-    """
-    try:
-        value = int(raw)
-    except (ValueError, TypeError):
-        return None
-    if value >= MIN_EFFECTIVE_LIMIT:
-        return value
-    logger.warning(
-        f"Ignoring {source} {value!r} for {username}: a limit must be "
-        f"{MIN_EFFECTIVE_LIMIT} or greater. Falling back to the next limit in the "
-        f"chain - to exempt this user entirely, add them to the whitelist instead."
-    )
-    return None
-
-
 async def resolve_effective_limit(
     username: str,
     config: dict | None = None,
@@ -122,104 +91,24 @@ async def resolve_effective_limit(
     special_limit: dict[str, int] | None = None,
     group_limits: dict[str, int] | None = None,
 ) -> int:
+    """Resolve current special > group > general limits for legacy report callers.
+
+    Optional mappings contain current batched overrides. Derived metadata fields,
+    including effective_ip_limit and special_limit, never supply policy authority.
     """
-    Single source of truth for resolving a user's effective IP limit.
+    facts = metadata
+    if facts is None:
+        from utils.user_sync import USER_METADATA_CACHE
 
-    Priority order:
-    1. Special Limit (Direct user override in DB / special_limit dict)
-    2. Pre-computed Metadata Limit (effective_ip_limit from RAM metadata)
-    3. Group Limit (Batched group limit from Pasargad group)
-    4. Direct Group Limit Fallback (Defense-in-depth from config & user group_ids)
-    5. General Fallback Limit (Default config limit, e.g. 2)
-
-    Args:
-        username: Username to resolve limit for
-        config: Full or partial configuration dictionary
-        metadata: Cached metadata dictionary for the user (optional)
-        special_limit: Mapping of username -> special limit override (optional)
-        group_limits: Mapping of username -> group limit (optional)
-
-    Returns:
-        int: The resolved effective IP limit (>= 1)
-    """
-    # 1. Check direct special limit override
-    if special_limit and username in special_limit:
-        resolved = _usable_limit(special_limit[username], username, "special limit")
-        if resolved is not None:
-            return resolved
-
-    # 2. Check pre-computed metadata limit (if provided)
-    if metadata and isinstance(metadata, dict):
-        eff_limit = metadata.get("effective_ip_limit")
-        if eff_limit is not None:
-            resolved = _usable_limit(eff_limit, username, "pre-computed limit")
-            if resolved is not None:
-                return resolved
-
-    # 3. Check Group Limit (from pre-batched mapping)
-    if group_limits and username in group_limits:
-        resolved = _usable_limit(group_limits[username], username, "group limit")
-        if resolved is not None:
-            return resolved
-
-    # 4. Direct Group Limit Fallback (Defense-in-depth from config & user group_ids)
-    cfg_group_limits = config.get("group_limits", {}) if (config and isinstance(config, dict)) else {}
-    if cfg_group_limits:
-        user_gids = None
-        if metadata and isinstance(metadata, dict):
-            user_gids = metadata.get("group_ids")
-        if user_gids is None:
-            try:
-                from utils.user_sync import USER_METADATA_CACHE
-
-                if username in USER_METADATA_CACHE:
-                    user_gids = USER_METADATA_CACHE[username].get("group_ids")
-            except Exception:
-                pass
-
-        if user_gids:
-            from utils.user_sync import get_max_group_limit
-
-            max_glim = get_max_group_limit(user_gids, cfg_group_limits)
-            if max_glim is not None:
-                resolved = _usable_limit(max_glim, username, "group limit")
-                if resolved is not None:
-                    return resolved
-
-    # 5. General Fallback Limit
-    general_limit = DEFAULT_GENERAL_LIMIT
-    if config and isinstance(config, dict):
-        # The flat "general_limit" key used to be unreachable: config.get("limits", {})
-        # returns {} when the key is absent, {} is a dict, so the first branch always
-        # won and resolved to the hardcoded default. read_config always supplies
-        # "limits", so this only bit callers passing a partial config - and it bit them
-        # in the stricter direction, ignoring a configured higher limit.
-        limits_sec = config.get("limits")
-        if isinstance(limits_sec, dict) and "general" in limits_sec:
-            general_limit = limits_sec["general"]
-        elif "general_limit" in config:
-            general_limit = config["general_limit"]
-
-    try:
-        resolved_general = int(general_limit)
-    except (ValueError, TypeError):
-        return DEFAULT_GENERAL_LIMIT
-    if resolved_general >= MIN_EFFECTIVE_LIMIT:
-        return resolved_general
-
-    # Nothing left to fall through to, and returning this would ban every active user
-    # on the installation after the usual consecutive scans - the one outcome this
-    # project treats as unshippable. Values below 1 are refused at every input now, so
-    # reaching here means a hand-edited row or an old .env; the documented default is
-    # used instead and said loudly, because the operator's intent was almost certainly
-    # "no limit", which is the whitelist rather than a limit of zero.
-    logger.critical(
-        f"⛔ Configured general limit {resolved_general!r} is not a usable limit - a "
-        f"limit below {MIN_EFFECTIVE_LIMIT} would ban every active user. Using the "
-        f"default of {DEFAULT_GENERAL_LIMIT} instead. Set GENERAL_LIMIT to 1 or more, "
-        f"and use the whitelist to exempt users."
+        facts = USER_METADATA_CACHE.get(username)
+    limit, _source = _calculate_user_limit(
+        username=username,
+        config=config or {},
+        facts=facts,
+        special_limits=special_limit,
+        batched_group_limits=group_limits,
     )
-    return DEFAULT_GENERAL_LIMIT
+    return limit
 
 
 class MetadataUnavailable(RuntimeError):
@@ -284,8 +173,7 @@ async def get_group_limits_batch(
                         # A fresh entry created here carries only group_ids, so it
                         # is flagged partial: get_active_users_metadata_batch used
                         # to treat mere presence in this cache as "fully cached"
-                        # and skip the read that fills in is_monitored,
-                        # is_excepted and effective_ip_limit.
+                        # and skip the read that fills in owner_username.
                         if row.username not in USER_METADATA_CACHE:
                             USER_METADATA_CACHE[row.username] = {"_partial": True}
                         USER_METADATA_CACHE[row.username]["group_ids"] = gids
@@ -345,7 +233,7 @@ async def get_active_users_metadata_batch(
     strict: bool = False,
 ) -> dict[str, dict]:
     """
-    Fetch group_ids, owner_username, is_excepted, and special_limit for multiple users.
+    Fetch factual group_ids and owner_username for multiple users.
     FIRST checks RAM cache (USER_METADATA_CACHE). Zero database queries if cached!
     """
     if not usernames:
@@ -358,11 +246,8 @@ async def get_active_users_metadata_batch(
 
     for u in usernames:
         cached = USER_METADATA_CACHE.get(u)
-        # A partial entry (group_ids only, written by get_group_limits_batch) is a
-        # cache MISS here. Treating it as a hit left the user without is_monitored,
-        # is_excepted or effective_ip_limit for the rest of the sync period, which
-        # silently disabled their whitelist and dropped their limit to the general
-        # fallback. The full read below replaces the entry wholesale.
+        # Group-only cache entries do not establish the current owner. Complete the
+        # factual entry before report or policy callers consume it.
         if cached is not None and not cached.get("_partial"):
             metadata[u] = cached
         else:
@@ -384,20 +269,12 @@ async def get_active_users_metadata_batch(
                     User.username,
                     User.group_ids,
                     User.owner_username,
-                    User.is_excepted,
-                    User.special_limit,
-                    User.is_monitored,
-                    User.effective_ip_limit,
                 ).where(User.username.in_(chunk))
                 result = await db.execute(stmt)
                 for row in result:
                     item = {
                         "group_ids": row.group_ids or [],
                         "owner_username": row.owner_username,
-                        "is_excepted": bool(row.is_excepted),
-                        "special_limit": row.special_limit,
-                        "is_monitored": bool(row.is_monitored) if row.is_monitored is not None else True,
-                        "effective_ip_limit": row.effective_ip_limit,
                     }
                     metadata[row.username] = item
                     USER_METADATA_CACHE[row.username] = item
