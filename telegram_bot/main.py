@@ -48,8 +48,6 @@ from telegram_bot.keyboards import (
     create_settings_menu_keyboard,
     create_limits_menu_keyboard,
     create_users_menu_keyboard,
-    create_monitoring_menu_keyboard,
-    create_reports_menu_keyboard,
     create_admin_menu_keyboard,
     create_back_to_main_keyboard,
     create_disable_method_keyboard,
@@ -149,6 +147,7 @@ from telegram_bot.handlers.reports import (
     ip_history_12h_command,
     ip_history_48h_command,
 )
+from telegram_bot.handlers.status_reports import health_report_command, status_command
 from telegram_bot.handlers.backup import (
     send_backup,
     restore_config,
@@ -307,8 +306,6 @@ MENU_TEXTS = {
     "settings": "⚙️ <b>Settings Menu</b>\n\nConfigure your bot settings:",
     "limits": "🎯 <b>Limits Menu</b>\n\nManage user connection limits:",
     "users": "👥 <b>Users Menu</b>\n\nManage users and view disabled accounts:",
-    "monitoring": "📡 <b>Monitoring Menu</b>\n\nView user monitoring status:",
-    "reports": "📊 <b>Reports Menu</b>\n\nGenerate usage reports:",
     "admin": "👑 <b>Admin Menu</b>\n\nManage bot administrators:",
     "whitelist": (
         "✅ <b>Whitelist Users</b>\n\n"
@@ -461,10 +458,10 @@ CALLBACK_ROUTES = {
     CallbackData.LIMITS_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["limits"], create_limits_menu_keyboard()),
     CallbackData.USERS_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["users"], create_users_menu_keyboard()),
     CallbackData.BACK_USERS: lambda u, q, c: _show_screen(q, MENU_TEXTS["users"], create_users_menu_keyboard()),
-    CallbackData.MONITORING_MENU: lambda u, q, c: _show_screen(
-        q, MENU_TEXTS["monitoring"], create_monitoring_menu_keyboard()
-    ),
-    CallbackData.REPORTS_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["reports"], create_reports_menu_keyboard()),
+    CallbackData.STATUS_REPORTS: lambda u, q, c: status_command(u, c),
+    CallbackData.HEALTH_REPORT: lambda u, q, c: health_report_command(u, c),
+    CallbackData.MONITORING_MENU: lambda u, q, c: status_command(u, c),
+    CallbackData.REPORTS_MENU: lambda u, q, c: status_command(u, c),
     CallbackData.ADMIN_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["admin"], create_admin_menu_keyboard()),
     "noop": lambda u, q, c: q.answer(),
     # --- Users --------------------------------------------------------------
@@ -1250,6 +1247,8 @@ application.add_handler(
 
 # Monitoring
 application.add_handler(CommandHandler("monitoring_status", monitoring_status))
+application.add_handler(CommandHandler("status", status_command))
+application.add_handler(CommandHandler("health_report", health_report_command))
 application.add_handler(CommandHandler("monitoring_details", monitoring_details))
 application.add_handler(CommandHandler("clear_monitoring", clear_monitoring))
 
