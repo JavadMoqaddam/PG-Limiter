@@ -26,10 +26,14 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from utils.logs import get_logger
 from utils.atomic_io import atomic_write_json
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from db.models import ViolationHistory
 
 punishment_logger = get_logger("punishment")
 
@@ -252,6 +256,13 @@ class PunishmentSystem:
         # (step_index, duration_minutes). The next attempt reconciles the record
         # instead of re-applying the panel side effect.
         self._applied_unrecorded: dict[str, tuple[int, int]] = {}
+        # A pending incident can already have its authoritative record while its
+        # JSON mirror or caller is interrupted. Retain that progress until the
+        # caller consumes the incident, so reconciliation never inserts it twice.
+        self._recorded_incidents: set[str] = set()
+        # Keep the flushed row identity when commit confirmation is unavailable.
+        # Reconciliation checks that attempt before inserting another violation.
+        self._unconfirmed_incidents: dict[str, tuple[int, float, ViolationRecord]] = {}
         # Rate limit for the "reading the JSON copy instead of SQLite" warning: the
         # enforcement loop asks about thousands of users per cycle, so warning per
         # user would bury the log it is meant to make legible.
@@ -454,16 +465,39 @@ class PunishmentSystem:
     async def record_violation(self, username: str, step_applied: int, duration_minutes: int):
         """
         Record a new violation for a user in SQLite and in-memory cache.
-        
+
         Args:
             username: The username
             step_applied: Which step was applied (0-indexed)
             duration_minutes: Duration of disable in minutes (0 for warning or unlimited)
         """
+        if username in self._recorded_incidents and self.get_unrecorded_incident(username) == (
+            step_applied,
+            duration_minutes,
+        ):
+            await self.save_violations()
+            return
+
+        attempt = self._unconfirmed_incidents.get(username)
+        if attempt is not None and self.get_unrecorded_incident(username) == (step_applied, duration_minutes):
+            try:
+                if await self._confirm_recorded_violation(attempt):
+                    await self.save_violations()
+                    return
+            except Exception as error:
+                raise ViolationRecordError(str(error)) from error
+
         now = time.time()
+        record = ViolationRecord(
+            username=username,
+            timestamp=now,
+            step_applied=step_applied,
+            disable_duration=duration_minutes,
+        )
         db_available = False
         try:
             from db.database import DB_AVAILABLE
+
             db_available = DB_AVAILABLE
         except Exception:
             db_available = False
@@ -474,33 +508,92 @@ class PunishmentSystem:
             # divergence let the next cycle re-apply the same step. The caller reconciles.
             from db.database import get_db
             from db.crud.violations import ViolationHistoryCRUD
+
             try:
                 async with get_db() as db:
-                    await ViolationHistoryCRUD.add(
-                        db=db,
-                        username=username,
-                        step_applied=step_applied,
-                        disable_duration=duration_minutes
+                    violation = await ViolationHistoryCRUD.add(
+                        db=db, username=username, step_applied=step_applied, disable_duration=duration_minutes
                     )
-                    await db.commit()
+                    await self._commit_recorded_violation(db, record, violation)
             except Exception as e:
                 punishment_logger.error(f"Error saving violation to DB for {username}: {e}")
                 raise ViolationRecordError(str(e)) from e
 
-        if username not in self.violations:
-            self.violations[username] = []
-        
-        record = ViolationRecord(
-            username=username,
-            timestamp=now,
-            step_applied=step_applied,
-            disable_duration=duration_minutes
-        )
-        
-        self.violations[username].append(record)
+        if not db_available:
+            self._remember_recorded_violation(record)
         await self.save_violations()
 
-        punishment_logger.info(f"📝 Recorded violation #{len(self.violations[username])} for {username} (step {step_applied}, duration: {duration_minutes}min)")
+        punishment_logger.info(
+            f"📝 Recorded violation #{len(self.violations[username])} for {username} (step {step_applied}, duration: {duration_minutes}min)"
+        )
+
+    async def _commit_recorded_violation(
+        self, db: "AsyncSession", record: ViolationRecord, violation: "ViolationHistory"
+    ) -> None:
+        """Resolve the authoritative commit before propagating task cancellation."""
+        attempt = (violation.id, violation.timestamp, record)
+        if self.get_unrecorded_incident(record.username) == (record.step_applied, record.disable_duration):
+            self._unconfirmed_incidents[record.username] = attempt
+
+        async def commit_and_acknowledge():
+            try:
+                await db.commit()
+            except (Exception, asyncio.CancelledError):
+                # SQLAlchemy after_commit callbacks can raise after physical
+                # success. Confirmation and acknowledgement share the owned task
+                # so caller cancellation cannot interrupt that outcome check.
+                try:
+                    await self._confirm_recorded_violation(attempt)
+                except Exception as error:
+                    punishment_logger.error(f"Could not confirm violation commit for {record.username}: {error}")
+                raise
+            self._remember_recorded_violation(record)
+
+        commit = asyncio.create_task(commit_and_acknowledge())
+        interrupted = None
+        while True:
+            try:
+                await asyncio.shield(commit)
+                break
+            except asyncio.CancelledError as error:
+                if commit.cancelled():
+                    raise
+                interrupted = error
+            except Exception:
+                if interrupted is not None:
+                    raise interrupted
+                raise
+
+        if interrupted is not None:
+            raise interrupted
+
+    async def _confirm_recorded_violation(self, attempt: tuple[int, float, ViolationRecord]) -> bool:
+        """Check the attempted row through a fresh session before any retry insert."""
+        from db.database import AsyncSessionLocal
+        from db.crud.violations import ViolationHistoryCRUD
+
+        violation_id, timestamp, record = attempt
+        async with AsyncSessionLocal() as confirmation:
+            persisted = await ViolationHistoryCRUD.is_persisted(
+                confirmation,
+                violation_id,
+                record.username,
+                timestamp,
+                record.step_applied,
+                record.disable_duration,
+            )
+            # Capture the query result before session cleanup can raise or yield.
+            if persisted:
+                self._remember_recorded_violation(record)
+            self._unconfirmed_incidents.pop(record.username, None)
+            return persisted
+
+    def _remember_recorded_violation(self, record: ViolationRecord) -> None:
+        """Advance the cache and pending incident together without yielding."""
+        self.violations.setdefault(record.username, []).append(record)
+        if self.get_unrecorded_incident(record.username) == (record.step_applied, record.disable_duration):
+            self._recorded_incidents.add(record.username)
+            self._unconfirmed_incidents.pop(record.username, None)
 
     def begin_incident(self, username: str) -> bool:
         """Claim a punishment incident for a user.
@@ -520,11 +613,19 @@ class PunishmentSystem:
     def mark_unrecorded(self, username: str, step_index: int, duration_minutes: int) -> None:
         """Remember that a panel action was applied but its violation was not recorded."""
         self._applied_unrecorded[username] = (step_index, duration_minutes)
+        self._recorded_incidents.discard(username)
+        self._unconfirmed_incidents.pop(username, None)
 
     def has_unrecorded_incident(self, username: str) -> bool:
         return username in self._applied_unrecorded
 
+    def get_unrecorded_incident(self, username: str) -> Optional[tuple[int, int]]:
+        """Read pending reconciliation without discarding it before persistence."""
+        return self._applied_unrecorded.get(username)
+
     def pop_unrecorded_incident(self, username: str) -> Optional[tuple[int, int]]:
+        self._recorded_incidents.discard(username)
+        self._unconfirmed_incidents.pop(username, None)
         return self._applied_unrecorded.pop(username, None)
 
     async def clear_user_history(self, username: str):
