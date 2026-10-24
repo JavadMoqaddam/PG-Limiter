@@ -3,6 +3,8 @@ Limit management handlers for the Telegram bot.
 Includes functions for setting special limits, general limits, and viewing limits.
 """
 
+import html
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ContextTypes,
@@ -32,7 +34,8 @@ from telegram_bot.keyboards import (
     create_limits_menu_keyboard,
 )
 from telegram_bot.handlers.admin import check_admin_privilege
-from utils.read_config import read_config
+from utils import settings_service
+from utils.settings_service import read_settings as read_config
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -79,13 +82,16 @@ async def get_limit_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html(text=rejection)
         return ConversationHandler.END
     out_put = await handel_special_limit(context.user_data["selected_user"], context.user_data["limit_number"])
+    if not out_put:
+        await update.message.reply_html("❌ Could not save the special limit; check the username and try again.")
+        return ConversationHandler.END
     if out_put[0]:
         await update.message.reply_html(
-            text=f"<code>{context.user_data['selected_user']}</code> already has a"
+            text=f"<code>{html.escape(context.user_data['selected_user'])}</code> already has a"
             + " special limit. Change it with new value"
         )
     await update.message.reply_html(
-        text=f"Special limit for <code>{context.user_data['selected_user']}</code>"
+        text=f"Special limit for <code>{html.escape(context.user_data['selected_user'])}</code>"
         + f" set to <code>{out_put[1]}</code> successfully!"
     )
     return ConversationHandler.END
@@ -135,7 +141,9 @@ async def get_general_limit_number_handler(update: Update, _context: ContextType
     if rejection:
         await update.message.reply_html(rejection)
         return ConversationHandler.END
-    await save_general_limit(limit_number)
+    if await save_general_limit(limit_number) is None:
+        await update.message.reply_html("❌ Could not save the general limit; try again.")
+        return ConversationHandler.END
     await update.message.reply_text(f"General limit set to {limit_number}")
     return ConversationHandler.END
 
@@ -172,9 +180,12 @@ async def handle_special_limit_1_callback(query, context: ContextTypes.DEFAULT_T
     if "selected_user" in context.user_data:
         username = context.user_data["selected_user"]
         out_put = await handel_special_limit(username, 1)
-        msg = f"✅ Special limit for <b>{username}</b> set to <b>1 device</b>"
+        if not out_put:
+            await query.edit_message_text("❌ Could not save the special limit; check the username and try again.")
+            return
+        msg = f"✅ Special limit for <b>{html.escape(username)}</b> set to <b>1 device</b>"
         if out_put[0]:
-            msg = f"✅ Updated <b>{username}</b> limit to <b>1 device</b>"
+            msg = f"✅ Updated <b>{html.escape(username)}</b> limit to <b>1 device</b>"
         await query.edit_message_text(text=msg, reply_markup=create_back_to_main_keyboard(), parse_mode="HTML")
         context.user_data.pop("selected_user", None)
 
@@ -184,9 +195,12 @@ async def handle_special_limit_2_callback(query, context: ContextTypes.DEFAULT_T
     if "selected_user" in context.user_data:
         username = context.user_data["selected_user"]
         out_put = await handel_special_limit(username, 2)
-        msg = f"✅ Special limit for <b>{username}</b> set to <b>2 devices</b>"
+        if not out_put:
+            await query.edit_message_text("❌ Could not save the special limit; check the username and try again.")
+            return
+        msg = f"✅ Special limit for <b>{html.escape(username)}</b> set to <b>2 devices</b>"
         if out_put[0]:
-            msg = f"✅ Updated <b>{username}</b> limit to <b>2 devices</b>"
+            msg = f"✅ Updated <b>{html.escape(username)}</b> limit to <b>2 devices</b>"
         await query.edit_message_text(text=msg, reply_markup=create_back_to_main_keyboard(), parse_mode="HTML")
         context.user_data.pop("selected_user", None)
 
@@ -320,20 +334,14 @@ async def handle_special_limit_info_callback(query, _context: ContextTypes.DEFAU
 
 async def handle_remove_special_limit_callback(query, _context: ContextTypes.DEFAULT_TYPE, username: str):
     """Handle callback for removing a special limit."""
-    from db.database import get_db, DB_AVAILABLE
-    from db.crud import UserCRUD
-    from utils.read_config import config_write_transaction
-
-    if DB_AVAILABLE:
-        async with config_write_transaction(), get_db() as db:
-            result = await UserCRUD.set_special_limit(db, username, None)
-            await db.commit()
-        if result is not None:
-            text = f"✅ Special limit for <b>{username}</b> removed!\n\nThis user will now use the general limit."
+    escaped_username = html.escape(username)
+    try:
+        if await settings_service.set_special_limit(username, None, require_existing=True):
+            text = f"✅ Special limit for <b>{escaped_username}</b> removed!\n\nThis user will now use the group or general limit."
         else:
-            text = f"❌ No special limit found for <b>{username}</b>."
-    else:
-        text = "❌ Database not available."
+            text = f"❌ No special limit found for <b>{escaped_username}</b>."
+    except settings_service.SettingsUnavailable:
+        text = "❌ Could not save the special limit removal; try again."
 
     await query.edit_message_text(
         text=text,
@@ -360,7 +368,9 @@ async def handle_general_limit_menu_callback(query, _context: ContextTypes.DEFAU
 
 async def handle_general_limit_preset_callback(query, _context: ContextTypes.DEFAULT_TYPE, limit: int):
     """Handle callback for setting a preset general limit (2, 3, or 4)."""
-    await save_general_limit(limit)
+    if await save_general_limit(limit) is None:
+        await query.edit_message_text(text="❌ Could not save the general limit; try again.")
+        return
     await query.edit_message_text(
         text=f"✅ General limit set to <b>{limit}</b>", reply_markup=create_back_to_main_keyboard(), parse_mode="HTML"
     )
@@ -420,9 +430,13 @@ async def handle_special_limit_number_input(update: Update, context: ContextType
     try:
         username = context.user_data.get("selected_user", "user")
         out_put = await handel_special_limit(username, limit)
-        msg = f"✅ Special limit for <b>{username}</b> set to <b>{limit}</b>"
+        if not out_put:
+            await update.message.reply_html("❌ Could not save the special limit; check the username and try again.")
+            context.user_data["waiting_for"] = None
+            return
+        msg = f"✅ Special limit for <b>{html.escape(username)}</b> set to <b>{limit}</b>"
         if out_put[0]:
-            msg = f"✅ Updated <b>{username}</b> limit to <b>{limit}</b>"
+            msg = f"✅ Updated <b>{html.escape(username)}</b> limit to <b>{limit}</b>"
         await update.message.reply_html(text=msg, reply_markup=create_back_to_main_keyboard())
         context.user_data.pop("selected_user", None)
         context.user_data["waiting_for"] = None
@@ -452,7 +466,10 @@ async def handle_general_limit_input(update: Update, context: ContextTypes.DEFAU
         context.user_data["waiting_for"] = None
         return
 
-    await save_general_limit(limit)
+    if await save_general_limit(limit) is None:
+        await update.message.reply_html("❌ Could not save the general limit; try again.")
+        context.user_data["waiting_for"] = None
+        return
     await update.message.reply_html(
         text=f"✅ General limit set to <b>{limit}</b>", reply_markup=create_back_to_main_keyboard()
     )

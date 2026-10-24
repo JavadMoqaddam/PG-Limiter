@@ -9,23 +9,17 @@ import os
 import sys
 
 from utils.types import PanelType
-from utils.read_config import config_write_transaction, invalidate_config_cache
 from utils.atomic_io import atomic_write_json
+from utils.logs import get_logger
+from utils import settings_service
+
+settings_logger = get_logger("telegram.settings")
 
 try:
     import httpx
 except ImportError:
     print("Module 'httpx' is not installed use: 'pip install httpx' to install it")
     sys.exit()
-
-# Import database utilities
-try:
-    from db import get_db, UserCRUD, ConfigCRUD
-
-    DB_AVAILABLE = True
-except ImportError:
-    DB_AVAILABLE = False
-
 
 _config_write_lock = asyncio.Lock()
 
@@ -242,7 +236,7 @@ def general_limit_rejection(limit: int) -> str | None:
     return None
 
 
-async def handle_special_limit(username: str, limit: int) -> list:
+async def handle_special_limit(username: str, limit: int) -> list | None:
     """
     Handles the special limit for a given username using database.
 
@@ -254,33 +248,14 @@ async def handle_special_limit(username: str, limit: int) -> list:
         A list where the first element is a flag indicating whether the limit was set before,
         and the second element is the new limit.
     """
-    if DB_AVAILABLE:
-        async with config_write_transaction(), get_db() as db:
-            # Check if limit was set before
-            existing_limit = await UserCRUD.get_special_limit(db, username)
-            set_before = 1 if existing_limit is not None else 0
-
-            # Set the new limit
-            await UserCRUD.set_special_limit(db, username, limit)
-            await db.commit()
-        return [set_before, limit]
-
-    # Fallback to config.json
-    set_before = 0
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-        if "limits" not in data:
-            data["limits"] = {}
-        special_limit = data.get("limits", {}).get("special", {})
-        if special_limit.get(username):
-            set_before = 1
-        special_limit[username] = limit
-        data["limits"]["special"] = special_limit
-        await write_json_file(data)
-        return [set_before, special_limit[username]]
-    data = {"limits": {"special": {username: limit}}}
-    await write_json_file(data)
-    return [0, limit]
+    try:
+        special_limits = (await settings_service.read_settings())["limits"]["special"]
+        if not await settings_service.set_special_limit(username, limit):
+            return None
+        return [int(username in special_limits), limit]
+    except settings_service.SettingsUnavailable:
+        settings_logger.exception("Failed to save special limit")
+        return None
 
 
 # Backward-compatible alias
@@ -344,182 +319,53 @@ async def add_base_information(domain: str, password: str, username: str):
 
 
 async def get_special_limits_dict() -> dict:
-    """
-    This function retrieves the special limits from database as a dictionary.
-
-    Returns:
-        dict: Dictionary of username -> limit
-    """
-    if DB_AVAILABLE:
-        async with get_db() as db:
-            special_limits = await UserCRUD.get_all_special_limits(db)
-            return special_limits or {}
-
-    # Fallback to config.json
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-        return data.get("limits", {}).get("special", {})
-    return {}
+    """Read the canonical special overrides shown to administrators."""
+    return (await settings_service.read_settings())["limits"]["special"]
 
 
 async def get_special_limit_list() -> list | None:
-    """
-    This function retrieves the list of special limits from database,
-    and returns this list in a format suitable for messaging (split into shorter messages).
-
-    Returns:
-        list
-    """
-    if DB_AVAILABLE:
-        async with get_db() as db:
-            special_limits = await UserCRUD.get_all_special_limits(db)
-            if not special_limits:
-                return None
-            special_list = "\n".join([f"{key} : {value}" for key, value in special_limits.items()])
-            messages = special_list.split("\n")
-            shorter_messages = ["\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)]
-            return shorter_messages
-
-    # Fallback to config.json
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-        special_list = data.get("limits", {}).get("special", None)
-        if not special_list:
-            return None
-        special_list = "\n".join([f"{key} : {value}" for key, value in special_list.items()])
-        messages = special_list.split("\n")
-        shorter_messages = ["\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)]
-        return shorter_messages
-    return None
+    """Split special overrides into messages of at most 100 entries."""
+    special_limits = await get_special_limits_dict()
+    messages = [f"{username} : {limit}" for username, limit in special_limits.items()]
+    return ["\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)] or None
 
 
 async def add_except_user(except_user: str) -> str | None:
-    """
-    Add a user to the exception list using database.
-    Falls back to config.json if database is not available.
-    """
-    if DB_AVAILABLE:
-        async with config_write_transaction(), get_db() as db:
-            await UserCRUD.set_excepted(db, except_user, True)
-            await db.commit()
-        return except_user
-
-    # Fallback to config.json
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-        if "limits" not in data:
-            data["limits"] = {}
-        users = data.get("limits", {}).get("except_users", [])
-        if except_user not in users:
-            users.append(except_user)
-            data["limits"]["except_users"] = users
-            await write_json_file(data)
+    """Return the username only after canonical whitelist membership commits."""
+    try:
+        if await settings_service.set_exception(except_user, True):
             return except_user
-    else:
-        data = {"limits": {"except_users": [except_user]}}
-        await write_json_file(data)
-        return except_user
+    except settings_service.SettingsUnavailable:
+        settings_logger.exception("Failed to add whitelist user")
     return None
 
 
 async def get_except_users_list() -> list:
-    """
-    Retrieve the list of exception users from the database as a list.
-
-    Returns:
-        list: List of usernames in the whitelist
-    """
-    if DB_AVAILABLE:
-        async with get_db() as db:
-            except_users = await UserCRUD.get_all_excepted(db)
-            return except_users or []
-
-    # Fallback to config.json
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-        return data.get("except_users", [])
-    return []
+    """Read the canonical whitelist."""
+    return (await settings_service.read_settings())["except_users"]
 
 
 async def show_except_users_handler() -> list | None:
-    """
-    Retrieve the list of exception users from the database.
-    If the list is too long, it splits the list into shorter messages.
-    """
-    if DB_AVAILABLE:
-        async with get_db() as db:
-            except_users = await UserCRUD.get_all_excepted(db)
-            if not except_users:
-                return None
-            except_users_str = "\n".join([f"{user}" for user in except_users])
-            messages = except_users_str.split("\n")
-            shorter_messages = ["\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)]
-            return shorter_messages
-
-    # Fallback to config.json
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-        except_users = data.get("limits", {}).get("except_users", None)
-        if not except_users:
-            return None
-        except_users = "\n".join([f"{key}" for key in except_users])
-        messages = except_users.split("\n")
-        shorter_messages = ["\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)]
-        return shorter_messages
-    return None
+    """Split whitelist entries into messages of at most 100 entries."""
+    messages = await get_except_users_list()
+    return ["\n".join(messages[i : i + 100]) for i in range(0, len(messages), 100)] or None
 
 
 async def remove_except_user_from_config(user: str) -> str | None:
-    """
-    Remove a user from the exception list using database.
-    """
-    if DB_AVAILABLE:
-        async with config_write_transaction(), get_db() as db:
-            result = await UserCRUD.set_excepted(db, user, False)
-            await db.commit()
-        return user if result is not None else None
-
-    # Fallback to config.json
-    if not os.path.exists("config.json"):
-        return None
-    data = await read_json_file()
-    except_users = data.get("limits", {}).get("except_users", [])
-    if user in except_users:
-        except_users.remove(user)
-        data["limits"]["except_users"] = except_users
-        await write_json_file(data)
-        return user
+    """Remove actual canonical membership and report committed success."""
+    try:
+        if await settings_service.set_exception(user, False, require_existing=True):
+            return user
+    except settings_service.SettingsUnavailable:
+        settings_logger.exception("Failed to remove whitelist user")
     return None
 
 
-async def save_general_limit(limit: int) -> int:
-    """
-    Save the general limit to the database.
-    Falls back to config.json if database is not available.
-
-    Every path invalidates the configuration cache. That cache has no expiry - it is
-    dropped only by an explicit invalidation - and read_config() overlays the stored
-    general_limit onto config["limits"]["general"], which is what the enforcement loop
-    compares device counts against. Without the invalidation the new limit was written
-    to the database and then ignored for the life of the process, so raising the limit
-    from the bot did not stop the old one from banning people.
-    """
-    if DB_AVAILABLE:
-        async with config_write_transaction(), get_db() as db:
-            await ConfigCRUD.set(db, "general_limit", limit)
-            await db.commit()
+async def save_general_limit(limit: int) -> int | None:
+    """Return the new limit only after the canonical setting commits."""
+    try:
+        await settings_service.write_settings({"general_limit": limit})
         return limit
-
-    # Fallback to config.json
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-        if "limits" not in data:
-            data["limits"] = {}
-        data["limits"]["general"] = limit
-        await write_json_file(data)
-        await invalidate_config_cache()
-        return limit
-    data = {"limits": {"general": limit}}
-    await write_json_file(data)
-    await invalidate_config_cache()
-    return limit
+    except settings_service.SettingsUnavailable:
+        settings_logger.exception("Failed to save general limit")
+        return None

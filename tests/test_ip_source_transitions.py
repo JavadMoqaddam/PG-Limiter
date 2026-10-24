@@ -603,8 +603,12 @@ async def live_config_writer(source_runtime, monkeypatch, request):
     r = source_runtime
     monkeypatch.setattr(db, "get_db", r.config.get_db)
     monkeypatch.setattr(database, "get_db", r.config.get_db)
-    monkeypatch.setattr(bot_utils, "get_db", r.config.get_db)
-    monkeypatch.setattr(bot_utils, "DB_AVAILABLE", True)
+    # The shared commands only mutate actual mirrored users. Seed the user so
+    # these source-evidence tests exercise a committed policy change.
+    from db.crud.users import UserCRUD
+
+    async with r.config.get_db() as session:
+        await UserCRUD.create_or_update(session, "u1")
     kind = request.param
     if kind == "punishment":
         return lambda: punishment._save_punishment_setting("punishment_enabled", "false")
