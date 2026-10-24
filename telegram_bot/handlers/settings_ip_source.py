@@ -266,9 +266,10 @@ async def ip_source_concurrency_handler(update: Update, context: ContextTypes.DE
     try:
         value = int(text)
     except ValueError:
-        await update.message.reply_html("❌ Please send a whole number between <code>1</code> and <code>40</code>.")
         context.user_data["waiting_for"] = "ip_source_concurrency"
-        return
+        return await update.message.reply_html(
+            "❌ Please send a whole number between <code>1</code> and <code>40</code>."
+        )
 
     clamped = max(1, min(40, value))
     await save_config_value("api_ip_concurrency", str(clamped))
@@ -320,13 +321,11 @@ async def ip_source_freshness_handler(update: Update, context: ContextTypes.DEFA
         return
     if not text.isascii() or not text.isdecimal() or int(text) <= 0:
         context.user_data["waiting_for"] = "ip_source_freshness"
-        await update.message.reply_html("❌ Send a positive whole number of seconds.")
-        return
+        return await update.message.reply_html("❌ Send a positive whole number of seconds.")
     value = int(text)
     if not await save_config_value("api_ip_freshness", str(value)):
         context.user_data["waiting_for"] = "ip_source_freshness"
-        await update.message.reply_html("❌ Could not save Last seen. Try again or /cancel.")
-        return
+        return await update.message.reply_html("❌ Could not save Last seen. Try again or /cancel.")
     await update.message.reply_html(
         f"✅ Last seen set to <code>{value}s</code>.",
         reply_markup=create_ip_source_keyboard(source, concurrency, value),

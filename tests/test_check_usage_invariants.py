@@ -60,7 +60,7 @@ async def test_requeue_is_noop_when_every_user_has_a_newer_event(completed_logs_
     assert ACTIVE_USERS["carol"].ip == ["5.5.5.5"]
 
 
-async def test_api_batch_is_never_merged_back_after_failed_preparation():
+async def test_api_batch_is_never_merged_back_after_failed_preparation(operational_topics):
     from utils.read_config import get_config_revision
     from utils.shared_state import APISampleEvidence, begin_api_collection, pop_api_users_snapshot, publish_api_snapshot
     from utils.types import ConnectionInfo
