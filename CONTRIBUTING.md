@@ -15,6 +15,7 @@ Thank you for your interest in contributing to Limiter!
    python3 -m venv .venv
    source .venv/bin/activate
    pip install -r requirements.txt
+   pip install -r requirements-dev.txt
    ```
 
 ## Development
@@ -28,8 +29,15 @@ python3 limiter.py
 ### Running Tests
 
 ```bash
-python3 -m pytest tests/
+python3 -m pytest tests/ --ignore=tests/core_test.py --ignore=tests/test_minimal.py
 ```
+
+Dependabot checks Python dependencies each weekday at 09:00 Asia/Tehran and GitHub
+Actions and Docker images weekly on Monday at 09:00. It opens grouped minor/patch update
+PRs; major updates stay separate for review. Python test tools retain their
+supported major ranges in `requirements-dev.txt`.
+The Claude security reviewer is pinned to a reviewed commit and needs manual updates
+until upstream publishes version tags that Dependabot can track.
 
 ### Code Style
 
