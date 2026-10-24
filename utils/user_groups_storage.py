@@ -10,6 +10,7 @@ import time
 
 from utils.logs import logger
 from utils.atomic_io import atomic_write_json
+from utils.backup_paths import groups_file, legacy_groups_file
 
 # In-memory cache
 USER_ORIGINAL_GROUPS = {}
@@ -22,8 +23,9 @@ class UserGroupsStorage:
     original groups so we can restore them when re-enabling.
     """
 
-    def __init__(self, filename=".user_groups_backup.json"):
-        self.filename = filename
+    def __init__(self, filename=None):
+        self.filename = str(groups_file() if filename is None else filename)
+        self._legacy_filename = str(legacy_groups_file()) if filename is None else None
         self.user_groups = {}  # {username: {"groups": [group_ids], "saved_at": timestamp}}
         self._write_lock = asyncio.Lock()
         self.load_data()
@@ -32,8 +34,13 @@ class UserGroupsStorage:
         """Load user groups data from the JSON file."""
         global USER_ORIGINAL_GROUPS
         try:
-            if os.path.exists(self.filename):
-                with open(self.filename, "r", encoding="utf-8") as file:
+            source = self.filename
+            # Read the old container-local copy only until a persisted copy exists;
+            # future saves always land on the volume and leave the legacy file intact.
+            if not os.path.exists(source) and self._legacy_filename:
+                source = self._legacy_filename
+            if os.path.exists(source):
+                with open(source, "r", encoding="utf-8") as file:
                     data = json.load(file)
                     self.user_groups = data.get("user_groups", {})
                     USER_ORIGINAL_GROUPS = self.user_groups.copy()
@@ -62,17 +69,14 @@ class UserGroupsStorage:
     async def save_user_groups(self, username: str, group_ids: list[int]):
         """
         Save user's original groups before moving to disabled group.
-        
+
         Args:
             username: The username
             group_ids: List of group IDs the user had before being disabled
         """
         global USER_ORIGINAL_GROUPS
         current_time = time.time()
-        self.user_groups[username] = {
-            "groups": group_ids,
-            "saved_at": current_time
-        }
+        self.user_groups[username] = {"groups": group_ids, "saved_at": current_time}
         USER_ORIGINAL_GROUPS = self.user_groups.copy()
         await self.save_data()
         logger.info(f"Saved original groups for {username}: {group_ids}")
@@ -80,16 +84,16 @@ class UserGroupsStorage:
     async def get_user_groups(self, username: str) -> list[int] | None:
         """
         Get user's original groups that were saved.
-        
+
         Args:
             username: The username
-            
+
         Returns:
             List of group IDs or None if not found
         """
         # Reload from file to get latest data
         await asyncio.to_thread(self.load_data)
-        
+
         if username in self.user_groups:
             return self.user_groups[username].get("groups", None)
         return None
@@ -97,7 +101,7 @@ class UserGroupsStorage:
     async def remove_user(self, username: str):
         """
         Remove user's saved groups after re-enabling.
-        
+
         Args:
             username: The username
         """
@@ -111,10 +115,10 @@ class UserGroupsStorage:
     async def has_saved_groups(self, username: str) -> bool:
         """
         Check if user has saved groups.
-        
+
         Args:
             username: The username
-            
+
         Returns:
             True if user has saved groups
         """
@@ -124,7 +128,7 @@ class UserGroupsStorage:
     async def get_all_users_with_saved_groups(self) -> list[str]:
         """
         Get list of all usernames that have saved groups.
-        
+
         Returns:
             List of usernames
         """
