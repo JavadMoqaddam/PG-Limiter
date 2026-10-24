@@ -99,6 +99,8 @@ class QueueItem:
     chunk_index: int = 0
     attempt_done: asyncio.Event = field(default_factory=asyncio.Event)
     enqueued: bool = False
+    monitoring_revision: Optional[int] = None
+    destination_revision: Optional[int] = None
 
     @property
     def is_cancelled(self) -> bool:
@@ -232,6 +234,8 @@ class TelegramDispatcher:
             "topic_type": item.topic_type.value,
             "chat_id": item.chat_id,
             "message_thread_id": item.message_thread_id,
+            "monitoring_revision": item.monitoring_revision,
+            "destination_revision": item.destination_revision,
             "destination_pinned": item.destination_pinned,
             "message_id": item.message_id,
             "reply_markup": markup,
@@ -288,7 +292,14 @@ class TelegramDispatcher:
                 batch_id = data.get("batch_id") or db_id
                 namespace = None
                 if data.get("message_key"):
-                    namespace = (data.get("chat_id"), data.get("message_thread_id"), topic.value, data["message_key"])
+                    namespace = (
+                        data.get("chat_id"),
+                        data.get("message_thread_id"),
+                        topic.value,
+                        data.get("monitoring_revision"),
+                        data.get("destination_revision"),
+                        data["message_key"],
+                    )
                 batch = self._batches.setdefault(batch_id, SendBatch(batch_id, data.get("chunk_count", 1), namespace))
                 if namespace and state != DeliveryState.FAILED:
                     self._dedup_batches[namespace] = batch
@@ -309,6 +320,8 @@ class TelegramDispatcher:
                     action_type=data.get("action_type", ActionType.SEND),
                     chat_id=data.get("chat_id"),
                     message_thread_id=data.get("message_thread_id"),
+                    monitoring_revision=data.get("monitoring_revision"),
+                    destination_revision=data.get("destination_revision"),
                     destination_pinned=bool(data.get("chat_id")),
                     text=data.get("text"),
                     topic_type=topic,
@@ -350,7 +363,14 @@ class TelegramDispatcher:
                 if batch and batch.namespace:
                     if self._dedup_batches.get(batch.namespace) is batch:
                         self._dedup_batches.pop(batch.namespace)
-                    batch.namespace = (item.chat_id, item.message_thread_id, item.topic_type.value, batch.namespace[-1])
+                    batch.namespace = (
+                        item.chat_id,
+                        item.message_thread_id,
+                        item.topic_type.value,
+                        item.monitoring_revision,
+                        item.destination_revision,
+                        batch.namespace[-1],
+                    )
                     self._dedup_batches[batch.namespace] = batch
                 changed = True
                 dispatcher_logger.info(f"Pinned legacy notification {db_id} to chat {item.chat_id}")
@@ -376,8 +396,10 @@ class TelegramDispatcher:
         message_key: Optional[str] = None,
     ) -> list[asyncio.Future]:
         """Reserve and persist all chunks together, reusing a live dedup batch's futures."""
-        if self._shutting_down or not texts:
+        if self._shutting_down or not texts or not get_topics_manager().enabled:
             return []
+        monitoring_revision = get_topics_manager().monitoring_revision
+        destination_revision = get_topics_manager().destination_revision
         destination = QueueItem(
             priority,
             ActionType.SEND,
@@ -393,7 +415,16 @@ class TelegramDispatcher:
                 self._dedup_batches.pop(key)
                 self._batches.pop(previous.batch_id, None)
         namespace = (
-            (destination.chat_id, destination.message_thread_id, topic_type.value, message_key) if message_key else None
+            (
+                destination.chat_id,
+                destination.message_thread_id,
+                topic_type.value,
+                monitoring_revision,
+                destination_revision,
+                message_key,
+            )
+            if message_key
+            else None
         )
         if namespace:
             existing = self._dedup_batches.get(namespace)
@@ -414,6 +445,8 @@ class TelegramDispatcher:
                 chat_id=destination.chat_id,
                 message_thread_id=destination.message_thread_id,
                 destination_pinned=destination.destination_pinned,
+                monitoring_revision=monitoring_revision,
+                destination_revision=destination_revision,
                 text=text,
                 topic_type=topic_type,
                 reply_markup=reply_markup if index == len(texts) - 1 else None,
@@ -529,9 +562,20 @@ class TelegramDispatcher:
         success = all(part.state == DeliveryState.DELIVERED for part in batch.items.values())
         if not batch.completed and success and batch.namespace:
             manager = get_topics_manager()
-            if manager.group_id == batch.namespace[0]:
+            if (
+                manager.group_id == batch.namespace[0]
+                and item.monitoring_revision is not None
+                and item.destination_revision is not None
+            ):
                 try:
-                    await manager.mark_message_sent(item.topic_type, batch.namespace[-1])
+                    await manager.mark_message_sent(
+                        item.topic_type,
+                        batch.namespace[-1],
+                        chat_id=batch.namespace[0],
+                        message_thread_id=batch.namespace[1],
+                        monitoring_revision=item.monitoring_revision,
+                        destination_revision=item.destination_revision,
+                    )
                 except Exception as error:
                     dispatcher_logger.error(f"Could not mark delivered message key: {error}")
         if not batch.completed:
@@ -633,10 +677,16 @@ class TelegramDispatcher:
                     if item.state == DeliveryState.DELIVERED:
                         await self._complete_delivery(item)
                         continue
+                    if self._observation_obsolete(item):
+                        item.state = DeliveryState.CANCELLED
+                        await self._finish(item)
+                        continue
                     item.state = DeliveryState.PREPARING
                     if self._paused_until > time.monotonic():
                         await asyncio.sleep(self._paused_until - time.monotonic())
                     await self.bucket.consume(1.0)
+                    if self._observation_obsolete(item):
+                        item.state = DeliveryState.CANCELLED
                     if item.is_cancelled:
                         await self._finish(item)
                         continue
@@ -686,6 +736,13 @@ class TelegramDispatcher:
                     self.queue.task_done()
         finally:
             self._is_running = False
+
+    def _observation_obsolete(self, item: QueueItem) -> bool:
+        """Discard observations invalidated by a pause, retaining applied critical incidents."""
+        if item.action_type != ActionType.SEND or item.priority == Priority.CRITICAL:
+            return False
+        manager = get_topics_manager()
+        return not manager.enabled or item.monitoring_revision != manager.monitoring_revision
 
     async def _execute_item(self, item: QueueItem) -> DeliveryOutcome:
         bot = self._bot
