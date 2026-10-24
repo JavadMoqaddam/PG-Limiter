@@ -9,7 +9,6 @@ import json
 import os
 import shutil
 import tempfile
-import zipfile
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -20,6 +19,8 @@ from telegram.ext import (
 )
 from utils.atomic_io import atomic_write_json
 from utils.read_config import config_write_transaction
+from utils.backup import create_backup, runtime_layout, stage_backup
+from utils.backup_paths import AUTO_BACKUP_CONFIG_FILE
 
 from telegram_bot.input_owner import reply_input_prompt
 from telegram_bot.constants import RESTORE_CONFIG
@@ -27,6 +28,7 @@ from telegram_bot.handlers.admin import check_admin_privilege
 from utils.logs import get_logger
 
 backup_logger = get_logger("backup")
+RESTORE_STAGING_DIR = "/var/lib/pg-limiter/restore-staging"
 
 # Conversation state for migration
 MIGRATE_WAITING_FILE = 100
@@ -62,78 +64,15 @@ async def _prefetch_settings_users(data: dict) -> None:
 
 
 def _sync_create_backup_zip() -> tuple[str, str, str]:
-    """Create backup zip file synchronously. Returns (zip_path, zip_name, temp_dir)."""
+    """Create a consistent SQLite snapshot with independently captured JSON state."""
     temp_dir = tempfile.mkdtemp()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_name = f"pg-limiter-backup-{timestamp}.zip"
+    zip_name = f"pg-limiter-backup-{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     zip_path = os.path.join(temp_dir, zip_name)
-
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        # Check Docker mounted config directory (read-only mount)
-        docker_config_dir = "/etc/opt/pg-limiter"
-        config_found = False
-        if os.path.exists(docker_config_dir):
-            for filename in os.listdir(docker_config_dir):
-                filepath = os.path.join(docker_config_dir, filename)
-                if os.path.isfile(filepath):
-                    zipf.write(filepath, f"config/{filename}")
-                    config_found = True
-                    backup_logger.info(f"Added config file: {filename}")
-
-        # Also check local .env if not found in config dir
-        if os.path.exists(".env"):
-            zipf.write(".env", "config/.env")
-            config_found = True
-            backup_logger.info("Added local .env file")
-
-        if not config_found:
-            backup_logger.warning("No config files found to backup")
-
-        # Add data files from /var/lib/pg-limiter/ (or local data/)
-        data_dirs = [
-            "/var/lib/pg-limiter/data",
-            "data",
-        ]
-        for data_dir in data_dirs:
-            if os.path.exists(data_dir) and os.path.isdir(data_dir):
-                for root, dirs, files in os.walk(data_dir):
-                    for file in files:
-                        filepath = os.path.join(root, file)
-                        arcname = os.path.join("data", os.path.relpath(filepath, data_dir))
-                        zipf.write(filepath, arcname)
-                break
-
-        # Add legacy JSON files if they exist
-        legacy_files = [
-            ".disable_users.json",
-            ".violation_history.json",
-            ".user_groups_backup.json",
-        ]
-        for legacy_file in legacy_files:
-            if os.path.exists(legacy_file):
-                zipf.write(legacy_file, f"legacy/{legacy_file}")
-
-        # Add backup info
-        hostname = "unknown"
-        try:
-            hostname = os.uname().nodename
-        except AttributeError:
-            pass
-
-        backup_info = f"""PG-Limiter Backup
-Created: {datetime.now().isoformat()}
-Hostname: {hostname}
-
-Contents:
-- config/: Configuration files (.env)
-- data/: Database and persistent data
-- legacy/: Legacy JSON files (if any)
-
-To restore:
-1. Send this zip file to the bot with /restore command
-2. Or use: pg-limiter restore <this-file.zip>
-"""
-        zipf.writestr("backup_info.txt", backup_info)
+    try:
+        create_backup(zip_path, runtime_layout(live_instances=True))
+    except BaseException:
+        shutil.rmtree(temp_dir)
+        raise
     return zip_path, zip_name, temp_dir
 
 
@@ -143,6 +82,7 @@ async def send_backup(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     if check is not None:
         return check
 
+    temp_dir = None
     try:
         await update.message.reply_text("📦 Creating backup... Please wait.")
 
@@ -157,9 +97,9 @@ async def send_backup(update: Update, _context: ContextTypes.DEFAULT_TYPE):
                     "✅ <b>Backup created successfully!</b>\n\n"
                     "📁 This backup includes:\n"
                     "• Configuration files\n"
-                    "• Database (SQLite)\n"
-                    "• Legacy JSON files (if any)\n\n"
-                    "💡 To restore, use /restore command and send this file."
+                    "• Database-consistent SQLite snapshot\n"
+                    "• Persisted JSON state, captured independently\n\n"
+                    "💡 /restore validates and stages this file for offline restoration."
                 ),
                 parse_mode="HTML",
             )
@@ -168,7 +108,10 @@ async def send_backup(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         shutil.rmtree(temp_dir)
 
     except Exception as e:
-        await update.message.reply_html(f"❌ <b>Error creating backup:</b>\n<code>{str(e)}</code>")
+        await update.message.reply_html(f"❌ <b>Error creating backup:</b>\n<code>{html.escape(str(e))}</code>")
+    finally:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 async def restore_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -182,174 +125,43 @@ async def restore_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update.message.reply_html(
             "📥 <b>Restore from Backup</b>\n\n"
             "Please send your backup file (zip or json format).\n\n"
-            "<b>⚠️ Warning:</b> This will replace your current data!"
+            "The bot validates and stages it. Apply it offline with the host command shown afterward."
         ),
     )
     return RESTORE_CONFIG
 
 
-def _sync_restore_config_zip(file_content: bytearray) -> tuple[bool, str]:
-    """Restore zip backup synchronously. Returns (env_restored, env_restore_note)."""
-    temp_dir = tempfile.mkdtemp()
-    zip_path = os.path.join(temp_dir, "backup.zip")
-
-    with open(zip_path, "wb") as f:
-        f.write(file_content)
-
-    with zipfile.ZipFile(zip_path, "r") as zipf:
-        # Validate against Zip Slip (directory traversal attack)
-        real_temp_dir = os.path.realpath(temp_dir)
-        for member in zipf.infolist():
-            target_path = os.path.realpath(os.path.join(temp_dir, member.filename))
-            if not (target_path == real_temp_dir or target_path.startswith(real_temp_dir + os.sep)):
-                raise ValueError(f"Dangerous zip archive detected (Zip Slip): {member.filename}")
-        zipf.extractall(temp_dir)
-
-    # Restore .env file if present
-    env_restored = False
-    env_restore_note = ""
-    for env_name in ["config/.env", ".env"]:
-        src_path = os.path.join(temp_dir, env_name)
-        if os.path.exists(src_path):
-            # Determine destination - check if config dir exists AND is writable
-            config_dir = "/etc/opt/pg-limiter"
-            if os.path.exists(config_dir) and os.access(config_dir, os.W_OK):
-                env_dst = os.path.join(config_dir, ".env")
-            else:
-                env_dst = ".env"
-                if os.path.exists(config_dir):
-                    # Config dir exists but is read-only (Docker mount)
-                    env_restore_note = " (saved locally - config dir is read-only)"
-
-            shutil.copy(src_path, env_dst)
-            env_restored = True
-            backup_logger.info(f"Restored .env to: {env_dst}")
-            break
-
-    # Restore data files
-    data_src = os.path.join(temp_dir, "data")
-    if os.path.exists(data_src):
-        data_dst = "/var/lib/pg-limiter/data" if os.path.exists("/var/lib/pg-limiter") else "data"
-
-        # Copy database files
-        for item in os.listdir(data_src):
-            src = os.path.join(data_src, item)
-            dst = os.path.join(data_dst, item)
-            if os.path.isfile(src):
-                os.makedirs(data_dst, exist_ok=True)
-                shutil.copy2(src, dst)
-
-    # Restore legacy files (for migration)
-    legacy_src = os.path.join(temp_dir, "legacy")
-    if os.path.exists(legacy_src):
-        for item in os.listdir(legacy_src):
-            src = os.path.join(legacy_src, item)
-            if os.path.isfile(src):
-                shutil.copy2(src, item)
-
-    # Cleanup
-    shutil.rmtree(temp_dir)
-
-    return env_restored, env_restore_note
+def _sync_restore_config_zip(file_content: bytearray):
+    """Validate and stage an upload; application belongs to the offline host command."""
+    return stage_backup(file_content, runtime_layout(live_instances=True), RESTORE_STAGING_DIR)
 
 
 async def restore_config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the uploaded backup file and restore it."""
+    """Stage ZIP or legacy JSON uploads without changing any live store."""
+    check = await check_admin_privilege(update)
+    if check is not None:
+        return check
     try:
-        # Check if a document was sent
-        if not update.message.document:
-            await update.message.reply_html(
-                "❌ Please send a valid backup file (zip or json).\nUse /restore to try again."
-            )
+        document = update.message.document
+        if not document or not str(document.file_name or "").lower().endswith((".zip", ".json")):
+            await update.message.reply_html("❌ Please send a .zip or .json backup. Use /restore to try again.")
             return ConversationHandler.END
-
-        file_name = update.message.document.file_name
-
-        # Download the file
-        file = await update.message.document.get_file()
-        file_content = await file.download_as_bytearray()
-
-        if file_name.endswith(".zip"):
-            # Handle zip backup (new format)
-            env_restored, env_restore_note = await asyncio.to_thread(_sync_restore_config_zip, file_content)
-
-            env_status = "✓" + env_restore_note if env_restored else "✗"
-            await update.message.reply_html(
-                "✅ <b>Backup restored successfully!</b>\n\n"
-                f"• Environment file: {env_status}\n"
-                "• Database: ✓\n\n"
-                "⚠️ Please restart the service for changes to take effect."
-            )
-
-        elif file_name.endswith(".json"):
-            # Handle legacy JSON config - migrate to database
-            try:
-                config_data = json.loads(file_content.decode("utf-8"))
-
-                from db import get_db, ConfigCRUD, UserCRUD
-
-                await _prefetch_settings_users(config_data)
-                async with config_write_transaction(), get_db() as db:
-                    # Import settings to database
-                    if "disable_method" in config_data:
-                        await ConfigCRUD.set(db, "disable_method", str(config_data["disable_method"]))
-                    if config_data.get("disabled_group_id"):
-                        await ConfigCRUD.set(db, "disabled_group_id", str(config_data["disabled_group_id"]))
-                    if config_data.get("enhanced_details") is not None:
-                        await ConfigCRUD.set(db, "enhanced_details", str(config_data["enhanced_details"]).lower())
-
-                    # Skip bad input before CRUD. A revision/persistence error
-                    # after flush must escape and roll back the whole batch.
-                    special_limits = config_data.get("limits", {}).get("special", {})
-                    skipped_limits = []
-                    for username, limit in special_limits.items():
-                        try:
-                            validated_limit = _validated_import_limit(limit)
-                        except ValueError as error:
-                            skipped_limits.append(f"{username} ({error})")
-                            continue
-                        result = await UserCRUD.set_special_limit(db, username, validated_limit, fetch_from_panel=False)
-                        if result is None:
-                            skipped_limits.append(f"{username} (user not found)")
-
-                    # Import except users
-                    except_users = config_data.get("except_users", [])
-                    for username in except_users:
-                        result = await UserCRUD.set_excepted(
-                            db, username, True, reason="Restored from backup", fetch_from_panel=False
-                        )
-                        if result is None:
-                            raise ValueError(f"Whitelist user {username!r} was not found; restore rolled back")
-
-                await update.message.reply_html(
-                    "✅ <b>Legacy config imported to database!</b>\n\n"
-                    "📝 Panel credentials should be set in .env file.\n"
-                    "ℹ️ The imported settings are already live; only .env changes "
-                    "need a service restart."
-                    + (
-                        "\n\n⚠️ Skipped these special limits because a limit must be 1 "
-                        "or greater — put the user in the whitelist for no limit:\n"
-                        + "\n".join(f"• <code>{html.escape(entry)}</code>" for entry in skipped_limits)
-                        if skipped_limits
-                        else ""
-                    )
-                )
-
-            except json.JSONDecodeError as e:
-                await update.message.reply_html(f"❌ Invalid JSON format: {str(e)}\nUse /restore to try again.")
-                return ConversationHandler.END
-        else:
-            await update.message.reply_html(
-                "❌ Unsupported file format. Please send a .zip or .json file.\nUse /restore to try again."
-            )
-            return ConversationHandler.END
-
-    except Exception as e:
+        file = await document.get_file()
+        content = await file.download_as_bytearray()
+        staged = await asyncio.to_thread(_sync_restore_config_zip, content)
         await update.message.reply_html(
-            f"❌ <b>Error during restore:</b>\n<code>{str(e)}</code>\n\nUse /restore to try again."
+            "✅ <b>Backup verified and staged.</b>\n\n"
+            "Apply it from the host terminal:\n"
+            f"<code>pg-limiter restore {html.escape(str(staged))}</code>\n\n"
+            "That command stops the service before applying the backup and asks before starting it again. "
+            "Your live data has not been changed."
         )
-
-    context.user_data["waiting_for"] = None
+    except Exception as error:
+        await update.message.reply_html(
+            f"❌ <b>Backup validation failed:</b>\n<code>{html.escape(str(error))}</code>\nUse /restore to try again."
+        )
+    finally:
+        context.user_data["waiting_for"] = None
     return ConversationHandler.END
 
 
@@ -706,51 +518,11 @@ async def migrate_backup_cancel(update: Update, _context: ContextTypes.DEFAULT_T
 
 
 def _sync_create_auto_backup_zip(interval_hours: int) -> tuple[str, str, str]:
-    """Create auto backup zip file synchronously. Returns (zip_path, zip_name, temp_dir)."""
-    temp_dir = tempfile.mkdtemp()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_name = f"pg-limiter-auto-backup-{timestamp}.zip"
-    zip_path = os.path.join(temp_dir, zip_name)
-
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        # Check Docker mounted config directory
-        docker_config_dir = "/etc/opt/pg-limiter"
-        if os.path.exists(docker_config_dir):
-            for filename in os.listdir(docker_config_dir):
-                filepath = os.path.join(docker_config_dir, filename)
-                if os.path.isfile(filepath):
-                    zipf.write(filepath, f"config/{filename}")
-
-        if os.path.exists(".env"):
-            zipf.write(".env", "config/.env")
-
-        # Add data files
-        data_dirs = ["/var/lib/pg-limiter/data", "data"]
-        for data_dir in data_dirs:
-            if os.path.exists(data_dir) and os.path.isdir(data_dir):
-                for root, _, files in os.walk(data_dir):
-                    for file in files:
-                        filepath = os.path.join(root, file)
-                        arcname = os.path.join("data", os.path.relpath(filepath, data_dir))
-                        zipf.write(filepath, arcname)
-                break
-
-        # Add legacy files
-        for legacy_file in [".disable_users.json", ".violation_history.json", ".user_groups_backup.json"]:
-            if os.path.exists(legacy_file):
-                zipf.write(legacy_file, f"legacy/{legacy_file}")
-
-        # Add backup info
-        backup_info = f"""PG-Limiter Automatic Backup
-Created: {datetime.now().isoformat()}
-Type: Automatic (scheduled every {interval_hours} hour(s))
-"""
-        zipf.writestr("backup_info.txt", backup_info)
-
-    return zip_path, zip_name, temp_dir
+    """Use the same database-consistent format for scheduled backups."""
+    return _sync_create_backup_zip()
 
 
-async def send_automatic_backup():
+async def send_automatic_backup() -> bool:
     """
     Send an automatic backup to the forum group (if topics enabled) or all admins.
     Called by scheduler based on auto-backup config.
@@ -761,6 +533,7 @@ async def send_automatic_backup():
 
     backup_logger.info("📦 Creating automatic backup...")
 
+    temp_dir = None
     try:
         # Get auto-backup config for interval info
         config = await asyncio.to_thread(get_auto_backup_config)
@@ -775,7 +548,7 @@ async def send_automatic_backup():
         caption = (
             "💾 <b>Automatic Backup</b>\n\n"
             f"🕐 Time: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
-            "📁 Includes: Config, Database, Legacy files\n\n"
+            "📁 Includes: Environment, database-consistent SQLite snapshot, and separately captured JSON state\n\n"
             f"💡 <i>Backups are sent every {interval_hours} hour(s)</i>"
         )
 
@@ -794,12 +567,13 @@ async def send_automatic_backup():
                     )
                 backup_logger.info(f"✅ Automatic backup sent to forum group (thread={thread_id})")
                 shutil.rmtree(temp_dir)
-                return
+                return True
             except Exception as e:
                 backup_logger.warning(f"⚠️ Failed to send backup to forum group: {e}, falling back to admins")
 
         # Fallback: send to all admins
         admins = await check_admin()
+        delivered = 0
 
         for admin in admins:
             try:
@@ -812,22 +586,27 @@ async def send_automatic_backup():
                         parse_mode="HTML",
                     )
                 backup_logger.info(f"✅ Automatic backup sent to admin {admin}")
+                delivered += 1
             except Exception as e:
                 backup_logger.error(f"❌ Failed to send backup to admin {admin}: {e}")
 
         # Cleanup
         shutil.rmtree(temp_dir)
         backup_logger.info("✅ Automatic backup completed successfully")
+        return delivered > 0
 
     except Exception as e:
         backup_logger.error(f"❌ Automatic backup failed: {e}")
+        return False
+    finally:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AUTO-BACKUP SETTINGS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-AUTO_BACKUP_CONFIG_FILE = "data/auto_backup_config.json"
 
 _auto_backup_lock = asyncio.Lock()
 
@@ -969,11 +748,11 @@ async def auto_backup_now(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer("📦 Creating backup...")
 
     # Run the backup
-    await send_automatic_backup()
+    sent = await send_automatic_backup()
 
     if update.callback_query:
         await update.callback_query.edit_message_text(
-            text="✅ <b>Backup sent successfully!</b>\n\nThe backup has been sent to all admins.",
+            text=("✅ <b>Backup sent successfully!</b>" if sent else "❌ <b>Backup failed. Check the service log.</b>"),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="auto_backup_menu")]]),
         )
