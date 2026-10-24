@@ -10,6 +10,30 @@ from collections.abc import Callable
 helpers_logger = get_logger("warning_helpers")
 
 
+async def get_disable_ip_activity(warning, config_data: dict) -> str:
+    """Enrich recorded activity only after the caller has applied a disable.
+
+    The warning record must already be cleared before this optional network I/O,
+    so a timeout or cancellation cannot repeat an applied punishment next scan.
+    """
+    from utils.check_usage import _ensure_isp_detector
+    from utils.isp_detector import ISPDetector
+    from telegram_bot.topics import get_topics_manager
+
+    if not get_topics_manager().group_id:
+        return warning.get_ip_activity_summary()
+
+    ips = list(warning.ip_first_seen)
+    formatted_ips = {ip: ISPDetector.format_ip_with_isp(ip, {}) for ip in ips}
+    try:
+        detector = await _ensure_isp_detector(config_data)
+        results = await detector.get_multiple_isp_info(ips)
+        formatted_ips.update({ip: detector.format_ip_with_isp(ip, results.get(ip, {})) for ip in ips})
+    except Exception as error:
+        helpers_logger.warning("Failed to enrich disable activity for %s: %s", warning.username, type(error).__name__)
+    return warning.get_ip_activity_summary(formatted_ips)
+
+
 def capture_monitoring_guard() -> Callable[[], bool]:
     """Capture Topics admission when the optional monitoring gate is installed."""
     from importlib import import_module

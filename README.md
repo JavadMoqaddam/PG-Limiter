@@ -145,7 +145,7 @@ The bot features a comprehensive menu structure with support for Telegram Superg
 ├── 🎯 Limits        → General & special user limit management
 ├── 👥 Users         → Exception whitelist, disabled users & manual enable
 ├── 📡 Monitoring    → Live active violations & connection monitor
-├── 📊 Reports       → ISP, protocol, node usage & IP history reports
+├── 📊 Reports       → Protocol, node usage & IP history reports
 └── 👑 Admin         → Manage authorized Telegram admins
 ```
 
@@ -158,7 +158,31 @@ PG-Limiter can organize notifications across dedicated Forum topics in a Telegra
 | 🚫 **Disable / Enable** | Critical disable notifications with instant `[✅ Enable]` action buttons |
 | 📡 **Monitoring & Status** | Node connection statuses, heartbeat logs, and sync stats |
 | 💾 **Backups** | Automated and manual database/config backup archives |
+| 📊 **Daily Report** | Previous calendar day’s users actually banned, grouped by applied punishment step |
 | ♾️ **No Limit** | Notifications for unlimited / exempted users |
+
+Daily Report sends one brief message at **00:00** for the previous complete calendar
+day, using the current `TZ` environment setting. An unset `TZ` uses UTC; an invalid
+explicit zone pauses reporting with a service diagnostic. Changes to the running
+process environment reschedule the next midnight within 60 seconds. After editing
+a deployment `.env` file, restart the process or recreate the container so it receives
+the new environment; log-source timezone settings do not control this schedule.
+
+The report counts distinct users per actual applied step and once in the total,
+with a separate Plain ban row when escalation is disabled. A user can appear in
+several step counts, so their sum can exceed the total. Warnings and failed disables
+are excluded. Reports contain no usernames or IPs and fit one message of at most
+2000 UTF-16 units; exceptionally many steps are combined as user/step counts.
+Zero-ban days report `Total: 0 users`.
+
+Configure the Daily Report topic in Forum Topics settings. Topics off produces no
+new report or disabled-day backlog. Restart recovery considers the most recent
+eligible missed day. Pending fact writes delay its summary, and known delivered
+receipts prevent replay after topic-cache or destination changes. An uncertain
+panel action or Telegram send remains unresolved instead of inventing a successful
+outcome or automatically sending a possible duplicate. Run one limiter daemon per
+database. New backups include the pending fact outbox; valid older backups remain
+restorable and remove any newer outbox before the restored database starts.
 
 ---
 
@@ -206,6 +230,24 @@ Switching to API mode runs a pre-flight probe against a real online user first, 
 
 Logs preserves Xray's original printed process-local time and rejects retained replay records across reconnects. Configure `LOG_NODE_TIMEZONES` and/or an explicit `LOG_TIMEZONE` for the Xray process/container; host or panel timezone alone does not establish it. Unknown zones, fleet or transport readiness preserve warnings while enforcement waits. A source/settings change or transport recovery requires a full ordinary `CHECK_INTERVAL` before Logs resumes. See [Panel API IP source](docs/API_IP_SOURCE.md) and [Node Logs source and readiness](docs/LOG_SOURCE.md) for configuration, recovery and protocol limits.
 
+### 7. Device Counting Modes
+Choose the enforcement measure at runtime from **Settings → 🧮 Device Counting**:
+
+| Mode | What counts as one device |
+|---|---|
+| **Per Device (by inbound)** — default | One client IP (or grouped subnet) on one inbound |
+| **Per IP** | One client IP (or grouped subnet), regardless of inbound |
+| **Per Inbound** | One distinct inbound tag observed during the current check window, regardless of IPs |
+| **Per Node** | One known connected monitored node with accepted active user connections |
+
+In Per Inbound mode, ten IPs on one inbound count as **1**, while one IP on three inbounds counts as **3**. The same inbound tag across several nodes counts once. Tags are trimmed and case-sensitive; disabled nodes, blank tags and the reserved `Unknown` placeholder contribute nothing. Without inbound information, the count is **0** and never falls back to the number of IPs. CDN, subnet and High Trust grouping do not change this count.
+
+Per Inbound uses accepted log traffic collected between checks, so it measures observed activity during that window. It requires **Node Logs (SSE)**: switch the IP source to logs before selecting it, and choose Per Device, Per IP or Per Node before switching to the panel API. If an incompatible API + Per Inbound combination is persisted externally, collection and enforcement pause while existing samples and warning counters are preserved.
+
+Per Node works with **Logs and API**. Several IPs or inbounds on one eligible node count as **1**; the same IP on two eligible nodes counts as **2**, including CDN traffic. CDN, subnet and High Trust grouping do not change this count. Nodes disabled in the limiter or panel, unknown IDs and malformed IDs contribute nothing. An integer ID of zero is valid when it belongs to the authoritative node fleet. Bare IPs cannot establish a node count. Accepted connections still obey country, policy and source freshness checks; missing fleet readiness or unknown user evidence preserves warnings and pauses the affected enforcement instead of clearing them as zero usage.
+
+All counting modes use the dynamic database setting `device_count_mode` (`device`, `ip`, `inbound` or `node`); changing it requires no restart or schema migration.
+
 ---
 
 ## ⚙️ Configuration
@@ -239,8 +281,8 @@ CHECK_INTERVAL=60
 TIME_TO_ACTIVE_USERS=1800
 COUNTRY_CODE=IR
 
-# Timezone
-TZ=Asia/Tehran
+# Daily Report calendar timezone (00:00; unset defaults to UTC)
+TZ=UTC
 ```
 
 ---
@@ -294,8 +336,12 @@ Runs on port `8080` by default. Swagger documentation available at `http://local
 | **Access Tokens** | 30 min | Panel API authentication |
 | **Node List** | 1 hour | Active PasarGuard SSE nodes |
 | **Configuration** | 5 min | Dynamic runtime parameters |
-| **Subnet & ISP Info** | 7 days | IP-to-carrier resolution cache |
 | **User Metadata** | 1 min | Pre-computed limits held in RAM |
+
+ISP lookups run only for successful disable notifications, once per raw IP, with
+no memory/database cache or subnet request aggregation. Warnings and reports do
+not request ISP information. `/24` device grouping remains available; the former
+ISP-dependent `/16` mode now uses `/24`. See [ISP notifications](docs/ISP_NOTIFICATIONS.md).
 
 ---
 
@@ -320,14 +366,14 @@ PG-Limiter/
 │       ├── limits.py           # General & custom limit handlers
 │       ├── users.py            # User whitelist & disable controllers
 │       ├── monitoring.py       # Live connection monitor
-│       ├── reports.py          # Detailed connection & ISP reports
+│       ├── reports.py          # Connection and IP history reports
 │       └── backup.py           # Backup & restore handlers
 │
 ├── utils/                      # Core Business Logic & Workers
 │   ├── check_usage.py          # IP analysis, limits resolution & enforcement
 │   ├── ip_source_api.py        # API-mode IP collector (panel online-stats)
 │   ├── user_sync.py            # Fast parallel panel user synchronization
-│   ├── isp_detector.py         # Subnet & ISP detection engine
+│   ├── isp_detector.py         # Fresh per-IP lookups for disable notifications
 │   ├── punishment_system.py    # Tiered punishment duration manager
 │   └── warning_system/         # 3-cycle consecutive tracking & trust scoring
 │

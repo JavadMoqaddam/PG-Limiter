@@ -162,7 +162,7 @@ class IPHistoryTracker:
         results.sort(key=lambda item: item[1], reverse=True)
         return results
 
-    async def generate_report(self, hours: int, config_data: dict, isp_detector=None) -> str:
+    async def generate_report(self, hours: int, config_data: dict) -> str:
         """Generate a formatted report of users exceeding limits."""
         users_data = await self.get_users_exceeding_limits(hours, config_data)
 
@@ -171,14 +171,6 @@ class IPHistoryTracker:
                 f"📊 <b>{hours}H IP History Report</b>\n\n"
                 f"✅ No users went over their unique-IP allowance in the last {hours} hours."
             )
-
-        isp_info_batch = {}
-        if isp_detector:
-            all_ips = set()
-            for _, _, _, ips in users_data:
-                all_ips.update(ips)
-            if all_ips:
-                isp_info_batch = await isp_detector.get_multiple_isp_info(list(all_ips))
 
         report_lines = [
             f"📊 <b>{hours}H IP History Report</b>",
@@ -196,13 +188,7 @@ class IPHistoryTracker:
             report_lines.append(f"   📍 Unique IPs: <b>{ip_count}</b> (Limit: {limit})")
             report_lines.append(f"   ⚠️ Over by: <b>{ip_count - limit}</b> unique IPs")
 
-            ip_list = []
-            for ip in sorted(unique_ips):
-                info = isp_info_batch.get(ip)
-                if info:
-                    ip_list.append(f"{ip} ({info.get('isp', 'Unknown')}, {info.get('country', 'Unknown')})")
-                else:
-                    ip_list.append(ip)
+            ip_list = sorted(unique_ips)
 
             for ip_str in ip_list[:5]:
                 report_lines.append(f"      • {ip_str}")

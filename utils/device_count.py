@@ -6,20 +6,26 @@ path and the "user normalized" clearing path all compare it against the user's
 limit - so it lives in its own module with no database, panel or Telegram
 imports, and is unit tested directly.
 
-Two counting modes exist because operators deploy nodes differently. Neither
-mode ever puts ``node_id`` in the key: several nodes commonly serve one core
-config, so a single client is registered on all of them at once and would
-otherwise be counted once per node.
+Four counting modes exist because operators deploy nodes differently. Only
+"node" mode includes ``node_id`` in the key; the other modes collapse a client
+registered on several nodes serving the same core config.
 
     "device"  (ip-or-subnet, inbound)  one IP reaching two inbounds counts as
                                        two devices. This is what catches
                                        several people sharing one connection.
     "ip"      (ip-or-subnet)           one client IP is exactly one device.
+    "inbound" (inbound)                every observed inbound tag counts once,
+                                       regardless of client IPs or grouping rules.
+    "node"    (node_id)                every eligible connected node counts once,
+                                       regardless of IPs, inbounds or grouping rules.
 
-CDN traffic is collapsed before either rule applies, because a CDN presents many
+CDN traffic is collapsed in "device" and "ip" modes, because a CDN presents many
 edge addresses for one client: every CDN node together counts as one device, and
 a CDN inbound counts as one device per inbound in "device" mode - all of them
-together in "ip" mode.
+together in "ip" mode. In "inbound" and "node" modes, CDN, subnet and High Trust
+grouping do not affect the count. Missing tags (including the reserved "Unknown"
+placeholder) contribute nothing in inbound mode. Bare IPs cannot establish
+inbound or node counts; node mode requires an authoritative eligible-node set.
 """
 
 import ipaddress
@@ -30,6 +36,8 @@ from utils.types import ConnectionInfo, EnhancedUserInfo, UserType
 # Counting modes, as stored in the ``device_count_mode`` config key.
 COUNT_MODE_DEVICE = "device"
 COUNT_MODE_IP = "ip"
+COUNT_MODE_INBOUND = "inbound"
+COUNT_MODE_NODE = "node"
 
 
 @dataclass(slots=True)
@@ -40,14 +48,22 @@ class DeviceCountingConfig:
     cdn_nodes: list[int] = field(default_factory=list)
     disabled_nodes: list[int] = field(default_factory=list)
     subnet_ip_grouping: bool = False
-    subnet_grouping_mode: str = "/24"  # "/24" (standard) or "/16" (wide + ISP)
+    subnet_grouping_mode: str = "/24"  # Historical /16 settings now use /24.
     high_trust_ip_grouping: bool = False
     high_trust_threshold: int = 20
     count_mode: str = COUNT_MODE_DEVICE
+    eligible_node_ids: frozenset[int] | None = None
+
+    def __post_init__(self) -> None:
+        self.subnet_grouping_mode = "/24"
+        if self.eligible_node_ids is not None:
+            self.eligible_node_ids = frozenset(node_id for node_id in self.eligible_node_ids if type(node_id) is int)
 
     @classmethod
-    def from_config(cls, config_data: dict) -> "DeviceCountingConfig":
-        """Build DeviceCountingConfig from application config dictionary."""
+    def from_config(
+        cls, config_data: dict, *, eligible_node_ids: frozenset[int] | None = None
+    ) -> "DeviceCountingConfig":
+        """Build counting rules, with node authority supplied by source evidence."""
         return cls(
             cdn_inbounds=config_data.get("cdn_inbounds", []) or [],
             cdn_nodes=config_data.get("cdn_nodes", []) or [],
@@ -57,6 +73,7 @@ class DeviceCountingConfig:
             high_trust_ip_grouping=config_data.get("high_trust_ip_grouping", False),
             high_trust_threshold=config_data.get("high_trust_threshold", 20),
             count_mode=config_data.get("device_count_mode", COUNT_MODE_DEVICE),
+            eligible_node_ids=eligible_node_ids,
         )
 
 
@@ -72,37 +89,8 @@ def subnet_key(ip: str) -> str:
     return network.network_address.exploded.rsplit(".", 1)[0]
 
 
-def wide_subnet_key(ip: str) -> str:
-    """Return the /16 subnet (first two octets) of an IPv4 address."""
-    try:
-        ip_obj = ipaddress.ip_address(ip)
-    except ValueError:
-        return ip
-    if ip_obj.version != 4:
-        return ip  # IPv6: the full address is the key
-    network = ipaddress.ip_network(f"{ip}/16", strict=False)
-    parts = network.network_address.exploded.split(".")
-    return f"{parts[0]}.{parts[1]}"
-
-
-def isp_name_of(ip: str, isp_info: dict | None) -> str:
-    """Return the ISP (or org) name known for an IP, or "" when unknown."""
-    info = (isp_info or {}).get(ip) or {}
-    return info.get("isp", "") or info.get("org", "") or ""
-
-
-def _subnet_parts(ip: str, config: DeviceCountingConfig, isp_info: dict | None) -> tuple:
-    """
-    Return the grouping key of an IP when subnet grouping is enabled.
-
-    In "/16" mode the ISP has to be known, otherwise a whole /16 of unrelated
-    customers would collapse into one device; without it the address falls back
-    to the narrower /24 key.
-    """
-    if config.subnet_grouping_mode == "/16":
-        ip_isp = isp_name_of(ip, isp_info)
-        if ip_isp:
-            return ("SUBNET_ISP_GROUP", wide_subnet_key(ip), ip_isp)
+def _subnet_parts(ip: str) -> tuple:
+    """Return the /24 key used by optional device-count grouping."""
     return ("SUBNET_GROUP", subnet_key(ip))
 
 
@@ -110,7 +98,6 @@ def device_key(
     conn: ConnectionInfo,
     config: DeviceCountingConfig,
     apply_high_trust: bool = False,
-    isp_info: dict | None = None,
 ) -> tuple | None:
     """
     Return the identity of the device behind a single connection.
@@ -123,16 +110,31 @@ def device_key(
         conn: One connection of the user.
         config: Counting and grouping rules.
         apply_high_trust: Whether High Trust grouping is active for this user.
-        isp_info: ``{ip: isp_info}`` used by "/16" subnet grouping.
 
     Returns:
         tuple | None: The device key, or None for connections that are ignored.
     """
+    if config.count_mode == COUNT_MODE_NODE:
+        if (
+            type(conn.node_id) is not int
+            or config.eligible_node_ids is None
+            or conn.node_id not in config.eligible_node_ids
+            or conn.node_id in config.disabled_nodes
+        ):
+            return None
+        return ("NODE_ONLY", conn.node_id)
+
     if conn.node_id in config.disabled_nodes:
         return None
 
+    if config.count_mode == COUNT_MODE_INBOUND:
+        inbound = (conn.inbound_protocol or "").strip()
+        if not inbound or inbound == "Unknown":
+            return None
+        return ("INBOUND_ONLY", inbound)
+
     # A CDN presents many addresses for one client, so its traffic collapses.
-    # The node id is deliberately NOT part of the key: several nodes serve one
+    # In device and IP modes the node id is deliberately absent: several nodes serve one
     # core config, so a single client is registered on all of them at once and
     # would otherwise be counted once per node - which is how a user with one
     # IP was reported as "7 devices".
@@ -147,9 +149,9 @@ def device_key(
 
     if config.count_mode == COUNT_MODE_IP:
         # One client IP is one device, whatever it connects to. Subnet grouping
-        # still applies, so a whole /24 (or /16 + ISP) collapses into one.
+        # still applies, so a whole /24 collapses into one.
         if config.subnet_ip_grouping:
-            return _subnet_parts(conn.ip, config, isp_info)
+            return _subnet_parts(conn.ip)
         return ("IP_ONLY", conn.ip)
 
     if apply_high_trust:
@@ -158,7 +160,7 @@ def device_key(
         return ("HIGH_TRUST", conn.inbound_protocol)
 
     if config.subnet_ip_grouping:
-        return _subnet_parts(conn.ip, config, isp_info) + (conn.inbound_protocol,)
+        return _subnet_parts(conn.ip) + (conn.inbound_protocol,)
 
     return (conn.ip, conn.inbound_protocol)
 
@@ -173,7 +175,6 @@ def _connections_of(user: UserType | None) -> list[ConnectionInfo]:
 def count_devices_from_ips(
     ips: set[str] | list[str] | None,
     config: DeviceCountingConfig | None = None,
-    isp_info: dict | None = None,
 ) -> int:
     """
     Count devices from bare addresses, with no per-connection detail.
@@ -187,15 +188,13 @@ def count_devices_from_ips(
     would have produced through ``device_key``.
 
     The same subnet rule ``device_key`` applies is reused here, so the fallback
-    and the full path agree. Inbound is unknown, so "device" mode cannot tell two
-    devices behind one address apart; the count is identical in both modes and is
-    therefore a lower bound - the safe direction, since it can never invent a
-    violation that the full path would not have found.
+    and the full path agree in "device" and "ip" modes. Inbound is unknown, so
+    "device" mode cannot tell two devices behind one address apart. "inbound"
+    and "node" modes return zero because addresses alone cannot establish their identities.
 
     Args:
         ips: The user's unique addresses.
         config: Counting and grouping rules; defaults are used when omitted.
-        isp_info: ``{ip: isp_info}`` used by "/16" subnet grouping.
 
     Returns:
         int: Number of distinct devices these addresses represent.
@@ -203,12 +202,15 @@ def count_devices_from_ips(
     if config is None:
         config = DeviceCountingConfig()
 
+    if config.count_mode in (COUNT_MODE_INBOUND, COUNT_MODE_NODE):
+        return 0
+
     keys = set()
     for ip in ips or ():
         if not ip:
             continue
         if config.subnet_ip_grouping:
-            keys.add(_subnet_parts(ip, config, isp_info))
+            keys.add(_subnet_parts(ip))
         else:
             keys.add(("IP_ONLY", ip))
     return len(keys)
@@ -218,7 +220,6 @@ def count_devices(
     user: UserType | None,
     config: DeviceCountingConfig | None = None,
     trust_score: float = 0.0,
-    isp_info: dict | None = None,
     fallback_count: int = 0,
 ) -> int:
     """
@@ -232,10 +233,11 @@ def count_devices(
         user: The user whose connections are counted.
         config: Counting and grouping rules; defaults are used when omitted.
         trust_score: Current trust score, for High Trust grouping.
-        isp_info: ``{ip: isp_info}`` used by "/16" subnet grouping.
-        fallback_count: Returned when there is no connection information at all
+        fallback_count: Returned in "device" or "ip" mode when there is no connection information at all
             (log or API collection gave IPs but no inbound/node detail); the
-            caller passes the user's unique-IP count there.
+            caller passes the user's grouped-IP count there. "inbound" mode ignores
+            this fallback and returns zero without inbound information. "node"
+            mode likewise requires factual node connections.
 
     Returns:
         int: Number of distinct devices.
@@ -245,6 +247,8 @@ def count_devices(
 
     connections = _connections_of(user)
     if not connections:
+        if config.count_mode in (COUNT_MODE_INBOUND, COUNT_MODE_NODE):
+            return 0
         return fallback_count
 
     apply_high_trust = config.high_trust_ip_grouping and trust_score >= config.high_trust_threshold
@@ -255,7 +259,7 @@ def count_devices(
     cdn_node_observations: set[tuple] = set()
     cdn_inbound_observations: dict[tuple, set[tuple]] = {}
     for conn in connections:
-        key = device_key(conn, config, apply_high_trust=apply_high_trust, isp_info=isp_info)
+        key = device_key(conn, config, apply_high_trust=apply_high_trust)
         if key is not None:
             # Match real observations rather than subnet/trust keys, so grouping
             # never invents a link between different IPs across CDN categories.
@@ -332,15 +336,15 @@ def count_devices_and_details(
     show_enhanced_details: bool = False,
     device_config: DeviceCountingConfig | None = None,
     user_trust_score: float = 0.0,
-    isp_info: dict | None = None,
 ) -> tuple[list[str], int]:
     """
     Count devices and optionally render the per-IP display lines in one pass.
 
     Returns:
         tuple[list[str], int]: (display lines, device count). The lines are empty
-        when ``show_enhanced_details`` is False. With no connection information
-        the count comes from ``count_devices_from_ips``, which applies the same
+        when ``show_enhanced_details`` is False. With no connection information,
+        "inbound" and "node" modes return zero. In other modes, the count comes from
+        ``count_devices_from_ips``, which applies the same
         subnet rule the full path uses - it used to be the number of formatted
         display strings, which collapsed "1.2.3.x (5)" to 1 and so disagreed with
         the number enforcement acted on for the very same user.
@@ -349,18 +353,19 @@ def count_devices_and_details(
         device_config = DeviceCountingConfig()
 
     if not _connections_of(original_user):
+        if device_config.count_mode in (COUNT_MODE_INBOUND, COUNT_MODE_NODE):
+            return [], 0
         raw_ips = getattr(original_user, "ip", None)
         if not raw_ips:
             # Nothing but display strings to go on; keep the old behaviour rather
             # than report a zero that would read as "no devices".
             return [], len(user_info.formatted_ips)
-        return [], count_devices_from_ips(raw_ips, device_config, isp_info)
+        return [], count_devices_from_ips(raw_ips, device_config)
 
     device_count = count_devices(
         original_user,
         device_config,
         trust_score=user_trust_score,
-        isp_info=isp_info,
     )
     if not show_enhanced_details:
         return [], device_count

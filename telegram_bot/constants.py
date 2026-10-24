@@ -250,10 +250,12 @@ class CallbackData:
     IP_SOURCE_SET_FRESHNESS = "ip_source_set_freshness"
     IP_SOURCE_STATS = "ip_source_stats"
 
-    # Device counting mode (node-aware devices vs node-agnostic IPs)
+    # Device counting mode (IP/inbound pairs, IPs, inbound tags, or nodes)
     DEVICE_COUNT_MENU = "device_count_menu"
     DEVICE_COUNT_SET_DEVICE = "device_count_set_device"
     DEVICE_COUNT_SET_IP = "device_count_set_ip"
+    DEVICE_COUNT_SET_INBOUND = "device_count_set_inbound"
+    DEVICE_COUNT_SET_NODE = "device_count_set_node"
 
     # Auto-backup settings
     AUTO_BACKUP_MENU = "auto_backup_menu"
@@ -305,7 +307,7 @@ Settings → Enhanced Details - Toggle node names, IDs and protocols in reports
 Settings → IP Source - Switch between node logs (SSE) and the panel API
 
 <b>🧮 Device Counting:</b>
-Settings → Device Counting - Count per device (by inbound) or per IP
+Settings → Device Counting - Count per device (by inbound), per IP, per inbound, or per node
 
 <b>📊 Status &amp; Reports:</b>
 /status - Limiter status

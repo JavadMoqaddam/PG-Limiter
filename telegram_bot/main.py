@@ -629,6 +629,12 @@ CALLBACK_ROUTES = {
         "telegram_bot.handlers.settings", "handle_device_count_set_device_callback"
     ),
     CallbackData.DEVICE_COUNT_SET_IP: _lazy("telegram_bot.handlers.settings", "handle_device_count_set_ip_callback"),
+    CallbackData.DEVICE_COUNT_SET_INBOUND: _lazy(
+        "telegram_bot.handlers.settings", "handle_device_count_set_inbound_callback"
+    ),
+    CallbackData.DEVICE_COUNT_SET_NODE: _lazy(
+        "telegram_bot.handlers.settings", "handle_device_count_set_node_callback"
+    ),
     # --- Trust ---------------------------------------------------------------
     CallbackData.TRUST_RESET_MENU: _lazy("telegram_bot.handlers.settings", "trust_reset_menu_callback"),
     CallbackData.TRUST_RESET_ALL: _lazy("telegram_bot.handlers.settings", "trust_reset_all_callback"),

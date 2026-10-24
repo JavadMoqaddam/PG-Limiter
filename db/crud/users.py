@@ -405,6 +405,20 @@ class UserCRUD:
     # ==================== Disable Status Methods ====================
 
     @staticmethod
+    async def prepare_disable_provenance(db: AsyncSession, username: str, provenance: dict) -> dict:
+        """Persist the inverse before a panel mutation without confirming a ban."""
+        user = await UserCRUD.get_by_username(db, username)
+        if user is None:
+            user = await UserCRUD.create_or_update(db, username=username)
+        if user.disable_provenance is None:
+            user.disable_provenance = provenance
+            await db.flush()
+            register_user_cache_invalidation(db, username)
+        # A retry must retain the original inverse, even if the first PUT's
+        # response was lost after it changed the panel.
+        return user.disable_provenance
+
+    @staticmethod
     async def set_disabled(
         db: AsyncSession,
         username: str,
@@ -415,6 +429,7 @@ class UserCRUD:
         reason: Optional[str] = None,
         punishment_step: int = 0,
         fetch_from_panel: bool = True,
+        clear_provenance: bool = False,
     ) -> Optional[User]:
         """
         Set user disable status by limiter.
@@ -429,6 +444,7 @@ class UserCRUD:
             reason: Reason for disable
             punishment_step: Current punishment step
             fetch_from_panel: If True, fetch user from panel if not in local DB
+            clear_provenance: Remove the inverse after confirmed panel enable or 404
         """
         db_users_logger.debug(f"📝 Setting disabled for {username}: {disabled}")
         result = await db.execute(select(User).where(User.username == username))
@@ -461,10 +477,7 @@ class UserCRUD:
             user.is_disabled_by_limiter = True
             user.disabled_at = disabled_at
             user.enable_at = enable_at
-            # Only overwrite the saved groups when the caller actually supplies
-            # them: the group-based disable path stores them first, and the
-            # registry then records the timing with original_groups=None. Blindly
-            # writing [] there destroyed the backup the re-enable path reads.
+            # Replace a supplied group snapshot only when the caller provides it.
             if original_groups is not None:
                 user.original_groups = original_groups
             user.disable_reason = reason
@@ -475,6 +488,8 @@ class UserCRUD:
             user.disabled_at = None
             user.enable_at = None
             user.original_groups = []
+            if clear_provenance:
+                user.disable_provenance = None
             user.disable_reason = None
             # Keep punishment_step for history
             db_users_logger.info(f"✅ User {username} enabled")

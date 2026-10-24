@@ -571,12 +571,9 @@ async def _merge_loaded_config(env_config, db_data, check_required_elements=Fals
         except ValueError:
             pass
 
-    # Subnet IP Grouping - relaxed mode where IPs in the same /24 or /16 subnet
-    # that use the same node AND inbound are counted as a single device
+    # Subnet grouping remains /24 only; persisted /16 ISP mode is retired.
     config["subnet_ip_grouping"] = db_config.get("subnet_ip_grouping", "false").lower() == "true"
-    config["subnet_grouping_mode"] = db_config.get("subnet_grouping_mode", "/24")
-    if config["subnet_grouping_mode"] not in ["/24", "/16"]:
-        config["subnet_grouping_mode"] = "/24"
+    config["subnet_grouping_mode"] = "/24"
 
     # High Trust IP Grouping - for users with high trust score, multiple IPs
     # using the SAME node AND inbound are counted as one device
@@ -589,9 +586,8 @@ async def _merge_loaded_config(env_config, db_data, check_required_elements=Fals
     except (ValueError, TypeError):
         config["high_trust_threshold"] = 20
 
-    # Device counting mode. node_id is never part of the device key: several
-    # nodes can serve the same core config, so one client is registered on all
-    # of them simultaneously.
+    # Only node mode includes node_id in the device key. Other modes collapse
+    # the same client registered on several nodes serving one core config.
     #   "device" -> the inbound stays in the key (default). One IP reaching two
     #               inbounds counts as two devices, which is how several people
     #               sharing a single connection are detected.
@@ -599,8 +595,11 @@ async def _merge_loaded_config(env_config, db_data, check_required_elements=Fals
     #               device. Subnet grouping still applies when enabled; High
     #               Trust grouping has no effect (IP counting is already the
     #               most lenient key).
+    #   "inbound" -> distinct observed inbound tags only, regardless of IPs or
+    #               grouping settings. Requires log mode for real inbound names.
+    #   "node" -> distinct known connected monitored nodes with accepted activity.
     config["device_count_mode"] = str(db_config.get("device_count_mode", "device")).strip().lower()
-    if config["device_count_mode"] not in ("device", "ip"):
+    if config["device_count_mode"] not in ("device", "ip", "inbound", "node"):
         config["device_count_mode"] = "device"
 
     # Disabled nodes - list of node IDs to exclude from monitoring
