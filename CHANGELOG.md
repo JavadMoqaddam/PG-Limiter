@@ -6,6 +6,39 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-25
+
+Node-based connection limits and private daily ban summaries, with more reliable monitoring, management and recovery.
+
+### Added
+
+- **Per Node counting for Logs and API.** Count each user's distinct eligible active nodes, independent of their IPs or inbounds. Missing or malformed node evidence preserves warnings and pauses affected enforcement without falling back to IP counts.
+- **Per Inbound counting for Logs.** Count distinct observed inbound tags during the check window without multiplying them by client IPs.
+- **Daily Report forum topic.** Send the previous calendar day's actual-ban totals at 00:00 using the current environment `TZ`. Report distinct users per applied punishment step and globally, with plain bans separate and warnings/failed disables excluded. Private summaries omit usernames/IPs; persistent delivery receipts prevent replay of known delivered reports.
+- **Unified Status & Reports.** Show aggregate enforcement, source and service health without exposing users, IPs or raw failure details; unavailable telemetry remains unknown.
+
+### Fixed
+
+- Shared settings across Telegram, CLI and API and refreshed current user eligibility/limits before punishment, including whitelist, group, administrator and country policy changes.
+- Preserved warnings when source evidence is incomplete or settings change during a scan; kept API cycles separate and log reconnects tied to original source timestamps.
+- Bound Telegram replies to their active prompt and retained forum destinations and cancellation ownership, including repeated cancellation and Topics pause.
+- Preserved completion of already-started punishment and critical notifications without allowing refused, unstarted attempts to bypass a pause. Actual disable history survives warning cleanup; recovery restores the recorded disable incident.
+- Deduplicated overlapping CDN observations and applied monitoring exclusions consistently across collection paths.
+- Created database-consistent SQLite backups, validated/staged Telegram uploads for offline restore, and made legacy imports atomic and one-time. Startup remains available during temporary Telegram outages.
+
+### Changed
+
+- Configurable API Last seen threshold and optional automatic Logs fallback after two unsuccessful API cycles; existing positive thresholds retain their exact value.
+- ISP details are requested only for successful disable notifications. Ordinary scans, active-user displays and IP-history reports no longer request them; retired `/16` grouping uses `/24`.
+- Database schema advances to `011_daily_reports`; backup format v2 includes pending daily reporting evidence and valid v1 restore remains supported.
+- Refreshed dependencies and automated dependency maintenance, with Python 3.12–3.14 correctness checks.
+
+### Upgrade notes
+
+- Back up before upgrading. Keep the management script and application image on the same release; startup applies the SQLite migrations. Telegram `/restore` stages an upload; apply it offline with `pg-limiter restore FILE`.
+- Run one limiter daemon per database. Daily Report uses current environment `TZ`, defaulting to UTC when unset. Invalid explicit zones pause reporting with a service diagnostic; deployment `.env` changes require a restart or container recreation.
+- Per Inbound requires Logs; use Per Device, Per IP or Per Node with API, and grant the panel account `nodes:stats` permission. Existing `/16` subnet settings become `/24`.
+
 ## [1.6.1] - 2026-09-22
 
 A security-hardening release. A report-only whole-tree security review found no critical

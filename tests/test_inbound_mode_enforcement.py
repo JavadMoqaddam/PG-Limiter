@@ -2,14 +2,13 @@
 
 import asyncio
 import time
-from contextlib import asynccontextmanager
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import utils.check_usage as usage
-from db.models import Base, User
+from db.models import User
+from test_config_revisions import settings_db  # noqa: F401
 from utils.isp_detector import ISPDetector
 from utils.shared_state import ACTIVE_USERS
 from utils.types import ConnectionInfo, PanelType, UserType
@@ -50,17 +49,21 @@ async def test_direct_incompatible_enforcement_keeps_sample_and_warning(monkeypa
     assert warning.consecutive_violations == 2
 
 
-async def test_daemon_incompatible_mode_keeps_sample_without_collection(monkeypatch):
+async def test_daemon_incompatible_mode_keeps_sample_without_collection(monkeypatch, operational_topics):
     user = UserType(name="alice", ip=["5.6.7.8", "9.9.9.9"])
     warning = existing_warning()
     ACTIVE_USERS["alice"] = user
     monkeypatch.setattr(usage.warning_system, "warnings", {"alice": warning})
 
-    async def config():
+    async def config(*, refresh=False):
+        assert refresh is True
         return {"ip_source": "api", "device_count_mode": "inbound", "check_interval": 60}
+
+    collections = []
 
     async def replace_snapshot(*_args):
         # A successful API collection normally replaces the shared sample.
+        collections.append(True)
         ACTIVE_USERS.clear()
         return False
 
@@ -73,11 +76,13 @@ async def test_daemon_incompatible_mode_keeps_sample_without_collection(monkeypa
     with pytest.raises(asyncio.CancelledError):
         await usage.run_check_users_usage(PanelType("admin", "secret", "panel.local"))
     assert ACTIVE_USERS["alice"] is user
+    assert usage.warning_system.warnings["alice"] is warning
     assert warning.consecutive_violations == 2
+    assert collections == []
 
 
 @pytest.fixture
-async def enforcement_cycle(monkeypatch, tmp_path):
+async def enforcement_cycle(monkeypatch, tmp_path, completed_logs_evidence, settings_db):
     """Use real counting, warning state, persistence and policy with local I/O."""
     from utils.shared_state import NODE_LAST_EVENT
     from utils.user_sync import USER_METADATA_CACHE
@@ -86,23 +91,23 @@ async def enforcement_cycle(monkeypatch, tmp_path):
     saved_heartbeats = dict(NODE_LAST_EVENT)
     USER_METADATA_CACHE.clear()
     NODE_LAST_EVENT.clear()
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'enforcement.db'}")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    import db.database as database
+    from db.crud.config import ConfigCRUD
+    from db.crud.users import UserCRUD
+    from utils.read_config import read_config
 
-    @asynccontextmanager
-    async def get_db():
-        async with sessions() as session:
-            yield session
-            await session.commit()
-
+    get_db = database.get_db
     async with get_db() as session:
-        session.add(User(username="alice", is_monitored=True, effective_ip_limit=1))
-    monkeypatch.setattr("db.database.get_db", get_db)
+        await UserCRUD.create_or_update(session, "alice", group_ids=[])
+        await UserCRUD.set_special_limit(session, "alice", 1, fetch_from_panel=False)
+        await ConfigCRUD.set(session, "general_limit", "1")
+        await ConfigCRUD.set(session, "device_count_mode", "inbound")
+        await ConfigCRUD.set(session, "check_interval", "60")
+    await read_config()
     system = EnhancedWarningSystem(str(tmp_path / "warnings.json"), str(tmp_path / "history.json"))
     monkeypatch.setattr(usage, "warning_system", system)
     monkeypatch.setattr(usage, "isp_detector", None)
+    completed_logs_evidence({"device_count_mode": "inbound", "limits": {"general": 1}, "check_interval": 60})
 
     async def no_external_isp(self, ips):
         return {}
@@ -137,7 +142,6 @@ async def enforcement_cycle(monkeypatch, tmp_path):
     USER_METADATA_CACHE.update(saved_metadata)
     NODE_LAST_EVENT.clear()
     NODE_LAST_EVENT.update(saved_heartbeats)
-    await engine.dispose()
 
 
 def observed_user(pairs):

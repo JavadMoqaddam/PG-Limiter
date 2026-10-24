@@ -7,6 +7,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_version:
+        description: Stable version already validated by the release workflow
+        required: true
+        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -23,6 +29,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
 
       - name: Set up QEMU (for Multi-Arch amd64/arm64)
         uses: docker/setup-qemu-action@v4.4.0
@@ -45,6 +53,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ inputs.release_version != '' }}
+            type=raw,value=${{ inputs.release_version || 'latest' }},enable=${{ inputs.release_version != '' }}
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/develop' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

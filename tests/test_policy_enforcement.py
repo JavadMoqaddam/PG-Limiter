@@ -529,6 +529,59 @@ async def test_threshold_clear_during_remote_await_cannot_remove_replacement_war
     assert json.loads(open(policy_cycle.system.filename).read())["alice"]["consecutive_violations"] == 1
 
 
+@pytest.mark.parametrize(
+    ("action", "newly_applied", "attempts"),
+    [
+        ("disabled", True, 1),
+        ("reconciled", False, 1),
+        ("applied_unrecorded", True, 1),
+        ("applied_unrecorded", False, 1),
+        ("reconciled", False, 2),
+    ],
+)
+async def test_expired_remote_incident_preserves_replacement_warning(
+    policy_cycle, monkeypatch, action, newly_applied, attempts
+):
+    import utils.warning_system.enhanced_system as warning_module
+
+    for _attempt in range(attempts):
+        original_record = policy_cycle.warning(expired=True, count=3)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def punish(_panel, _user):
+            entered.set()
+            await release.wait()
+            return {
+                "action": action,
+                "newly_applied": newly_applied,
+                "duration_minutes": 15,
+                "violation_count": 1,
+                "step_index": 0,
+            }
+
+        monkeypatch.setattr(warning_module, "safe_disable_user_with_punishment", punish)
+        running = asyncio.create_task(policy_cycle.run())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            # Management can clear this incident and create a new owner while
+            # the old panel operation is still awaiting its response.
+            await policy_cycle.system.clear_user_trust_data("alice")
+            replacement = policy_cycle.warning(count=1)
+            await policy_cycle.system.save_warnings()
+            with open(policy_cycle.system.filename, encoding="utf-8") as file:
+                saved_replacement = json.load(file)["alice"]
+        finally:
+            release.set()
+            await asyncio.wait_for(running, timeout=5)
+
+        assert original_record.consecutive_violations == 3
+        assert policy_cycle.system.warnings.get("alice") is replacement
+        assert replacement.consecutive_violations == 1
+        with open(policy_cycle.system.filename, encoding="utf-8") as file:
+            assert json.load(file)["alice"] == saved_replacement
+
+
 async def test_normalization_save_cannot_clear_new_warning_history(policy_cycle, monkeypatch):
     async with database.get_db() as db:
         await UserCRUD.set_special_limit(db, "alice", 9, fetch_from_panel=False)

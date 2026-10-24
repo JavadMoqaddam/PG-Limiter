@@ -225,3 +225,12 @@ def completed_logs_evidence(operational_topics):
         return LOG_OBSERVATIONS.evidence()
 
     return build
+
+
+@pytest.fixture(autouse=True)
+def isolate_punishment_fact_outbox(tmp_path, monkeypatch):
+    """Keep actual-effect reporting state local to each test."""
+    import utils.punishment_facts as facts
+
+    monkeypatch.setattr(facts, "OUTBOX_FILE", str(tmp_path / "punishment_fact_outbox.json"))
+    monkeypatch.setattr(facts, "_journal", None)

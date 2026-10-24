@@ -128,6 +128,8 @@ def _parse_ip_payload(payload: dict) -> dict[int, dict[str, int] | None]:
         raise ValueError("Online-IP response has no node map")
     parsed = {}
     for node_key, node_value in nodes.items():
+        if type(node_key) is not int and not (isinstance(node_key, str) and node_key.removeprefix("-").isdecimal()):
+            raise ValueError("Invalid node ID")
         try:
             node_id = int(node_key)
         except (ValueError, TypeError) as error:

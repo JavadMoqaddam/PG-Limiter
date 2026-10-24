@@ -352,12 +352,7 @@ async def test_current_destination_creation_continues_after_one_topic_error(foru
         create_forum_topic=AsyncMock(side_effect=create_topic),
     )
     created = await forum.manager.create_topics_for_group(bot)
-    expected = {
-        TopicType.WARNINGS: 71,
-        TopicType.DISABLE_ENABLE: 71,
-        TopicType.BACKUPS: 71,
-        TopicType.NO_LIMIT: 71,
-    }
+    expected = {topic: 71 for topic in TopicType if topic != TopicType.GENERAL}
     assert created == expected
     assert (
         forum.manager.get_all_topics()

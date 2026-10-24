@@ -231,11 +231,14 @@ async def test_fixed_completed_interval_survives_slow_enforcement_preparation(ap
     await parse_logs(record(), 1, "node", api_cycle.config)
     await parse_logs(record(ip="9.9.9.9"), 1, "node", api_cycle.config)
 
-    async def slow_isp(*args):
-        logs.clock[0] = EPOCH + 125
-        return {}
+    prepare = usage.get_active_users_metadata_batch
 
-    monkeypatch.setattr(usage.ISPDetector, "get_multiple_isp_info", slow_isp)
+    async def slow_metadata(*args, **kwargs):
+        metadata = await prepare(*args, **kwargs)
+        logs.clock[0] = EPOCH + 125
+        return metadata
+
+    monkeypatch.setattr(usage, "get_active_users_metadata_batch", slow_metadata)
     await usage.check_users_usage(api_cycle.panel, api_cycle.config)
     assert api_cycle.warning.warnings["alice"].consecutive_violations == 1
 

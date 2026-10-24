@@ -22,7 +22,7 @@ Collection is a two-stage process:
 import asyncio
 import copy
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from utils.logs import get_logger
@@ -36,6 +36,7 @@ from utils.shared_state import (
 )
 from utils.monitoring_gate import monitoring_is_current, monitoring_snapshot, synchronize_monitoring
 from utils.types import ConnectionInfo, PanelType, UserType
+from utils.device_count import COUNT_MODE_NODE
 
 api_ip_logger = get_logger("ip_source_api")
 
@@ -132,6 +133,7 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
     node_name_map: dict[int, str] = {}
     connected_node_ids: set = set()
     disabled_nodes = set(config_data.get("disabled_nodes") or [])
+    node_mode = config_data.get("device_count_mode") == COUNT_MODE_NODE
     try:
         nodes = await get_nodes(panel_data)
     except Exception as error:
@@ -141,7 +143,11 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
     if nodes and not isinstance(nodes, ValueError):
         register_node_ips(node.node_ip for node in nodes)
         for node in nodes:
+            if node_mode and type(node.node_id) is not int:
+                raise ValueError("Invalid node ID in the authoritative node list")
             node_name_map[node.node_id] = node.node_name
+            if node_mode and node.status in ("disabled", "limited"):
+                disabled_nodes.add(node.node_id)
             if getattr(node, "status", None) == "connected":
                 connected_node_ids.add(node.node_id)
             elif node.node_id not in disabled_nodes:
@@ -434,6 +440,16 @@ async def _build_users_from_payloads(
     }
     now = time.time()
     for username, node_map in payloads.items():
+        if config_data.get("device_count_mode") == COUNT_MODE_NODE:
+            # Unknown identities cannot supply a required map, even when bools
+            # or floats compare equal to an integer node ID in Python.
+            node_map = {
+                node_id: values
+                for node_id, values in node_map.items()
+                if type(node_id) is int and expected_node_ids is not None and node_id in expected_node_ids
+            }
+            if expected_node_ids is None:
+                unknown.add(username)
         if expected_node_ids and not expected_node_ids.issubset(node_map):
             unknown.add(username)
         pairs = []
@@ -713,6 +729,7 @@ async def _collect_api_cycle(
     except ValueError:
         LAST_CYCLE_STATS["skipped_reason"] = "node availability unknown"
         return _CollectionResult("failure", False, "node availability unknown", evidence)
+    evidence = replace(evidence, eligible_node_ids=frozenset(expected_node_ids))
 
     if not monitoring_is_current(admission):
         return _CollectionResult("superseded", False, "Topics monitoring paused or changed", evidence)
@@ -873,9 +890,7 @@ async def _collect_api_cycle(
         await _handle_coverage_skip(reason)
         return _CollectionResult("partial", False, reason, evidence)
 
-    evidence = APISampleEvidence(
-        evidence.generation, evidence.config_revision, evidence.freshness_seconds, frozenset(unknown_users)
-    )
+    evidence = replace(evidence, unknown_users=frozenset(unknown_users))
     if not await publish_api_snapshot(new_users, evidence):
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
         return _CollectionResult("superseded", False, "configuration or collection changed", evidence)

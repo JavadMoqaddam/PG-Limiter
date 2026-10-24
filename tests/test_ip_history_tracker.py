@@ -3,6 +3,9 @@ device-limit violation: enforcement counts devices (dedup by inbound/subnet/ISP)
 so this report is history, not enforcement parity."""
 
 from telegram_bot.handlers import reports as reports_mod
+from telegram_bot.handlers import status_reports
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 import httpx
 import pytest
 
@@ -52,16 +55,18 @@ async def test_requested_history_reports_make_no_isp_requests(monkeypatch, hours
     async def config():
         return {"ipinfo_token": "notice-token"}
 
-    async def send(_update, message, **_kwargs):
-        messages.append(message)
-
     monkeypatch.setattr(ip_history_tracker, "get_users_exceeding_limits", rows)
-    monkeypatch.setattr(reports_mod, "check_admin_privilege", admin)
-    monkeypatch.setattr(reports_mod, "read_config", config)
-    monkeypatch.setattr(reports_mod, "_send_response", send)
+    monkeypatch.setattr(status_reports, "check_admin_privilege", admin)
+    monkeypatch.setattr(status_reports, "_read_current_config", AsyncMock(return_value=(await config(), 0)))
+    monkeypatch.setattr(status_reports, "_runtime_module", lambda: None)
+    monkeypatch.setattr(status_reports, "_config_revision", lambda: 0)
+    monkeypatch.setattr(
+        status_reports, "deliver_card", AsyncMock(side_effect=lambda _update, text, _keyboard: messages.append(text))
+    )
     command = reports_mod.ip_history_12h_command if hours == 12 else reports_mod.ip_history_48h_command
-    await command(object(), object())
+    await command(object(), SimpleNamespace(user_data={}))
 
     assert requests == []
-    assert "alice" in messages[-1]
-    assert "5.6.7.10" in messages[-1] and "5.6.7.20" in messages[-1]
+    assert "Aggregate health report" in messages[-1]
+    assert "alice" not in messages[-1]
+    assert "5.6.7.10" not in messages[-1] and "5.6.7.20" not in messages[-1]

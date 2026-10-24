@@ -113,8 +113,7 @@ async def test_failed_punishment_window_write_does_not_render_success(settings_d
     assert "48h" not in message
 
 
-@pytest.mark.parametrize("handler_name", ["restore_config_handler", "migrate_backup_handler"])
-async def test_restore_fetches_missing_user_before_writer_transaction(settings_db, monkeypatch, handler_name):
+async def test_migration_fetches_missing_user_before_writer_transaction(settings_db, monkeypatch):
     async def panel_sync(username):
         # A sync/import owns its writer; running it under the restore writer deadlocks.
         async with config.config_write_transaction(), database.get_db() as db:
@@ -123,11 +122,11 @@ async def test_restore_fetches_missing_user_before_writer_transaction(settings_d
 
     monkeypatch.setattr("utils.user_sync.fetch_and_sync_single_user", panel_sync)
     update = message_update(payload={"disable_method": "user", "limits": {"special": {"alice": 7}}})
-    await asyncio.wait_for(getattr(backup, handler_name)(update, SimpleNamespace(user_data={})), timeout=2)
+    await asyncio.wait_for(backup.migrate_backup_handler(update, SimpleNamespace(user_data={})), timeout=2)
     assert (await config.read_config(refresh=True))["limits"]["special"] == {"alice": 7}
 
 
-async def test_restore_settings_batch_rolls_back_revision_and_values(settings_db, monkeypatch):
+async def test_migration_settings_batch_rolls_back_revision_and_values(settings_db, monkeypatch):
     async with database.get_db() as db:
         initial_revision = await ConfigRevisionCRUD.read(db)
     real_set = ConfigCRUD.set
@@ -139,7 +138,7 @@ async def test_restore_settings_batch_rolls_back_revision_and_values(settings_db
 
     monkeypatch.setattr(ConfigCRUD, "set", fail_second)
     update = message_update(payload={"disable_method": "group", "disabled_group_id": 9})
-    await backup.restore_config_handler(update, SimpleNamespace(user_data={}))
+    await backup.migrate_backup_handler(update, SimpleNamespace(user_data={}))
     async with database.get_db() as db:
         assert await ConfigCRUD.get(db, "disable_method") is None
         assert await ConfigCRUD.get(db, "disabled_group_id") is None
@@ -162,9 +161,8 @@ async def test_corrupt_revision_general_write_reaches_telegram(settings_db):
         assert await ConfigCRUD.get(db, "general_limit") is None
 
 
-@pytest.mark.parametrize("handler_name", ["restore_config_handler", "migrate_backup_handler"])
 @pytest.mark.parametrize("kind", ["special", "except"])
-async def test_corrupt_revision_aborts_restored_user_mutations(settings_db, handler_name, kind):
+async def test_corrupt_revision_aborts_migrated_user_mutations(settings_db, kind):
     from db.crud.config_revision import REVISION_KEY
     from db.models import Config
 
@@ -173,7 +171,7 @@ async def test_corrupt_revision_aborts_restored_user_mutations(settings_db, hand
         db.add(Config(key=REVISION_KEY, value={"revision": "corrupt"}))
     payload = {"limits": {"special": {"alice": 7}}} if kind == "special" else {"except_users": ["alice"]}
     update = message_update(payload=payload)
-    await getattr(backup, handler_name)(update, SimpleNamespace(user_data={}))
+    await backup.migrate_backup_handler(update, SimpleNamespace(user_data={}))
     async with database.get_db() as db:
         user = await UserCRUD.get_by_username(db, "alice")
         assert user.special_limit is None
@@ -182,8 +180,7 @@ async def test_corrupt_revision_aborts_restored_user_mutations(settings_db, hand
     assert "❌" in update.message.reply_html.call_args.args[0]
 
 
-@pytest.mark.parametrize("handler_name", ["restore_config_handler", "migrate_backup_handler"])
-async def test_revision_error_on_second_restored_user_rolls_back_whole_batch(settings_db, monkeypatch, handler_name):
+async def test_revision_error_on_second_migrated_user_rolls_back_whole_batch(settings_db, monkeypatch):
     from sqlalchemy import update as sql_update
     from db.crud.config_revision import REVISION_KEY
     from db.models import Config
@@ -202,7 +199,7 @@ async def test_revision_error_on_second_restored_user_rolls_back_whole_batch(set
 
     monkeypatch.setattr(UserCRUD, "set_special_limit", corrupt_after_first)
     update = message_update(payload={"limits": {"special": {"alice": 7, "bob": 8}}})
-    await getattr(backup, handler_name)(update, SimpleNamespace(user_data={}))
+    await backup.migrate_backup_handler(update, SimpleNamespace(user_data={}))
     async with database.get_db() as db:
         assert await UserCRUD.get_special_limit(db, "alice") is None
         assert await UserCRUD.get_special_limit(db, "bob") is None
@@ -210,18 +207,54 @@ async def test_revision_error_on_second_restored_user_rolls_back_whole_batch(set
     assert "❌" in update.message.reply_html.call_args.args[0]
 
 
-@pytest.mark.parametrize("handler_name", ["restore_config_handler", "migrate_backup_handler"])
-async def test_invalid_import_limits_are_skipped_before_valid_user_write(settings_db, handler_name):
+async def test_invalid_import_limits_are_skipped_before_valid_user_write(settings_db):
     async with database.get_db() as db:
         for username in ("invalid", "badtext", "badshape", "alice"):
             await UserCRUD.create_or_update(db, username)
     update = message_update(
         payload={"limits": {"special": {"invalid": 0, "badtext": "bad", "badshape": {}, "alice": 7}}}
     )
-    await getattr(backup, handler_name)(update, SimpleNamespace(user_data={}))
+    await backup.migrate_backup_handler(update, SimpleNamespace(user_data={}))
     async with database.get_db() as db:
         assert await UserCRUD.get_special_limit(db, "alice") == 7
         for username in ("invalid", "badtext", "badshape"):
             assert await UserCRUD.get_special_limit(db, username) is None
         assert await ConfigRevisionCRUD.read(db) == 1
     assert "✅" in update.message.reply_html.call_args.args[0]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"disable_method": "group", "disabled_group_id": 9},
+        {"limits": {"special": {"alice": 7}}},
+        {"except_users": ["alice"]},
+    ],
+)
+async def test_staged_restore_preserves_canonical_values_revision_and_panel_state(settings_db, monkeypatch, payload):
+    from utils.backup import BackupLayout
+
+    async with database.get_db() as db:
+        await UserCRUD.create_or_update(db, "alice")
+        await UserCRUD.set_special_limit(db, "alice", 3, fetch_from_panel=False)
+        await ConfigCRUD.set(db, "disable_method", "user")
+        initial_revision = await ConfigRevisionCRUD.read(db)
+    stage_dir = settings_db.path / "staged"
+    monkeypatch.setattr(backup, "RESTORE_STAGING_DIR", stage_dir)
+    monkeypatch.setattr(backup, "runtime_layout", lambda **_: BackupLayout(settings_db.url, None, {}))
+    monkeypatch.setattr(backup, "check_admin_privilege", AsyncMock(return_value=None))
+    fetch = AsyncMock(side_effect=AssertionError("staging cannot fetch panel users"))
+    monkeypatch.setattr("utils.user_sync.fetch_and_sync_single_user", fetch)
+    update = message_update(payload=payload)
+    await backup.restore_config_handler(update, SimpleNamespace(user_data={}))
+    assert len(list(stage_dir.iterdir())) == 1
+    assert json.loads(next(stage_dir.iterdir()).read_text()) == payload
+    async with database.get_db() as db:
+        user = await UserCRUD.get_by_username(db, "alice")
+        assert user.special_limit == 3
+        assert not user.is_excepted
+        assert await ConfigCRUD.get(db, "disable_method") == "user"
+        assert await ConfigCRUD.get(db, "disabled_group_id") is None
+        assert await ConfigRevisionCRUD.read(db) == initial_revision
+    assert fetch.await_count == 0
+    assert "staged" in update.message.reply_html.call_args.args[0]

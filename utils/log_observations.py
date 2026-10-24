@@ -22,6 +22,7 @@ class LogSampleEvidence:
     interval_end: float
     fault_version: int
     unavailable_reason: str = ""
+    eligible_node_ids: frozenset[int] | None = None
 
 
 class LogObservations:
@@ -112,7 +113,14 @@ class LogObservations:
 
     def register_fleet(self, nodes) -> None:
         """Record an authoritative panel list before any access payload is read."""
-        self.panel_nodes = {node.node_id: node.status for node in nodes} if nodes is not None else None
+        raw_nodes = tuple(nodes) if nodes is not None else None
+        # Validate before dict equality can merge integer IDs with bool/float
+        # aliases. A malformed fleet is unknown, even if a valid ID came first.
+        self.panel_nodes = (
+            {node.node_id: node.status for node in raw_nodes}
+            if raw_nodes is not None and all(type(node.node_id) is int for node in raw_nodes)
+            else None
+        )
         if self.panel_nodes is not None:
             self.excluded_panel_nodes = frozenset(
                 node_id for node_id, status in self.panel_nodes.items() if status in ("disabled", "limited")
@@ -242,6 +250,13 @@ class LogObservations:
             now,
             self.fault_version,
             self.unavailable_reason(end=now),
+            (
+                frozenset(
+                    node_id for node_id, connected in self.required_nodes.items() if type(node_id) is int and connected
+                )
+                if self.required_nodes is not None and all(type(node_id) is int for node_id in self.required_nodes)
+                else None
+            ),
         )
 
     def is_current(self, evidence: LogSampleEvidence | None) -> bool:

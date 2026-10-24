@@ -21,6 +21,7 @@ import httpx
 from utils.logs import log_api_request, get_logger
 from utils.types import PanelType
 from utils.panel_api.auth import get_token, invalidate_token_cache
+from utils.enforcement_guard import EnforcementProtected, start_enforcement_effect, validate_enforcement
 
 # Module logger
 request_logger = get_logger("panel_api.request")
@@ -30,23 +31,24 @@ class PanelCircuitBreaker:
     """
     Circuit Breaker pattern for Panel API to prevent thundering herd
     and system hanging during panel outages.
-    
+
     States:
     - CLOSED: Normal operation, requests flow freely.
     - OPEN: Consecutive server/network failures (5+) tripped breaker. Fail-fast for cooldown.
     - HALF_OPEN: Cooldown expired, testing 1 request.
     """
+
     STATE_CLOSED = "CLOSED"
     STATE_OPEN = "OPEN"
     STATE_HALF_OPEN = "HALF_OPEN"
-    
+
     def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.state = self.STATE_CLOSED
         self.consecutive_failures = 0
         self.last_state_change = time.time()
-        
+
     def allow_request(self) -> bool:
         """Check if request is allowed by circuit breaker state."""
         now = time.time()
@@ -71,7 +73,9 @@ class PanelCircuitBreaker:
             if self.consecutive_failures >= self.failure_threshold and self.state != self.STATE_OPEN:
                 self.state = self.STATE_OPEN
                 self.last_state_change = now
-                request_logger.warning(f"⚡ Circuit Breaker TRIPPED to OPEN state! Consecutive failures: {self.consecutive_failures}. Cooldown: {self.recovery_timeout}s")
+                request_logger.warning(
+                    f"⚡ Circuit Breaker TRIPPED to OPEN state! Consecutive failures: {self.consecutive_failures}. Cooldown: {self.recovery_timeout}s"
+                )
         else:
             # Success or 4xx client error (panel server is reachable and functioning)
             if self.state != self.STATE_CLOSED:
@@ -187,11 +191,11 @@ def _record_connection_success():
 async def check_panel_availability(panel_data: PanelType, timeout: float = 5.0) -> bool:
     """
     Quick check if the panel is available.
-    
+
     Args:
         panel_data: Panel connection data
         timeout: Timeout for the check in seconds
-        
+
     Returns:
         bool: True if panel is reachable, False otherwise
     """
@@ -213,7 +217,7 @@ async def check_panel_availability(panel_data: PanelType, timeout: float = 5.0) 
             continue
         except Exception:
             continue
-    
+
     _record_connection_failure()
     return False
 
@@ -221,20 +225,20 @@ async def check_panel_availability(panel_data: PanelType, timeout: float = 5.0) 
 async def wait_for_panel(panel_data: PanelType, max_wait: float = None) -> bool:
     """
     Wait for the panel to become available (useful during panel restarts).
-    
+
     Args:
         panel_data: Panel connection data
         max_wait: Maximum seconds to wait (default: MAX_WAIT_FOR_PANEL)
-        
+
     Returns:
         bool: True if panel became available, False if timeout
     """
     if max_wait is None:
         max_wait = MAX_WAIT_FOR_PANEL
-    
+
     start_time = time.time()
     check_count = 0
-    
+
     while (time.time() - start_time) < max_wait:
         check_count += 1
         if await check_panel_availability(panel_data):
@@ -242,19 +246,19 @@ async def wait_for_panel(panel_data: PanelType, max_wait: float = None) -> bool:
                 elapsed = time.time() - start_time
                 request_logger.info(f"✅ Panel available after {elapsed:.0f}s ({check_count} checks)")
             return True
-        
+
         elapsed = time.time() - start_time
         remaining = max_wait - elapsed
         wait_time = min(PANEL_CHECK_INTERVAL, remaining)
-        
+
         if check_count == 1:
             request_logger.warning(f"⏳ Panel unavailable, waiting up to {max_wait:.0f}s for it to come back...")
         elif check_count % 6 == 0:  # Log every ~60 seconds
             request_logger.info(f"⏳ Still waiting for panel... ({elapsed:.0f}s elapsed, {remaining:.0f}s remaining)")
-        
+
         if wait_time > 0:
             await asyncio.sleep(wait_time)
-    
+
     request_logger.error(f"❌ Panel did not become available after {max_wait:.0f}s")
     return False
 
@@ -273,7 +277,7 @@ async def panel_request(
 ) -> tuple[Optional[httpx.Response], Optional[str]]:
     """
     Make a panel API request with automatic retry and scheme fallback.
-    
+
     Args:
         panel_data: Panel connection data
         method: HTTP method
@@ -285,7 +289,7 @@ async def panel_request(
         timeout: Request timeout in seconds
         max_retries: Maximum number of retry attempts
         retry_delay: Initial delay between retries (doubles each retry)
-    
+
     Returns:
         Tuple of (response, error_message)
         - On success: (response, None)
@@ -298,7 +302,7 @@ async def panel_request(
 
     headers = {"Authorization": f"Bearer {token}"}
     last_error = None
-    
+
     for attempt in range(max_retries):
         schemes = _get_scheme_order(panel_data.panel_domain)
         clean_domain = panel_data.panel_domain
@@ -306,53 +310,65 @@ async def panel_request(
             clean_domain = clean_domain[8:]
         elif clean_domain.startswith("http://"):
             clean_domain = clean_domain[7:]
-        
+
         for scheme in schemes:
             url = f"{scheme}://{clean_domain}{endpoint}"
             start_time = time.perf_counter()
-            
+
             try:
                 client = await get_panel_client()
+                if method != "GET":
+                    # Authentication/client acquisition may suspend after the
+                    # journal and provenance checks. Refresh facts once more,
+                    # then own the first mutation with no intervening await.
+                    await validate_enforcement()
+                    start_enforcement_effect()
                 if method == "GET":
                     response = await client.get(url, headers=headers, params=params, timeout=timeout)
                 elif method == "POST":
                     if form_data:
-                        response = await client.post(url, headers=headers, data=form_data, params=params, timeout=timeout)
+                        response = await client.post(
+                            url, headers=headers, data=form_data, params=params, timeout=timeout
+                        )
                     else:
-                        response = await client.post(url, headers=headers, json=json_data, params=params, timeout=timeout)
+                        response = await client.post(
+                            url, headers=headers, json=json_data, params=params, timeout=timeout
+                        )
                 elif method == "PUT":
                     response = await client.put(url, headers=headers, json=json_data, params=params, timeout=timeout)
                 elif method == "DELETE":
                     response = await client.delete(url, headers=headers, params=params, timeout=timeout)
                 else:
-                    response = await client.request(method, url, headers=headers, json=json_data, params=params, timeout=timeout)
-                
+                    response = await client.request(
+                        method, url, headers=headers, json=json_data, params=params, timeout=timeout
+                    )
+
                 elapsed = (time.perf_counter() - start_time) * 1000
                 log_api_request(method, url, response.status_code, elapsed)
-                
+
                 # Any response means panel server is reachable
                 _record_connection_success()
-                
+
                 # 4xx Client Errors (400, 401, 403, 404): Panel is UP and functioning!
                 # Reset/don't trip Circuit Breaker on 4xx business responses
                 if response.status_code < 500:
                     circuit_breaker.record_result(is_server_failure=False)
-                
+
                 # Success
                 if response.status_code in (200, 201, 204):
                     _record_success(scheme)
                     return response, None
-                
+
                 # Auth error - caller should refresh token
                 if response.status_code == 401:
                     _record_failure(scheme)
                     return response, "Unauthorized - token may be expired"
-                
+
                 # Not found
                 if response.status_code == 404:
                     _record_success(scheme)  # Server responded, just not found
                     return response, None
-                
+
                 # Rate limited (429)
                 if response.status_code == 429:
                     _record_failure(scheme)
@@ -360,7 +376,7 @@ async def panel_request(
                     request_logger.warning(last_error)
                     await asyncio.sleep(retry_delay * 2 + random.uniform(0.1, 0.5))
                     continue
-                
+
                 # 5xx Server error - count as server failure for Circuit Breaker
                 if response.status_code >= 500:
                     circuit_breaker.record_result(is_server_failure=True)
@@ -368,13 +384,15 @@ async def panel_request(
                     last_error = f"Server error ({response.status_code}) on {url}"
                     request_logger.warning(last_error)
                     continue
-                
+
                 # Other errors
                 _record_failure(scheme)
                 # Do not embed the untrusted panel response body in the error
                 # string returned to callers/logs; the status code is enough.
                 last_error = f"HTTP {response.status_code}"
-                    
+
+            except EnforcementProtected:
+                raise
             except (SSLError, httpx.TimeoutException, httpx.ConnectError, httpx.RequestError) as e:
                 elapsed = (time.perf_counter() - start_time) * 1000
                 log_api_request(method, url, None, elapsed, type(e).__name__)
@@ -385,7 +403,7 @@ async def panel_request(
                 last_error = f"Network/Server error on {url}: {type(e).__name__}: {str(e)[:50]}"
                 request_logger.warning(last_error)
                 continue
-                
+
             except Exception as e:
                 elapsed = (time.perf_counter() - start_time) * 1000
                 log_api_request(method, url, None, elapsed, str(e)[:50])
@@ -394,15 +412,15 @@ async def panel_request(
                 last_error = f"Error on {url}: {type(e).__name__}: {str(e)[:50]}"
                 request_logger.error(last_error)
                 continue
-        
+
         # All schemes failed for this attempt, wait before retry with proportional jitter
         if attempt < max_retries - 1:
-            base_delay = min(10.0, retry_delay * (2 ** attempt))
+            base_delay = min(10.0, retry_delay * (2**attempt))
             jitter = random.uniform(0, base_delay * 0.5)
             wait_time = base_delay + jitter
             request_logger.debug(f"Retrying in {wait_time:.2f}s (attempt {attempt + 1}/{max_retries})")
             await asyncio.sleep(wait_time)
-    
+
     return None, last_error or "All attempts failed"
 
 
@@ -427,36 +445,31 @@ async def _execute_panel_request(
     json_data: Optional[dict] = None,
     form_data: Optional[dict] = None,
     params: Optional[dict] = None,
-    **kwargs
+    **kwargs,
 ) -> Optional[httpx.Response]:
     """Internal helper executing panel requests with automatic token handling and 401 retry."""
     token = await _get_token_for_request(panel_data, force_refresh)
     if not token:
         return None
-    
+
     response, error = await panel_request(
-        panel_data, method, endpoint, token,
-        params=params, json_data=json_data, form_data=form_data, **kwargs
+        panel_data, method, endpoint, token, params=params, json_data=json_data, form_data=form_data, **kwargs
     )
-    
+
     # On 401, retry once with fresh token
     if response and response.status_code == 401 and not force_refresh:
         await invalidate_token_cache()
         token = await _get_token_for_request(panel_data, force_refresh=True)
         if token:
             response, error = await panel_request(
-                panel_data, method, endpoint, token,
-                params=params, json_data=json_data, form_data=form_data, **kwargs
+                panel_data, method, endpoint, token, params=params, json_data=json_data, form_data=form_data, **kwargs
             )
-    
+
     return response
 
 
 async def panel_get(
-    panel_data: PanelType,
-    endpoint: str,
-    force_refresh: bool = False,
-    **kwargs
+    panel_data: PanelType, endpoint: str, force_refresh: bool = False, **kwargs
 ) -> Optional[httpx.Response]:
     """Convenience wrapper for GET requests with automatic token handling."""
     return await _execute_panel_request(panel_data, "GET", endpoint, force_refresh=force_refresh, **kwargs)
@@ -468,34 +481,25 @@ async def panel_post(
     json_data: Optional[dict] = None,
     form_data: Optional[dict] = None,
     force_refresh: bool = False,
-    **kwargs
+    **kwargs,
 ) -> Optional[httpx.Response]:
     """Convenience wrapper for POST requests with automatic token handling."""
     return await _execute_panel_request(
-        panel_data, "POST", endpoint, force_refresh=force_refresh,
-        json_data=json_data, form_data=form_data, **kwargs
+        panel_data, "POST", endpoint, force_refresh=force_refresh, json_data=json_data, form_data=form_data, **kwargs
     )
 
 
 async def panel_put(
-    panel_data: PanelType,
-    endpoint: str,
-    json_data: Optional[dict] = None,
-    force_refresh: bool = False,
-    **kwargs
+    panel_data: PanelType, endpoint: str, json_data: Optional[dict] = None, force_refresh: bool = False, **kwargs
 ) -> Optional[httpx.Response]:
     """Convenience wrapper for PUT requests with automatic token handling."""
     return await _execute_panel_request(
-        panel_data, "PUT", endpoint, force_refresh=force_refresh,
-        json_data=json_data, **kwargs
+        panel_data, "PUT", endpoint, force_refresh=force_refresh, json_data=json_data, **kwargs
     )
 
 
 async def panel_delete(
-    panel_data: PanelType,
-    endpoint: str,
-    force_refresh: bool = False,
-    **kwargs
+    panel_data: PanelType, endpoint: str, force_refresh: bool = False, **kwargs
 ) -> Optional[httpx.Response]:
     """Convenience wrapper for DELETE requests with automatic token handling."""
     return await _execute_panel_request(panel_data, "DELETE", endpoint, force_refresh=force_refresh, **kwargs)
