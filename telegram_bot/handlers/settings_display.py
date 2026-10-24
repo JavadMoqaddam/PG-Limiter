@@ -17,6 +17,7 @@ once pretended to set it here were unreachable and have been removed.
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 
+from telegram_bot.input_owner import reply_input_prompt
 from telegram_bot.constants import (
     CallbackData,
     SET_IPINFO_TOKEN,
@@ -27,10 +28,7 @@ from utils.read_config import read_config, save_config_value
 
 # Shown instead of a confirmation when the database write did not commit. Saying
 # "saved" for a write that failed is worse than saying nothing.
-SAVE_FAILED_NOTE = (
-    "❌ Could not write the setting to the database - it is unchanged. "
-    "Check the container logs."
-)
+SAVE_FAILED_NOTE = "❌ Could not write the setting to the database - it is unchanged. Check the container logs."
 
 
 def create_enhanced_details_keyboard():
@@ -45,15 +43,18 @@ def create_enhanced_details_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-async def set_ipinfo_token(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def set_ipinfo_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set the ipinfo.io API token."""
     check = await check_admin_privilege(update)
     if check is not None:
         return check
-    await update.message.reply_html(
-        "Send your ipinfo.io API token:\n\n"
-        + "Get one at https://ipinfo.io\n"
-        + "Or send <code>remove</code> to remove the token"
+    await reply_input_prompt(
+        context,
+        update.message.reply_html(
+            "Send your ipinfo.io API token:\n\n"
+            + "Get one at https://ipinfo.io\n"
+            + "Or send <code>remove</code> to remove the token"
+        ),
     )
     return SET_IPINFO_TOKEN
 
@@ -64,21 +65,15 @@ async def ipinfo_token_handler(update: Update, _context: ContextTypes.DEFAULT_TY
 
     if token.lower() == "remove":
         saved = await save_ipinfo_token("")
-        await update.message.reply_html(
-            "✅ IPINFO_TOKEN removed!" if saved else SAVE_FAILED_NOTE
-        )
+        await update.message.reply_html("✅ IPINFO_TOKEN removed!" if saved else SAVE_FAILED_NOTE)
         return ConversationHandler.END
 
     if len(token) < 10:
-        await update.message.reply_html(
-            "❌ Invalid token format!\nTry again with <b>/set_ipinfo_token</b>"
-        )
+        await update.message.reply_html("❌ Invalid token format!\nTry again with <b>/set_ipinfo_token</b>")
         return ConversationHandler.END
 
     saved = await save_ipinfo_token(token)
-    await update.message.reply_html(
-        "✅ IPINFO_TOKEN set successfully!" if saved else SAVE_FAILED_NOTE
-    )
+    await update.message.reply_html("✅ IPINFO_TOKEN set successfully!" if saved else SAVE_FAILED_NOTE)
     return ConversationHandler.END
 
 
@@ -104,10 +99,10 @@ async def handle_enhanced_menu_callback(query, _context: ContextTypes.DEFAULT_TY
         status = "Unknown"
     await query.edit_message_text(
         text=f"📋 <b>Enhanced Details</b>\n\nCurrently: <b>{status}</b>\n\n"
-             + "• <b>ON</b>: Shows node names, IDs, and protocols\n"
-             + "• <b>OFF</b>: Shows only IP addresses",
+        + "• <b>ON</b>: Shows node names, IDs, and protocols\n"
+        + "• <b>OFF</b>: Shows only IP addresses",
         reply_markup=create_enhanced_details_keyboard(),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
@@ -118,16 +113,14 @@ async def handle_enhanced_toggle_callback(query, _context: ContextTypes.DEFAULT_
         status = "ON ✅" if enable else "OFF ❌"
         await query.edit_message_text(
             text=f"📋 <b>Enhanced Details</b>\n\nCurrently: <b>{status}</b>\n\n"
-                 + "• <b>ON</b>: Shows node names, IDs, and protocols\n"
-                 + "• <b>OFF</b>: Shows only IP addresses",
+            + "• <b>ON</b>: Shows node names, IDs, and protocols\n"
+            + "• <b>OFF</b>: Shows only IP addresses",
             reply_markup=create_enhanced_details_keyboard(),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     except Exception as e:
         await query.edit_message_text(
-            text=f"❌ Error: {e}",
-            reply_markup=create_back_to_main_keyboard(),
-            parse_mode="HTML"
+            text=f"❌ Error: {e}", reply_markup=create_back_to_main_keyboard(), parse_mode="HTML"
         )
 
 
@@ -136,12 +129,12 @@ async def handle_ipinfo_callback(query, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["waiting_for"] = "ipinfo_token"
     await query.edit_message_text(
         text="🔑 <b>IPInfo Token</b>\n\n"
-             + "Send your ipinfo.io API token:\n\n"
-             + "Get one at: https://ipinfo.io\n\n"
-             + "Or send <code>remove</code> to remove the token\n\n"
-             + "<i>Or click Back to cancel.</i>",
+        + "Send your ipinfo.io API token:\n\n"
+        + "Get one at: https://ipinfo.io\n\n"
+        + "Or send <code>remove</code> to remove the token\n\n"
+        + "<i>Or click Back to cancel.</i>",
         reply_markup=create_back_to_main_keyboard(),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
@@ -151,18 +144,14 @@ async def handle_ipinfo_token_input(update: Update, context: ContextTypes.DEFAUL
     if text.lower() == "remove":
         saved = await save_ipinfo_token("")
         await update.message.reply_html(
-            text="✅ IPInfo token removed!" if saved else SAVE_FAILED_NOTE,
-            reply_markup=create_back_to_main_keyboard()
+            text="✅ IPInfo token removed!" if saved else SAVE_FAILED_NOTE, reply_markup=create_back_to_main_keyboard()
         )
     elif len(text) < 10:
-        await update.message.reply_html(
-            text="❌ Invalid token format!",
-            reply_markup=create_back_to_main_keyboard()
-        )
+        await update.message.reply_html(text="❌ Invalid token format!", reply_markup=create_back_to_main_keyboard())
     else:
         saved = await save_ipinfo_token(text)
         await update.message.reply_html(
             text="✅ IPInfo token set successfully!" if saved else SAVE_FAILED_NOTE,
-            reply_markup=create_back_to_main_keyboard()
+            reply_markup=create_back_to_main_keyboard(),
         )
     context.user_data["waiting_for"] = None

@@ -21,6 +21,8 @@ class Topics:
     def __init__(self):
         self.group_id = -100111
         self.enabled = True
+        self.monitoring_revision = 0
+        self.destination_revision = 0
         self.threads = {TopicType.GENERAL: 10, TopicType.DISABLE_ENABLE: 20, TopicType.NO_LIMIT: 30}
         self.delivered = set()
 
@@ -30,8 +32,12 @@ class Topics:
     def is_message_sent(self, topic, key):
         return (self.group_id, topic, key) in self.delivered
 
-    async def mark_message_sent(self, topic, key):
-        self.delivered.add((self.group_id, topic, key))
+    async def mark_message_sent(
+        self, topic, key, *, chat_id=None, message_thread_id=None, monitoring_revision=None, destination_revision=None
+    ):
+        thread = self.threads.get(topic) or self.threads.get(TopicType.GENERAL)
+        if chat_id is None or (self.group_id == chat_id and thread == message_thread_id):
+            self.delivered.add((self.group_id, topic, key))
 
     async def set_enabled(self, value):
         self.enabled = value

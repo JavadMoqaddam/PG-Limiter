@@ -169,6 +169,9 @@ async def send_logs(
     """Admit one owned outbound batch with the destination captured before any await."""
     msg = _sanitize_html_message(msg)
     manager = get_topics_manager()
+    if not manager.enabled:
+        tg_send_logger.debug("Topics are disabled; monitoring logs are not queued")
+        return None
     chat_id = manager.group_id
     if not chat_id:
         tg_send_logger.warning("No forum group configured to send logs")
@@ -176,8 +179,6 @@ async def send_logs(
     thread_id = manager.get_topic_id(topic_type) or manager.get_topic_id(TopicType.GENERAL)
     if message_key and manager.is_message_sent(topic_type, message_key):
         return None
-    if not manager.enabled:
-        await manager.set_enabled(True)
     futures = await get_dispatcher().enqueue_send_batch(
         _split_message(msg, 3900),
         topic_type=topic_type,
@@ -396,7 +397,11 @@ async def send_user_message(
     topics_manager = get_topics_manager()
     message_key = f"no_limit:{username}"
 
-    if not topics_manager.group_id or topics_manager.is_message_sent(TopicType.NO_LIMIT, message_key):
+    if (
+        not topics_manager.enabled
+        or not topics_manager.group_id
+        or topics_manager.is_message_sent(TopicType.NO_LIMIT, message_key)
+    ):
         return
 
     reply_markup = None
