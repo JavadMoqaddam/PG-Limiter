@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import (
 
 from db.models import Base
 from db.crud.config_revision import ConfigRevisionCRUD, PENDING_CONFIG_INVALIDATIONS
+from db.crud.legacy_import import LegacyTableImportCRUD
 from utils.logs import get_logger
 
 db_logger = get_logger("database")
@@ -146,42 +148,72 @@ _init_db_lock = asyncio.Lock()
 _DB_INITIALIZED = False
 
 
-def _sync_deprecated_legacy_tables_sync(sync_conn):
-    """
-    Ensure data consistency by migrating legacy records from deprecated tables
-    (user_limits, except_users, disabled_users) into the consolidated `users` table
-    if any exist.
+def _validate_deprecated_legacy_sources_sync(sync_conn: Connection, tables: set[str]) -> None:
+    """Reject unusable source records rather than silently completing a partial import."""
+    from sqlalchemy import text
+
+    for table in ("user_limits", "except_users", "disabled_users"):
+        if table not in tables:
+            continue
+        fields = {
+            "user_limits": 'username, "limit"',
+            "except_users": "username",
+            "disabled_users": "username, disabled_at, original_groups",
+        }[table]
+        for row in sync_conn.execute(text(f"SELECT {fields} FROM {table}")).mappings():
+            if not isinstance(row["username"], str) or not row["username"].strip():
+                raise ValueError(f"Invalid legacy {table} username")
+            if table == "user_limits" and type(row["limit"]) is not int:
+                raise ValueError("Invalid legacy user_limits limit")
+            if table == "disabled_users":
+                if not isinstance(row["disabled_at"], (int, float)):
+                    raise ValueError("Invalid legacy disabled_users disabled_at")
+                groups = row["original_groups"]
+                if isinstance(groups, str):
+                    try:
+                        groups = json.loads(groups)
+                    except ValueError as error:
+                        raise ValueError("Invalid legacy disabled_users original_groups") from error
+                if groups is not None and (not isinstance(groups, list) or any(type(g) is not int for g in groups)):
+                    raise ValueError("Invalid legacy disabled_users original_groups")
+
+
+def _sync_deprecated_legacy_tables_sync(sync_conn: Connection) -> None:
+    """Import retained deprecated tables once in the caller-owned transaction.
+
+    Completion covers absent/empty sources too. Later legacy rows are ignored,
+    so subsequent user commands remain authoritative across process restarts.
+    Sources are retained unchanged; any failure leaves the whole import retryable.
     """
     from sqlalchemy import text, inspect
 
     inspector = inspect(sync_conn)
     existing_tables = set(inspector.get_table_names())
 
-    if "users" not in existing_tables:
+    if not {"users", "config"}.issubset(existing_tables):
+        return
+    if not LegacyTableImportCRUD.claim_connection(sync_conn):
         return
 
+    _validate_deprecated_legacy_sources_sync(sync_conn, existing_tables)
     policy_changed = False
     # 1. Migrate user_limits -> users.special_limit
     if "user_limits" in existing_tables:
-        try:
-            result = sync_conn.execute(
-                text("""
+        result = sync_conn.execute(
+            text("""
                 INSERT INTO users (username, special_limit, is_excepted, is_disabled_by_limiter, status)
                 SELECT username, "limit", 0, 0, 'active' FROM user_limits WHERE username IS NOT NULL
                 ON CONFLICT(username) DO UPDATE SET
                     special_limit = excluded.special_limit
                 WHERE users.special_limit IS NULL;
             """)
-            )
-            policy_changed |= result.rowcount > 0
-        except Exception as e:
-            db_logger.debug(f"Legacy user_limits sync note: {e}")
+        )
+        policy_changed |= result.rowcount > 0
 
     # 2. Migrate except_users -> users.is_excepted
     if "except_users" in existing_tables:
-        try:
-            result = sync_conn.execute(
-                text("""
+        result = sync_conn.execute(
+            text("""
                 INSERT INTO users (username, is_excepted, exception_reason, excepted_by, is_disabled_by_limiter, status)
                 SELECT username, 1, reason, created_by, 0, 'active' FROM except_users WHERE username IS NOT NULL
                 ON CONFLICT(username) DO UPDATE SET
@@ -190,16 +222,23 @@ def _sync_deprecated_legacy_tables_sync(sync_conn):
                     excepted_by = COALESCE(users.excepted_by, excluded.excepted_by)
                 WHERE users.is_excepted = 0 OR users.is_excepted IS NULL;
             """)
-            )
-            policy_changed |= result.rowcount > 0
-        except Exception as e:
-            db_logger.debug(f"Legacy except_users sync note: {e}")
+        )
+        policy_changed |= result.rowcount > 0
 
     # 3. Migrate disabled_users -> users.is_disabled_by_limiter
     if "disabled_users" in existing_tables:
-        try:
+        # New users change the facts available to a config snapshot. Updating an
+        # existing user's disable registry alone does not change policy inputs.
+        policy_changed |= (
             sync_conn.execute(
-                text("""
+                text("""SELECT 1 FROM disabled_users AS legacy
+                WHERE NOT EXISTS (SELECT 1 FROM users WHERE users.username = legacy.username)
+                LIMIT 1""")
+            ).first()
+            is not None
+        )
+        sync_conn.execute(
+            text("""
                 INSERT INTO users (username, is_disabled_by_limiter, disabled_at, enable_at, original_groups, disable_reason, punishment_step, status)
                 SELECT username, 1, disabled_at, enable_at, original_groups, reason, punishment_step, 'active' FROM disabled_users WHERE username IS NOT NULL
                 ON CONFLICT(username) DO UPDATE SET
@@ -211,12 +250,11 @@ def _sync_deprecated_legacy_tables_sync(sync_conn):
                     punishment_step = COALESCE(users.punishment_step, excluded.punishment_step)
                 WHERE users.is_disabled_by_limiter = 0 OR users.is_disabled_by_limiter IS NULL;
             """)
-            )
-        except Exception as e:
-            db_logger.debug(f"Legacy disabled_users sync note: {e}")
+        )
 
     if policy_changed:
         ConfigRevisionCRUD.advance_connection(sync_conn)
+    LegacyTableImportCRUD.complete_connection(sync_conn)
 
 
 async def init_db():
@@ -243,6 +281,10 @@ async def init_db():
 
         # Create all tables and indexes via SQLAlchemy declarative metadata
         async with engine.begin() as conn:
+            if conn.dialect.name == "sqlite":
+                # Own a physical transaction before check-first DDL and source
+                # reads; independent fresh startups must not race create_all.
+                await conn.exec_driver_sql("BEGIN IMMEDIATE")
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(_sync_deprecated_legacy_tables_sync)
 
