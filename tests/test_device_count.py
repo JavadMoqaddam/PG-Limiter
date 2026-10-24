@@ -126,20 +126,17 @@ class TestCdnCollapsing:
         config = DeviceCountingConfig(cdn_nodes=[5], cdn_inbounds=["CDN_WS"])
         user = make_user(
             [
-                ("104.21.45.1", "Vless", 5),   # CDN node -> 1
+                ("104.21.45.1", "Vless", 5),  # CDN node -> 1
                 ("104.21.45.2", "CDN_WS", 1),  # CDN inbound -> 1
-                ("5.6.7.8", "Vless", 1),       # direct -> 1
+                ("5.6.7.8", "Vless", 1),  # direct -> 1
             ]
         )
         assert count_devices(user, config) == 3
 
     def test_cdn_collapsing_also_applies_in_ip_mode(self):
         config = DeviceCountingConfig(count_mode=COUNT_MODE_IP, cdn_nodes=[5])
-        user = make_user(
-            [("104.21.45.1", "Vless", 5), ("104.21.45.2", "Vless", 5)]
-        )
+        user = make_user([("104.21.45.1", "Vless", 5), ("104.21.45.2", "Vless", 5)])
         assert count_devices(user, config) == 1
-
 
     def test_one_ip_on_several_cdn_nodes_is_one_device(self):
         # Regression: with one CDN key per node, a single-IP user connected to
@@ -161,11 +158,104 @@ class TestCdnCollapsing:
 
     def test_ip_mode_collapses_all_cdn_inbounds(self):
         # In "ip" mode the inbound is part of no key, CDN inbounds included.
-        config = DeviceCountingConfig(
-            count_mode=COUNT_MODE_IP, cdn_inbounds=["CDN_WS", "CDN_GRPC"]
-        )
+        config = DeviceCountingConfig(count_mode=COUNT_MODE_IP, cdn_inbounds=["CDN_WS", "CDN_GRPC"])
         user = make_user([("5.6.7.8", "CDN_WS", 1), ("5.6.7.8", "CDN_GRPC", 1)])
         assert count_devices(user, config) == 1
+
+
+class TestCdnOverlap:
+    """The same observation on CDN and ordinary nodes cannot add a device."""
+
+    @pytest.mark.parametrize("mode", [COUNT_MODE_DEVICE, COUNT_MODE_IP])
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_same_observation_on_cdn_and_direct_node_counts_once(self, mode, reverse):
+        rows = [("5.6.7.8", "Vless", 5), ("5.6.7.8", "Vless", 1)]
+        user = make_user(rows[::-1] if reverse else rows)
+        config = DeviceCountingConfig(count_mode=mode, cdn_nodes=[5])
+        assert count_devices(user, config) == 1
+
+    @pytest.mark.parametrize("mode", [COUNT_MODE_DEVICE, COUNT_MODE_IP])
+    def test_same_cdn_inbound_on_cdn_and_ordinary_node_counts_once(self, mode):
+        config = DeviceCountingConfig(count_mode=mode, cdn_nodes=[5], cdn_inbounds=["CDN_WS"])
+        user = make_user([("5.6.7.8", "CDN_WS", 5), ("5.6.7.8", "CDN_WS", 1)])
+        assert count_devices(user, config) == 1
+
+    @pytest.mark.parametrize("mode, expected", [(COUNT_MODE_DEVICE, 2), (COUNT_MODE_IP, 1)])
+    def test_same_ip_on_different_inbounds_respects_counting_mode(self, mode, expected):
+        config = DeviceCountingConfig(count_mode=mode, cdn_nodes=[5])
+        user = make_user([("5.6.7.8", "Vless", 5), ("5.6.7.8", "Vmess", 1)])
+        assert count_devices(user, config) == expected
+
+    @pytest.mark.parametrize("mode, expected", [(COUNT_MODE_DEVICE, 2), (COUNT_MODE_IP, 1)])
+    def test_cdn_inbound_and_direct_overlap_respects_counting_mode(self, mode, expected):
+        config = DeviceCountingConfig(count_mode=mode, cdn_inbounds=["CDN_WS"])
+        user = make_user([("5.6.7.8", "CDN_WS", 1), ("5.6.7.8", "Vless", 1)])
+        assert count_devices(user, config) == expected
+
+    @pytest.mark.parametrize("mode", [COUNT_MODE_DEVICE, COUNT_MODE_IP])
+    def test_cdn_bucket_does_not_merge_two_distinct_direct_devices(self, mode):
+        config = DeviceCountingConfig(count_mode=mode, cdn_nodes=[5])
+        user = make_user(
+            [
+                ("5.6.7.8", "Vless", 5),
+                ("9.9.9.9", "Vless", 5),
+                ("5.6.7.8", "Vless", 1),
+                ("9.9.9.9", "Vless", 1),
+            ]
+        )
+        assert count_devices(user, config) == 2
+
+    def test_cdn_node_does_not_merge_two_distinct_cdn_inbounds(self):
+        config = DeviceCountingConfig(cdn_nodes=[5], cdn_inbounds=["CDN_WS", "CDN_GRPC"])
+        user = make_user(
+            [
+                ("5.6.7.8", "CDN_WS", 5),
+                ("9.9.9.9", "CDN_GRPC", 5),
+                ("5.6.7.8", "CDN_WS", 1),
+                ("9.9.9.9", "CDN_GRPC", 1),
+            ]
+        )
+        assert count_devices(user, config) == 2
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_ip_mode_handles_overlap_from_cdn_node_through_inbound_to_direct(self, reverse):
+        config = DeviceCountingConfig(count_mode=COUNT_MODE_IP, cdn_nodes=[5], cdn_inbounds=["CDN_WS"])
+        rows = [
+            ("5.6.7.8", "Vless", 5),
+            ("5.6.7.8", "CDN_WS", 1),
+            ("9.9.9.9", "CDN_WS", 1),
+            ("9.9.9.9", "Vless", 1),
+        ]
+        assert count_devices(make_user(rows[::-1] if reverse else rows), config) == 1
+
+    @pytest.mark.parametrize("mode", [COUNT_MODE_DEVICE, COUNT_MODE_IP])
+    @pytest.mark.parametrize("disabled_node", [1, 5])
+    def test_disabled_overlap_cannot_suppress_enabled_traffic(self, mode, disabled_node):
+        config = DeviceCountingConfig(count_mode=mode, cdn_nodes=[5], disabled_nodes=[disabled_node])
+        user = make_user([("5.6.7.8", "Vless", 5), ("5.6.7.8", "Vless", 1)])
+        assert count_devices(user, config) == 1
+
+    @pytest.mark.parametrize("mode", [COUNT_MODE_DEVICE, COUNT_MODE_IP])
+    def test_subnet_grouping_does_not_invent_overlap_between_different_ips(self, mode):
+        config = DeviceCountingConfig(count_mode=mode, cdn_nodes=[5], subnet_ip_grouping=True)
+        user = make_user([("5.6.7.8", "Vless", 5), ("5.6.7.9", "Vless", 1)])
+        assert count_devices(user, config) == 2
+
+    @pytest.mark.parametrize("overlap, expected", [(True, 1), (False, 2)])
+    def test_high_trust_requires_exact_observation_for_cdn_overlap(self, overlap, expected):
+        config = DeviceCountingConfig(cdn_nodes=[5], high_trust_ip_grouping=True)
+        direct_ip = "5.6.7.8" if overlap else "9.9.9.9"
+        user = make_user([("5.6.7.8", "Vless", 5), (direct_ip, "Vless", 1)])
+        assert count_devices(user, config, trust_score=50) == expected
+
+    @pytest.mark.parametrize("show_details", [False, True])
+    def test_report_uses_deduplicated_cdn_count(self, show_details):
+        user = make_user([("5.6.7.8", "Vless", 5), ("5.6.7.8", "Vless", 1)])
+        info = EnhancedUserInfo(user=user, formatted_ips=["5.6.7.8"])
+        _, count = count_devices_and_details(
+            info, user, show_details, device_config=DeviceCountingConfig(cdn_nodes=[5])
+        )
+        assert count == 1
 
 
 class TestDisabledNodes:
@@ -278,16 +368,12 @@ class TestHighTrustGrouping:
     def test_high_trust_is_inactive_in_ip_mode(self):
         # In ip mode the address itself is the device, so trust cannot merge two
         # different addresses into one.
-        config = DeviceCountingConfig(
-            count_mode=COUNT_MODE_IP, high_trust_ip_grouping=True, high_trust_threshold=20
-        )
+        config = DeviceCountingConfig(count_mode=COUNT_MODE_IP, high_trust_ip_grouping=True, high_trust_threshold=20)
         user = make_user([("5.6.7.8", "Vless", 1), ("9.9.9.9", "Vless", 1)])
         assert count_devices(user, config, trust_score=90.0) == 2
 
     def test_high_trust_takes_precedence_over_subnet_grouping(self):
-        config = DeviceCountingConfig(
-            high_trust_ip_grouping=True, high_trust_threshold=20, subnet_ip_grouping=True
-        )
+        config = DeviceCountingConfig(high_trust_ip_grouping=True, high_trust_threshold=20, subnet_ip_grouping=True)
         user = make_user([("5.6.7.8", "Vless", 1), ("9.9.9.9", "Vless", 1)])
         assert count_devices(user, config, trust_score=90.0) == 1
 
@@ -416,9 +502,7 @@ class TestFromConfig:
         assert config.high_trust_threshold == 35
 
     def test_null_lists_become_empty_lists(self):
-        config = DeviceCountingConfig.from_config(
-            {"cdn_inbounds": None, "cdn_nodes": None, "disabled_nodes": None}
-        )
+        config = DeviceCountingConfig.from_config({"cdn_inbounds": None, "cdn_nodes": None, "disabled_nodes": None})
         assert (config.cdn_inbounds, config.cdn_nodes, config.disabled_nodes) == ([], [], [])
 
 
@@ -459,9 +543,7 @@ class TestGroupIpsBySubnet:
         assert mapping == {"5.6.7.x (3)": ips}
 
     def test_mixed_subnets(self):
-        formatted, mapping = group_ips_by_subnet(
-            ["5.6.7.1", "5.6.7.2", "5.6.7.3", "9.9.9.9"]
-        )
+        formatted, mapping = group_ips_by_subnet(["5.6.7.1", "5.6.7.2", "5.6.7.3", "9.9.9.9"])
         assert formatted == ["5.6.7.x (3)", "9.9.9.9"]
         assert mapping["9.9.9.9"] == ["9.9.9.9"]
 
@@ -503,9 +585,7 @@ class TestCountDevicesAndDetails:
 
     def test_details_skip_ips_the_report_does_not_list(self):
         user = make_user([("5.6.7.8", "Vless", 1), ("9.9.9.9", "Vless", 1)])
-        info = EnhancedUserInfo(
-            user=UserType(name="user1", ip=["5.6.7.8"]), formatted_ips=["5.6.7.8"]
-        )
+        info = EnhancedUserInfo(user=UserType(name="user1", ip=["5.6.7.8"]), formatted_ips=["5.6.7.8"])
         assert build_ip_details(info, user) == ["  • 5.6.7.8 → node-1(1) | Vless"]
 
     def test_details_of_a_user_without_connections_are_empty(self):
