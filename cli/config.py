@@ -1,6 +1,7 @@
 """
 CLI commands for configuration management
 """
+
 from typing import Optional
 import typer
 from rich.table import Table
@@ -11,10 +12,11 @@ from cli.utils import (
     info,
     load_config,
     print_table,
-    save_config,
+    run_command,
     success,
-    warning,
 )
+
+from utils.settings_service import read_settings, write_settings
 
 app = typer.Typer(no_args_is_help=True, help="Manage configuration")
 
@@ -23,7 +25,7 @@ app = typer.Typer(no_args_is_help=True, help="Manage configuration")
 def show_config():
     """Show current configuration"""
     config = load_config()
-    
+
     # Panel info
     panel = config.get("panel", {})
     info("📡 Panel Configuration:")
@@ -31,7 +33,7 @@ def show_config():
     print(f"  Username: {panel.get('username', 'Not set')}")
     print(f"  Password: {'*' * len(panel.get('password', '')) or 'Not set'}")
     print()
-    
+
     # Limits
     limits = config.get("limits", {})
     info("🎯 Limits:")
@@ -42,21 +44,19 @@ def show_config():
     else:
         print("  Special limits: None")
     print()
-    
+
     # Timing
-    timing = config.get("timing", {})
     info("⏱️ Timing:")
-    print(f"  Check interval:     {timing.get('check_interval', 120)}s")
-    print(f"  Time to re-enable:  {timing.get('time_to_active_users', 300)}s")
+    print(f"  Check interval:     {config['check_interval']}s")
+    print(f"  Time to re-enable:  {config['time_to_active_users']}s")
     print()
-    
+
     # Users
-    users = config.get("users", {})
-    except_users = users.get("except", [])
+    except_users = config["except_users"]
     info("👥 Users:")
     print(f"  Except users: {len(except_users)}")
     print()
-    
+
     # Telegram
     telegram = config.get("telegram", {})
     info("📱 Telegram:")
@@ -71,15 +71,9 @@ def set_general_limit(
     """Set the general IP limit"""
     if limit < 1:
         error("Limit must be at least 1")
-    
-    config = load_config()
-    
-    if "limits" not in config:
-        config["limits"] = {}
-    
-    config["limits"]["general"] = limit
-    save_config(config)
-    
+
+    run_command(lambda: write_settings({"general_limit": limit}))
+
     success(f"General limit set to {limit}")
 
 
@@ -90,15 +84,9 @@ def set_check_interval(
     """Set the check interval"""
     if interval < 30:
         error("Interval must be at least 30 seconds")
-    
-    config = load_config()
-    
-    if "timing" not in config:
-        config["timing"] = {}
-    
-    config["timing"]["check_interval"] = interval
-    save_config(config)
-    
+
+    run_command(lambda: write_settings({"check_interval": interval}))
+
     success(f"Check interval set to {interval} seconds")
 
 
@@ -109,68 +97,55 @@ def set_reenable_time(
     """Set the time to automatically re-enable disabled users"""
     if time < 60:
         error("Time must be at least 60 seconds")
-    
-    config = load_config()
-    
-    if "timing" not in config:
-        config["timing"] = {}
-    
-    config["timing"]["time_to_active_users"] = time
-    save_config(config)
-    
+
+    run_command(lambda: write_settings({"time_to_active_users": time}))
+
     success(f"Re-enable time set to {time} seconds ({time // 60} minutes)")
 
 
 @app.command(name="set-country")
 def set_country_filter(
-    code: Optional[str] = typer.Option(None, "-c", "--code", help="Country code to filter (e.g., IR, RU) or 'none' to disable"),
+    code: Optional[str] = typer.Option(
+        None, "-c", "--code", help="Country code to filter (e.g., IR, RU) or 'none' to disable"
+    ),
 ):
     """Set or disable country code filter"""
-    config = load_config()
-    
-    if "settings" not in config:
-        config["settings"] = {}
-    
     if code is None or code.lower() == "none":
-        config["settings"]["country_code"] = None
-        save_config(config)
+        run_command(lambda: write_settings({"country_code": ""}))
         success("Country filter disabled")
     else:
         code = code.upper()
-        config["settings"]["country_code"] = code
-        save_config(config)
+        run_command(lambda: write_settings({"country_code": code}))
         success(f"Country filter set to {code}")
 
 
 @app.command(name="cleanup")
 def cleanup_deleted_users():
     """Remove deleted users from limiter config (special limits, except users, disabled list)"""
-    import asyncio
     from rich.progress import Progress, SpinnerColumn, TextColumn
-    
-    from utils.read_config import read_config
+
     from utils.types import PanelType
     from utils.panel_api import cleanup_deleted_users as do_cleanup
-    
+
     async def run_cleanup():
         # Load config for panel data
-        config = await read_config()
+        config = await read_settings()
         panel_config = config.get("panel", {})
-        
+
         if not panel_config.get("domain"):
             error("Panel not configured. Run the Telegram bot to set up panel config first.")
             return
-        
+
         panel_data = PanelType(
             panel_username=panel_config.get("username", ""),
             panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", "")
+            panel_domain=panel_config.get("domain", ""),
         )
-        
+
         info("🔍 Fetching users from panel...")
         result = await do_cleanup(panel_data)
         return result
-    
+
     try:
         with Progress(
             SpinnerColumn(),
@@ -178,54 +153,54 @@ def cleanup_deleted_users():
             transient=True,
         ) as progress:
             progress.add_task(description="Cleaning up deleted users...", total=None)
-            result = asyncio.run(run_cleanup())
-        
+            result = run_command(run_cleanup)
+
         if result is None:
             return
-        
+
         total_removed = (
-            len(result["special_limits_removed"]) +
-            len(result["except_users_removed"]) +
-            len(result["disabled_users_removed"]) +
-            len(result["user_groups_backup_removed"])
+            len(result["special_limits_removed"])
+            + len(result["except_users_removed"])
+            + len(result["disabled_users_removed"])
+            + len(result["user_groups_backup_removed"])
         )
-        
+
         if total_removed == 0:
             success("✅ No deleted users found. Everything is clean!")
             return
-        
+
         # Build result table
         table = Table(title="🧹 Cleanup Results")
         table.add_column("Category", style="cyan")
         table.add_column("Removed", style="green")
         table.add_column("Users", style="yellow")
-        
+
         if result["special_limits_removed"]:
             users_str = ", ".join(result["special_limits_removed"][:5])
             if len(result["special_limits_removed"]) > 5:
                 users_str += f" (+{len(result['special_limits_removed']) - 5} more)"
             table.add_row("Special Limits", str(len(result["special_limits_removed"])), users_str)
-        
+
         if result["except_users_removed"]:
             users_str = ", ".join(result["except_users_removed"][:5])
             if len(result["except_users_removed"]) > 5:
                 users_str += f" (+{len(result['except_users_removed']) - 5} more)"
             table.add_row("Except Users", str(len(result["except_users_removed"])), users_str)
-        
+
         if result["disabled_users_removed"]:
             users_str = ", ".join(result["disabled_users_removed"][:5])
             if len(result["disabled_users_removed"]) > 5:
                 users_str += f" (+{len(result['disabled_users_removed']) - 5} more)"
             table.add_row("Disabled Users", str(len(result["disabled_users_removed"])), users_str)
-        
+
         if result["user_groups_backup_removed"]:
             users_str = ", ".join(result["user_groups_backup_removed"][:5])
             if len(result["user_groups_backup_removed"]) > 5:
                 users_str += f" (+{len(result['user_groups_backup_removed']) - 5} more)"
             table.add_row("Groups Backup", str(len(result["user_groups_backup_removed"])), users_str)
-        
+
         console.print(table)
         success(f"Total removed: {total_removed} user entries")
-        
+
     except Exception as e:
         error(f"Cleanup failed: {e}")

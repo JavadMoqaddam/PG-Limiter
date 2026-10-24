@@ -4,7 +4,7 @@ Limiter CLI - Command Line Interface for IP Limiter management
 
 Usage:
     python cli_main.py [COMMAND] [OPTIONS]
-    
+
 Commands:
     user        Manage user special limits
     except      Manage except (whitelisted) users
@@ -44,9 +44,7 @@ BANNER = """
 
 
 app = typer.Typer(
-    no_args_is_help=True, 
-    add_completion=False,
-    help="Limiter CLI - Manage IP limits, users, and configuration"
+    no_args_is_help=True, add_completion=False, help="Limiter CLI - Manage IP limits, users, and configuration"
 )
 
 # Add subcommands
@@ -75,14 +73,10 @@ def get_default_shell() -> Shells:
     return Shells.bash
 
 
-@app_completion.command(
-    help="Show completion for the specified shell, to copy or customize it."
-)
+@app_completion.command(help="Show completion for the specified shell, to copy or customize it.")
 def show(
     ctx: typer.Context,
-    shell: Shells = typer.Option(
-        None, help="The shell to install completion for.", case_sensitive=False
-    ),
+    shell: Shells = typer.Option(None, help="The shell to install completion for.", case_sensitive=False),
 ) -> None:
     if shell is None:
         shell = get_default_shell()
@@ -92,9 +86,7 @@ def show(
 @app_completion.command(help="Install completion for the specified shell.")
 def install(
     ctx: typer.Context,
-    shell: Shells = typer.Option(
-        None, help="The shell to install completion for.", case_sensitive=False
-    ),
+    shell: Shells = typer.Option(None, help="The shell to install completion for.", case_sensitive=False),
 ) -> None:
     if shell is None:
         shell = get_default_shell()
@@ -102,62 +94,44 @@ def install(
 
 
 def _disabled_user_count() -> int:
-    """Count disabled users from the SQLite registry.
+    """Count disabled users with one CLI-owned database event loop."""
+    from cli.utils import run_command
+    from utils.handel_dis_users import disabled_usernames
 
-    The CLI used to read the retired ``.disable_users.json``; the registry lives in
-    SQLite now, so query it. Runs its own loop because the CLI command is synchronous.
-    """
-    try:
-        import asyncio
-        from utils.handel_dis_users import disabled_usernames
+    async def count():
+        return len(await disabled_usernames())
 
-        return len(asyncio.run(disabled_usernames()))
-    except Exception:
-        return 0
+    return run_command(count)
 
 
 @app.command(name="status")
 def status():
     """Show current limiter status summary"""
     from rich.console import Console
-    from rich.panel import Panel
     from rich.table import Table
-    import json
-    import time
-    
+    from cli.utils import run_command
+    from utils.handel_dis_users import disabled_usernames
+    from utils.settings_service import read_settings
+
     console = Console()
     console.print(BANNER)
-    
-    # Load configs
-    try:
-        with open("config.json", "r") as f:
-            config = json.load(f)
-    except FileNotFoundError:
-        console.print("[red]Config file not found. Run the limiter first.[/red]")
-        return
-    
-    # Disabled users (from the SQLite registry, not the retired JSON file)
-    disabled_count = _disabled_user_count()
-    
-    # Special limits
-    special_count = 0
-    if "limits" in config and "special" in config["limits"]:
-        special_count = len(config["limits"]["special"])
-    
-    # Except users
-    except_count = 0
-    if "users" in config and "except" in config["users"]:
-        except_count = len(config["users"]["except"])
-    
+
+    async def read_status():
+        return await read_settings(), len(await disabled_usernames())
+
+    config, disabled_count = run_command(read_status)
+    special_count = len(config["limits"]["special"])
+    except_count = len(config["except_users"])
+
     # Create status table
     table = Table(title="Limiter Status", show_header=False)
     table.add_column("Key", style="cyan")
     table.add_column("Value", style="green")
-    
+
     general_limit = config.get("limits", {}).get("general", 2)
-    check_interval = config.get("timing", {}).get("check_interval", 120)
-    reenable_time = config.get("timing", {}).get("time_to_active_users", 300)
-    
+    check_interval = config["check_interval"]
+    reenable_time = config["time_to_active_users"]
+
     table.add_row("General Limit", str(general_limit))
     table.add_row("Check Interval", f"{check_interval}s")
     table.add_row("Re-enable Time", f"{reenable_time}s ({reenable_time // 60}m)")
@@ -165,9 +139,9 @@ def status():
     table.add_row("Special Limits", str(special_count))
     table.add_row("Except Users", str(except_count))
     table.add_row("Disabled Users", f"[red]{disabled_count}[/red]" if disabled_count else "0")
-    
+
     console.print(table)
-    
+
     # Quick tips
     console.print("\n[dim]Quick commands:[/dim]")
     console.print("  [cyan]python cli_main.py user list[/cyan]      - List special limits")
@@ -179,6 +153,7 @@ def status():
 def version():
     """Show CLI version"""
     from rich.console import Console
+
     console = Console()
     console.print(BANNER)
     console.print("Version: 1.6.1")

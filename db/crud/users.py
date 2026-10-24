@@ -582,7 +582,7 @@ class UserCRUD:
     async def bulk_upsert_users(db: AsyncSession, users_data: List[dict]) -> int:
         """
         Perform native SQLite Bulk Upsert (ON CONFLICT(username) DO UPDATE).
-        Upserts thousands of users in single atomic SQL executions per chunk.
+        Upserts panel-owned facts in atomic chunks, preserving local and legacy derived columns.
         """
         if not users_data:
             return 0
@@ -610,8 +610,6 @@ class UserCRUD:
                         "used_traffic": d.get("used_traffic", 0),
                         "expire_at": d.get("expire_at"),
                         "note": d.get("note"),
-                        "is_monitored": d.get("is_monitored", True),
-                        "effective_ip_limit": d.get("effective_ip_limit"),
                         "last_synced_at": now,
                     }
                 )
@@ -629,8 +627,6 @@ class UserCRUD:
                     "used_traffic": stmt.excluded.used_traffic,
                     "expire_at": stmt.excluded.expire_at,
                     "note": stmt.excluded.note,
-                    "is_monitored": stmt.excluded.is_monitored,
-                    "effective_ip_limit": stmt.excluded.effective_ip_limit,
                     "last_synced_at": stmt.excluded.last_synced_at,
                 },
             )
