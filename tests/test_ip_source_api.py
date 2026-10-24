@@ -12,6 +12,91 @@ import time
 import pytest
 
 
+@pytest.mark.parametrize("bad", [{}, {"nodes": None}, {"nodes": {"1": {"ips": {"5.6.7.8": True}}}}])
+def test_malformed_ip_payload_is_not_a_valid_empty_result(bad):
+    from utils.panel_api.online_ips import _parse_ip_payload
+
+    with pytest.raises(ValueError):
+        _parse_ip_payload(bad)
+
+
+def test_valid_empty_node_is_preserved():
+    from utils.panel_api.online_ips import _parse_ip_payload
+
+    assert _parse_ip_payload({"nodes": {"1": {"ips": {}}}}) == {1: {}}
+
+
+@pytest.mark.parametrize("interval", [500, 900])
+async def test_candidate_http_query_uses_online_flag(monkeypatch, panel, api_config, interval):
+    from types import SimpleNamespace
+
+    import utils.panel_api.request_helper as requests
+    import utils.ip_source_api as api
+
+    seen = []
+
+    async def get(_panel, path, **kwargs):
+        assert path == "/api/users"
+        seen.append(kwargs["params"])
+        return SimpleNamespace(json=lambda: {"users": [], "total": 0})
+
+    async def nodes(*args):
+        return {1: "node"}, set(), {1}
+
+    monkeypatch.setattr(requests, "panel_get", get)
+    monkeypatch.setattr(api, "_resolve_node_context", nodes)
+    api_config.update(check_interval=interval, group_filter={"enabled": True, "mode": "include", "group_ids": [7, 9]})
+    assert await api.collect_active_users_from_api(panel, api_config)
+    assert seen == [{"offset": 0, "limit": 500, "status": "active", "group": [7, 9], "online": "true"}]
+
+
+@pytest.mark.parametrize("bad_page", [None, {}, {"users": None, "total": 2}])
+async def test_partial_candidate_pages_are_unknown(monkeypatch, panel, bad_page):
+    from types import SimpleNamespace
+
+    import utils.panel_api.request_helper as requests
+    from utils.panel_api.online_ips import fetch_online_candidates
+
+    async def get(_panel, _path, **kwargs):
+        data = {"users": [{"id": 1, "username": "alice"}], "total": 2} if kwargs["params"]["offset"] == 0 else bad_page
+        return None if data is None else SimpleNamespace(json=lambda: data)
+
+    monkeypatch.setattr(requests, "panel_get", get)
+    assert await fetch_online_candidates(panel, page_size=1) is None
+
+
+async def test_duplicate_candidates_on_first_page_are_unknown(monkeypatch, panel):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import utils.panel_api.request_helper as requests
+    from utils.panel_api.online_ips import fetch_online_candidates
+
+    body = {"users": [{"id": 1, "username": "alice"}, {"id": 1, "username": "alice"}], "total": 2}
+    monkeypatch.setattr(requests, "panel_get", AsyncMock(return_value=SimpleNamespace(json=lambda: body)))
+    assert await fetch_online_candidates(panel) is None
+
+
+@pytest.mark.parametrize("age, present", [(89, True), (90, False), (91, False), (-1, False)])
+async def test_exact_freshness_boundary_and_source_timestamp(monkeypatch, api_config, age, present):
+    import utils.ip_source_api as api
+
+    monkeypatch.setattr(api.time, "time", lambda: 1_800_000_000)
+    api_config["api_ip_freshness"] = 90
+    users, _ = await api._build_users_from_payloads(
+        {"alice": {1: {"5.6.7.8": 1_800_000_000 - age}}}, {}, {1: "node"}, set(), api_config
+    )
+    assert ("alice" in users) is present
+    if present:
+        assert users["alice"].device_info.connections[0].last_seen == 1_799_999_911
+
+
+def test_short_freshness_is_not_clamped_to_interval(api_config):
+    from utils.ip_source_api import _resolve_freshness_window
+
+    api_config.update(api_ip_freshness=10, check_interval=500)
+    assert _resolve_freshness_window(api_config) == 10
+
+
 def fresh() -> int:
     """
     A last-seen timestamp that passes the freshness filter.
@@ -53,7 +138,7 @@ def api_config():
 
 
 @pytest.fixture(autouse=True)
-def clean_collector_state():
+def clean_collector_state(operational_topics):
     """Reset collector globals, shared maps and the IP caches per test."""
     import utils.ip_source_api as api_mod
     from utils.ip_facts import BLOCKED_IPS, COUNTRY_CACHE, VERDICT_CACHE
@@ -67,6 +152,7 @@ def clean_collector_state():
     VERDICT_CACHE.clear()
     COUNTRY_CACHE.clear()
     api_mod._consecutive_dead_cycles = 0
+    api_mod._failure_revision = None
     api_mod._forbidden_alert_sent = False
     api_mod._consecutive_coverage_skips = 0
     api_mod._coverage_alert_sent = False
@@ -80,6 +166,7 @@ def clean_collector_state():
     BLOCKED_IPS.clear()
     BLOCKED_IPS.update(blocklist_seed)
     api_mod._consecutive_dead_cycles = 0
+    api_mod._failure_revision = None
     api_mod._forbidden_alert_sent = False
     api_mod._consecutive_coverage_skips = 0
     api_mod._coverage_alert_sent = False
@@ -118,16 +205,11 @@ def _patch_collector(
         # in node_name_map minus the disabled ones, which is what a healthy panel
         # looks like; pass expected_node_ids explicitly to simulate a fleet where
         # some nodes have gone quiet.
-        expected = (
-            set(expected_node_ids)
-            if expected_node_ids is not None
-            else set(names) - disabled
-        )
+        expected = set(expected_node_ids) if expected_node_ids is not None else set(names) - disabled
         return names, disabled, expected
 
     async def fake_fetch(_panel, targets, **_kwargs):
-        default = {"ok": len(targets), "failed": 0, "not_found": 0,
-                   "forbidden": 0, "unauthorized": 0}
+        default = {"ok": len(targets), "failed": 0, "not_found": 0, "forbidden": 0, "unauthorized": 0}
         resolved = dict(payloads or {})
         now = time.time()
         return resolved, dict(counters or default), {name: now for name in resolved}
@@ -229,7 +311,9 @@ class TestResolveMonitoredAdmins:
 
         config = {
             "admin_filter": {
-                "enabled": True, "mode": "include", "admin_usernames": ["reseller1"],
+                "enabled": True,
+                "mode": "include",
+                "admin_usernames": ["reseller1"],
             }
         }
         assert resolve_monitored_admins(config) is None
@@ -239,7 +323,9 @@ class TestResolveMonitoredAdmins:
 
         config = {
             "admin_filter": {
-                "enabled": True, "mode": "exclude", "admin_usernames": ["reseller1"],
+                "enabled": True,
+                "mode": "exclude",
+                "admin_usernames": ["reseller1"],
             }
         }
         assert resolve_monitored_admins(config) is None
@@ -287,9 +373,7 @@ class TestPrefilterCandidates:
             {"username": "bad_id", "id": "abc"},
             {"username": "ok", "id": "7"},
         ]
-        assert _prefilter_candidates(candidates) == [
-            ("ok", 7, {"username": "ok", "id": "7"})
-        ]
+        assert _prefilter_candidates(candidates) == [("ok", 7, {"username": "ok", "id": "7"})]
 
 
 class TestValidateIps:
@@ -406,8 +490,13 @@ class TestBuildUsersFromPayloads:
         assert {c.node_name for c in user.device_info.connections} == {"de-node"}
         assert {c.inbound_protocol for c in user.device_info.connections} == {"API"}
         assert stats == {
-            "geo_lookups": 0, "nodes_seen": 1, "total_ips": 2, "users_with_ips": 1,
-            "stale_ips": 0, "future_ips": 0, "unknown_age_ips": 0,
+            "geo_lookups": 0,
+            "nodes_seen": 1,
+            "total_ips": 2,
+            "users_with_ips": 1,
+            "stale_ips": 0,
+            "future_ips": 0,
+            "unknown_age_ips": 0,
         }
 
     @pytest.mark.asyncio
@@ -420,9 +509,7 @@ class TestBuildUsersFromPayloads:
         now = int(time.time())
         api_config["check_interval"] = 180
         payloads = {"alice": {1: {"5.6.7.8": now, "9.9.9.9": now - 3600}}}
-        users, stats = await _build_users_from_payloads(
-            payloads, {}, {1: "node"}, set(), api_config
-        )
+        users, stats = await _build_users_from_payloads(payloads, {}, {1: "node"}, set(), api_config)
         assert users["alice"].ip == ["5.6.7.8"]
         assert stats["stale_ips"] == 1
 
@@ -437,56 +524,50 @@ class TestBuildUsersFromPayloads:
         # like several simultaneous devices. Every unparseable value lands here too:
         # _parse_ip_payload coerces an ISO-8601 string or a float-formatted epoch to 1.
         payloads = {"alice": {1: {"5.6.7.8": 3, "9.9.9.9": 1}}}
-        users, stats = await _build_users_from_payloads(
-            payloads, {}, {1: "node"}, set(), api_config
-        )
+        users, stats = await _build_users_from_payloads(payloads, {}, {1: "node"}, set(), api_config)
         assert users == {}
         assert stats["unknown_age_ips"] == 2
-        # Counted as stale as well, so the existing "every IP filtered" gate skips the
-        # cycle rather than publishing an empty snapshot that clears pending warnings.
-        assert stats["stale_ips"] == 2
+        assert stats["stale_ips"] == 0
+        assert users.unknown_users == {"alice"}
 
     @pytest.mark.asyncio
-    async def test_a_fresh_ip_survives_alongside_an_unknown_age_one(self, api_config):
+    async def test_unknown_age_protects_user_even_with_a_fresh_ip(self, api_config):
         from utils.ip_source_api import _build_users_from_payloads
 
         payloads = {"alice": {1: {"5.6.7.8": fresh(), "9.9.9.9": 1}}}
-        users, stats = await _build_users_from_payloads(
-            payloads, {}, {1: "node"}, set(), api_config
-        )
-        assert users["alice"].ip == ["5.6.7.8"]
+        users, stats = await _build_users_from_payloads(payloads, {}, {1: "node"}, set(), api_config)
+        assert users == {}
+        assert users.unknown_users == {"alice"}
         assert stats["unknown_age_ips"] == 1
-        assert stats["total_ips"] == 1
-        # Also counted as stale, which is what lets the all-stale gate fire when a whole
-        # payload comes back sub-floor.
-        assert stats["stale_ips"] == 1
+        assert stats["total_ips"] == 0
+        assert stats["stale_ips"] == 0
 
     @pytest.mark.asyncio
-    async def test_freshness_is_measured_from_the_fetch_time(self, api_config):
+    async def test_old_fetch_time_cannot_preserve_an_expired_observation(self, api_config):
         from utils.ip_source_api import _build_users_from_payloads
 
-        # A slow fan-out can finish minutes after the first users were sampled.
-        # Judging their IPs against "now" would discard data that was live when
-        # it was read, silently turning early users into inactive ones.
+        # Receipt time cannot keep an old observation eligible after the fan-out.
         now = int(time.time())
         api_config["check_interval"] = 180
         fetched_at = now - 400
         payloads = {"alice": {1: {"5.6.7.8": fetched_at - 10, "9.9.9.9": fetched_at - 900}}}
         users, stats = await _build_users_from_payloads(
-            payloads, {}, {1: "node"}, set(), api_config,
+            payloads,
+            {},
+            {1: "node"},
+            set(),
+            api_config,
             fetch_times={"alice": fetched_at},
         )
-        assert users["alice"].ip == ["5.6.7.8"]
-        assert stats["stale_ips"] == 1
+        assert users == {}
+        assert stats["stale_ips"] == 2
 
     @pytest.mark.asyncio
     async def test_disabled_nodes_are_excluded(self, api_config):
         from utils.ip_source_api import _build_users_from_payloads
 
         payloads = {"alice": {1: {"5.6.7.8": fresh()}, 2: {"9.9.9.9": fresh()}}}
-        users, stats = await _build_users_from_payloads(
-            payloads, {}, {1: "keep", 2: "drop"}, {2}, api_config
-        )
+        users, stats = await _build_users_from_payloads(payloads, {}, {1: "keep", 2: "drop"}, {2}, api_config)
         assert users["alice"].ip == ["5.6.7.8"]
         assert stats["nodes_seen"] == 1
 
@@ -498,9 +579,7 @@ class TestBuildUsersFromPayloads:
             "private_only": {1: {"192.168.1.5": fresh()}},
             "real": {1: {"5.6.7.8": fresh()}},
         }
-        users, stats = await _build_users_from_payloads(
-            payloads, {}, {1: "node"}, set(), api_config
-        )
+        users, stats = await _build_users_from_payloads(payloads, {}, {1: "node"}, set(), api_config)
         assert set(users) == {"real"}
         assert stats["users_with_ips"] == 1
         assert stats["total_ips"] == 1
@@ -510,9 +589,7 @@ class TestBuildUsersFromPayloads:
         from utils.ip_source_api import _build_users_from_payloads
 
         payloads = {"alice": {1: {"5.6.7.8": fresh()}, 2: {"5.6.7.8": fresh()}}}
-        users, stats = await _build_users_from_payloads(
-            payloads, {}, {1: "a", 2: "b"}, set(), api_config
-        )
+        users, stats = await _build_users_from_payloads(payloads, {}, {1: "a", 2: "b"}, set(), api_config)
         user = users["alice"]
         assert user.ip == ["5.6.7.8"]
         assert stats["total_ips"] == 1
@@ -536,9 +613,7 @@ class TestBuildUsersFromPayloads:
     async def test_unknown_node_gets_placeholder_name(self, api_config):
         from utils.ip_source_api import _build_users_from_payloads
 
-        users, _ = await _build_users_from_payloads(
-            {"alice": {7: {"5.6.7.8": fresh()}}}, {}, {}, set(), api_config
-        )
+        users, _ = await _build_users_from_payloads({"alice": {7: {"5.6.7.8": fresh()}}}, {}, {}, set(), api_config)
         assert users["alice"].device_info.connections[0].node_name == "Node-7"
 
     @pytest.mark.asyncio
@@ -555,51 +630,20 @@ class TestBuildUsersFromPayloads:
             "flat": {"admin": "reseller2"},
             "legacy": {"admin_username": "reseller3"},
         }
-        users, _ = await _build_users_from_payloads(
-            payloads, raw_by_name, {1: "node"}, set(), api_config
-        )
+        users, _ = await _build_users_from_payloads(payloads, raw_by_name, {1: "node"}, set(), api_config)
         assert users["nested"].admin_username == "reseller1"
         assert users["flat"].admin_username == "reseller2"
         assert users["legacy"].admin_username == "reseller3"
 
 
-class TestOnlineWindow:
-    """The freshness window has to track CHECK_INTERVAL from ENV/DB."""
-
-    def test_auto_window_is_interval_plus_grace(self, api_config):
-        from utils.ip_source_api import _resolve_online_window
-
-        api_config["check_interval"] = 240
-        assert _resolve_online_window(api_config) == 270
-
-    def test_explicit_window_wins(self, api_config):
-        from utils.ip_source_api import _resolve_online_window
-
-        api_config["api_ip_online_window"] = 600
-        assert _resolve_online_window(api_config) == 600
-
-    def test_short_interval_keeps_a_floor(self, api_config):
-        from utils.ip_source_api import _resolve_online_window
-
-        api_config["check_interval"] = 10
-        assert _resolve_online_window(api_config) == 60
-
-    def test_falls_back_to_monitoring_interval(self, api_config):
-        from utils.ip_source_api import _resolve_online_window
-
-        api_config.pop("check_interval")
-        api_config["monitoring"] = {"check_interval": 180}
-        assert _resolve_online_window(api_config) == 210
-
-
 class TestFreshnessWindow:
     """An IP older than this window is not a currently connected device."""
 
-    def test_auto_window_is_the_check_interval(self, api_config):
+    def test_missing_freshness_uses_configurable_default(self, api_config):
         from utils.ip_source_api import _resolve_freshness_window
 
         api_config["check_interval"] = 240
-        assert _resolve_freshness_window(api_config) == 240
+        assert _resolve_freshness_window(api_config) == 60
 
     def test_explicit_value_wins(self, api_config):
         from utils.ip_source_api import _resolve_freshness_window
@@ -632,9 +676,7 @@ class TestCollectFailSafe:
         assert get_last_cycle_stats()["skipped_reason"] == "panel unavailable"
 
     @pytest.mark.asyncio
-    async def test_failed_candidate_query_keeps_previous_state(
-        self, panel, api_config, monkeypatch
-    ):
+    async def test_failed_candidate_query_keeps_previous_state(self, panel, api_config, monkeypatch):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
         from utils.shared_state import ACTIVE_USERS
         from utils.types import UserType
@@ -649,16 +691,13 @@ class TestCollectFailSafe:
         assert get_last_cycle_stats()["skipped_reason"] == "candidate query failed"
 
     @pytest.mark.asyncio
-    async def test_zero_successful_lookups_skips_the_cycle(
-        self, panel, api_config, monkeypatch
-    ):
+    async def test_zero_successful_lookups_skips_the_cycle(self, panel, api_config, monkeypatch):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
 
         _patch_collector(
             monkeypatch,
             candidates=[{"username": "alice", "id": 1}],
-            counters={"ok": 0, "failed": 1, "not_found": 0,
-                      "forbidden": 0, "unauthorized": 0},
+            counters={"ok": 0, "failed": 1, "not_found": 0, "forbidden": 0, "unauthorized": 0},
         )
         assert await collect_active_users_from_api(panel, api_config) is False
         assert get_last_cycle_stats()["skipped_reason"] == "no successful lookups"
@@ -674,8 +713,7 @@ class TestCollectFailSafe:
             monkeypatch,
             candidates=[{"username": f"u{i}", "id": i} for i in range(1, 5)],
             payloads={"u1": {1: {"5.6.7.8": fresh()}}},
-            counters={"ok": 1, "failed": 3, "not_found": 0,
-                      "forbidden": 0, "unauthorized": 0},
+            counters={"ok": 1, "failed": 3, "not_found": 0, "forbidden": 0, "unauthorized": 0},
         )
 
         # 1 of 4 answered = 25% coverage, below the configured 80%.
@@ -688,12 +726,12 @@ class TestCollectFailSafe:
     @pytest.mark.asyncio
     async def test_not_found_counts_as_covered(self, panel, api_config, monkeypatch):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
+
         _patch_collector(
             monkeypatch,
             candidates=[{"username": f"u{i}", "id": i} for i in range(1, 5)],
             payloads={"u1": {1: {"5.6.7.8": fresh()}}},
-            counters={"ok": 1, "failed": 0, "not_found": 3,
-                      "forbidden": 0, "unauthorized": 0},
+            counters={"ok": 1, "failed": 0, "not_found": 3, "forbidden": 0, "unauthorized": 0},
             node_name_map={1: "node"},
         )
 
@@ -702,9 +740,7 @@ class TestCollectFailSafe:
         assert get_last_cycle_stats()["coverage"] == 1.0
 
     @pytest.mark.asyncio
-    async def test_node_coverage_is_reported_even_with_the_gate_off(
-        self, panel, api_config, monkeypatch
-    ):
+    async def test_node_coverage_is_reported_even_with_the_gate_off(self, panel, api_config, monkeypatch):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
 
         seen_at = int(time.time())
@@ -717,8 +753,8 @@ class TestCollectFailSafe:
 
         # Per-user coverage is a perfect 1.0 while two of three nodes said nothing.
         # That is exactly the blind spot the node ratio exists to expose, so the
-        # cycle still runs but the numbers are now on the record.
-        assert await collect_active_users_from_api(panel, api_config) is True
+        # cycle is unknown regardless of the optional global coverage gate.
+        assert await collect_active_users_from_api(panel, api_config) is False
         stats = get_last_cycle_stats()
         assert stats["coverage"] == 1.0
         assert stats["nodes_seen"] == 1
@@ -726,9 +762,7 @@ class TestCollectFailSafe:
         assert stats["node_coverage"] == 0.3333
 
     @pytest.mark.asyncio
-    async def test_low_node_coverage_skips_the_cycle_when_configured(
-        self, panel, api_config, monkeypatch
-    ):
+    async def test_low_node_coverage_skips_the_cycle_when_configured(self, panel, api_config, monkeypatch):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
         from utils.shared_state import ACTIVE_USERS
         from utils.types import UserType
@@ -746,11 +780,10 @@ class TestCollectFailSafe:
         assert await collect_active_users_from_api(panel, api_config) is False
         assert list(ACTIVE_USERS) == ["carol"]
         stats = get_last_cycle_stats()
-        assert "node coverage" in stats["skipped_reason"]
-        # What the build actually found still has to be reported, or the
-        # diagnostics read like a dead panel instead of a partial fleet.
-        assert stats["users_with_ips"] == 1
-        assert stats["total_ips"] == 1
+        assert "unknown" in stats["skipped_reason"]
+        assert stats["users_with_ips"] == 0
+        assert stats["total_ips"] == 0
+        assert stats["nodes_seen"] == 1
 
     @pytest.mark.asyncio
     async def test_full_node_coverage_passes_the_gate(self, panel, api_config, monkeypatch):
@@ -773,14 +806,12 @@ class TestCollectFailSafe:
         assert list(ACTIVE_USERS) == ["alice"]
 
     @pytest.mark.asyncio
-    async def test_all_stale_ips_skip_the_cycle(self, panel, api_config, monkeypatch):
+    async def test_all_valid_expired_ips_publish_empty_cycle(self, panel, api_config, monkeypatch):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
         from utils.shared_state import ACTIVE_USERS
         from utils.types import UserType
 
-        # Timestamps that are uniformly ancient point at clock skew, not at
-        # 1300 users going offline at once. Publishing the empty snapshot would
-        # clear every pending warning, so the cycle must be abandoned.
+        # Expired timestamps are a valid empty observation, distinct from unknown age.
         ACTIVE_USERS["carol"] = UserType(name="carol", ip=["5.6.7.8"])
         _patch_collector(
             monkeypatch,
@@ -789,47 +820,39 @@ class TestCollectFailSafe:
             node_name_map={1: "de"},
         )
 
-        assert await collect_active_users_from_api(panel, api_config) is False
-        assert list(ACTIVE_USERS) == ["carol"]
-        assert get_last_cycle_stats()["skipped_reason"] == "every IP filtered as stale"
+        assert await collect_active_users_from_api(panel, api_config) is True
+        assert ACTIVE_USERS == {}
+        assert get_last_cycle_stats()["skipped_reason"] == ""
 
     @pytest.mark.asyncio
-    async def test_low_coverage_does_not_count_as_a_dead_cycle(
-        self, panel, api_config, monkeypatch
-    ):
+    async def test_low_coverage_counts_as_one_unsuccessful_cycle(self, panel, api_config, monkeypatch):
         import utils.ip_source_api as api_mod
 
-        api_mod._consecutive_dead_cycles = 2
         _patch_collector(
             monkeypatch,
             candidates=[{"username": f"u{i}", "id": i} for i in range(1, 5)],
-            counters={"ok": 1, "failed": 3, "not_found": 0,
-                      "forbidden": 0, "unauthorized": 0},
+            counters={"ok": 1, "failed": 3, "not_found": 0, "forbidden": 0, "unauthorized": 0},
         )
         assert await api_mod.collect_active_users_from_api(panel, api_config) is False
-        # The panel answered, so the auto-fallback streak resets.
-        assert api_mod._consecutive_dead_cycles == 0
+        assert api_mod._consecutive_dead_cycles == 1
 
     @pytest.mark.asyncio
-    async def test_repeated_coverage_skips_raise_one_alert(
-        self, panel, api_config, monkeypatch
-    ):
+    async def test_repeated_coverage_skips_raise_one_alert(self, panel, api_config, monkeypatch):
         """
         A run of coverage skips means enforcement has stopped entirely.
 
         One skip is the correct, safe outcome. Three in a row means nobody is being
         warned or banned at all, and the only trace used to be one WARNING per cycle
         that reads exactly like the previous one. Reverting to log mode is not the
-        remedy here - the panel is answering, just incompletely - so this is an
-        alarm, not a mode change.
+        remedy when disabled by the operator, so this test keeps automatic
+        fallback off and checks the separate enforcement alarm.
         """
         import utils.ip_source_api as api_mod
 
         notifications = _patch_collector(
             monkeypatch,
             candidates=[{"username": f"u{i}", "id": i} for i in range(1, 5)],
-            counters={"ok": 1, "failed": 3, "not_found": 0,
-                      "forbidden": 0, "unauthorized": 0},
+            counters={"ok": 1, "failed": 3, "not_found": 0, "forbidden": 0, "unauthorized": 0},
         )
 
         for _ in range(api_mod.COVERAGE_SKIP_ALERT_THRESHOLD + 2):
@@ -847,8 +870,7 @@ class TestCollectFailSafe:
         notifications = _patch_collector(
             monkeypatch,
             candidates=[{"username": "alice", "id": 1}],
-            counters={"ok": 0, "failed": 0, "not_found": 0,
-                      "forbidden": 1, "unauthorized": 0},
+            counters={"ok": 0, "failed": 0, "not_found": 0, "forbidden": 1, "unauthorized": 0},
         )
 
         assert await api_mod.collect_active_users_from_api(panel, api_config) is False
@@ -858,15 +880,14 @@ class TestCollectFailSafe:
         assert "nodes:stats" in notifications[0]
 
     @pytest.mark.asyncio
-    async def test_auto_fallback_reverts_after_three_dead_cycles(
-        self, panel, api_config, monkeypatch
-    ):
+    async def test_auto_fallback_reverts_after_two_unsuccessful_cycles(self, panel, api_config, monkeypatch):
         import utils.ip_source_api as api_mod
         import utils.read_config as read_config_mod
 
         saved: list[tuple[str, str]] = []
 
-        async def fake_save(key, value):
+        async def fake_save(key, value, *, expected_revision):
+            assert expected_revision == read_config_mod.get_config_revision()
             saved.append((key, value))
             return True
 
@@ -874,8 +895,7 @@ class TestCollectFailSafe:
         api_config["api_ip_auto_fallback"] = True
         _patch_collector(monkeypatch, candidates=None)
 
-        for _ in range(2):
-            assert await api_mod.collect_active_users_from_api(panel, api_config) is False
+        assert await api_mod.collect_active_users_from_api(panel, api_config) is False
         assert saved == []
 
         assert await api_mod.collect_active_users_from_api(panel, api_config) is False
@@ -883,9 +903,7 @@ class TestCollectFailSafe:
         assert api_mod._consecutive_dead_cycles == 0
 
     @pytest.mark.asyncio
-    async def test_auto_fallback_off_never_writes_config(
-        self, panel, api_config, monkeypatch
-    ):
+    async def test_auto_fallback_off_never_writes_config(self, panel, api_config, monkeypatch):
         import utils.ip_source_api as api_mod
         import utils.read_config as read_config_mod
 
@@ -918,7 +936,7 @@ class TestCollectHappyPath:
                 {"username": "bob", "id": 2, "status": "active"},
             ],
             payloads={
-                "alice": {1: {"5.6.7.8": fresh()}},
+                "alice": {1: {"5.6.7.8": fresh()}, 2: {}},
                 "bob": {1: {"9.9.9.9": fresh()}, 2: {"4.4.4.4": fresh()}},
             },
             node_name_map={1: "de", 2: "nl"},
@@ -938,9 +956,7 @@ class TestCollectHappyPath:
         assert stats["skipped_reason"] == ""
 
     @pytest.mark.asyncio
-    async def test_empty_candidate_set_still_runs_enforcement(
-        self, panel, api_config, monkeypatch
-    ):
+    async def test_empty_candidate_set_still_runs_enforcement(self, panel, api_config, monkeypatch):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
         from utils.shared_state import ACTIVE_USERS
         from utils.types import UserType
@@ -986,9 +1002,7 @@ class TestCollectHappyPath:
         assert api_mod.get_last_cycle_stats()["prefiltered"] == 1
 
     @pytest.mark.asyncio
-    async def test_candidate_query_is_narrowed_by_the_include_filter(
-        self, panel, api_config, monkeypatch
-    ):
+    async def test_candidate_query_is_narrowed_by_the_include_filter(self, panel, api_config, monkeypatch):
         import utils.panel_api.online_ips as online_ips_mod
         from utils.ip_source_api import collect_active_users_from_api
 
@@ -997,23 +1011,20 @@ class TestCollectHappyPath:
         async def capture(_panel, **kwargs):
             captured.update(kwargs)
             return []
+
         _patch_collector(monkeypatch, candidates=[])
         monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", capture)
 
-        api_config["group_filter"] = {
-            "enabled": True, "mode": "include", "group_ids": [12, 15]
-        }
+        api_config["group_filter"] = {"enabled": True, "mode": "include", "group_ids": [12, 15]}
         api_config["check_interval"] = 240
 
         assert await collect_active_users_from_api(panel, api_config) is True
         assert captured["group_ids"] == [12, 15]
         assert captured["status"] == "active"
-        assert captured["online_window"] == 270
+        assert captured["online_window"] > 0
 
     @pytest.mark.asyncio
-    async def test_group_limits_do_not_narrow_the_candidate_query(
-        self, panel, api_config, monkeypatch
-    ):
+    async def test_group_limits_do_not_narrow_the_candidate_query(self, panel, api_config, monkeypatch):
         """
         The regression that matters: group limits are limits, not a monitoring scope.
 
@@ -1030,6 +1041,7 @@ class TestCollectHappyPath:
         async def capture(_panel, **kwargs):
             captured.update(kwargs)
             return []
+
         _patch_collector(monkeypatch, candidates=[])
         monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", capture)
 
@@ -1040,9 +1052,7 @@ class TestCollectHappyPath:
         assert captured["status"] == "active"
 
     @pytest.mark.asyncio
-    async def test_exclude_filter_does_not_narrow_to_the_excluded_group(
-        self, panel, api_config, monkeypatch
-    ):
+    async def test_exclude_filter_does_not_narrow_to_the_excluded_group(self, panel, api_config, monkeypatch):
         """
         The worst shape of the old bug: exclude mode fell through to group_limits, so a
         limit on the very group being excluded made the query ask for exactly the users
@@ -1056,21 +1066,18 @@ class TestCollectHappyPath:
         async def capture(_panel, **kwargs):
             captured.update(kwargs)
             return []
+
         _patch_collector(monkeypatch, candidates=[])
         monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", capture)
 
-        api_config["group_filter"] = {
-            "enabled": True, "mode": "exclude", "group_ids": [7]
-        }
+        api_config["group_filter"] = {"enabled": True, "mode": "exclude", "group_ids": [7]}
         api_config["group_limits"] = {"7": 4}
 
         assert await collect_active_users_from_api(panel, api_config) is True
         assert captured["group_ids"] is None
 
     @pytest.mark.asyncio
-    async def test_all_monitored_mode_drops_the_online_window(
-        self, panel, api_config, monkeypatch
-    ):
+    async def test_legacy_all_monitored_setting_cannot_widen_online_candidates(self, panel, api_config, monkeypatch):
         import utils.panel_api.online_ips as online_ips_mod
         from utils.ip_source_api import collect_active_users_from_api
 
@@ -1079,6 +1086,7 @@ class TestCollectHappyPath:
         async def capture(_panel, **kwargs):
             captured.update(kwargs)
             return []
+
         _patch_collector(monkeypatch, candidates=[])
         monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", capture)
 
@@ -1086,5 +1094,5 @@ class TestCollectHappyPath:
         api_config["api_ip_page_size"] = 250
 
         assert await collect_active_users_from_api(panel, api_config) is True
-        assert captured["online_window"] == 0
+        assert captured["online_window"] > 0
         assert captured["page_size"] == 250

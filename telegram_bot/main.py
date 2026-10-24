@@ -20,10 +20,7 @@ try:
         filters,
     )
 except ImportError:
-    print(
-        "Module 'python-telegram-bot' is not installed. "
-        "Use: 'pip install python-telegram-bot' to install it"
-    )
+    print("Module 'python-telegram-bot' is not installed. Use: 'pip install python-telegram-bot' to install it")
     sys.exit(1)
 
 # Import constants and keyboards
@@ -51,8 +48,6 @@ from telegram_bot.keyboards import (
     create_settings_menu_keyboard,
     create_limits_menu_keyboard,
     create_users_menu_keyboard,
-    create_monitoring_menu_keyboard,
-    create_reports_menu_keyboard,
     create_admin_menu_keyboard,
     create_back_to_main_keyboard,
     create_disable_method_keyboard,
@@ -152,6 +147,7 @@ from telegram_bot.handlers.reports import (
     ip_history_12h_command,
     ip_history_48h_command,
 )
+from telegram_bot.handlers.status_reports import health_report_command, status_command
 from telegram_bot.handlers.backup import (
     send_backup,
     restore_config,
@@ -207,6 +203,14 @@ from telegram_bot.utils import (
 )
 from utils.logs import get_logger
 from utils.read_config import save_config_value, read_config
+from telegram_bot.input_owner import (
+    OWNER_KEY,
+    ScopedConversationHandler,
+    accepts_inline,
+    bind_input,
+    end_input,
+    supersede_input,
+)
 
 # Module logger
 bot_logger = get_logger("telegram.bot")
@@ -224,9 +228,7 @@ try:
         # old token[:15] printed the public id plus the first four characters of the
         # secret into every normal log the operator shares. run_telegram.py was fixed
         # for this; this second call site was missed.
-        bot_logger.info(
-            f"✓ Bot token loaded from environment (id={bot_token.split(':', 1)[0]}, secret redacted)"
-        )
+        bot_logger.info(f"✓ Bot token loaded from environment (id={bot_token.split(':', 1)[0]}, secret redacted)")
     else:
         bot_logger.warning("⚠ BOT_TOKEN environment variable is empty")
 except Exception as e:
@@ -239,6 +241,7 @@ if bot_token:
     bot_logger.info("✓ Telegram application created successfully")
     try:
         from telegram_bot.dispatcher import get_dispatcher
+
         get_dispatcher().set_bot(application.bot)
     except Exception as e:
         bot_logger.debug(f"Dispatcher injection note: {e}")
@@ -252,40 +255,34 @@ else:
 # CORE COMMAND HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 async def start(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     """Handle the /start command."""
     user_id = update.effective_user.id if update.effective_user else None
     bot_logger.info(f"📩 Received /start from user_id={user_id}")
-    
+
     if not user_id:
-        await update.message.reply_html(
-            text="Sorry, you do not have permission to use this bot."
-        )
+        await update.message.reply_html(text="Sorry, you do not have permission to use this bot.")
         return
-    
+
     admins = await check_admin()
     bot_logger.debug(f"Admin list: {admins}")
-    
+
     if not admins:
         bot_logger.warning(f"No admins configured in system. Access denied for user_id={user_id}")
         await update.message.reply_html(
             text="⚠️ <b>Bot is not configured.</b>\n"
-                 "Please configure <code>ADMIN_IDS</code> in your <code>.env</code> or <code>config.json</code> file to gain access."
+            "Please configure <code>ADMIN_IDS</code> in your <code>.env</code> or <code>config.json</code> file to gain access."
         )
         return
-    
+
     if user_id not in admins:
         bot_logger.warning(f"Unauthorized access attempt from user_id={user_id}")
-        await update.message.reply_html(
-            text="Sorry, you do not have permission to use this bot."
-        )
+        await update.message.reply_html(text="Sorry, you do not have permission to use this bot.")
         return
-    
+
     bot_logger.info(f"Sending main menu to user_id={user_id}")
-    await update.message.reply_html(
-        text=START_MESSAGE,
-        reply_markup=create_main_menu_keyboard()
-    )
+    await update.message.reply_html(text=START_MESSAGE, reply_markup=create_main_menu_keyboard())
 
 
 async def help_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
@@ -294,7 +291,6 @@ async def help_command(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     if check is not None:
         return check
     await update.message.reply_html(text=HELP_TEXT)
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -310,8 +306,6 @@ MENU_TEXTS = {
     "settings": "⚙️ <b>Settings Menu</b>\n\nConfigure your bot settings:",
     "limits": "🎯 <b>Limits Menu</b>\n\nManage user connection limits:",
     "users": "👥 <b>Users Menu</b>\n\nManage users and view disabled accounts:",
-    "monitoring": "📡 <b>Monitoring Menu</b>\n\nView user monitoring status:",
-    "reports": "📊 <b>Reports Menu</b>\n\nGenerate usage reports:",
     "admin": "👑 <b>Admin Menu</b>\n\nManage bot administrators:",
     "whitelist": (
         "✅ <b>Whitelist Users</b>\n\n"
@@ -329,12 +323,9 @@ MENU_TEXTS = {
         "<b>⚠️ Warning:</b> This will replace your current data!\n\n"
         "Use /restore command to upload your backup file."
     ),
-    "create_config": (
-        "⚙️ <b>Create Config</b>\n\nUse the command:\n<code>/create_config</code>"
-    ),
+    "create_config": ("⚙️ <b>Create Config</b>\n\nUse the command:\n<code>/create_config</code>"),
     "add_admin": (
-        "👤 <b>Add Admin</b>\n\nUse the command:\n<code>/add_admin</code>\n\n"
-        "Then send the chat ID of the user to add."
+        "👤 <b>Add Admin</b>\n\nUse the command:\n<code>/add_admin</code>\n\nThen send the chat ID of the user to add."
     ),
     "remove_admin": (
         "🗑 <b>Remove Admin</b>\n\nUse the command:\n<code>/remove_admin</code>\n\n"
@@ -350,10 +341,12 @@ async def _show_screen(query, text: str, keyboard) -> None:
 
 def _admin_screen_keyboard() -> InlineKeyboardMarkup:
     """Keyboard shared by the add/remove admin instruction screens."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("« Back to Admins", callback_data=CallbackData.LIST_ADMINS)],
-        [InlineKeyboardButton("« Back to Main Menu", callback_data=CallbackData.MAIN_MENU)],
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("« Back to Admins", callback_data=CallbackData.LIST_ADMINS)],
+            [InlineKeyboardButton("« Back to Main Menu", callback_data=CallbackData.MAIN_MENU)],
+        ]
+    )
 
 
 def _lazy(module_name: str, func_name: str, *args, pass_update: bool = False):
@@ -363,6 +356,7 @@ def _lazy(module_name: str, func_name: str, *args, pass_update: bool = False):
     Keeps the heavier handler modules out of the startup import graph, exactly
     as the previous inline ``from ... import ...`` statements did.
     """
+
     async def _route(update, query, context):
         import importlib
 
@@ -381,9 +375,7 @@ DISABLE_METHOD_BULLETS = (
     "• <b>Fallback Group</b>: Default group for re-enabled users"
 )
 DISABLE_METHOD_TEXT_HEADER = "🚫 <b>Disable Method</b>\n\n"
-DISABLE_METHOD_TEXT = (
-    f"{DISABLE_METHOD_TEXT_HEADER}Choose how users should be disabled:\n\n{DISABLE_METHOD_BULLETS}"
-)
+DISABLE_METHOD_TEXT = f"{DISABLE_METHOD_TEXT_HEADER}Choose how users should be disabled:\n\n{DISABLE_METHOD_BULLETS}"
 
 
 async def _show_disable_method_menu(update, query, context) -> None:
@@ -433,6 +425,7 @@ async def _set_disable_by_status(update, query, context) -> None:
 
 async def _send_backup_from_button(update, query, context) -> None:
     """Backup expects an Update-like object carrying the message."""
+
     class _FakeUpdate:
         def __init__(self, message, effective_user, effective_chat):
             self.message = message
@@ -456,19 +449,28 @@ CALLBACK_ROUTES = {
     # --- Main navigation ----------------------------------------------------
     CallbackData.MAIN_MENU: lambda u, q, c: _show_screen(q, START_MESSAGE, create_main_menu_keyboard()),
     CallbackData.BACK_MAIN: lambda u, q, c: _show_screen(q, START_MESSAGE, create_main_menu_keyboard()),
-    CallbackData.SETTINGS_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["settings"], create_settings_menu_keyboard()),
-    CallbackData.BACK_SETTINGS: lambda u, q, c: _show_screen(q, MENU_TEXTS["settings"], create_settings_menu_keyboard()),
+    CallbackData.SETTINGS_MENU: lambda u, q, c: _show_screen(
+        q, MENU_TEXTS["settings"], create_settings_menu_keyboard()
+    ),
+    CallbackData.BACK_SETTINGS: lambda u, q, c: _show_screen(
+        q, MENU_TEXTS["settings"], create_settings_menu_keyboard()
+    ),
     CallbackData.LIMITS_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["limits"], create_limits_menu_keyboard()),
     CallbackData.USERS_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["users"], create_users_menu_keyboard()),
     CallbackData.BACK_USERS: lambda u, q, c: _show_screen(q, MENU_TEXTS["users"], create_users_menu_keyboard()),
-    CallbackData.MONITORING_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["monitoring"], create_monitoring_menu_keyboard()),
-    CallbackData.REPORTS_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["reports"], create_reports_menu_keyboard()),
+    CallbackData.STATUS_REPORTS: lambda u, q, c: status_command(u, c),
+    CallbackData.HEALTH_REPORT: lambda u, q, c: health_report_command(u, c),
+    CallbackData.MONITORING_MENU: lambda u, q, c: status_command(u, c),
+    CallbackData.REPORTS_MENU: lambda u, q, c: status_command(u, c),
     CallbackData.ADMIN_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["admin"], create_admin_menu_keyboard()),
     "noop": lambda u, q, c: q.answer(),
-
     # --- Users --------------------------------------------------------------
-    CallbackData.WHITELIST_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["whitelist"], create_whitelist_menu_keyboard()),
-    CallbackData.SPECIAL_LIMITS_MENU: lambda u, q, c: _show_screen(q, MENU_TEXTS["special_limits"], create_special_limits_menu_keyboard()),
+    CallbackData.WHITELIST_MENU: lambda u, q, c: _show_screen(
+        q, MENU_TEXTS["whitelist"], create_whitelist_menu_keyboard()
+    ),
+    CallbackData.SPECIAL_LIMITS_MENU: lambda u, q, c: _show_screen(
+        q, MENU_TEXTS["special_limits"], create_special_limits_menu_keyboard()
+    ),
     CallbackData.FILTERED_USERS_MENU: lambda u, q, c: handle_filtered_users_menu(q, c),
     CallbackData.SHOW_DISABLED_USERS: lambda u, q, c: show_disabled_users_menu(q),
     CallbackData.ENABLE_ALL_DISABLED: lambda u, q, c: enable_all_disabled_users(q),
@@ -480,7 +482,6 @@ CALLBACK_ROUTES = {
     CallbackData.REMOVE_EXCEPT_USER: lambda u, q, c: handle_remove_except_user_callback(q, c),
     CallbackData.SHOW_SPECIAL_LIMIT: lambda u, q, c: handle_show_special_limit_callback(q, c),
     CallbackData.SET_SPECIAL_LIMIT: lambda u, q, c: handle_set_special_limit_callback(q, c),
-
     # --- Admins & backup ----------------------------------------------------
     CallbackData.LIST_ADMINS: lambda u, q, c: handle_admins_list_callback(q, c),
     CallbackData.ADD_ADMIN: lambda u, q, c: _show_screen(q, MENU_TEXTS["add_admin"], _admin_screen_keyboard()),
@@ -496,7 +497,6 @@ CALLBACK_ROUTES = {
     CallbackData.REPORT_MULTI_DEVICE: lambda u, q, c: multi_device_users_command(u, c),
     CallbackData.REPORT_IP_12H: lambda u, q, c: ip_history_12h_command(u, c),
     CallbackData.REPORT_IP_48H: lambda u, q, c: ip_history_48h_command(u, c),
-
     # --- Limits -------------------------------------------------------------
     CallbackData.GENERAL_LIMIT_2: lambda u, q, c: handle_general_limit_preset_callback(q, c, 2),
     CallbackData.GENERAL_LIMIT_3: lambda u, q, c: handle_general_limit_preset_callback(q, c, 3),
@@ -505,21 +505,20 @@ CALLBACK_ROUTES = {
     CallbackData.SPECIAL_LIMIT_1: lambda u, q, c: handle_special_limit_1_callback(q, c),
     CallbackData.SPECIAL_LIMIT_2: lambda u, q, c: handle_special_limit_2_callback(q, c),
     CallbackData.SPECIAL_LIMIT_CUSTOM: _lazy("telegram_bot.handlers.limits", "handle_special_limit_custom_callback"),
-
     # --- Core settings ------------------------------------------------------
-    CallbackData.CREATE_CONFIG: lambda u, q, c: _show_screen(q, MENU_TEXTS["create_config"], create_back_to_main_keyboard()),
+    CallbackData.CREATE_CONFIG: lambda u, q, c: _show_screen(
+        q, MENU_TEXTS["create_config"], create_back_to_main_keyboard()
+    ),
     CallbackData.SET_IPINFO: lambda u, q, c: handle_ipinfo_callback(q, c),
     CallbackData.ENHANCED_MENU: lambda u, q, c: handle_enhanced_menu_callback(q, c),
     CallbackData.ENHANCED_ON: lambda u, q, c: handle_enhanced_toggle_callback(q, c, True),
     CallbackData.ENHANCED_OFF: lambda u, q, c: handle_enhanced_toggle_callback(q, c, False),
-
     # --- Disable method -----------------------------------------------------
     CallbackData.DISABLE_METHOD_MENU: _show_disable_method_menu,
     CallbackData.DISABLE_BY_STATUS: _set_disable_by_status,
     CallbackData.DISABLE_BY_GROUP: lambda u, q, c: handle_disable_by_group_callback(q, c),
     CallbackData.FALLBACK_GROUP_MENU: lambda u, q, c: handle_fallback_group_menu_callback(q, c),
     CallbackData.CLEAR_FALLBACK_GROUP: lambda u, q, c: handle_clear_fallback_group_callback(q, c),
-
     # --- User sync ----------------------------------------------------------
     CallbackData.USER_SYNC_MENU: lambda u, q, c: handle_user_sync_menu_callback(q, c),
     CallbackData.USER_SYNC_1: lambda u, q, c: handle_user_sync_interval_callback(q, c, 1),
@@ -535,36 +534,72 @@ CALLBACK_ROUTES = {
     CallbackData.TOPICS_SETUP: _lazy("telegram_bot.handlers.topics_settings", "handle_topics_setup_callback"),
     CallbackData.TOPICS_CLEAR: _lazy("telegram_bot.handlers.topics_settings", "handle_topics_clear_callback"),
     CallbackData.TOPICS_SET_GROUP: _lazy("telegram_bot.handlers.topics_settings", "handle_topics_set_group_callback"),
-    CallbackData.TOPICS_CHECK_PERMISSIONS: _lazy("telegram_bot.handlers.topics_settings", "handle_topics_check_permissions_callback"),
-    CallbackData.TOPICS_CLEAR_CACHE: _lazy("telegram_bot.handlers.topics_settings", "handle_topics_clear_cache_callback"),
-
+    CallbackData.TOPICS_CHECK_PERMISSIONS: _lazy(
+        "telegram_bot.handlers.topics_settings", "handle_topics_check_permissions_callback"
+    ),
+    CallbackData.TOPICS_CLEAR_CACHE: _lazy(
+        "telegram_bot.handlers.topics_settings", "handle_topics_clear_cache_callback"
+    ),
     # --- Auto-backup (handlers take the Update) ------------------------------
     CallbackData.AUTO_BACKUP_MENU: _lazy("telegram_bot.handlers.backup", "auto_backup_menu", pass_update=True),
     CallbackData.AUTO_BACKUP_TOGGLE: _lazy("telegram_bot.handlers.backup", "auto_backup_toggle", pass_update=True),
-    CallbackData.AUTO_BACKUP_INTERVAL_1H: _lazy("telegram_bot.handlers.backup", "handle_auto_backup_interval_1h", pass_update=True),
-    CallbackData.AUTO_BACKUP_INTERVAL_3H: _lazy("telegram_bot.handlers.backup", "handle_auto_backup_interval_3h", pass_update=True),
-    CallbackData.AUTO_BACKUP_INTERVAL_6H: _lazy("telegram_bot.handlers.backup", "handle_auto_backup_interval_6h", pass_update=True),
-    CallbackData.AUTO_BACKUP_INTERVAL_12H: _lazy("telegram_bot.handlers.backup", "handle_auto_backup_interval_12h", pass_update=True),
+    CallbackData.AUTO_BACKUP_INTERVAL_1H: _lazy(
+        "telegram_bot.handlers.backup", "handle_auto_backup_interval_1h", pass_update=True
+    ),
+    CallbackData.AUTO_BACKUP_INTERVAL_3H: _lazy(
+        "telegram_bot.handlers.backup", "handle_auto_backup_interval_3h", pass_update=True
+    ),
+    CallbackData.AUTO_BACKUP_INTERVAL_6H: _lazy(
+        "telegram_bot.handlers.backup", "handle_auto_backup_interval_6h", pass_update=True
+    ),
+    CallbackData.AUTO_BACKUP_INTERVAL_12H: _lazy(
+        "telegram_bot.handlers.backup", "handle_auto_backup_interval_12h", pass_update=True
+    ),
     CallbackData.AUTO_BACKUP_NOW: _lazy("telegram_bot.handlers.backup", "auto_backup_now", pass_update=True),
-
     # --- Punishment (handlers take the Update) -------------------------------
     CallbackData.PUNISHMENT_MENU: lambda u, q, c: punishment_status(u, c),
     CallbackData.PUNISHMENT_TOGGLE: lambda u, q, c: punishment_toggle(u, c),
     CallbackData.PUNISHMENT_WINDOW: lambda u, q, c: punishment_set_window(u, c),
     CallbackData.PUNISHMENT_STEPS: lambda u, q, c: punishment_set_steps(u, c),
-    CallbackData.PUNISHMENT_WINDOW_24: _lazy("telegram_bot.handlers.punishment", "punishment_set_window_hours", 24, pass_update=True),
-    CallbackData.PUNISHMENT_WINDOW_48: _lazy("telegram_bot.handlers.punishment", "punishment_set_window_hours", 48, pass_update=True),
-    CallbackData.PUNISHMENT_WINDOW_72: _lazy("telegram_bot.handlers.punishment", "punishment_set_window_hours", 72, pass_update=True),
-    CallbackData.PUNISHMENT_WINDOW_168: _lazy("telegram_bot.handlers.punishment", "punishment_set_window_hours", 168, pass_update=True),
-    CallbackData.PUNISHMENT_ADD_STEP: _lazy("telegram_bot.handlers.punishment", "punishment_add_step_menu", pass_update=True),
-    CallbackData.PUNISHMENT_STEPS_RESET: _lazy("telegram_bot.handlers.punishment", "punishment_reset_steps", pass_update=True),
-    CallbackData.PUNISHMENT_STEP_WARNING: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "warning", 0, pass_update=True),
-    CallbackData.PUNISHMENT_STEP_DISABLE_10: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "disable", 10, pass_update=True),
-    CallbackData.PUNISHMENT_STEP_DISABLE_30: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "disable", 30, pass_update=True),
-    CallbackData.PUNISHMENT_STEP_DISABLE_60: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "disable", 60, pass_update=True),
-    CallbackData.PUNISHMENT_STEP_DISABLE_240: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "disable", 240, pass_update=True),
-    CallbackData.PUNISHMENT_STEP_DISABLE_UNLIMITED: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "disable", 0, pass_update=True),
-    CallbackData.PUNISHMENT_STEP_REVOKE: _lazy("telegram_bot.handlers.punishment", "punishment_add_step", "revoke", 0, pass_update=True),
+    CallbackData.PUNISHMENT_WINDOW_24: _lazy(
+        "telegram_bot.handlers.punishment", "punishment_set_window_hours", 24, pass_update=True
+    ),
+    CallbackData.PUNISHMENT_WINDOW_48: _lazy(
+        "telegram_bot.handlers.punishment", "punishment_set_window_hours", 48, pass_update=True
+    ),
+    CallbackData.PUNISHMENT_WINDOW_72: _lazy(
+        "telegram_bot.handlers.punishment", "punishment_set_window_hours", 72, pass_update=True
+    ),
+    CallbackData.PUNISHMENT_WINDOW_168: _lazy(
+        "telegram_bot.handlers.punishment", "punishment_set_window_hours", 168, pass_update=True
+    ),
+    CallbackData.PUNISHMENT_ADD_STEP: _lazy(
+        "telegram_bot.handlers.punishment", "punishment_add_step_menu", pass_update=True
+    ),
+    CallbackData.PUNISHMENT_STEPS_RESET: _lazy(
+        "telegram_bot.handlers.punishment", "punishment_reset_steps", pass_update=True
+    ),
+    CallbackData.PUNISHMENT_STEP_WARNING: _lazy(
+        "telegram_bot.handlers.punishment", "punishment_add_step", "warning", 0, pass_update=True
+    ),
+    CallbackData.PUNISHMENT_STEP_DISABLE_10: _lazy(
+        "telegram_bot.handlers.punishment", "punishment_add_step", "disable", 10, pass_update=True
+    ),
+    CallbackData.PUNISHMENT_STEP_DISABLE_30: _lazy(
+        "telegram_bot.handlers.punishment", "punishment_add_step", "disable", 30, pass_update=True
+    ),
+    CallbackData.PUNISHMENT_STEP_DISABLE_60: _lazy(
+        "telegram_bot.handlers.punishment", "punishment_add_step", "disable", 60, pass_update=True
+    ),
+    CallbackData.PUNISHMENT_STEP_DISABLE_240: _lazy(
+        "telegram_bot.handlers.punishment", "punishment_add_step", "disable", 240, pass_update=True
+    ),
+    CallbackData.PUNISHMENT_STEP_DISABLE_UNLIMITED: _lazy(
+        "telegram_bot.handlers.punishment", "punishment_add_step", "disable", 0, pass_update=True
+    ),
+    CallbackData.PUNISHMENT_STEP_REVOKE: _lazy(
+        "telegram_bot.handlers.punishment", "punishment_add_step", "revoke", 0, pass_update=True
+    ),
     # --- Group & admin filters ----------------------------------------------
     CallbackData.GROUP_FILTER_MENU: lambda u, q, c: handle_group_filter_menu_callback(q, c),
     CallbackData.GROUP_LIMIT_SET: lambda u, q, c: handle_group_limit_menu_callback(q, c),
@@ -575,21 +610,28 @@ CALLBACK_ROUTES = {
     CallbackData.ADMIN_FILTER_TOGGLE: lambda u, q, c: handle_admin_filter_toggle_callback(q, c),
     CallbackData.ADMIN_FILTER_MODE_INCLUDE: lambda u, q, c: handle_admin_filter_mode_callback(q, c, "include"),
     CallbackData.ADMIN_FILTER_MODE_EXCLUDE: lambda u, q, c: handle_admin_filter_mode_callback(q, c, "exclude"),
-
     # --- Device counting & grouping -----------------------------------------
     CallbackData.SUBNET_IP_GROUPING_MENU: _lazy("telegram_bot.handlers.settings", "subnet_ip_grouping_menu_callback"),
-    CallbackData.SUBNET_IP_GROUPING_TOGGLE: _lazy("telegram_bot.handlers.settings", "subnet_ip_grouping_toggle_callback"),
-    CallbackData.SUBNET_IP_GROUPING_MODE_TOGGLE: _lazy("telegram_bot.handlers.settings", "subnet_ip_grouping_mode_toggle_callback"),
-    CallbackData.HIGH_TRUST_IP_GROUPING_MENU: _lazy("telegram_bot.handlers.settings", "high_trust_ip_grouping_menu_callback"),
-    CallbackData.HIGH_TRUST_IP_GROUPING_TOGGLE: _lazy("telegram_bot.handlers.settings", "high_trust_ip_grouping_toggle_callback"),
+    CallbackData.SUBNET_IP_GROUPING_TOGGLE: _lazy(
+        "telegram_bot.handlers.settings", "subnet_ip_grouping_toggle_callback"
+    ),
+    CallbackData.SUBNET_IP_GROUPING_MODE_TOGGLE: _lazy(
+        "telegram_bot.handlers.settings", "subnet_ip_grouping_mode_toggle_callback"
+    ),
+    CallbackData.HIGH_TRUST_IP_GROUPING_MENU: _lazy(
+        "telegram_bot.handlers.settings", "high_trust_ip_grouping_menu_callback"
+    ),
+    CallbackData.HIGH_TRUST_IP_GROUPING_TOGGLE: _lazy(
+        "telegram_bot.handlers.settings", "high_trust_ip_grouping_toggle_callback"
+    ),
     CallbackData.DEVICE_COUNT_MENU: _lazy("telegram_bot.handlers.settings", "handle_device_count_menu_callback"),
-    CallbackData.DEVICE_COUNT_SET_DEVICE: _lazy("telegram_bot.handlers.settings", "handle_device_count_set_device_callback"),
+    CallbackData.DEVICE_COUNT_SET_DEVICE: _lazy(
+        "telegram_bot.handlers.settings", "handle_device_count_set_device_callback"
+    ),
     CallbackData.DEVICE_COUNT_SET_IP: _lazy("telegram_bot.handlers.settings", "handle_device_count_set_ip_callback"),
-
     # --- Trust ---------------------------------------------------------------
     CallbackData.TRUST_RESET_MENU: _lazy("telegram_bot.handlers.settings", "trust_reset_menu_callback"),
     CallbackData.TRUST_RESET_ALL: _lazy("telegram_bot.handlers.settings", "trust_reset_all_callback"),
-
     # --- CDN -----------------------------------------------------------------
     CallbackData.CDN_MODE_MENU: _lazy("telegram_bot.handlers.settings", "cdn_mode_menu_callback"),
     CallbackData.CDN_MODE_REMOVE: _lazy("telegram_bot.handlers.settings", "cdn_mode_remove_callback"),
@@ -598,7 +640,6 @@ CALLBACK_ROUTES = {
     CallbackData.CDN_PROVIDER_MENU: _lazy("telegram_bot.handlers.settings", "cdn_provider_menu_callback"),
     CallbackData.CDN_PROVIDER_CLOUDFLARE: _lazy("telegram_bot.handlers.settings", "cdn_provider_cloudflare_callback"),
     CallbackData.CDN_MODE_ADD: _cdn_mode_add,
-
     # --- Nodes ---------------------------------------------------------------
     CallbackData.NODE_SETTINGS_MENU: _lazy("telegram_bot.handlers.settings", "node_settings_menu_callback"),
     CallbackData.NODE_SETTINGS_REFRESH: _lazy("telegram_bot.handlers.settings", "node_settings_refresh_callback"),
@@ -606,12 +647,16 @@ CALLBACK_ROUTES = {
     CallbackData.NODE_DISABLED_MENU: _lazy("telegram_bot.handlers.settings", "node_disabled_menu_callback"),
     CallbackData.NODE_CDN_CLEAR: _lazy("telegram_bot.handlers.settings", "node_cdn_clear_callback"),
     CallbackData.NODE_DISABLED_CLEAR: _lazy("telegram_bot.handlers.settings", "node_disabled_clear_callback"),
-
     # --- IP source -----------------------------------------------------------
     CallbackData.IP_SOURCE_MENU: _lazy("telegram_bot.handlers.settings", "handle_ip_source_menu_callback"),
     CallbackData.IP_SOURCE_SET_LOGS: _lazy("telegram_bot.handlers.settings", "handle_ip_source_set_logs_callback"),
     CallbackData.IP_SOURCE_SET_API: _lazy("telegram_bot.handlers.settings", "handle_ip_source_set_api_callback"),
-    CallbackData.IP_SOURCE_SET_CONCURRENCY: _lazy("telegram_bot.handlers.settings", "handle_ip_source_concurrency_callback"),
+    CallbackData.IP_SOURCE_SET_CONCURRENCY: _lazy(
+        "telegram_bot.handlers.settings", "handle_ip_source_concurrency_callback"
+    ),
+    CallbackData.IP_SOURCE_SET_FRESHNESS: _lazy(
+        "telegram_bot.handlers.settings", "handle_ip_source_freshness_callback"
+    ),
     CallbackData.IP_SOURCE_STATS: _lazy("telegram_bot.handlers.settings", "handle_ip_source_stats_callback"),
 }
 
@@ -620,21 +665,49 @@ CALLBACK_ROUTES = {
 # CALLBACK QUERY HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all callback queries from inline keyboards."""
     query = update.callback_query
     await query.answer()
-    
+
     data = query.data
-    
+
     # Admin check - use effective_user.id for group compatibility
     user_id = update.effective_user.id if update.effective_user else None
     admins = await check_admin()
     if not user_id or user_id not in admins:
-        await query.edit_message_text(
-            text="Sorry, you do not have permission to use this bot."
-        )
+        end_input(context)
+        await query.edit_message_text(text="Sorry, you do not have permission to use this bot.")
         return
+
+    # Choice buttons carry no username, so only their current originating prompt
+    # may use the selected-user payload. Other callbacks replace pending input.
+    choices = {CallbackData.SPECIAL_LIMIT_1, CallbackData.SPECIAL_LIMIT_2, CallbackData.SPECIAL_LIMIT_CUSTOM}
+    if data in choices:
+        owner = context.user_data.get(OWNER_KEY)
+        if not accepts_inline(update, context, require_prompt=True) or owner.flow != "special_limit_choice":
+            await query.answer("This input session has expired. Open the limit menu again.", show_alert=True)
+            return
+    else:
+        end_input(context)
+
+    try:
+        await _dispatch_callback_query(update, context)
+    except Exception:
+        end_input(context)
+        raise
+    waiting_for = context.user_data.get("waiting_for")
+    if waiting_for or context.user_data.get("selected_user"):
+        bind_input(update, context, "inline", waiting_for or "special_limit_choice", prompt_id=query.message.message_id)
+    else:
+        end_input(context)
+
+
+async def _dispatch_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dispatch an authorized callback after its interaction ownership is checked."""
+    query = update.callback_query
+    data = query.data
 
     # Exact-match callbacks come from the routing table; only callbacks that
     # carry a payload (``prefix:value``) are matched below.
@@ -645,6 +718,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     if data.startswith("disabled_group_page:"):
         from telegram_bot.handlers.users import show_users_in_disabled_group
+
         page = int(data.split(":")[1])
         await show_users_in_disabled_group(query, page)
         return
@@ -664,16 +738,18 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     if data.startswith("punishment_remove_step:"):
         step_index = int(data.split(":")[1])
         from telegram_bot.handlers.punishment import punishment_remove_step
+
         await punishment_remove_step(update, context, step_index)
         return
-    
+
     # Handle edit step callbacks (click on step to edit)
     if data.startswith("punishment_edit_step:"):
         step_index = int(data.split(":")[1])
         from telegram_bot.handlers.punishment import punishment_edit_step
+
         await punishment_edit_step(update, context, step_index)
         return
-    
+
     # Handle update step callbacks (apply new type/duration to step)
     if data.startswith("punishment_update_step:"):
         parts = data.split(":")
@@ -681,9 +757,10 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         step_type = parts[2]
         duration = int(parts[3])
         from telegram_bot.handlers.punishment import punishment_update_step
+
         await punishment_update_step(update, context, step_index, step_type, duration)
         return
-    
+
     # Handle group filter toggle group callbacks
     if data.startswith("gf_toggle_group:"):
         group_id = int(data.split(":")[1])
@@ -702,23 +779,26 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         username = data.split(":")[1]
         await handle_admin_filter_toggle_admin_callback(query, context, username)
         return
-    
+
     # Handle CDN remove inbound callbacks
     if data.startswith("cdn_remove_"):
         from telegram_bot.handlers.settings import cdn_mode_remove_inbound_callback
+
         await cdn_mode_remove_inbound_callback(query, context)
         return
-    
+
     # Handle node toggle callbacks
     if data.startswith("node_cdn_toggle:"):
         node_id = int(data.split(":")[1])
         from telegram_bot.handlers.settings import node_cdn_toggle_callback
+
         await node_cdn_toggle_callback(query, context, node_id)
         return
 
     if data.startswith("node_disabled_toggle:"):
         node_id = int(data.split(":")[1])
         from telegram_bot.handlers.settings import node_disabled_toggle_callback
+
         await node_disabled_toggle_callback(query, context, node_id)
         return
 
@@ -727,100 +807,98 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         username = data.split(":", 1)[1]
         await enable_single_user(query, username)
         return
-    
+
     if data.startswith("disabled_page:"):
         page = int(data.split(":", 1)[1])
         await show_disabled_users_menu(query, page=page)
         return
-    
+
     # Handle special limits pagination
     if data.startswith("special_limits_page:"):
         page = int(data.split(":", 1)[1])
         await handle_special_limits_page_callback(query, context, page)
         return
-    
+
     # Handle edit special limit callback
     if data.startswith("edit_special_limit:"):
         username = data.split(":", 1)[1]
         await handle_edit_special_limit_callback(query, context, username)
         return
-    
+
     # Handle special limit info callback
     if data.startswith("special_limit_info:"):
         username = data.split(":", 1)[1]
         await handle_special_limit_info_callback(query, context, username)
         return
-    
+
     # Handle remove special limit callback
     if data.startswith("remove_special_limit:"):
         username = data.split(":", 1)[1]
         await handle_remove_special_limit_callback(query, context, username)
         return
-    
+
     # Handle whitelist pagination
     if data.startswith("whitelist_page:"):
         page = int(data.split(":", 1)[1])
         await handle_whitelist_page_callback(query, context, page)
         return
-    
+
     # Handle whitelist info callback
     if data.startswith("whitelist_info:"):
         username = data.split(":", 1)[1]
         await handle_whitelist_info_callback(query, context, username)
         return
-    
+
     # Handle delete whitelist callback
     if data.startswith("delete_whitelist:"):
         username = data.split(":", 1)[1]
         await handle_delete_whitelist_callback(query, context, username)
         return
-    
+
     # Handle filtered users pagination
     if data.startswith("filtered_page:"):
         page = int(data.split(":", 1)[1])
         await handle_filtered_users_menu(query, context, page)
         return
-    
+
     # Handle filtered user info callback (placeholder - just shows user is monitored)
     if data.startswith("filtered_info:"):
         username = data.split(":", 1)[1]
         await query.answer(f"User {username} - under general limit", show_alert=True)
         return
-    
+
     # Handle admins pagination
     if data.startswith("admins_page:"):
         page = int(data.split(":", 1)[1])
         await handle_admins_page_callback(query, context, page)
         return
-    
+
     # Handle admin info callback
     if data.startswith("admin_info:"):
         admin_id = data.split(":", 1)[1]
         await handle_admin_info_callback(query, context, admin_id)
         return
-    
+
     # Handle delete admin callback
     if data.startswith("delete_admin:"):
         admin_id = data.split(":", 1)[1]
         await handle_delete_admin_callback(query, context, admin_id)
         return
-    
+
     # Handle add_except:username callback (from notification buttons)
     if data.startswith("add_except:"):
         username = data.split(":", 1)[1]
         result = await add_except_user(username)
         if result:
             await query.edit_message_text(
-                text=f"✅ User <code>{html.escape(username)}</code> added to except list!",
-                parse_mode="HTML"
+                text=f"✅ User <code>{html.escape(username)}</code> added to except list!", parse_mode="HTML"
             )
         else:
             await query.edit_message_text(
-                text=f"⚠️ Failed to add <code>{html.escape(username)}</code> to except list.",
-                parse_mode="HTML"
+                text=f"⚠️ Failed to add <code>{html.escape(username)}</code> to except list.", parse_mode="HTML"
             )
         return
-    
+
     # Handle set_limit:username:limit callback (from notification buttons)
     if data.startswith("set_limit:"):
         parts = data.split(":")
@@ -830,8 +908,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 limit = int(parts[2])
             except ValueError:
                 await query.edit_message_text(
-                    text=f"❌ Malformed limit in the button: <code>{parts[2]}</code>",
-                    parse_mode="HTML"
+                    text=f"❌ Malformed limit in the button: <code>{parts[2]}</code>", parse_mode="HTML"
                 )
                 return
             # The button's number comes from the general limit at the time the
@@ -846,15 +923,14 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             if result:
                 await query.edit_message_text(
                     text=f"✅ Special limit <b>{limit}</b> set for <code>{html.escape(username)}</code>!",
-                    parse_mode="HTML"
+                    parse_mode="HTML",
                 )
             else:
                 await query.edit_message_text(
-                    text=f"⚠️ Failed to set special limit for <code>{html.escape(username)}</code>.",
-                    parse_mode="HTML"
+                    text=f"⚠️ Failed to set special limit for <code>{html.escape(username)}</code>.", parse_mode="HTML"
                 )
         return
-    
+
     # Handle custom_limit:username callback (from notification buttons)
     if data.startswith("custom_limit:"):
         username = data.split(":", 1)[1]
@@ -862,11 +938,11 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data["waiting_for"] = "notification_custom_limit"
         await query.edit_message_text(
             text=f"🎯 <b>Set Custom Limit for: {html.escape(username)}</b>\n\n"
-                 "Send the device limit number (e.g., <code>3</code>):",
-            parse_mode="HTML"
+            "Send the device limit number (e.g., <code>3</code>):",
+            parse_mode="HTML",
         )
         return
-    
+
     # Handle user_info: callback (informational only, from disabled users list)
     if data.startswith("user_info:"):
         username = data.split(":", 1)[1]
@@ -876,15 +952,14 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     # Fallback for unhandled callbacks
     bot_logger.warning(f"Unhandled callback data: {data}")
     await query.edit_message_text(
-        text=f"⚠️ Unhandled callback: {data}",
-        reply_markup=create_back_to_main_keyboard(),
-        parse_mode="HTML"
+        text=f"⚠️ Unhandled callback: {data}", reply_markup=create_back_to_main_keyboard(), parse_mode="HTML"
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TEXT MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages for inline keyboard flows."""
@@ -893,39 +968,60 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not waiting_for:
         return
 
+    if not accepts_inline(update, context):
+        # Retired/unscoped markers are not sufficient authority to accept input.
+        if not context.user_data.get(OWNER_KEY):
+            end_input(context)
+        return
+
     # A waiting_for state is a pending mutation begun from an inline flow. Re-check
     # privilege here so a revoked admin cannot complete it; entry authorization alone
     # is not enough for a continuation.
     if await check_admin_privilege(update) is not None:
-        context.user_data["waiting_for"] = None
+        end_input(context)
         return
+
+    try:
+        result = await _dispatch_inline_text(update, context, waiting_for)
+    except Exception:
+        end_input(context)
+        raise
+    if waiting_for == "special_limit_username" and context.user_data.get("selected_user"):
+        bind_input(update, context, "inline", "special_limit_choice", prompt_id=result.message_id)
+    elif not context.user_data.get("waiting_for"):
+        end_input(context)
+    elif result is not None:
+        bind_input(update, context, "inline", context.user_data["waiting_for"], prompt_id=result.message_id)
+
+
+async def _dispatch_inline_text(update: Update, context: ContextTypes.DEFAULT_TYPE, waiting_for: str):
+    """Route input accepted by the active inline interaction."""
 
     # Handle different input types based on waiting_for state
     if waiting_for == "general_limit":
         await handle_general_limit_input(update, context)
         return
-    
+
     if waiting_for == "special_limit_username":
-        await handle_special_limit_username_input(update, context)
-        return
-    
+        return await handle_special_limit_username_input(update, context)
+
     if waiting_for == "special_limit_number":
         await handle_special_limit_number_input(update, context)
         return
-    
+
     if waiting_for == "ipinfo_token":
         await handle_ipinfo_token_input(update, context)
         return
-    
+
     # Handle except user input
     if waiting_for == "except_user":
         await handle_except_user_input(update, context)
         return
-    
+
     if waiting_for == "remove_except_user":
         await handle_remove_except_user_input(update, context)
         return
-    
+
     # Handle notification custom limit input
     if waiting_for == "notification_custom_limit":
         username = context.user_data.get("selected_user")
@@ -935,26 +1031,22 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 limit = int(text)
                 rejection = special_limit_rejection(limit)
                 if rejection:
-                    await update.message.reply_html(
-                        text=rejection,
-                        reply_markup=create_back_to_main_keyboard()
-                    )
+                    await update.message.reply_html(text=rejection, reply_markup=create_back_to_main_keyboard())
                 else:
                     result = await handel_special_limit(username, limit)
                     if result:
                         await update.message.reply_html(
                             text=f"✅ Special limit <b>{limit}</b> set for <code>{html.escape(username)}</code>!",
-                            reply_markup=create_back_to_main_keyboard()
+                            reply_markup=create_back_to_main_keyboard(),
                         )
                     else:
                         await update.message.reply_html(
                             text=f"⚠️ Failed to set special limit for <code>{html.escape(username)}</code>.",
-                            reply_markup=create_back_to_main_keyboard()
+                            reply_markup=create_back_to_main_keyboard(),
                         )
             except ValueError:
                 await update.message.reply_html(
-                    text="❌ Invalid number. Please send a valid number.",
-                    reply_markup=create_back_to_main_keyboard()
+                    text="❌ Invalid number. Please send a valid number.", reply_markup=create_back_to_main_keyboard()
                 )
             context.user_data.pop("selected_user", None)
         context.user_data["waiting_for"] = None
@@ -964,29 +1056,37 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await receive_group_limit(update, context)
         context.user_data["waiting_for"] = None
         return
-    
+
     # Handle CDN inbound input
     if waiting_for == "cdn_inbound":
         from telegram_bot.handlers.settings import cdn_mode_add_handler
+
         await cdn_mode_add_handler(update, context)
         context.user_data["waiting_for"] = None
         return
-    
+
     # Handle IP source concurrency input. ``waiting_for`` is cleared first so
     # the handler can re-arm it when the value is rejected.
     if waiting_for == "ip_source_concurrency":
         from telegram_bot.handlers.settings import ip_source_concurrency_handler
+
         context.user_data["waiting_for"] = None
-        await ip_source_concurrency_handler(update, context)
-        return
+        return await ip_source_concurrency_handler(update, context)
+
+    if waiting_for == "ip_source_freshness":
+        from telegram_bot.handlers.settings import ip_source_freshness_handler
+
+        context.user_data["waiting_for"] = None
+        return await ip_source_freshness_handler(update, context)
 
     # Handle forum group ID input
     if waiting_for == "forum_group_id":
         from telegram_bot.handlers.topics_settings import topics_set_group_receive
+
         await topics_set_group_receive(update, context)
         context.user_data["waiting_for"] = None
         return
-    
+
     # Reset if no handler found
     context.user_data["waiting_for"] = None
 
@@ -995,13 +1095,24 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 # DOCUMENT MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 async def document_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle document uploads (for restore)."""
     waiting_for = context.user_data.get("waiting_for")
-    
-    if waiting_for == "restore":
-        await restore_config_handler(update, context)
-        return
+
+    if waiting_for == "restore" and accepts_inline(update, context):
+        try:
+            if await check_admin_privilege(update) is None:
+                await restore_config_handler(update, context)
+        finally:
+            end_input(context)
+
+
+async def cancel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel any pending command or inline input interaction."""
+    end_input(context)
+    if await check_admin_privilege(update) is None:
+        await update.message.reply_html("❌ Input cancelled.", reply_markup=create_back_to_main_keyboard())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1009,13 +1120,13 @@ async def document_message_handler(update: Update, context: ContextTypes.DEFAULT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Core commands
+application.add_handler(MessageHandler(filters.COMMAND, supersede_input), group=-1)
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("help", help_command))
+application.add_handler(CommandHandler("cancel", cancel_input))
 
-# Callback handler stays in the default group; the catch-all text router is pushed to
-# a later group so an active ConversationHandler (group 0) sees its text state first.
-# python-telegram-bot runs at most one handler per group, so a same-group catch-all
-# would otherwise consume the reply before the conversation.
+# Owned conversations stop later groups after applying their state transition.
+# Inline routers run later and accept only their own scoped pending interaction.
 application.add_handler(CallbackQueryHandler(callback_query_handler))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler), group=1)
 
@@ -1024,16 +1135,24 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_mes
 
 # Admin management
 application.add_handler(
-    ConversationHandler(
+    ScopedConversationHandler(
+        application,
         entry_points=[CommandHandler("add_admin", add_admin)],
-        states={GET_CHAT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_chat_id))]},
+        states={
+            GET_CHAT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_chat_id))]
+        },
         fallbacks=[],
     )
 )
 application.add_handler(
-    ConversationHandler(
+    ScopedConversationHandler(
+        application,
         entry_points=[CommandHandler("remove_admin", remove_admin)],
-        states={GET_CHAT_ID_TO_REMOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_chat_id_to_remove))]},
+        states={
+            GET_CHAT_ID_TO_REMOVE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_chat_id_to_remove))
+            ]
+        },
         fallbacks=[],
     )
 )
@@ -1041,7 +1160,8 @@ application.add_handler(CommandHandler("admins_list", admins_list))
 
 # Config management
 application.add_handler(
-    ConversationHandler(
+    ScopedConversationHandler(
+        application,
         entry_points=[CommandHandler("create_config", set_panel_domain)],
         states={
             GET_DOMAIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_domain))],
@@ -1054,36 +1174,58 @@ application.add_handler(
 
 # Limits management
 application.add_handler(
-    ConversationHandler(
+    ScopedConversationHandler(
+        application,
         entry_points=[CommandHandler("set_special_limit", set_special_limit)],
         states={
-            GET_SPECIAL_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_special_limit))],
-            GET_LIMIT_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_limit_number))],
+            GET_SPECIAL_LIMIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_special_limit))
+            ],
+            GET_LIMIT_NUMBER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_limit_number))
+            ],
         },
         fallbacks=[],
     )
 )
 application.add_handler(CommandHandler("show_special_limit", show_special_limit_function))
 application.add_handler(
-    ConversationHandler(
+    ScopedConversationHandler(
+        application,
         entry_points=[CommandHandler("set_general_limit_number", get_general_limit_number)],
-        states={GET_GENERAL_LIMIT_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_general_limit_number_handler))]},
+        states={
+            GET_GENERAL_LIMIT_NUMBER: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_general_limit_number_handler)
+                )
+            ]
+        },
         fallbacks=[],
     )
 )
 
 # User management
 application.add_handler(
-    ConversationHandler(
+    ScopedConversationHandler(
+        application,
         entry_points=[CommandHandler("set_except_user", set_except_users)],
-        states={SET_EXCEPT_USERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(set_except_users_handler))]},
+        states={
+            SET_EXCEPT_USERS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(set_except_users_handler))
+            ]
+        },
         fallbacks=[],
     )
 )
 application.add_handler(
-    ConversationHandler(
+    ScopedConversationHandler(
+        application,
         entry_points=[CommandHandler("remove_except_user", remove_except_user)],
-        states={REMOVE_EXCEPT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(remove_except_user_handler))]},
+        states={
+            REMOVE_EXCEPT_USER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(remove_except_user_handler))
+            ]
+        },
         fallbacks=[],
     )
 )
@@ -1091,15 +1233,22 @@ application.add_handler(CommandHandler("show_except_users", show_except_users))
 
 # Settings
 application.add_handler(
-    ConversationHandler(
+    ScopedConversationHandler(
+        application,
         entry_points=[CommandHandler("set_ipinfo_token", set_ipinfo_token)],
-        states={SET_IPINFO_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(ipinfo_token_handler))]},
+        states={
+            SET_IPINFO_TOKEN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(ipinfo_token_handler))
+            ]
+        },
         fallbacks=[],
     )
 )
 
 # Monitoring
 application.add_handler(CommandHandler("monitoring_status", monitoring_status))
+application.add_handler(CommandHandler("status", status_command))
+application.add_handler(CommandHandler("health_report", health_report_command))
 application.add_handler(CommandHandler("monitoring_details", monitoring_details))
 application.add_handler(CommandHandler("clear_monitoring", clear_monitoring))
 
@@ -1115,16 +1264,20 @@ application.add_handler(CommandHandler("ip_history_48h", ip_history_48h_command)
 # Backup
 application.add_handler(CommandHandler("backup", send_backup))
 application.add_handler(
-    ConversationHandler(
+    ScopedConversationHandler(
+        application,
         entry_points=[CommandHandler("restore", restore_config)],
-        states={RESTORE_CONFIG: [MessageHandler(filters.Document.ALL, require_admin_continuation(restore_config_handler))]},
+        states={
+            RESTORE_CONFIG: [MessageHandler(filters.Document.ALL, require_admin_continuation(restore_config_handler))]
+        },
         fallbacks=[],
     )
 )
 
 # Migrate backup (JSON to SQLite)
 application.add_handler(
-    ConversationHandler(
+    ScopedConversationHandler(
+        application,
         entry_points=[CommandHandler("migrate_backup", migrate_backup_start)],
         states={
             MIGRATE_WAITING_FILE: [

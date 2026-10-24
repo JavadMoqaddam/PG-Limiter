@@ -34,39 +34,76 @@ def _load_disable_messages() -> dict:
 
 
 def _save_disable_messages(data: dict) -> None:
-    """Save disable messages tracking to file."""
+    """Persist receipt ownership; the worker retries tracking if this fails."""
+    atomic_write_json(DISABLE_MESSAGES_FILE, data)
+
+
+async def _write_disable_messages(data: dict) -> None:
+    writer = asyncio.create_task(asyncio.to_thread(_save_disable_messages, data))
     try:
-        atomic_write_json(DISABLE_MESSAGES_FILE, data)
-    except Exception as e:
-        tg_send_logger.error(f"Error saving disable messages: {e}")
+        await asyncio.shield(writer)
+    except asyncio.CancelledError:
+        await writer
+        raise
 
 
-async def track_disable_message(username: str, message_id: int, chat_id: int) -> None:
-    """Track a disable message for later deletion."""
+def _receipts(info: dict) -> dict:
+    if "receipts" in info:
+        return dict(info["receipts"])
+    if "message_id" in info and "chat_id" in info:
+        return {
+            f"legacy:{info['chat_id']}:{info['message_id']}": {
+                "message_id": info["message_id"],
+                "chat_id": info["chat_id"],
+            }
+        }
+    return {}
+
+
+async def track_disable_message(username: str, message_id: int, chat_id: int, event_id: Optional[str] = None) -> None:
+    """Keep all event receipts while preserving the legacy latest-message view."""
     async with _disable_msg_lock:
         data = await asyncio.to_thread(_load_disable_messages)
-        data[username] = {"message_id": message_id, "chat_id": chat_id}
-        await asyncio.to_thread(_save_disable_messages, data)
-    tg_send_logger.debug(f"📝 Tracked disable message for {username}: msg={message_id}, chat={chat_id}")
+        receipts = _receipts(data.get(username, {}))
+        receipts[event_id or f"{chat_id}:{message_id}"] = {"message_id": message_id, "chat_id": chat_id}
+        data[username] = {"message_id": message_id, "chat_id": chat_id, "receipts": receipts}
+        await _write_disable_messages(data)
 
 
 async def get_disable_message(username: str) -> Optional[Tuple[int, int]]:
-    """Get tracked disable message for a user. Returns (message_id, chat_id) or None."""
+    """Return the latest receipt for backward-compatible callers."""
     data = await asyncio.to_thread(_load_disable_messages)
-    msg_info = data.get(username)
-    if msg_info:
-        return (msg_info["message_id"], msg_info["chat_id"])
-    return None
+    info = data.get(username)
+    return (info["message_id"], info["chat_id"]) if info else None
 
 
-async def remove_disable_message_tracking(username: str) -> None:
-    """Remove tracking for a user's disable message."""
+async def get_disable_messages(username: str) -> list[Tuple[int, int]]:
+    """Return every known delivered notice for this user's cancellation key."""
     async with _disable_msg_lock:
         data = await asyncio.to_thread(_load_disable_messages)
-        if username in data:
-            del data[username]
-            await asyncio.to_thread(_save_disable_messages, data)
-            tg_send_logger.debug(f"🗑️ Removed disable message tracking for {username}")
+        return [(receipt["message_id"], receipt["chat_id"]) for receipt in _receipts(data.get(username, {})).values()]
+
+
+async def remove_disable_message_tracking(username: str, message_info: Optional[Tuple[int, int]] = None) -> None:
+    """Clear only the deleted receipt when supplied; never erase a newer event."""
+    async with _disable_msg_lock:
+        data = await asyncio.to_thread(_load_disable_messages)
+        if username not in data:
+            return
+        if message_info is None:
+            data.pop(username)
+        else:
+            receipts = {
+                key: value
+                for key, value in _receipts(data[username]).items()
+                if (value["message_id"], value["chat_id"]) != message_info
+            }
+            if receipts:
+                latest = list(receipts.values())[-1]
+                data[username] = {**latest, "receipts": receipts}
+            else:
+                data.pop(username)
+        await _write_disable_messages(data)
 
 
 import html as html_lib
@@ -102,14 +139,14 @@ def _split_message(msg: str, max_length: int) -> list[str]:
         split_pos = remaining.rfind("\n\n", 0, max_length)
         if split_pos > max_length // 4:
             chunks.append(remaining[:split_pos])
-            remaining = remaining[split_pos + 2:]
+            remaining = remaining[split_pos + 2 :]
             continue
 
         # Try splitting at single newline
         split_pos = remaining.rfind("\n", 0, max_length)
         if split_pos > max_length // 4:
             chunks.append(remaining[:split_pos])
-            remaining = remaining[split_pos + 1:]
+            remaining = remaining[split_pos + 1 :]
             continue
 
         # Hard split at max_length as last resort
@@ -117,37 +154,6 @@ def _split_message(msg: str, max_length: int) -> list[str]:
         remaining = remaining[max_length:]
 
     return chunks
-
-
-# Upper bound on how long a dedup mark waits for delivery confirmation before giving
-# up. Skipping the mark risks a later duplicate, never suppression of a real message.
-_DEDUP_MARK_TIMEOUT = 300.0
-
-# Strong references to the background dedup-mark tasks. The event loop only holds a
-# weak reference, so without this a task could be garbage-collected mid-flight and the
-# dedup key would silently never be marked.
-_pending_dedup_tasks: set = set()
-
-
-def _mark_dedup_after_delivery(topics_manager, topic_type, message_key, futures, expected=None):
-    """Mark a dedup key only after every required send is confirmed delivered.
-
-    Runs in the background so a fire-and-forget caller is not blocked, and marks
-    nothing unless each future resolves to a delivered (non-None) result.
-    """
-    required = expected if expected is not None else len(futures)
-
-    async def _await_and_mark():
-        try:
-            results = await asyncio.wait_for(asyncio.gather(*futures), timeout=_DEDUP_MARK_TIMEOUT)
-        except Exception:
-            return
-        if len(results) >= required and all(result is not None for result in results):
-            await topics_manager.mark_message_sent(topic_type, message_key)
-
-    task = asyncio.ensure_future(_await_and_mark())
-    _pending_dedup_tasks.add(task)
-    task.add_done_callback(_pending_dedup_tasks.discard)
 
 
 async def send_logs(
@@ -160,119 +166,70 @@ async def send_logs(
     ttl: Optional[float] = None,
     cancel_key: Optional[str] = None,
 ) -> Optional[Tuple[int, int]]:
-    """
-    Send logs to forum group topic via TelegramDispatcher with rate limiting and prioritization.
-    
-    Args:
-        msg: HTML formatted message text
-        return_message_id: If True, awaits delivery and returns (message_id, chat_id)
-        reply_markup: Optional inline keyboard markup
-        topic_type: Topic type enum
-        message_key: Optional deduplication key
-        priority: Priority level (Priority.CRITICAL, WARNINGS, SYSTEM)
-        ttl: Optional Time-To-Live in seconds
-        cancel_key: Key used to cancel message before delivery if needed
-        
-    Returns:
-        (message_id, chat_id) or None
-    """
+    """Admit one owned outbound batch with the destination captured before any await."""
     msg = _sanitize_html_message(msg)
-    topics_manager = get_topics_manager()
-
-    if not topics_manager.group_id:
-        tg_send_logger.warning("⚠️ No forum group configured to send logs")
+    manager = get_topics_manager()
+    if not manager.enabled:
+        tg_send_logger.debug("Topics are disabled; monitoring logs are not queued")
         return None
-
-    if not topics_manager.enabled:
-        await topics_manager.set_enabled(True)
-
-    # Check for duplicate if message_key provided
-    if message_key and topics_manager.is_message_sent(topic_type, message_key):
-        tg_send_logger.debug(f"⏭️ Skipping duplicate message: {message_key[:50]}...")
+    chat_id = manager.group_id
+    if not chat_id:
+        tg_send_logger.warning("No forum group configured to send logs")
         return None
-
-    # A dedup key needs a delivery outcome, so request a future even when the caller
-    # is fire-and-forget; the key is marked from that outcome, never before it.
-    need_future = return_message_id or bool(message_key)
-
-    # Auto-split messages exceeding Telegram's 4096 char limit (use 3900 safe margin for HTML overhead)
-    TELEGRAM_MAX_LENGTH = 3900
-    if len(msg) > TELEGRAM_MAX_LENGTH:
-        tg_send_logger.warning(f"⚠️ Message too long ({len(msg)} chars), auto-splitting into chunks")
-        chunks = _split_message(msg, TELEGRAM_MAX_LENGTH)
-        dispatcher = get_dispatcher()
-        chunk_futures = []
-        for i, chunk in enumerate(chunks):
-            chunk_future = await dispatcher.enqueue_send(
-                text=chunk,
-                topic_type=topic_type,
-                priority=priority,
-                reply_markup=reply_markup if i == len(chunks) - 1 else None,
-                ttl=ttl,
-                cancel_key=f"{cancel_key}_part{i}" if cancel_key else None,
-                return_future=need_future,
-            )
-            if chunk_future is not None:
-                chunk_futures.append(chunk_future)
-
-        if message_key and chunk_futures:
-            # Mark only once every chunk is confirmed delivered.
-            _mark_dedup_after_delivery(
-                topics_manager, topic_type, message_key, chunk_futures, expected=len(chunks)
-            )
-
-        if return_message_id and chunk_futures:
-            try:
-                results = await asyncio.wait_for(asyncio.gather(*chunk_futures), timeout=10.0)
-                return results[-1] if results else None
-            except (asyncio.TimeoutError, Exception):
-                return None
+    thread_id = manager.get_topic_id(topic_type) or manager.get_topic_id(TopicType.GENERAL)
+    if message_key and manager.is_message_sent(topic_type, message_key):
         return None
-
-    dispatcher = get_dispatcher()
-    future = await dispatcher.enqueue_send(
-        text=msg,
+    futures = await get_dispatcher().enqueue_send_batch(
+        _split_message(msg, 3900),
         topic_type=topic_type,
         priority=priority,
         reply_markup=reply_markup,
         ttl=ttl,
         cancel_key=cancel_key,
-        return_future=need_future,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        message_key=message_key,
     )
-
-    if message_key and future is not None:
-        _mark_dedup_after_delivery(topics_manager, topic_type, message_key, [future])
-
-    if return_message_id and future:
+    if return_message_id and futures:
         try:
-            result = await asyncio.wait_for(future, timeout=10.0)
-            return result
+            # Caller cancellation/timeout owns only these shields, not shared delivery.
+            results = await asyncio.wait_for(
+                asyncio.gather(*(asyncio.shield(future) for future in futures)), timeout=10.0
+            )
+            return results[-1] if results and all(result is not None for result in results) else None
         except asyncio.TimeoutError:
-            tg_send_logger.warning("⏱ Timeout waiting for message send result from dispatcher")
-            return None
-        except Exception as e:
-            tg_send_logger.error(f"❌ Error waiting for message send result: {e}")
-            return None
-
+            tg_send_logger.warning("Timeout waiting for outbound batch delivery")
+        except Exception as error:
+            tg_send_logger.error(f"Error waiting for outbound delivery: {error}")
     return None
 
 
-async def send_warning_log(msg: str, return_message_id: bool = False, reply_markup: Any = None, ttl: Optional[float] = None) -> Optional[Tuple[int, int]]:
+async def send_warning_log(
+    msg: str, return_message_id: bool = False, reply_markup: Any = None, ttl: Optional[float] = None
+) -> Optional[Tuple[int, int]]:
     """Send a warning message to the warnings topic with Priority.WARNINGS."""
-    return await send_logs(msg, return_message_id, reply_markup, TopicType.WARNINGS, priority=Priority.WARNINGS, ttl=ttl)
+    return await send_logs(
+        msg, return_message_id, reply_markup, TopicType.WARNINGS, priority=Priority.WARNINGS, ttl=ttl
+    )
 
 
-async def send_disable_enable_log(msg: str, return_message_id: bool = False, reply_markup: Any = None) -> Optional[Tuple[int, int]]:
+async def send_disable_enable_log(
+    msg: str, return_message_id: bool = False, reply_markup: Any = None
+) -> Optional[Tuple[int, int]]:
     """Send a disable/enable message to the disable_enable topic with Priority.CRITICAL."""
     return await send_logs(msg, return_message_id, reply_markup, TopicType.DISABLE_ENABLE, priority=Priority.CRITICAL)
 
 
-async def send_backup_log(msg: str, return_message_id: bool = False, reply_markup: Any = None) -> Optional[Tuple[int, int]]:
+async def send_backup_log(
+    msg: str, return_message_id: bool = False, reply_markup: Any = None
+) -> Optional[Tuple[int, int]]:
     """Send a backup message to the backups topic with Priority.SYSTEM."""
     return await send_logs(msg, return_message_id, reply_markup, TopicType.BACKUPS, priority=Priority.SYSTEM)
 
 
-async def send_no_limit_log(msg: str, return_message_id: bool = False, reply_markup: Any = None) -> Optional[Tuple[int, int]]:
+async def send_no_limit_log(
+    msg: str, return_message_id: bool = False, reply_markup: Any = None
+) -> Optional[Tuple[int, int]]:
     """Send a no-limit message to the no_limit topic with Priority.SYSTEM."""
     return await send_logs(msg, return_message_id, reply_markup, TopicType.NO_LIMIT, priority=Priority.SYSTEM)
 
@@ -280,10 +237,10 @@ async def send_no_limit_log(msg: str, return_message_id: bool = False, reply_mar
 async def delete_message(message_info: Optional[Tuple[int, int]]) -> bool:
     """
     Delete a message through the rate-limited dispatcher.
-    
+
     Args:
         message_info: Tuple of (message_id, chat_id)
-        
+
     Returns:
         True if successfully enqueued/deleted, False otherwise
     """
@@ -302,7 +259,7 @@ async def delete_message(message_info: Optional[Tuple[int, int]]) -> bool:
     )
     if future:
         try:
-            return bool(await asyncio.wait_for(future, timeout=10.0))
+            return bool(await asyncio.wait_for(asyncio.shield(future), timeout=10.0))
         except asyncio.TimeoutError:
             tg_send_logger.warning(f"⏱ Timeout waiting for delete result of message {message_id}")
             return False
@@ -315,11 +272,11 @@ async def delete_message(message_info: Optional[Tuple[int, int]]) -> bool:
 async def edit_message(message_info: Optional[Tuple[int, int]], new_text: str) -> bool:
     """
     Edit an existing message through the rate-limited dispatcher.
-    
+
     Args:
         message_info: Tuple of (message_id, chat_id)
         new_text: The new text to replace the message with
-        
+
     Returns:
         True if successfully edited, False otherwise
     """
@@ -339,7 +296,7 @@ async def edit_message(message_info: Optional[Tuple[int, int]], new_text: str) -
     )
     if future:
         try:
-            return bool(await asyncio.wait_for(future, timeout=10.0))
+            return bool(await asyncio.wait_for(asyncio.shield(future), timeout=10.0))
         except asyncio.TimeoutError:
             tg_send_logger.warning(f"⏱ Timeout waiting for edit result of message {message_id}")
             return False
@@ -352,8 +309,8 @@ async def edit_message(message_info: Optional[Tuple[int, int]], new_text: str) -
 async def send_disable_notification(msg: str, username: str) -> None:
     """
     Send a disable notification with an Enable button to the disable/enable topic.
-    Guaranteed delivery with Priority.CRITICAL and tracks message ID for deletion.
-    
+    Persisted with Priority.CRITICAL; confirmed receipts are tracked for deletion.
+
     Args:
         msg: The message text to send
         username: The username that was disabled
@@ -382,42 +339,25 @@ safe_send_disable_notification = send_disable_notification
 
 
 async def cancel_or_delete_disable_message(username: str) -> bool:
-    """
-    Dual cancel/delete workflow:
-    1. If a disable message is still pending in the dispatcher queue, cancel it.
-    2. If it was already sent to Telegram, delete it and clear tracking.
-    
-    Args:
-        username: Username to cancel or delete disable notification for
-        
-    Returns:
-        True if cancelled or deleted, False otherwise
-    """
-    dispatcher = get_dispatcher()
-    cancel_key = f"disable:{username}"
-
-    # 1. Try cancelling pending queue item
-    if await dispatcher.cancel_pending(cancel_key):
-        await remove_disable_message_tracking(username)
-        tg_send_logger.info(f"🚫 Cancelled pending disable message in queue for {username}")
-        return True
-
-    # 2. If already sent to Telegram, delete it
-    message_info = await get_disable_message(username)
-    if message_info:
-        deleted = await delete_message(message_info)
-        await remove_disable_message_tracking(username)
-        if deleted:
-            tg_send_logger.info(f"🗑️ Deleted disable message for {username}")
-        return deleted
-
-    return False
+    """Cancel pre-send events, then delete each known delivered receipt safely."""
+    cancelled = await get_dispatcher().cancel_pending(f"disable:{username}")
+    receipts = await get_disable_messages(username)
+    success = cancelled
+    failed = False
+    for receipt in receipts:
+        if await delete_message(receipt):
+            await remove_disable_message_tracking(username, receipt)
+            success = True
+        else:
+            # Preserve failed deletion ownership for a later cleanup attempt.
+            failed = True
+    return success and not failed
 
 
 async def send_enable_notification(username: str, delete_disable_msg: bool = False) -> None:
     """
     Send an enable notification without deleting the original disable message.
-    
+
     Args:
         username: The username that was enabled
         delete_disable_msg: Whether to cancel/delete the original disable message (default: False)
@@ -457,19 +397,27 @@ async def send_user_message(
     topics_manager = get_topics_manager()
     message_key = f"no_limit:{username}"
 
-    if not topics_manager.group_id or topics_manager.is_message_sent(TopicType.NO_LIMIT, message_key):
+    if (
+        not topics_manager.enabled
+        or not topics_manager.group_id
+        or topics_manager.is_message_sent(TopicType.NO_LIMIT, message_key)
+    ):
         return
 
     reply_markup = None
     if not has_special_limit and not is_except:
         keyboard = [
             [
-                InlineKeyboardButton(f"📱 Set {device_count} limit", callback_data=f"set_limit:{username}:{device_count}"),
+                InlineKeyboardButton(
+                    f"📱 Set {device_count} limit", callback_data=f"set_limit:{username}:{device_count}"
+                ),
                 InlineKeyboardButton("🚫 Add to except", callback_data=f"add_except:{username}"),
             ],
             [
                 InlineKeyboardButton("1️⃣ Set 1 device", callback_data=f"set_limit:{username}:1"),
-                InlineKeyboardButton(f"🔢 Set {general_limit} (general)", callback_data=f"set_limit:{username}:{general_limit}"),
+                InlineKeyboardButton(
+                    f"🔢 Set {general_limit} (general)", callback_data=f"set_limit:{username}:{general_limit}"
+                ),
             ],
             [
                 InlineKeyboardButton("✏️ Custom limit", callback_data=f"custom_limit:{username}"),

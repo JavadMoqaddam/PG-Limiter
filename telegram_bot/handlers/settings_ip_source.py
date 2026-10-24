@@ -8,13 +8,16 @@ the only way to tell a healthy cycle from a skipped one.
 """
 
 import time
+from html import escape
+
+from utils.log_observations import LOG_OBSERVATIONS
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from telegram_bot.constants import CallbackData
-from utils.read_config import normalize_min_coverage, read_config, save_config_value
+from utils.read_config import normalize_api_ip_freshness, normalize_min_coverage, read_config, save_config_value
 
 
 def _build_panel_data(config_data: dict):
@@ -29,27 +32,20 @@ def _build_panel_data(config_data: dict):
     )
 
 
-def create_ip_source_keyboard(current_source: str, concurrency: int):
+def create_ip_source_keyboard(current_source: str, concurrency: int, freshness: int = 60):
     """Create the IP source selection keyboard with the active mode marked."""
     logs_prefix = "✅" if current_source == "logs" else "⬜"
     api_prefix = "✅" if current_source == "api" else "⬜"
     keyboard = [
-        [InlineKeyboardButton(
-            f"{logs_prefix} 📜 Node Logs (SSE)",
-            callback_data=CallbackData.IP_SOURCE_SET_LOGS
-        )],
-        [InlineKeyboardButton(
-            f"{api_prefix} 🛰️ Panel API",
-            callback_data=CallbackData.IP_SOURCE_SET_API
-        )],
-        [InlineKeyboardButton(
-            f"⚡ API Concurrency: {concurrency}",
-            callback_data=CallbackData.IP_SOURCE_SET_CONCURRENCY
-        )],
-        [InlineKeyboardButton(
-            "📊 Last API Cycle",
-            callback_data=CallbackData.IP_SOURCE_STATS
-        )],
+        [InlineKeyboardButton(f"{logs_prefix} 📜 Node Logs (SSE)", callback_data=CallbackData.IP_SOURCE_SET_LOGS)],
+        [InlineKeyboardButton(f"{api_prefix} 🛰️ Panel API", callback_data=CallbackData.IP_SOURCE_SET_API)],
+        [
+            InlineKeyboardButton(
+                f"⚡ API Concurrency: {concurrency}", callback_data=CallbackData.IP_SOURCE_SET_CONCURRENCY
+            )
+        ],
+        [InlineKeyboardButton(f"🕒 Last seen: {freshness}s", callback_data=CallbackData.IP_SOURCE_SET_FRESHNESS)],
+        [InlineKeyboardButton("📊 Last API Cycle", callback_data=CallbackData.IP_SOURCE_STATS)],
         [InlineKeyboardButton("« Back to Settings", callback_data=CallbackData.SETTINGS_MENU)],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -58,22 +54,8 @@ def create_ip_source_keyboard(current_source: str, concurrency: int):
 def _build_ip_source_text(config_data: dict) -> str:
     """Render the IP source menu body for the current configuration."""
     current_source = str(config_data.get("ip_source") or "logs")
-    candidate_mode = str(config_data.get("api_ip_candidate_mode") or "online")
-    window = int(config_data.get("api_ip_online_window") or 0)
-    interval = config_data.get("check_interval") or config_data.get(
-        "monitoring", {}
-    ).get("check_interval", 60)
-    try:
-        interval = int(float(interval))
-    except (ValueError, TypeError):
-        interval = 60
-    window_label = (
-        f"auto ({max(60, interval + 30)}s = interval + 30s)" if window == 0 else f"{window}s"
-    )
-    freshness = int(config_data.get("api_ip_freshness") or 0)
-    freshness_label = (
-        f"auto ({max(60, interval)}s = check interval)" if freshness == 0 else f"{freshness}s"
-    )
+    interval = config_data.get("check_interval", 60)
+    freshness = normalize_api_ip_freshness(config_data.get("api_ip_freshness"))
     # normalize_min_coverage rather than "or 0.0": an absent key means the documented
     # default, and the old fallback would have shown 0% on this screen while the
     # collector was actually enforcing 80%.
@@ -88,30 +70,31 @@ def _build_ip_source_text(config_data: dict) -> str:
         )
     else:
         active = "📜 <b>Node Logs (SSE)</b>"
-        active_note = (
-            "IPs are streamed continuously from each node's log endpoint, which is "
-            "the original behaviour."
-        )
+        active_note = "IPs use the original Xray log timestamp and explicit node process timezones."
+    logs_reason = LOG_OBSERVATIONS.unavailable_reason()
+    logs_readiness = escape(logs_reason) if logs_reason else "ready"
 
     return (
         "🛰️ <b>IP Source</b>\n\n"
         f"<b>Active:</b> {active}\n"
         f"<i>{active_note}</i>\n\n"
+        f"<b>Logs evidence:</b> {logs_readiness}\n"
+        "Set <code>LOG_NODE_TIMEZONES</code> (or explicit <code>LOG_TIMEZONE</code>) for Xray containers. "
+        "Missing zones, incomplete fleet or replay uncertainty preserve warning history. "
+        "A source/settings change requires one complete check interval.\n\n"
         "<b>API mode settings:</b>\n"
         f"• Check interval: <code>{interval}s</code>\n"
-        f"• Candidate mode: <code>{candidate_mode}</code>\n"
-        f"• Online window: <code>{window_label}</code>\n"
-        f"• IP freshness: <code>{freshness_label}</code>\n"
+        "• Candidates: active users with <code>online=true</code> and Group Filter\n"
+        f"• Last seen: <code>{freshness}s</code> (independent of check interval)\n"
         f"• Min coverage: <code>{coverage:.0%}</code>\n"
         f"• Auto-fallback to logs: {auto_fallback}\n\n"
-        "<b>Trade-offs of API mode:</b>\n"
-        "• A cycle is an <b>instant snapshot</b>, not the union of a whole interval, "
-        "so it reports fewer violations — never more.\n"
-        "• The panel keeps every IP with its last-seen timestamp, so IPs older "
-        "than the freshness window above are dropped; without that a user who "
-        "changed network looks like several devices.\n"
-        "• A cycle with too few successful lookups is <b>skipped entirely</b>, "
-        "keeping consecutive-violation counters intact.\n"
+        "<b>API observations:</b>\n"
+        "• An IP counts only when its original timestamp is less than Last seen "
+        "seconds old at evaluation. Future or invalid timestamps are unknown.\n"
+        "• Xray updates this timestamp when a tracked connection opens; a "
+        "long-lived connection can have an old timestamp.\n"
+        "• Unknown user/node evidence preserves that user's warning record. "
+        "Valid empty or expired observations can clear it.\n"
         "• Inbound protocol is not exposed by the API, so per-inbound CDN grouping "
         "is inactive (use <b>CDN Nodes</b> instead).\n"
         "• Requires the <code>nodes:stats</code> panel permission."
@@ -121,14 +104,15 @@ def _build_ip_source_text(config_data: dict) -> str:
 async def handle_ip_source_menu_callback(query, _context: ContextTypes.DEFAULT_TYPE):
     """Show the IP source selection menu."""
     config_data = await read_config()
+    _context.user_data.pop("waiting_for", None)
     current_source = str(config_data.get("ip_source") or "logs")
     concurrency = int(config_data.get("api_ip_concurrency") or 20)
 
     try:
         await query.edit_message_text(
             text=_build_ip_source_text(config_data),
-            reply_markup=create_ip_source_keyboard(current_source, concurrency),
-            parse_mode="HTML"
+            reply_markup=create_ip_source_keyboard(current_source, concurrency, config_data["api_ip_freshness"]),
+            parse_mode="HTML",
         )
     except BadRequest as e:
         if "message is not modified" in str(e).lower():
@@ -144,7 +128,9 @@ async def handle_ip_source_set_logs_callback(query, context: ContextTypes.DEFAUL
         await query.answer("Already using node logs")
         return
 
-    await save_config_value("ip_source", "logs")
+    if not await save_config_value("ip_source", "logs"):
+        await query.answer("❌ Could not save the IP source. Please try again.", show_alert=True)
+        return
     await query.answer("✅ IP source: node logs (SSE)")
     await handle_ip_source_menu_callback(query, context)
 
@@ -199,8 +185,8 @@ async def handle_ip_source_set_api_callback(query, context: ContextTypes.DEFAULT
 
     await query.edit_message_text(
         text="🛰️ <b>Checking panel API access...</b>\n\n"
-             "<i>Probing /api/node/online_stats — this takes a few seconds.</i>",
-        parse_mode="HTML"
+        "<i>Probing /api/node/online_stats — this takes a few seconds.</i>",
+        parse_mode="HTML",
     )
 
     from utils.panel_api.online_ips import check_online_stats_permission
@@ -218,17 +204,21 @@ async def handle_ip_source_set_api_callback(query, context: ContextTypes.DEFAULT
     if not ok:
         await query.edit_message_text(
             text="❌ <b>Cannot switch to Panel API</b>\n\n"
-                 f"{reason}\n\n"
-                 "The IP source is unchanged and node logs keep being used.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Retry", callback_data=CallbackData.IP_SOURCE_SET_API)],
-                [InlineKeyboardButton("« Back", callback_data=CallbackData.IP_SOURCE_MENU)],
-            ]),
-            parse_mode="HTML"
+            f"{reason}\n\n"
+            "The IP source is unchanged and node logs keep being used.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🔄 Retry", callback_data=CallbackData.IP_SOURCE_SET_API)],
+                    [InlineKeyboardButton("« Back", callback_data=CallbackData.IP_SOURCE_MENU)],
+                ]
+            ),
+            parse_mode="HTML",
         )
         return
 
-    await save_config_value("ip_source", "api")
+    if not await save_config_value("ip_source", "api"):
+        await query.answer("❌ Could not save the IP source. Please try again.", show_alert=True)
+        return
     await query.answer("✅ IP source: panel API")
     await handle_ip_source_menu_callback(query, context)
 
@@ -240,18 +230,18 @@ async def handle_ip_source_concurrency_callback(query, context: ContextTypes.DEF
 
     await query.edit_message_text(
         text="⚡ <b>API Concurrency</b>\n\n"
-             f"Current: <code>{current}</code>\n\n"
-             "How many per-user online-IP requests may run at once during a "
-             "collection cycle.\n\n"
-             "• Allowed range: <code>1</code> – <code>40</code>\n"
-             "• Higher = faster cycles, more panel load\n"
-             "• The shared HTTP pool holds 50 connections, so values above "
-             "<code>40</code> only cause queueing\n\n"
-             "Send the number, or /cancel to abort.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("« Cancel", callback_data=CallbackData.IP_SOURCE_MENU)]
-        ]),
-        parse_mode="HTML"
+        f"Current: <code>{current}</code>\n\n"
+        "How many per-user online-IP requests may run at once during a "
+        "collection cycle.\n\n"
+        "• Allowed range: <code>1</code> – <code>40</code>\n"
+        "• Higher = faster cycles, more panel load\n"
+        "• The shared HTTP pool holds 50 connections, so values above "
+        "<code>40</code> only cause queueing\n\n"
+        "Send the number, or /cancel to abort.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Cancel", callback_data=CallbackData.IP_SOURCE_MENU)]]
+        ),
+        parse_mode="HTML",
     )
     context.user_data["waiting_for"] = "ip_source_concurrency"
 
@@ -266,19 +256,20 @@ async def ip_source_concurrency_handler(update: Update, context: ContextTypes.DE
         await update.message.reply_html(
             "❌ Cancelled.",
             reply_markup=create_ip_source_keyboard(
-                current_source, int(config_data.get("api_ip_concurrency") or 20)
-            )
+                current_source,
+                int(config_data.get("api_ip_concurrency") or 20),
+                normalize_api_ip_freshness(config_data.get("api_ip_freshness")),
+            ),
         )
         return
 
     try:
         value = int(text)
     except ValueError:
-        await update.message.reply_html(
+        context.user_data["waiting_for"] = "ip_source_concurrency"
+        return await update.message.reply_html(
             "❌ Please send a whole number between <code>1</code> and <code>40</code>."
         )
-        context.user_data["waiting_for"] = "ip_source_concurrency"
-        return
 
     clamped = max(1, min(40, value))
     await save_config_value("api_ip_concurrency", str(clamped))
@@ -286,7 +277,58 @@ async def ip_source_concurrency_handler(update: Update, context: ContextTypes.DE
     note = "" if clamped == value else f"\n\n<i>Clamped from {value} to the allowed range.</i>"
     await update.message.reply_html(
         f"✅ API concurrency set to <code>{clamped}</code>.{note}",
-        reply_markup=create_ip_source_keyboard(current_source, clamped)
+        reply_markup=create_ip_source_keyboard(
+            current_source, clamped, normalize_api_ip_freshness(config_data.get("api_ip_freshness"))
+        ),
+    )
+
+
+async def handle_ip_source_freshness_callback(query, context: ContextTypes.DEFAULT_TYPE):
+    """Prompt for an exact Last seen threshold in seconds."""
+    config_data = await read_config()
+    current = normalize_api_ip_freshness(config_data.get("api_ip_freshness"))
+    await query.edit_message_text(
+        text=(
+            "🕒 <b>Last seen</b>\n\n"
+            f"Current: <code>{current}s</code>\n\n"
+            "Count an IP only while its Xray timestamp is younger than this value. "
+            "Xray updates the timestamp when a tracked connection opens, so a "
+            "long-lived connection may have an old timestamp.\n\n"
+            "Send a positive whole number of seconds, or /cancel."
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Cancel", callback_data=CallbackData.IP_SOURCE_MENU)]]
+        ),
+        parse_mode="HTML",
+    )
+    context.user_data["waiting_for"] = "ip_source_freshness"
+
+
+async def ip_source_freshness_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Persist exact positive seconds; retain the prompt when validation/save fails."""
+    text = (update.message.text or "").strip()
+    config_data = await read_config()
+    source = str(config_data.get("ip_source") or "logs")
+    concurrency = int(config_data.get("api_ip_concurrency") or 20)
+    context.user_data.pop("waiting_for", None)
+    if text.lower() in ("/cancel", "cancel"):
+        await update.message.reply_html(
+            "❌ Cancelled.",
+            reply_markup=create_ip_source_keyboard(
+                source, concurrency, normalize_api_ip_freshness(config_data.get("api_ip_freshness"))
+            ),
+        )
+        return
+    if not text.isascii() or not text.isdecimal() or int(text) <= 0:
+        context.user_data["waiting_for"] = "ip_source_freshness"
+        return await update.message.reply_html("❌ Send a positive whole number of seconds.")
+    value = int(text)
+    if not await save_config_value("api_ip_freshness", str(value)):
+        context.user_data["waiting_for"] = "ip_source_freshness"
+        return await update.message.reply_html("❌ Could not save Last seen. Try again or /cancel.")
+    await update.message.reply_html(
+        f"✅ Last seen set to <code>{value}s</code>.",
+        reply_markup=create_ip_source_keyboard(source, concurrency, value),
     )
 
 
@@ -298,10 +340,12 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
     stats = get_last_cycle_stats()
     ran_at = float(stats.get("ran_at") or 0)
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.IP_SOURCE_STATS)],
-        [InlineKeyboardButton("« Back", callback_data=CallbackData.IP_SOURCE_MENU)],
-    ])
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.IP_SOURCE_STATS)],
+            [InlineKeyboardButton("« Back", callback_data=CallbackData.IP_SOURCE_MENU)],
+        ]
+    )
 
     if not ran_at:
         hint = (
@@ -311,9 +355,7 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
         )
         try:
             await query.edit_message_text(
-                text=f"📊 <b>Last API Cycle</b>\n\n{hint}",
-                reply_markup=keyboard,
-                parse_mode="HTML"
+                text=f"📊 <b>Last API Cycle</b>\n\n{hint}", reply_markup=keyboard, parse_mode="HTML"
             )
         except BadRequest as e:
             if "message is not modified" not in str(e).lower():
@@ -324,7 +366,9 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
     age = max(0, int(time.time() - ran_at))
     age_label = f"{age}s ago" if age < 120 else f"{age // 60}m ago"
     skipped = stats.get("skipped_reason") or ""
-    verdict = f"⚠️ Cycle skipped — {skipped}" if skipped else "✅ Enforcement ran on this cycle"
+    verdict = f"⚠️ Cycle skipped — {skipped}" if skipped else "✅ Sample available for enforcement"
+    if not skipped and stats.get("collection_outcome") == "partial":
+        verdict += f" ({stats.get('unknown_users', 0)} users protected: incomplete evidence)"
 
     # Nodes seen was rendered without its denominator, which is the number that matters:
     # a per-user coverage of 100% says nothing about a fleet where two thirds of the

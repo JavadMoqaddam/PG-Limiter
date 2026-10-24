@@ -26,6 +26,20 @@ from telegram_bot.topics import TopicType
 from utils.check_usage import dispatch_chunked_warnings
 
 
+@pytest.fixture(autouse=True)
+def isolated_dispatcher(tmp_path, monkeypatch):
+    """Give every queue test a configured destination and test-owned durable file."""
+    monkeypatch.setattr(dispatcher_mod, "PENDING_NOTIFICATIONS_FILE", str(tmp_path / "pending.json"))
+    topics = MagicMock()
+    topics.group_id = -100123456
+    topics.enabled = True
+    topics.monitoring_revision = 0
+    topics.destination_revision = 0
+    topics.get_topic_id.return_value = 10
+    topics.mark_message_sent = AsyncMock()
+    monkeypatch.setattr(dispatcher_mod, "get_topics_manager", lambda: topics)
+
+
 class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
     """Test suite for TelegramDispatcher and Chunked Warnings."""
 
@@ -120,6 +134,7 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
         now = time.time()
         self.assertTrue(item.ttl and (now - item.created_at) > item.ttl)
 
+    @pytest.mark.usefixtures("operational_topics")
     async def test_dispatch_chunked_warnings_formatting(self):
         """Test chunked warning aggregation into batches of 10 with item-level error handling."""
         sample_warnings = [
@@ -160,10 +175,11 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
         gl._last_status_text = "sample text"
 
         mock_edit = AsyncMock(return_value=True)
-        with patch("utils.get_logs.edit_message", mock_edit), \
-             patch("utils.get_logs._get_status_throttle_interval", AsyncMock(return_value=0.0)), \
-             patch("utils.get_logs._build_node_status_message", AsyncMock(return_value="sample text")):
-
+        with (
+            patch("utils.get_logs.edit_message", mock_edit),
+            patch("utils.get_logs._get_status_throttle_interval", AsyncMock(return_value=0.0)),
+            patch("utils.get_logs._build_node_status_message", AsyncMock(return_value="sample text")),
+        ):
             await _update_node_status(1, "node-1", "✅ Connected")
             # Since text is unchanged ("sample text" == "sample text"), edit_message should not be called
             mock_edit.assert_not_called()
@@ -187,6 +203,7 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
         cancelled = await dispatcher.cancel_pending("disable:john_doe")
         self.assertTrue(cancelled)
 
+    @pytest.mark.usefixtures("operational_topics")
     async def test_trailing_node_status_update(self):
         """Test that delayed trailing task flushes latest status to Telegram."""
         import utils.get_logs as gl
@@ -198,10 +215,11 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
         gl._pending_status_update_task = None
 
         mock_edit = AsyncMock(return_value=True)
-        with patch("utils.get_logs.edit_message", mock_edit), \
-             patch("utils.get_logs._get_status_throttle_interval", AsyncMock(return_value=0.05)), \
-             patch("utils.get_logs._build_node_status_message", AsyncMock(return_value="new updated status")):
-
+        with (
+            patch("utils.get_logs.edit_message", mock_edit),
+            patch("utils.get_logs._get_status_throttle_interval", AsyncMock(return_value=0.05)),
+            patch("utils.get_logs._build_node_status_message", AsyncMock(return_value="new updated status")),
+        ):
             await _update_node_status(2, "node-2", "✅ Connected")
             # Immediately within throttle, edit_message is not called directly
             mock_edit.assert_not_called()
