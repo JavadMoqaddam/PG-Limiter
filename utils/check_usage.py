@@ -1105,7 +1105,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         )
                     # Clear the incident before optional network enrichment or Telegram.
                     # A provider failure must never repeat an applied punishment.
-                    await warning_system.clear_user_trust_data(user_name)
+                    await warning_system.clear_user_warning(user_name)
                     if ban_action in ("reconciled", "deduplicated") or (
                         ban_action == "applied_unrecorded" and not punishment_result.get("newly_applied", False)
                     ):
@@ -1113,6 +1113,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                             "Punishment result for %s: %s; no new panel action was applied", user_name, ban_action
                         )
                         continue
+                    await warning_system.record_disable_outcome(user_name, ban_action)
                     if notice_action in ("disabled", "revoked") and w_obj is not None:
                         from utils.warning_system.helpers import get_disable_ip_activity
 
@@ -1121,7 +1122,9 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         revoke_note = (
                             "✅ Sub revoked" if punishment_result.get("revoke_success", False) else "⚠️ Revoke failed"
                         )
-                        uuid_note = "✅ UUID reset" if punishment_result.get("uuid_reset_success", False) else "⚠️ UUID failed"
+                        uuid_note = (
+                            "✅ UUID reset" if punishment_result.get("uuid_reset_success", False) else "⚠️ UUID failed"
+                        )
                         msg = (
                             f"🔄 <b>SUBSCRIPTION REVOKED + DISABLED</b> - {time_str}\n\n"
                             f"User: <code>{html.escape(user_name)}</code>\n"
@@ -1253,7 +1256,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
             # them is known well enough to justify clearing their record.
             continue
         if monitored_user not in all_users_actual_ips:
-            await warning_system.clear_user_trust_data(monitored_user)
+            await warning_system.clear_user_warning(monitored_user)
             logger.info(f"✅ User {monitored_user} inactive, monitoring cleared")
         else:
             user_current_ips = all_users_actual_ips.get(monitored_user, set())
@@ -1274,7 +1277,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
             # warning issued this cycle cannot be cleared in the same cycle.
             user_device_count = all_users_device_counts.get(monitored_user, len(user_current_ips))
             if user_device_count <= u_lim:
-                await warning_system.clear_user_trust_data(monitored_user)
+                await warning_system.clear_user_warning(monitored_user)
                 logger.info(
                     f"✅ User {monitored_user} normalized usage "
                     f"({user_device_count} devices / {len(user_current_ips)} IPs <= {u_lim}), monitoring cleared"
