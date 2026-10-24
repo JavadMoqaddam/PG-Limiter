@@ -1,6 +1,6 @@
 services:
   pg-limiter:
-    image: ghcr.io/javadmoqaddam/pg-limiter:latest
+    image: ghcr.io/javadmoqaddam/pg-limiter:1.7.0
     container_name: pg-limiter
     restart: always
     env_file: .env

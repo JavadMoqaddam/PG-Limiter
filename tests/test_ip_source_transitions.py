@@ -636,8 +636,6 @@ async def live_config_writer(source_runtime, monkeypatch, request):
             reply_text=AsyncMock(),
         )
     )
-    if kind == "restore_backup":
-        return lambda: backup.restore_config_handler(update, SimpleNamespace(user_data={}))
     assert kind == "migrate_backup"
     return lambda: backup.migrate_backup_handler(update, SimpleNamespace(user_data={}))
 
@@ -693,7 +691,6 @@ async def test_live_punishment_edit_cannot_overtake_fallback_or_inherit_its_retr
         "except_user",
         "remove_except_user",
         "remove_special_limit",
-        "restore_backup",
         "migrate_backup",
     ],
     indirect=True,
@@ -715,7 +712,7 @@ async def test_live_config_writers_wait_for_source_transition(source_runtime, li
     assert r.config.get_config_revision() > revision
 
 
-@pytest.mark.parametrize("live_config_writer", ["restore_backup", "migrate_backup"], indirect=True)
+@pytest.mark.parametrize("live_config_writer", ["migrate_backup"], indirect=True)
 async def test_backup_config_batch_rolls_back_and_invalidates_on_failure(
     source_runtime, live_config_writer, monkeypatch
 ):

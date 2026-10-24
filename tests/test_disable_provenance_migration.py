@@ -49,7 +49,7 @@ def test_provenance_has_one_head_and_keeps_retired_isp_cache_absent(tmp_path):
     database = tmp_path / "head.db"
     heads = migrate(database, "heads")
     assert heads.count("(head)") == 1
-    assert "010_disable_provenance (head)" in heads
+    assert heads.strip().endswith("(head)")
     migrate(database, "upgrade", "head")
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT name FROM sqlite_master WHERE name = 'subnet_isp'").fetchone() is None
@@ -69,7 +69,7 @@ def test_replay_preserves_provenance_and_downgrade_keeps_other_disable_fields(tm
     with sqlite3.connect(database) as connection:
         stored = connection.execute("SELECT disable_provenance FROM users WHERE username = 'alice'").fetchone()[0]
     assert json.loads(stored) == PROVENANCE
-    migrate(database, "downgrade", "-1")
+    migrate(database, "downgrade", "009_drop_isp_cache")
     with sqlite3.connect(database) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
         assert "disable_provenance" not in columns

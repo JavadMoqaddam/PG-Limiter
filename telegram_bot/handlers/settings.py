@@ -17,7 +17,7 @@ unchanged.
     settings_cdn.py           CDN inbounds
     settings_nodes.py         CDN nodes, disabled nodes
     settings_ip_source.py     SSE logs vs panel API
-    settings_device_count.py  per-device, per-IP, or per-inbound counting
+    settings_device_count.py  per-device, per-IP, per-inbound, or per-node counting
 """
 
 from telegram_bot.handlers.settings_common import (
@@ -115,4 +115,5 @@ from telegram_bot.handlers.settings_device_count import (
     handle_device_count_set_device_callback,
     handle_device_count_set_ip_callback,
     handle_device_count_set_inbound_callback,
+    handle_device_count_set_node_callback,
 )

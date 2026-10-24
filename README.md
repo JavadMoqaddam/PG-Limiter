@@ -3,7 +3,7 @@
   <img src="https://img.shields.io/badge/License-AGPL--3.0-green" alt="License">
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white" alt="Docker">
-  <img src="https://img.shields.io/badge/Version-1.6.1-orange" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.7.0-orange" alt="Version">
 </p>
 
 <h1 align="center">🛡️ PG-Limiter</h1>
@@ -92,14 +92,14 @@
 Run the one-line installer:
 
 ```bash
-sudo bash <(curl -sSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/main/pg-limiter.sh) install
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.0/pg-limiter.sh) install
 ```
 
 Or download and run step-by-step:
 
 ```bash
 # Download the installer
-curl -sSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/main/pg-limiter.sh -o /tmp/pg-limiter.sh
+curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.0/pg-limiter.sh -o /tmp/pg-limiter.sh
 
 # Run installation
 sudo bash /tmp/pg-limiter.sh install

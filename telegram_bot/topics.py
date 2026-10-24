@@ -44,6 +44,7 @@ class TopicType(Enum):
     DISABLE_ENABLE = "disable_enable"
     BACKUPS = "backups"
     NO_LIMIT = "no_limit"
+    DAILY_REPORT = "daily_report"
 
 
 # Topic display configuration
@@ -67,6 +68,11 @@ TOPIC_CONFIG = {
         "name": "💾 Backups",
         "icon_color": 0xFF93B2,  # Pink
         "description": "Automatic backup notifications",
+    },
+    TopicType.DAILY_REPORT: {
+        "name": "📊 Daily Report",
+        "icon_color": 0x6FB9F0,
+        "description": "Previous calendar day's users actually banned, grouped by applied step",
     },
     TopicType.NO_LIMIT: {
         "name": "📱 No Limit Found",

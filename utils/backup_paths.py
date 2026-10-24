@@ -27,12 +27,14 @@ def state_paths() -> dict[str, Path]:
     from utils.warning_system import warning_system
     from utils.punishment_system import punishment_system
     from utils.handel_dis_users import LEGACY_JSON_PATH
+    from utils.punishment_facts import get_punishment_fact_journal
     from telegram_bot.topics import TOPICS_FILE, MESSAGE_CACHE_FILE
     from telegram_bot.dispatcher import PENDING_NOTIFICATIONS_FILE
     from telegram_bot.send_message import DISABLE_MESSAGES_FILE
     from telegram_bot.handlers.backup import AUTO_BACKUP_CONFIG_FILE
 
     return {
+        "punishment_fact_outbox": Path(get_punishment_fact_journal().filename),
         "warnings": Path(warning_system.filename),
         "trust_history": Path(warning_system.history_filename),
         "violation_history": Path(punishment_system.filename),

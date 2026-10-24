@@ -23,7 +23,8 @@ from sqlalchemy.engine import make_url
 from utils.backup_paths import groups_file, legacy_config_file, legacy_groups_file, state_paths
 
 FORMAT = "pg-limiter-backup"
-VERSION = 1
+VERSION = 2
+V2_STATE_ROLES = {"punishment_fact_outbox"}
 
 
 def sqlite_path(url: str, cwd: Path | None = None) -> Path:
@@ -243,10 +244,12 @@ def _extract(archive: zipfile.ZipFile, name: str, root: Path) -> Path:
 
 def _manifest_plan(archive, members, root: Path, layout: BackupLayout) -> RestorePlan:
     manifest = _json_object(archive.read("manifest.json"))
-    if manifest.get("format") != FORMAT or type(manifest.get("version")) is not int or manifest["version"] != VERSION:
+    version = manifest.get("version")
+    if manifest.get("format") != FORMAT or type(version) is not int or version not in (1, VERSION):
         raise ValueError("Unsupported backup manifest format/version")
     states = manifest.get("states")
-    if not isinstance(states, dict) or set(states) != set(layout.state_paths):
+    expected_roles = set(layout.state_paths) - (V2_STATE_ROLES if version == 1 else set())
+    if not isinstance(states, dict) or set(states) != expected_roles:
         raise ValueError("Incomplete backup state manifest")
     expected = {"manifest.json", "backup_info.txt"}
 
@@ -276,6 +279,11 @@ def _manifest_plan(archive, members, root: Path, layout: BackupLayout) -> Restor
     target = layout.database_target(env_content)
     destinations = layout.state_destinations(env_content)
     files = {target: database}
+    if version == 1:
+        # Pre-feature snapshots cannot contain journal evidence. Logical absence
+        # removes a newer outbox instead of replaying it into an older restored DB.
+        for role in V2_STATE_ROLES & set(destinations):
+            files[destinations[role].resolve()] = None
     for role, entry in states.items():
         source = checked(entry, f"state/{role}.json")
         if role == "user_groups" and source is None:

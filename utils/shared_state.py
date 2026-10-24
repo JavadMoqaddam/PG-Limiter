@@ -26,6 +26,7 @@ class APISampleEvidence:
     config_revision: int
     freshness_seconds: int
     unknown_users: frozenset[str] = frozenset()
+    eligible_node_ids: frozenset[int] | None = None
 
 
 class ActiveUsersSnapshot(dict[str, UserType]):
@@ -232,7 +233,9 @@ async def get_active_users_snapshot() -> dict[str, UserType]:
             if not api_evidence_is_current(_api_snapshot.api_evidence):
                 return ActiveUsersSnapshot()
             return _clone_user_map(_api_snapshot)
-        return _clone_user_map(ACTIVE_USERS)
+        snapshot = _clone_user_map(ACTIVE_USERS)
+        snapshot.log_evidence = LOG_OBSERVATIONS.evidence()
+        return snapshot
 
 
 async def pop_active_users_snapshot(config_data: dict | None = None) -> ActiveUsersSnapshot:

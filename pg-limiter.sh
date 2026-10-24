@@ -4,7 +4,7 @@ set -e
 # PG-Limiter Management Script
 # https://github.com/JavadMoqaddam/PG-Limiter
 
-VERSION="1.6.1"
+VERSION="1.7.0"
 
 # Configuration
 REPO_OWNER="JavadMoqaddam"
@@ -25,6 +25,7 @@ DOCKER_IMAGE="$DOCKER_REPO:$VERSION"
 COMPOSE_FILE="$CONFIG_DIR/docker-compose.yml"
 ENV_FILE="$CONFIG_DIR/.env"
 SCRIPT_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/pg-limiter.sh"
+INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/v$VERSION/pg-limiter.sh"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UTILITY FUNCTIONS
@@ -418,9 +419,9 @@ install_script() {
     # installed as the mode-755 CLI that root runs. Mirrors the hardened cmd_update.
     local new_script
     new_script=$(mktemp)
-    if ! curl -fsSL "$SCRIPT_URL" -o "$new_script"; then
+    if ! curl -fsSL "$INSTALL_SCRIPT_URL" -o "$new_script"; then
         rm -f "$new_script"
-        colorized_echo red "Could not download $SCRIPT_URL. Nothing was installed."
+        colorized_echo red "Could not download $INSTALL_SCRIPT_URL. Nothing was installed."
         exit 1
     fi
     if ! head -n 1 "$new_script" | grep -q '^#!'; then
@@ -428,7 +429,27 @@ install_script() {
         colorized_echo red "The download is not a shell script. Nothing was installed."
         exit 1
     fi
-    if ! grep -q 'cmd_update()' "$new_script"; then
+    # VERSION must be the single literal declaration in the executable header.
+    # A matching line inside a function or after dispatch cannot validate it.
+    if ! bash -n "$new_script" || ! awk -v expected="VERSION=\"$VERSION\"" '
+        /^[[:space:]]*(#|$)/ { next }
+        !header && $0 == "set -e" { next }
+        !header {
+            header = 1
+            if ($0 != expected) invalid = 1
+        }
+        /(^|[;&[:space:]])VERSION[+]?=/ {
+            assignments++
+            if ($0 != expected) invalid = 1
+        }
+        END { exit (invalid || assignments != 1) }
+    ' "$new_script"; then
+        rm -f "$new_script"
+        colorized_echo red "The download has invalid syntax or a different version. Nothing was installed."
+        exit 1
+    fi
+    if ! grep -q '^cmd_update() {' "$new_script" || ! grep -q '^cmd_update_stage2() {' "$new_script" || \
+       ! grep -Fq 'case "${1:-help}" in' "$new_script"; then
         rm -f "$new_script"
         colorized_echo red "The download looks truncated. Nothing was installed."
         exit 1
@@ -742,9 +763,8 @@ cmd_update_stage2() {
     colorized_echo blue "Pulling $DOCKER_IMAGE..."
     if ! docker pull "$DOCKER_IMAGE"; then
         colorized_echo red "✗ docker pull failed for $DOCKER_IMAGE"
-        colorized_echo yellow "The image is pinned to this script's version, so the usual cause is that the"
-        colorized_echo yellow "release tag v$VERSION has not been pushed yet: the registry only builds a"
-        colorized_echo yellow "versioned image when a v* git tag lands. Tags that do exist are listed at"
+        colorized_echo yellow "The image is pinned to this script's version. Check that release v$VERSION"
+        colorized_echo yellow "and its versioned image have been published successfully. Available images:"
         echo "  https://github.com/$REPO_OWNER/$REPO_NAME/pkgs/container/${DOCKER_REPO##*/}"
         colorized_echo yellow "It does not fall back to :latest on purpose - :latest is mutable, so that"
         colorized_echo yellow "would leave you unsure which build is actually running."

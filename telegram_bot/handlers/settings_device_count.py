@@ -1,5 +1,5 @@
 """
-Device counting mode: per device, per IP, or per observed inbound.
+Device counting mode: per device, per IP, per observed inbound, or per node.
 
 Which one is right depends on the deployment - with two nodes per inbound one
 client legitimately appears twice, with one node per inbound it does not. The
@@ -13,7 +13,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from telegram_bot.constants import CallbackData
-from utils.device_count import COUNT_MODE_INBOUND
+from utils.device_count import COUNT_MODE_INBOUND, COUNT_MODE_NODE
 from utils.read_config import read_config, save_config_value
 
 
@@ -22,6 +22,7 @@ def create_device_count_keyboard(current_mode: str):
     device_prefix = "✅" if current_mode == "device" else "⬜"
     ip_prefix = "✅" if current_mode == "ip" else "⬜"
     inbound_prefix = "✅" if current_mode == COUNT_MODE_INBOUND else "⬜"
+    node_prefix = "✅" if current_mode == COUNT_MODE_NODE else "⬜"
     keyboard = [
         [
             InlineKeyboardButton(
@@ -30,6 +31,7 @@ def create_device_count_keyboard(current_mode: str):
         ],
         [InlineKeyboardButton(f"{ip_prefix} 🌐 Per IP", callback_data=CallbackData.DEVICE_COUNT_SET_IP)],
         [InlineKeyboardButton(f"{inbound_prefix} 🚪 Per Inbound", callback_data=CallbackData.DEVICE_COUNT_SET_INBOUND)],
+        [InlineKeyboardButton(f"{node_prefix} 🖥️ Per Node", callback_data=CallbackData.DEVICE_COUNT_SET_NODE)],
         [InlineKeyboardButton("« Back to Settings", callback_data=CallbackData.SETTINGS_MENU)],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -43,7 +45,13 @@ def _build_device_count_text(config_data: dict) -> str:
     subnet_mode = "/24"
     high_trust_on = "✅ on" if config_data.get("high_trust_ip_grouping") else "❌ off"
 
-    if current_mode == COUNT_MODE_INBOUND:
+    if current_mode == COUNT_MODE_NODE:
+        active = "🖥️ <b>Per Node</b>"
+        active_note = (
+            "Each known connected monitored node with accepted active connections counts as <b>one device</b>, "
+            "regardless of IPs, inbounds or grouping settings. Works with <b>Logs and API</b>."
+        )
+    elif current_mode == COUNT_MODE_INBOUND:
         active = "🚪 <b>Per Inbound</b>"
         active_note = (
             "Each distinct inbound observed during the check window counts as <b>one device</b>, "
@@ -73,13 +81,15 @@ def _build_device_count_text(config_data: dict) -> str:
         f"• Subnet grouping: {subnet_on} (<code>{subnet_mode}</code>)\n"
         f"• High trust grouping: {high_trust_on}\n\n"
         "<b>Notes:</b>\n"
-        "• The node is <b>never</b> part of the device key: when "
+        "• In Per Device and Per IP modes, the node is excluded from the key: when "
         "several nodes serve the same core config, one client is registered on "
         "all of them at once.\n"
         "• Subnet grouping applies in Per Device and Per IP modes (same <code>/24</code> counts "
         "once). High Trust grouping is inactive in <b>Per IP</b> mode.\n"
         "• In Per Inbound mode, CDN, subnet and High Trust grouping do not change the count. "
         "Blank or <code>Unknown</code> inbound tags contribute nothing.\n"
+        "• Per Node excludes disabled or unknown nodes. CDN, subnet and High Trust grouping do not change its count. "
+        "Missing node evidence preserves warning state; bare IPs cannot establish a node count.\n"
         "• In API mode the panel does not expose the inbound. Per Device and Per IP "
         "behave the same there; Per Inbound is unavailable."
     )
@@ -133,3 +143,8 @@ async def handle_device_count_set_ip_callback(query, context: ContextTypes.DEFAU
 async def handle_device_count_set_inbound_callback(query, context: ContextTypes.DEFAULT_TYPE):
     """Switch to counting distinct observed inbound tags."""
     await _set_device_count_mode(query, context, COUNT_MODE_INBOUND, "per inbound")
+
+
+async def handle_device_count_set_node_callback(query, context: ContextTypes.DEFAULT_TYPE):
+    """Switch to counting distinct eligible nodes with observed connections."""
+    await _set_device_count_mode(query, context, COUNT_MODE_NODE, "per node")

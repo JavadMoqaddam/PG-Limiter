@@ -2,93 +2,89 @@ name: Release PG-Limiter
 
 on:
   push:
-    tags: [ 'v*' ]
+    branches: [main]
+    paths: [limiter.py, .github/workflows/release.yml]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
   contents: write
+  packages: write
+
+# Serialize version checks and publication so a second branch run sees the tag
+# created by the first and cannot rewrite an already published version.
+concurrency:
+  group: ${{ github.repository }}-stable-release
+  cancel-in-progress: false
 
 jobs:
-  release:
+  version:
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      notes: ${{ steps.version.outputs.notes }}
+      publish: ${{ steps.version.outputs.publish }}
     steps:
-    - uses: actions/checkout@v7.0.1
-    
-    - name: Get version from tag or Python file
-      id: get_version
-      run: |
-        if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-          VERSION="${GITHUB_REF#refs/tags/v}"
-        elif grep -q "VERSION\s*=" limiter.py; then
-          VERSION=$(python3 -c "import re; content=open('limiter.py').read(); match=re.search(r'VERSION\s*=\s*[\"\'](.*?)[\"\']', content); print(match.group(1) if match else 'latest')")
-        else
-          VERSION="latest"
-        fi
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
-        echo "tag=v$VERSION" >> $GITHUB_OUTPUT
-        echo "Version: $VERSION"
-    
-    - name: Create source archive
-      run: |
-        mkdir -p release
-        # Create tar.gz archive (excluding git and unnecessary files)
-        tar --exclude='.git' \
-            --exclude='__pycache__' \
-            --exclude='*.pyc' \
-            --exclude='.env' \
-            --exclude='*.bak' \
-            --exclude='data/' \
-            --exclude='logs/' \
-            --exclude='dist/' \
-            --exclude='build/' \
-            --exclude='*.egg-info' \
-            -czvf release/pg-limiter-${{ steps.get_version.outputs.version }}.tar.gz .
-        
-        # Create zip archive
-        zip -r release/pg-limiter-${{ steps.get_version.outputs.version }}.zip . \
-            -x ".git/*" \
-            -x "__pycache__/*" \
-            -x "*.pyc" \
-            -x ".env" \
-            -x "*.bak" \
-            -x "data/*" \
-            -x "logs/*" \
-            -x "dist/*" \
-            -x "build/*" \
-            -x "*.egg-info/*"
-    
-    - name: Create/Update Release
-      uses: softprops/action-gh-release@v3.0.3
-      with:
-        tag_name: ${{ steps.get_version.outputs.tag }}
-        name: "PG-Limiter ${{ steps.get_version.outputs.version }}"
-        generate_release_notes: true
-        body: |
-          ## 🛡️ PG-Limiter ${{ steps.get_version.outputs.version }}
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Validate committed version, tag and release notes
+        id: version
+        run: python3 tools/prepare_release.py --sha "$GITHUB_SHA" --ref "$GITHUB_REF" --output "$GITHUB_OUTPUT"
 
-          High-performance IP connection limiter for PasarGuard Panel: real-time SSE
-          log streaming or panel-API polling as the IP source, subnet grouping, High
-          Trust mode, escalating punishment, Telegram forum topics, and SQLite under
-          Alembic migrations as the single store.
+  verify:
+    needs: version
+    if: needs.version.outputs.publish == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
 
-          ### 🚀 Quick Install (Docker - Recommended)
+  image:
+    needs: [version, verify]
+    if: needs.version.outputs.publish == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+    with:
+      release_version: ${{ needs.version.outputs.version }}
 
-          ```bash
-          sudo bash <(curl -sSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/main/pg-limiter.sh) install
-          ```
+  release:
+    needs: [version, image]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
 
-          ### 🐳 Docker Image
+      - name: Create source archive
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          mkdir -p release
+          git archive --format=tar HEAD | gzip -n > "release/pg-limiter-${RELEASE_VERSION}.tar.gz"
+          git archive --format=zip --output="release/pg-limiter-${RELEASE_VERSION}.zip" HEAD
 
-          The Multi-Arch Docker image is available at:
-          ```
-          ghcr.io/javadmoqaddam/pg-limiter:latest
-          ghcr.io/javadmoqaddam/pg-limiter:${{ steps.get_version.outputs.version }}
-          ```
-        files: |
-          release/pg-limiter-${{ steps.get_version.outputs.version }}.tar.gz
-          release/pg-limiter-${{ steps.get_version.outputs.version }}.zip
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The reusable image workflow already pushed the exact version and latest
+      # for this SHA. A tag created with GITHUB_TOKEN need not trigger another run.
+      - name: Publish stable release
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "PG-Limiter ${{ needs.version.outputs.version }}"
+          body_path: ${{ needs.version.outputs.notes }}
+          files: |
+            release/pg-limiter-${{ needs.version.outputs.version }}.tar.gz
+            release/pg-limiter-${{ needs.version.outputs.version }}.zip
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

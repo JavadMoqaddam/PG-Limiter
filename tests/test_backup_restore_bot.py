@@ -35,6 +35,7 @@ def initialized_layout(layout):
 async def test_bot_stages_upload_without_mutating_live_state(initialized_layout, tmp_path, monkeypatch, kind):
     import telegram_bot.handlers.backup as handler
     from utils.backup import create_backup
+    from utils.read_config import get_config_revision
 
     layout = initialized_layout
     stage_dir = tmp_path / "restore-staging"
@@ -53,11 +54,13 @@ async def test_bot_stages_upload_without_mutating_live_state(initialized_layout,
         ).encode()
     update = _upload(f"backup.{kind}", payload)
     context = MagicMock(user_data={"waiting_for": "restore"})
+    revision = get_config_revision()
     await handler.restore_config_handler(update, context)
     staged = list(stage_dir.iterdir())
     assert len(staged) == 1
     assert staged[0].read_bytes() == payload
     assert (database.read_bytes(), layout.env_path.read_bytes()) == before
+    assert get_config_revision() == revision
     replies = " ".join(call.args[0] for call in update.message.reply_html.call_args_list)
     assert f"pg-limiter restore {staged[0]}" in replies
     assert "staged" in replies and "restored successfully" not in replies
@@ -65,6 +68,7 @@ async def test_bot_stages_upload_without_mutating_live_state(initialized_layout,
 
 
 async def test_offline_legacy_json_import_uses_one_canonical_transaction(initialized_layout, tmp_path):
+    from db.crud.config_revision import REVISION_KEY
     from utils.backup import apply_backup, stage_backup
 
     layout = initialized_layout
@@ -85,7 +89,11 @@ async def test_offline_legacy_json_import_uses_one_canonical_transaction(initial
     assert result.kind == "config"
     assert "invalid" in " ".join(result.notes)
     with sqlite3.connect(database) as connection:
-        assert {key: json.loads(value) for key, value in connection.execute("SELECT key, value FROM config")} == {
+        settings = {key: json.loads(value) for key, value in connection.execute("SELECT key, value FROM config")}
+        version = settings.pop(REVISION_KEY)
+        assert set(version) == {"revision"}
+        assert type(version["revision"]) is int and version["revision"] > 0
+        assert settings == {
             "disable_method": "group",
             "disabled_group_id": "9",
             "enhanced_details": "false",

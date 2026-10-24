@@ -13,6 +13,7 @@ async def api_cycle(tmp_path, monkeypatch, operational_topics):
 
     import db.database as database
     import utils.check_usage as usage
+    import utils.read_config as read_config
     import utils.ip_source_api as api
     import utils.panel_api.auth as auth
     import utils.panel_api.nodes as nodes
@@ -32,6 +33,12 @@ async def api_cycle(tmp_path, monkeypatch, operational_topics):
     )
     import asyncio
 
+    # This database owns a new canonical settings generation. A prior test's
+    # cached database revision must not invalidate the first collected sample.
+    monkeypatch.setattr(read_config, "_config_cache", None)
+    monkeypatch.setattr(read_config, "_config_cache_db_revision", None)
+    monkeypatch.setattr(read_config, "_config_read_lock", asyncio.Lock())
+    monkeypatch.setattr(read_config, "_config_write_lock", asyncio.Lock())
     monkeypatch.setattr(api, "_collection_lock", asyncio.Lock())
     monkeypatch.setattr(api, "_consecutive_dead_cycles", 0)
     monkeypatch.setattr(api, "_failure_revision", None)
@@ -177,11 +184,14 @@ async def test_freshness_is_rechecked_after_async_preparation(api_cycle, monkeyp
     clock = [float(api_cycle.now)]
     monkeypatch.setattr(time, "time", lambda: clock[0])
 
-    async def delayed_isp(*args):
-        clock[0] = api_cycle.now + 90
-        return {}
+    prepare = usage.read_config_snapshot
 
-    monkeypatch.setattr(usage.ISPDetector, "get_multiple_isp_info", delayed_isp)
+    async def delayed_metadata(*args, **kwargs):
+        metadata = await prepare(*args, **kwargs)
+        clock[0] = api_cycle.now + 90
+        return metadata
+
+    monkeypatch.setattr(usage, "read_config_snapshot", delayed_metadata)
     assert await api_cycle.run()
     assert api_cycle.warning.warnings == {}
 
@@ -194,11 +204,14 @@ async def test_config_change_during_preparation_keeps_counters(api_cycle, monkey
 
     monkeypatch.setattr(time, "time", lambda: api_cycle.now + 60)
 
-    async def changed_isp(*args):
-        await save_config_value("ip_source", "logs")
-        return {}
+    prepare = usage.read_config_snapshot
 
-    monkeypatch.setattr(usage.ISPDetector, "get_multiple_isp_info", changed_isp)
+    async def changed_metadata(*args, **kwargs):
+        metadata = await prepare(*args, **kwargs)
+        await save_config_value("ip_source", "logs")
+        return metadata
+
+    monkeypatch.setattr(usage, "read_config_snapshot", changed_metadata)
     assert await api_cycle.run()
     assert {n: w.consecutive_violations for n, w in api_cycle.warning.warnings.items()} == {"alice": 1, "bob": 1}
 

@@ -3,7 +3,6 @@
 import asyncio
 import json
 
-from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -18,6 +17,8 @@ import utils.user_sync as user_sync
 import utils.warning_system as warning_package
 import utils.warning_system.enhanced_system as warning_module
 from db.crud import UserCRUD
+from db.crud.config import ConfigCRUD
+from test_config_revisions import settings_db  # noqa: F401
 from utils.isp_detector import ISPDetector
 from utils.types import ConnectionInfo, PanelType, UserType
 from utils.warning_system.enhanced_system import EnhancedWarningSystem
@@ -25,7 +26,7 @@ from utils.warning_system.helpers import safe_disable_user_with_punishment
 
 
 @pytest.fixture
-def notice_cycle(tmp_path, monkeypatch):
+async def notice_cycle(tmp_path, monkeypatch, completed_logs_evidence, settings_db):
     """Keep counting/warnings real; isolate database, panel and Telegram boundaries."""
     now = [1000.0]
     monkeypatch.setattr(warning_module.time, "time", lambda: now[0])
@@ -34,18 +35,26 @@ def notice_cycle(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(usage, "warning_system", system)
     users = {"alice": UserType(name="alice", ip=["5.6.7.10", "5.6.7.20"])}
-    metadata = {"alice": {"is_monitored": True, "effective_ip_limit": 1}}
-    monkeypatch.setattr(user_sync, "USER_METADATA_CACHE", metadata)
+    import db.database as database
+    from utils.read_config import read_config
 
-    @asynccontextmanager
-    async def database():
-        yield object()
+    monkeypatch.setattr(user_sync, "USER_METADATA_CACHE", {})
+    async with database.get_db() as db:
+        await UserCRUD.create_or_update(db, "alice", group_ids=[], owner_username="admin")
+        await UserCRUD.set_special_limit(db, "alice", 1, fetch_from_panel=False)
+        await ConfigCRUD.set(db, "general_limit", "1")
+        await ConfigCRUD.set(db, "check_interval", "60")
+        await ConfigCRUD.set(db, "ipinfo_token", "notice-token")
+    config = await read_config()
 
-    monkeypatch.setattr("db.database.get_db", database)
-    monkeypatch.setattr(UserCRUD, "get_all_special_limits", AsyncMock(return_value={"alice": 1}))
-    monkeypatch.setattr(usage, "get_active_users_metadata_batch", AsyncMock(return_value=metadata))
-    monkeypatch.setattr(usage, "get_group_limits_batch", AsyncMock(return_value={}))
-    monkeypatch.setattr(usage, "pop_active_users_snapshot", AsyncMock(side_effect=lambda: users.copy()))
+    def snapshot(config):
+        from utils.shared_state import ActiveUsersSnapshot
+
+        batch = ActiveUsersSnapshot(users.copy())
+        batch.log_evidence = completed_logs_evidence(config)
+        return batch
+
+    monkeypatch.setattr(usage, "pop_active_users_snapshot", AsyncMock(side_effect=snapshot))
     monkeypatch.setattr(usage.ip_history_tracker, "record_many", AsyncMock())
     monkeypatch.setattr(usage, "_sample_is_trustworthy", lambda *_: True)
     monkeypatch.setattr(usage, "dispatch_chunked_warnings", AsyncMock())
@@ -102,7 +111,6 @@ def notice_cycle(tmp_path, monkeypatch):
     monkeypatch.setattr("telegram_bot.send_message.send_disable_notification", send_notice)
     monkeypatch.setattr("telegram_bot.topics.get_topics_manager", lambda: SimpleNamespace(group_id=-100123))
     monkeypatch.setattr(warning_module, "safe_send_warning_log", AsyncMock())
-    config = {"limits": {"general": 1}, "check_interval": 60, "ipinfo_token": "notice-token"}
 
     return {
         "system": system,

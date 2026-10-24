@@ -260,3 +260,50 @@ class IPHistory(Base):
 
     def __repr__(self):
         return f"<IPHistory(username='{self.username}', ip='{self.ip}')>"
+
+
+class PunishmentFact(Base):
+    """Independent evidence of actual effects; never cleared with violation history."""
+
+    __tablename__ = "punishment_facts"
+
+    incident_id = Column(String(64), primary_key=True)
+    username = Column(String(255), nullable=False)
+    step_index = Column(Integer, nullable=True)
+    started_at = Column(Float, nullable=False)
+    applied_at = Column(Float, nullable=True)
+    disable_succeeded = Column(Boolean, nullable=False, default=False)
+    revoke_succeeded = Column(Boolean, nullable=False, default=False)
+    uuid_reset_succeeded = Column(Boolean, nullable=False, default=False)
+    state = Column(String(20), nullable=False)
+
+    __table_args__ = (Index("ix_punishment_facts_applied_at", "applied_at"),)
+
+
+class DailyReportRun(Base):
+    """One immutable local date and its owned SYSTEM delivery receipt."""
+
+    __tablename__ = "daily_report_runs"
+
+    report_date = Column(String(10), primary_key=True)
+    timezone = Column(String(255), nullable=False)
+    start_utc = Column(Float, nullable=False)
+    end_utc = Column(Float, nullable=False)
+    payload = Column(Text, nullable=True)
+    event_id = Column(String(64), nullable=False, unique=True)
+    state = Column(String(20), nullable=False)
+    chat_id = Column(Integer, nullable=False)
+    message_thread_id = Column(Integer, nullable=False)
+    monitoring_revision = Column(Integer, nullable=False)
+    destination_revision = Column(Integer, nullable=False)
+    message_id = Column(Integer, nullable=True)
+
+
+class DailyReportCheckpoint(Base):
+    """Disabled-day scheduling progress, containing no observational payload."""
+
+    __tablename__ = "daily_report_checkpoint"
+
+    id = Column(Integer, primary_key=True)
+    closed_date = Column(String(10), nullable=False)
+    enabled = Column(Boolean, nullable=False)
