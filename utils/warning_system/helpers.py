@@ -5,6 +5,7 @@ Provides safe wrappers for external calls.
 
 from utils.logs import get_logger
 from utils.types import PanelType, UserType
+from collections.abc import Callable
 
 helpers_logger = get_logger("warning_helpers")
 
@@ -31,6 +32,21 @@ async def get_disable_ip_activity(warning, config_data: dict) -> str:
     except Exception as error:
         helpers_logger.warning("Failed to enrich disable activity for %s: %s", warning.username, type(error).__name__)
     return warning.get_ip_activity_summary(formatted_ips)
+
+
+def capture_monitoring_guard() -> Callable[[], bool]:
+    """Capture Topics admission when the optional monitoring gate is installed."""
+    from importlib import import_module
+
+    try:
+        gate = import_module("utils.monitoring_gate")
+    except ModuleNotFoundError as error:
+        if error.name != "utils.monitoring_gate":
+            raise
+        # The standalone policy stack predates the independent Topics gate PR.
+        return lambda: True
+    admission = gate.monitoring_snapshot()
+    return lambda: gate.monitoring_is_current(admission)
 
 
 async def safe_send_logs(message: str, is_warning: bool = False):

@@ -126,10 +126,12 @@ pg-limiter status     # Show service & container status
 pg-limiter logs       # View live logs (follow mode)
 pg-limiter update     # Update to the latest release & migrate DB automatically
 pg-limiter backup     # Create a manual backup zip
-pg-limiter restore    # Restore configuration & database from backup
+pg-limiter restore FILE  # Validate, stop service, and apply a backup offline
 pg-limiter config     # Edit environment configuration (.env)
 pg-limiter uninstall  # Remove PG-Limiter
 ```
+
+Telegram `/restore` validates and stages uploads; it does not change live data. See [backup and offline restore](docs/BACKUP_RESTORE.md) for the snapshot guarantee, database path selection, and legacy compatibility.
 
 ---
 
@@ -156,7 +158,31 @@ PG-Limiter can organize notifications across dedicated Forum topics in a Telegra
 | 🚫 **Disable / Enable** | Critical disable notifications with instant `[✅ Enable]` action buttons |
 | 📡 **Monitoring & Status** | Node connection statuses, heartbeat logs, and sync stats |
 | 💾 **Backups** | Automated and manual database/config backup archives |
+| 📊 **Daily Report** | Previous calendar day’s users actually banned, grouped by applied punishment step |
 | ♾️ **No Limit** | Notifications for unlimited / exempted users |
+
+Daily Report sends one brief message at **00:00** for the previous complete calendar
+day, using the current `TZ` environment setting. An unset `TZ` uses UTC; an invalid
+explicit zone pauses reporting with a service diagnostic. Changes to the running
+process environment reschedule the next midnight within 60 seconds. After editing
+a deployment `.env` file, restart the process or recreate the container so it receives
+the new environment; log-source timezone settings do not control this schedule.
+
+The report counts distinct users per actual applied step and once in the total,
+with a separate Plain ban row when escalation is disabled. A user can appear in
+several step counts, so their sum can exceed the total. Warnings and failed disables
+are excluded. Reports contain no usernames or IPs and fit one message of at most
+2000 UTF-16 units; exceptionally many steps are combined as user/step counts.
+Zero-ban days report `Total: 0 users`.
+
+Configure the Daily Report topic in Forum Topics settings. Topics off produces no
+new report or disabled-day backlog. Restart recovery considers the most recent
+eligible missed day. Pending fact writes delay its summary, and known delivered
+receipts prevent replay after topic-cache or destination changes. An uncertain
+panel action or Telegram send remains unresolved instead of inventing a successful
+outcome or automatically sending a possible duplicate. Run one limiter daemon per
+database. New backups include the pending fact outbox; valid older backups remain
+restorable and remove any newer outbox before the restored database starts.
 
 ---
 
@@ -187,20 +213,22 @@ The connected IPs of each user can come from either of two sources, switchable a
 | | 📜 **Node Logs (SSE)** — default | 🛰️ **Panel API** |
 |---|---|---|
 | Transport | One persistent SSE stream per node | `GET /api/node/online_stats/{id}/ip`, once per online user per cycle |
-| Timing | Continuous, accumulated between cycles | One instant snapshot taken immediately before enforcement |
+| Timing | Original Xray printed timestamps within a completed `CHECK_INTERVAL` | Original Xray IP timestamps checked against the editable Last seen threshold |
 | Inbound detail | Real inbound name per connection | Single sentinel inbound (`API`) |
-| Requires | Node logs reachable over SSE | Panel account with the `nodes:stats` permission |
+| Requires | Reachable SSE, explicit Xray process timezones and a ready fleet/complete interval | Panel account with `nodes:stats` and complete evidence from relevant enabled nodes |
 
-Both sources write into the same `ACTIVE_USERS` structure and share the 3-cycle warning system, trust scoring and punishment. **Per Inbound** counting requires node logs because the panel API does not expose inbound names.
+Both modes publish source-specific snapshots through the shared `ACTIVE_USERS` structure. Existing device counting, subnet/CDN/high-trust grouping, trust scoring and punishment continue to apply, with configurable `CHECK_INTERVAL` and `MAX_WARNING_COUNT`. API observations carry no real inbound names; inbound-only monitoring requires Logs.
 
 **How API mode keeps a cycle safe:**
-* **Candidate narrowing.** `GET /api/users` is filtered panel-side by `status=active` and by an online-freshness window equal to `CHECK_INTERVAL + 30s`, so only the handful of currently-online users is queried. A group filter in **include** mode narrows it further, because that setting is what makes users outside those groups unmonitored in the first place. Group Limits deliberately do *not* narrow the query: a group limit is a limit, not a monitoring scope, and users in no limited group are still judged against the general limit.
-* **Coverage gate.** If fewer than `API_IP_MIN_COVERAGE` (default **80%**, set as a percentage in `.env`) of the candidates answered, the whole cycle is skipped rather than enforced on partial data — an under-covered snapshot could otherwise clear the counters of real offenders.
-* **Never a false positive.** A snapshot can only report *fewer* IPs than continuous log streaming, never more, and a failed candidate query leaves the previous state untouched instead of wiping pending warnings.
-* **Auto-fallback.** After 3 consecutive cycles with no usable data (for example a missing `nodes:stats` permission) the IP source reverts to logs automatically and a Telegram alert is sent.
+* **Candidate narrowing.** `GET /api/users` uses `status=active` and `online=true`, independently of `CHECK_INTERVAL`. Include group IDs are sent together; empty Include selects nobody. Exclusions, administrator filters and exceptions still apply. Group Limits set limits and never replace the Group Filter.
+* **Exact Last seen threshold.** Edit a positive whole number of seconds T in **Settings → IP Source → Last seen**. An IP qualifies only when `0 <= evaluation time - original Xray timestamp < T`, including after asynchronous preparation. Receipt time never makes an observation fresh, and no 30-second buffer is added. Xray updates this timestamp when a tracked connection opens, so a long-lived connection can have an old timestamp. API and Logs counts can differ.
+* **Unknown evidence protection.** Failed requests, malformed bodies, invalid timestamps and missing expected node responses protect affected users from warnings, punishment and false clearing. Incomplete candidate/node lists or a relevant enabled node in `error`/`connecting` skip the whole cycle, including an empty candidate list, preserving existing warnings. Explicitly operator-disabled nodes are excluded. The configurable coverage gates (user coverage defaults to **80%**) can skip collection; a high answer rate never makes missing evidence known. Healthy empty maps, valid expired observations and confirmed deleted users can clear warnings.
+* **Auto-fallback.** With automatic fallback enabled, exactly two consecutive unsuccessful completed API collection cycles persist the source as Logs and attempt one Telegram alert. A complete successful cycle, including a genuinely empty one, resets the streak. Logs then waits for its timezone/readiness requirements and a completed interval.
 * **Per-inbound CDN grouping is inactive** in API mode because the panel reports no inbound names — use **CDN Nodes** (per-node) instead of CDN Inbounds.
 
 Switching to API mode runs a pre-flight probe against a real online user first, and refuses to switch if the endpoint is not reachable. **Settings → 🛰️ IP Source → 📊 Last API Cycle** shows the last cycle's candidate narrowing, coverage, 403/404 counts and duration.
+
+Logs preserves Xray's original printed process-local time and rejects retained replay records across reconnects. Configure `LOG_NODE_TIMEZONES` and/or an explicit `LOG_TIMEZONE` for the Xray process/container; host or panel timezone alone does not establish it. Unknown zones, fleet or transport readiness preserve warnings while enforcement waits. A source/settings change or transport recovery requires a full ordinary `CHECK_INTERVAL` before Logs resumes. See [Panel API IP source](docs/API_IP_SOURCE.md) and [Node Logs source and readiness](docs/LOG_SOURCE.md) for configuration, recovery and protocol limits.
 
 ### 7. Device Counting Modes
 Choose the enforcement measure at runtime from **Settings → 🧮 Device Counting**:
@@ -210,14 +238,30 @@ Choose the enforcement measure at runtime from **Settings → 🧮 Device Counti
 | **Per Device (by inbound)** — default | One client IP (or grouped subnet) on one inbound |
 | **Per IP** | One client IP (or grouped subnet), regardless of inbound |
 | **Per Inbound** | One distinct inbound tag observed during the current check window, regardless of IPs |
+| **Per Node** | One known connected monitored node with accepted active user connections |
 
 In Per Inbound mode, ten IPs on one inbound count as **1**, while one IP on three inbounds counts as **3**. The same inbound tag across several nodes counts once. Tags are trimmed and case-sensitive; disabled nodes, blank tags and the reserved `Unknown` placeholder contribute nothing. Without inbound information, the count is **0** and never falls back to the number of IPs. CDN, subnet and High Trust grouping do not change this count.
 
-Per Inbound uses accepted log traffic collected between checks, so it measures observed activity during that window. It requires **Node Logs (SSE)**: switch the IP source to logs before selecting it, and choose Per Device or Per IP before switching to the panel API. If an incompatible API + Per Inbound combination is persisted externally, collection and enforcement pause while existing samples and warning counters are preserved. The mode is stored in the dynamic database setting `device_count_mode`; changing it requires no restart or schema migration.
+Per Inbound uses accepted log traffic collected between checks, so it measures observed activity during that window. It requires **Node Logs (SSE)**: switch the IP source to logs before selecting it, and choose Per Device, Per IP or Per Node before switching to the panel API. If an incompatible API + Per Inbound combination is persisted externally, collection and enforcement pause while existing samples and warning counters are preserved.
+
+Per Node works with **Logs and API**. Several IPs or inbounds on one eligible node count as **1**; the same IP on two eligible nodes counts as **2**, including CDN traffic. CDN, subnet and High Trust grouping do not change this count. Nodes disabled in the limiter or panel, unknown IDs and malformed IDs contribute nothing. An integer ID of zero is valid when it belongs to the authoritative node fleet. Bare IPs cannot establish a node count. Accepted connections still obey country, policy and source freshness checks; missing fleet readiness or unknown user evidence preserves warnings and pauses the affected enforcement instead of clearing them as zero usage.
+
+All counting modes use the dynamic database setting `device_count_mode` (`device`, `ip`, `inbound` or `node`); changing it requires no restart or schema migration.
 
 ---
 
 ## ⚙️ Configuration
+
+Telegram, CLI, and API settings share the same stored configuration. Saved changes
+take effect on the next usable monitoring scan without restarting the daemon.
+User limits follow special limit → highest matching group limit → general limit.
+Whitelist, group, and admin filters apply to both ongoing and expired warnings.
+
+Before punishment, the limiter checks the user's current groups, owner, eligibility,
+and limit again. If settings or the IP source change during a scan, or current user
+facts are unavailable, punishment waits and existing warnings are retained. A user
+who becomes whitelisted or falls outside the configured filters also keeps their
+existing warning until they can be assessed within the monitoring scope again.
 
 ### Environment Variables (`/etc/opt/pg-limiter/.env`)
 
@@ -237,8 +281,8 @@ CHECK_INTERVAL=60
 TIME_TO_ACTIVE_USERS=1800
 COUNTRY_CODE=IR
 
-# Timezone
-TZ=Asia/Tehran
+# Daily Report calendar timezone (00:00; unset defaults to UTC)
+TZ=UTC
 ```
 
 ---

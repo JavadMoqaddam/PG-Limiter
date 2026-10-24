@@ -27,6 +27,7 @@ async def fetch_all_users_raw(
     online: bool = False,
     online_after: str | None = None,
     sort: str | None = None,
+    strict: bool = False,
 ) -> list[dict]:
     """
     Unified high-performance fetch of all users from Panel API using parallel pagination.
@@ -45,6 +46,7 @@ async def fetch_all_users_raw(
             online_at >= this value. Use instead of `online` when the desired
             freshness window is wider than the panel's fixed 2 minutes.
         sort: Optional sort expression (e.g. '-online_at').
+        strict: Reject malformed or incomplete pages instead of returning a partial list.
 
     Returns:
         list[dict]: List of raw user dictionaries from the panel API.
@@ -102,7 +104,30 @@ async def fetch_all_users_raw(
         users_logger.error(f"Failed to parse JSON response from /api/users: {e}")
         raise ValueError(f"Invalid JSON from /api/users: {e}") from e
 
-    if isinstance(data, dict) and "users" in data:
+    def validate_page(body, offset, expected_total=None):
+        if not isinstance(body, dict) or not isinstance(body.get("users"), list):
+            raise ValueError("Invalid /api/users page")
+        total = body.get("total")
+        if type(total) is not int or total < 0 or (expected_total is not None and total != expected_total):
+            raise ValueError("Missing or changing /api/users total")
+        rows = body["users"]
+        if len(rows) != min(limit, max(0, total - offset)):
+            raise ValueError("Incomplete /api/users page")
+        for row in rows:
+            if (
+                not isinstance(row, dict)
+                or not isinstance(row.get("username"), str)
+                or not row["username"].strip()
+                or type(row.get("id")) is not int
+            ):
+                raise ValueError("Invalid /api/users candidate")
+        if len({row["id"] for row in rows}) != len(rows) or len({row["username"] for row in rows}) != len(rows):
+            raise ValueError("Duplicate candidates in /api/users page")
+        return rows, total
+
+    if strict:
+        first_page_users, total_users = validate_page(data, 0)
+    elif isinstance(data, dict) and "users" in data:
         first_page_users = data["users"]
         total_users = data.get("total", len(first_page_users))
     elif isinstance(data, list):
@@ -139,9 +164,13 @@ async def fetch_all_users_raw(
             )
             if page_resp is None:
                 users_logger.warning(f"Failed to fetch page at offset {offset}")
+                if strict:
+                    raise ValueError(f"Unavailable /api/users page at {offset}")
                 return []
             try:
                 page_data = page_resp.json()
+                if strict:
+                    return validate_page(page_data, offset, total_users)[0]
                 if isinstance(page_data, dict) and "users" in page_data:
                     return page_data["users"]
                 elif isinstance(page_data, list):
@@ -149,6 +178,8 @@ async def fetch_all_users_raw(
                 return []
             except Exception as parse_err:
                 users_logger.warning(f"Error parsing page at offset {offset}: {parse_err}")
+                if strict:
+                    raise ValueError(f"Invalid /api/users page at {offset}") from parse_err
                 return []
 
     tasks = [fetch_page_task(off) for off in offsets]
@@ -158,10 +189,17 @@ async def fetch_all_users_raw(
     for i, page in enumerate(pages):
         if isinstance(page, Exception):
             users_logger.error(f"Exception fetching page {i + 1}: {page}")
+            if strict:
+                raise ValueError("Incomplete /api/users pagination") from page
             continue
         if isinstance(page, list):
             all_users.extend(page)
 
+    if strict and (
+        len({row["id"] for row in all_users}) != total_users
+        or len({row["username"] for row in all_users}) != total_users
+    ):
+        raise ValueError("Duplicate candidates in /api/users pagination")
     elapsed = (time.perf_counter() - start_time) * 1000
     users_logger.info(f"📋 Fetched all {len(all_users)} users in {elapsed:.0f}ms")
     return all_users
@@ -739,6 +777,10 @@ async def disable_user_by_status(panel_data: PanelType, username: str) -> bool:
     users_logger.debug(f"🚫 Disabling user by status: {username}")
     status = {"status": "disabled"}
 
+    from utils.enforcement_guard import validate_enforcement
+
+    await validate_enforcement()
+
     response = await panel_put(
         panel_data,
         f"/api/user/{quote(username, safe='')}",
@@ -762,6 +804,8 @@ async def disable_user_by_status(panel_data: PanelType, username: str) -> bool:
 
 async def disable_user_by_group(panel_data: PanelType, username: str, disabled_group_id: int) -> bool:
     """Stage an exact group inverse, then apply groups and disabled status together."""
+    from utils.enforcement_guard import EnforcementProtected, validate_enforcement
+
     try:
         details = await get_user_details(panel_data, username)
         if details is None:
@@ -772,6 +816,7 @@ async def disable_user_by_group(panel_data: PanelType, username: str, disabled_g
         provenance = await _prepare_disable_provenance(username, "group", list(current_groups), [disabled_group_id])
         if provenance["method"] != "group":
             raise ValueError(f"An unresolved status incident exists for {username}")
+        await validate_enforcement()
         success, _ = await _update_user_groups_and_status(
             panel_data, username, provenance["applied_groups"], "disabled"
         )
@@ -780,12 +825,26 @@ async def disable_user_by_group(panel_data: PanelType, username: str, disabled_g
                 "DISABLE", username, f"groups={provenance['applied_groups']}, status=disabled", success=True
             )
         return success
+    except EnforcementProtected:
+        raise
     except Exception as error:
         users_logger.error(f"Error disabling user by group for {username}: {error}")
         return False
 
 
 async def disable_user(
+    panel_data: PanelType, username: UserType, duration_seconds: int = 0, permanent: bool = False
+) -> None | ValueError:
+    """Disable a user, owning the actual success independently of history."""
+    from utils.punishment_facts import current_action, get_punishment_fact_journal
+
+    if current_action() is not None:
+        return await _disable_user(panel_data, username, duration_seconds, permanent)
+    async with get_punishment_fact_journal().action(username.name, None):
+        return await _disable_user(panel_data, username, duration_seconds, permanent)
+
+
+async def _disable_user(
     panel_data: PanelType, username: UserType, duration_seconds: int = 0, permanent: bool = False
 ) -> None | ValueError:
     """
@@ -811,6 +870,10 @@ async def disable_user(
     if not user_exists:
         message = f"User {username.name} not found in panel (deleted?), skipping disable"
         users_logger.warning(message)
+        from utils.punishment_facts import current_action
+
+        if current_action() is not None:
+            current_action().known_not_disabled = True
         await safe_send_logs_panel(message)
         return None
 
@@ -827,12 +890,22 @@ async def disable_user(
 
     success = False
 
+    from utils.enforcement_guard import validate_enforcement
+
+    await validate_enforcement()
+
     if disable_method == "group" and disabled_group_id is not None:
         success = await disable_user_by_group(panel_data, username.name, disabled_group_id)
     else:
         success = await disable_user_by_status(panel_data, username.name)
 
     if success:
+        from utils.punishment_facts import current_action
+
+        fact = current_action()
+        if fact is not None:
+            fact.mark_disabled()
+            await fact.save()
         tracked = await dis_users.disable(username.name, duration_seconds, permanent=permanent)
         if tracked:
             users_logger.info(f"🚫 User {username.name} added to disabled users list (permanent={permanent})")
@@ -879,31 +952,8 @@ async def disable_user_with_punishment(panel_data: PanelType, username: UserType
 
     system = get_punishment_system()
 
-    # A panel action applied earlier whose violation could not be recorded is
-    # reconciled here - retry the record only, never re-apply the side effect.
-    if system.has_unrecorded_incident(username.name):
-        step_index, duration_minutes = system.pop_unrecorded_incident(username.name)
-        try:
-            await record_user_violation(username.name, step_index, duration_minutes)
-            return {
-                "action": "reconciled",
-                "step_index": step_index,
-                "violation_count": 0,
-                "duration_minutes": duration_minutes,
-                "message": f"Reconciled a previously unrecorded punishment for {username.name}",
-            }
-        except ViolationRecordError:
-            system.mark_unrecorded(username.name, step_index, duration_minutes)
-            return {
-                "action": "applied_unrecorded",
-                "newly_applied": False,
-                "step_index": step_index,
-                "violation_count": 0,
-                "duration_minutes": duration_minutes,
-                "message": f"Punishment for {username.name} was applied but is still unrecorded",
-            }
-
-    # Deduplicate a concurrent application for the same user: apply once, not twice.
+    # Reconciliation owns the same claim as a new panel action. Keep its pending
+    # record until persistence succeeds, including across errors or cancellation.
     if not system.begin_incident(username.name):
         return {
             "action": "deduplicated",
@@ -913,6 +963,28 @@ async def disable_user_with_punishment(panel_data: PanelType, username: UserType
             "message": f"Punishment for {username.name} is already being applied",
         }
     try:
+        pending = system.get_unrecorded_incident(username.name)
+        if pending is not None:
+            step_index, duration_minutes = pending
+            try:
+                await record_user_violation(username.name, step_index, duration_minutes)
+            except ViolationRecordError:
+                return {
+                    "action": "applied_unrecorded",
+                    "newly_applied": False,
+                    "step_index": step_index,
+                    "violation_count": 0,
+                    "duration_minutes": duration_minutes,
+                    "message": f"Punishment for {username.name} was applied but is still unrecorded",
+                }
+            system.pop_unrecorded_incident(username.name)
+            return {
+                "action": "reconciled",
+                "step_index": step_index,
+                "violation_count": 0,
+                "duration_minutes": duration_minutes,
+                "message": f"Reconciled a previously unrecorded punishment for {username.name}",
+            }
         return await _apply_punishment_locked(panel_data, username, system)
     finally:
         system.end_incident(username.name)
@@ -924,7 +996,7 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
     Records that follow a panel side effect (disable/revoke) are reconciled through the
     punishment system's unrecorded ledger on failure, so the side effect is never repeated.
     """
-    from utils.punishment_system import get_punishment_for_user, record_user_violation, ViolationRecordError
+    from utils.punishment_system import get_punishment_for_user
 
     data = await read_config()
     punishment, step_index, violation_count = await get_punishment_for_user(username.name, data)
@@ -933,12 +1005,59 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
         f"⚖️ Punishment for {username.name}: step={step_index}, violations={violation_count}, type={punishment.step_type if punishment else 'none'}"
     )
 
+    from utils.punishment_facts import get_punishment_fact_journal
+    from utils.enforcement_guard import EnforcementProtected
+
+    def protected_result(error):
+        return {
+            "action": "skipped",
+            "protected": True,
+            "step_index": step_index if enabled else 0,
+            "violation_count": violation_count,
+            "duration_minutes": 0,
+            "message": str(error),
+        }
+
+    enabled = data.get("punishment", {}).get("enabled", True)
+    if enabled and punishment.is_warning():
+        try:
+            return await _apply_selected_punishment(
+                panel_data, username, system, data, punishment, step_index, violation_count
+            )
+        except EnforcementProtected as error:
+            return protected_result(error)
+    callback = (
+        (lambda: system.mark_unrecorded(username.name, step_index, punishment.duration_minutes)) if enabled else None
+    )
+    async with get_punishment_fact_journal().action(username.name, step_index if enabled else None, callback):
+        try:
+            return await _apply_selected_punishment(
+                panel_data, username, system, data, punishment, step_index, violation_count
+            )
+        except EnforcementProtected as error:
+            # Normal exit settles a prepared intent as known completed with no
+            # effects, preserving report readiness and the original warning.
+            return protected_result(error)
+
+
+async def _apply_selected_punishment(
+    panel_data, username, system, data, punishment, step_index, violation_count
+) -> dict:
+    """Apply the selected policy while owning an independent action snapshot."""
+    from utils.punishment_system import record_user_violation, ViolationRecordError
+    from utils.punishment_facts import current_action
+    from utils.enforcement_guard import own_returned_enforcement_effect, validate_enforcement
+
+    await validate_enforcement()
+
     punishment_enabled = data.get("punishment", {}).get("enabled", True)
 
     if not punishment_enabled:
         users_logger.debug(f"⚖️ Punishment system disabled, using simple disable for {username.name}")
         try:
             await disable_user(panel_data, username)
+            current_action().mark_disabled()
+            await current_action().save()
             return {
                 "action": "disabled",
                 "step_index": 0,
@@ -980,6 +1099,9 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
         try:
             # First revoke the subscription (changes subscription URL)
             revoke_success = await revoke_user_subscription(panel_data, username.name)
+            own_returned_enforcement_effect(revoke_success)
+            current_action().mark_partial("revoke_succeeded", revoke_success)
+            await current_action().save()
             if revoke_success:
                 users_logger.info(f"🔄 Revoked subscription for {username.name}")
             else:
@@ -987,6 +1109,9 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
 
             # Also reset the UUID directly (changes vless/vmess UUID)
             uuid_reset_success = await reset_user_uuid(panel_data, username.name)
+            own_returned_enforcement_effect(uuid_reset_success)
+            current_action().mark_partial("uuid_reset_succeeded", uuid_reset_success)
+            await current_action().save()
             if uuid_reset_success:
                 users_logger.info(f"🔑 Reset UUID for {username.name}")
             else:
@@ -994,13 +1119,14 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
 
             # Then permanently disable the user
             await disable_user(panel_data, username, 0, permanent=True)
-            # The panel side effects above already happened; if recording fails, mark
-            # the incident unrecorded so the next attempt reconciles the record rather
-            # than revoking and disabling a second time.
+            current_action().mark_disabled()
+            await current_action().save()
+            # Keep the applied incident before recording can fail or be cancelled.
+            # The next attempt reconciles it without repeating the panel actions.
+            system.mark_unrecorded(username.name, step_index, 0)
             try:
                 await record_user_violation(username.name, step_index, 0)
             except ViolationRecordError:
-                system.mark_unrecorded(username.name, step_index, 0)
                 return {
                     "action": "applied_unrecorded",
                     "newly_applied": True,
@@ -1011,6 +1137,7 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
                     "uuid_reset_success": uuid_reset_success,
                     "message": f"User {username.name} revoked + disabled; violation not yet recorded",
                 }
+            system.pop_unrecorded_incident(username.name)
 
             # Build status message
             status_parts = []
@@ -1053,12 +1180,14 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
 
     try:
         await disable_user(panel_data, username, duration_seconds, permanent=is_permanent)
-        # The disable already happened; a record failure is reconciled next attempt,
-        # never by disabling again.
+        current_action().mark_disabled()
+        await current_action().save()
+        # Preserve the completed panel action before the recording await, including
+        # cancellation and unexpected recording errors.
+        system.mark_unrecorded(username.name, step_index, punishment.duration_minutes)
         try:
             await record_user_violation(username.name, step_index, punishment.duration_minutes)
         except ViolationRecordError:
-            system.mark_unrecorded(username.name, step_index, punishment.duration_minutes)
             return {
                 "action": "applied_unrecorded",
                 "newly_applied": True,
@@ -1067,6 +1196,7 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
                 "duration_minutes": punishment.duration_minutes,
                 "message": f"User {username.name} disabled; violation not yet recorded",
             }
+        system.pop_unrecorded_incident(username.name)
 
         if is_permanent:
             message = f"🚫 User {username.name} disabled permanently (violation #{violation_count + 1})"

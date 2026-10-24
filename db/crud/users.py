@@ -6,11 +6,13 @@ Handles all user-related operations including exceptions, limits, and disable st
 import time
 from datetime import datetime, timezone
 from typing import Optional, List
+from collections.abc import Iterable
 
 from sqlalchemy import select, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import User
+from db.crud.config_revision import ConfigRevisionCRUD
 from utils.logs import get_logger
 
 _PENDING_USER_INVALIDATIONS = "pending_user_cache_invalidations"
@@ -39,6 +41,21 @@ class UserCRUD:
     Consolidated CRUD operations for Users table.
     Includes methods for panel sync, exceptions, limits, and disable status.
     """
+
+    @staticmethod
+    async def get_policy_facts(db: AsyncSession, usernames: Iterable[str]) -> dict[str, dict]:
+        """Read current groups and owner from the caller's coherent snapshot."""
+        names = sorted(set(usernames))
+        facts = {}
+        for offset in range(0, len(names), 500):
+            result = await db.execute(
+                select(User.username, User.group_ids, User.owner_username).where(
+                    User.username.in_(names[offset : offset + 500])
+                )
+            )
+            for row in result:
+                facts[row.username] = {"group_ids": list(row.group_ids or []), "owner_username": row.owner_username}
+        return facts
 
     # ==================== Core User Methods ====================
 
@@ -184,6 +201,7 @@ class UserCRUD:
         result = await db.execute(delete(User).where(User.username == username))
         deleted = result.rowcount > 0
         if deleted:
+            await ConfigRevisionCRUD.advance(db)
             register_user_cache_invalidation(db, username)
             db_users_logger.info(f"✅ Deleted user: {username}")
         else:
@@ -199,6 +217,7 @@ class UserCRUD:
         result = await db.execute(delete(User).where(User.username.in_(usernames)))
         deleted = result.rowcount
         if deleted:
+            await ConfigRevisionCRUD.advance(db)
             register_user_cache_invalidations(db, usernames)
         db_users_logger.info(f"✅ Deleted {deleted} users")
         return deleted
@@ -256,6 +275,7 @@ class UserCRUD:
         user.excepted_at = datetime.now(timezone.utc) if excepted else None
 
         await db.flush()
+        await ConfigRevisionCRUD.advance(db)
         action = "added to" if excepted else "removed from"
         register_user_cache_invalidation(db, username)
         db_users_logger.info(f"✅ User {username} {action} exception list")
@@ -343,6 +363,7 @@ class UserCRUD:
         user.special_limit_updated_at = datetime.now(timezone.utc) if limit is not None else None
 
         await db.flush()
+        await ConfigRevisionCRUD.advance(db)
         register_user_cache_invalidation(db, username)
         if limit is not None:
             db_users_logger.info(f"✅ Special limit set for {username}: {limit}")
@@ -576,7 +597,7 @@ class UserCRUD:
     async def bulk_upsert_users(db: AsyncSession, users_data: List[dict]) -> int:
         """
         Perform native SQLite Bulk Upsert (ON CONFLICT(username) DO UPDATE).
-        Upserts thousands of users in single atomic SQL executions per chunk.
+        Upserts panel-owned facts in atomic chunks, preserving local and legacy derived columns.
         """
         if not users_data:
             return 0
@@ -604,8 +625,6 @@ class UserCRUD:
                         "used_traffic": d.get("used_traffic", 0),
                         "expire_at": d.get("expire_at"),
                         "note": d.get("note"),
-                        "is_monitored": d.get("is_monitored", True),
-                        "effective_ip_limit": d.get("effective_ip_limit"),
                         "last_synced_at": now,
                     }
                 )
@@ -623,8 +642,6 @@ class UserCRUD:
                     "used_traffic": stmt.excluded.used_traffic,
                     "expire_at": stmt.excluded.expire_at,
                     "note": stmt.excluded.note,
-                    "is_monitored": stmt.excluded.is_monitored,
-                    "effective_ip_limit": stmt.excluded.effective_ip_limit,
                     "last_synced_at": stmt.excluded.last_synced_at,
                 },
             )
