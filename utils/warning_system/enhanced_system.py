@@ -9,6 +9,7 @@ import json
 import os
 import time
 import ipaddress
+from collections.abc import Awaitable, Mapping
 from typing import Callable, Dict, Optional, Set
 from datetime import datetime
 
@@ -20,8 +21,10 @@ from utils.warning_system.helpers import (
     safe_send_warning_log,
     safe_send_disable_notification,
     safe_disable_user_with_punishment,
+    capture_monitoring_guard,
 )
 from utils.atomic_io import atomic_write_json
+from utils.user_policy import UserPolicy, evaluate_user_policy
 
 # Module logger
 warning_logger = get_logger("warning_system")
@@ -174,27 +177,31 @@ class EnhancedWarningSystem:
         warning_logger.info(f"🗑️ Cleared all trust data: {warnings_count} warnings, {history_count} history entries")
         return warnings_count, history_count
 
-    async def clear_user_trust_data(self, username: str) -> bool:
+    async def clear_user_trust_data(self, username: str, *, expected_warning: UserLimitWarning | None = None) -> bool:
         """
         Clear trust data for a specific user.
 
         Args:
             username: The username to clear data for
+            expected_warning: Automatic clears consume only this warning owner.
 
         Returns:
             bool: True if user had data to clear
         """
-        had_data = False
+        if expected_warning is not None and self.warnings.get(username) is not expected_warning:
+            return False
+        # Claim both removals without an await. Persistence may yield to a new
+        # warning/history owner, whose state must survive the old clear operation.
+        had_warning = username in self.warnings
+        had_history = username in self.warning_history
+        self.warnings.pop(username, None)
+        self.warning_history.pop(username, None)
+        had_data = had_warning or had_history
 
-        if username in self.warnings:
-            del self.warnings[username]
+        if had_warning:
             await self.save_warnings()
-            had_data = True
-
-        if username in self.warning_history:
-            del self.warning_history[username]
+        if had_history:
             await self.save_warning_history()
-            had_data = True
 
         if had_data:
             warning_logger.info(f"🗑️ Cleared trust data for user: {username}")
@@ -677,6 +684,9 @@ class EnhancedWarningSystem:
         known_users: Optional[Set[str]] = None,
         protected_users: Optional[Set[str]] = None,
         refresh_user_evidence: Optional[Callable[[str], bool]] = None,
+        *,
+        user_policies: Mapping[str, UserPolicy] | None = None,
+        refresh_user_policy: Callable[[str], Awaitable[UserPolicy | None]] | None = None,
     ) -> tuple[Set[str], Set[str]]:
         """
         Check for users who still violate limits after the monitoring window ended.
@@ -689,23 +699,26 @@ class EnhancedWarningSystem:
                 incomplete. Nothing is banned and no record is deleted, because a
                 partial view cannot tell "this user disconnected" from "the node
                 carrying this user went silent".
-            except_users: Whitelisted usernames. The caller's main loop skips these;
-                without them here the second ban path could disable a user the
-                operator had explicitly excepted.
-            known_users: Usernames whose limit is actually known this cycle. A user
-                missing from it is left untouched: resolve_effective_limit would fall
-                back to the general limit, which is stricter than most group limits.
-
-            protected_users: Users whose API evidence is unknown; preserve their records.
+            batched_group_limits, except_users, known_users: Retained for caller
+                compatibility. Current canonical policy supplies eligibility/limits.
+            protected_users: Users whose evidence or policy cannot be judged;
+                preserve their records.
             refresh_user_evidence: Optional local evaluation hook after awaits. It
                 refreshes IP/device maps and returns False if a user cannot be judged.
+            user_policies: Initial coherent policies for active and retained users.
+            refresh_user_policy: Awaited current policy check immediately before
+                judgment. Default calls read canonical settings and factual fields.
 
         Returns:
             Tuple[Set[str], Set[str]]: (disabled_users, warned_users) - sets of users who were disabled or warned
         """
         disabled_users = set()
         warned_users = set()  # Track users who received warnings to prevent double processing
-        users_to_remove = []
+        users_to_remove = {}
+        normalized_users = set()
+        monitoring_is_current = capture_monitoring_guard()
+        if not monitoring_is_current():
+            return disabled_users, warned_users
 
         if not sample_is_trustworthy:
             # Deliberately before any other work. This function used to run before the
@@ -720,32 +733,56 @@ class EnhancedWarningSystem:
             )
             return disabled_users, warned_users
 
-        excepted = set(except_users or ())
+        if protected_users is None:
+            protected_users = set()
+        if refresh_user_policy is None:
+            from utils.read_config import get_config_revision, read_config_snapshot
+            from utils.settings_service import read_user_policy
 
-        limits_config = config_data.get("limits", {})
-        # A copy, not the cached dict itself. The DB refresh below calls .update() on
-        # this name, which used to mutate config_data["limits"]["special"] in place -
-        # so every cycle quietly rewrote the process-wide config cache, and because
-        # update() only ever adds keys, a special limit the operator REMOVED stayed
-        # visible until the cache happened to be rebuilt. The enforcement path does not
-        # read this dict (limits come from the per-cycle metadata batch); its readers
-        # are the Telegram display, the backup export and
-        # get_config_value("SPECIAL_LIMIT"), all of which should see what read_config
-        # loaded from the database rather than what this function last fetched.
-        special_limit = dict(limits_config.get("special", {}))
-        limit_number = limits_config.get("general", 2)
+            try:
+                snapshot = await read_config_snapshot(usernames=self.warnings)
+            except Exception as error:
+                warning_logger.error(f"Persistent enforcement waiting: {error}")
+                return disabled_users, warned_users
+            if snapshot.config.get("config_degraded"):
+                return disabled_users, warned_users
+            if user_policies is None:
+                user_policies = {
+                    name: evaluate_user_policy(
+                        username=name, config=snapshot.config, facts=snapshot.user_facts.get(name)
+                    )
+                    for name in self.warnings
+                }
 
-        # Read special limits from DB if available
-        try:
-            from db.database import get_db
-            from db.crud import UserCRUD
+            async def refresh_user_policy(username: str) -> UserPolicy | None:
+                if get_config_revision() != snapshot.local_revision:
+                    return None
+                if refresh_user_evidence is not None and not refresh_user_evidence(username):
+                    return None
+                policy = await read_user_policy(username, expected_db_revision=snapshot.db_revision)
+                if get_config_revision() != snapshot.local_revision:
+                    return None
+                if refresh_user_evidence is not None and not refresh_user_evidence(username):
+                    return None
+                return policy
 
-            async with get_db() as db:
-                db_special_limits = await UserCRUD.get_all_special_limits(db)
-                if db_special_limits:
-                    special_limit.update(db_special_limits)
-        except Exception:
-            pass
+        async def current_policy(username: str) -> UserPolicy | None:
+            if not monitoring_is_current():
+                protected_users.add(username)
+                return None
+            try:
+                policy = await refresh_user_policy(username)
+            except Exception as error:
+                warning_logger.error(f"Current policy unavailable for {username}: {error}")
+                policy = None
+            if not monitoring_is_current() or policy is None or not policy.known or not policy.eligible:
+                protected_users.add(username)
+                if policy is not None and not policy.known:
+                    from utils.user_sync import queue_unknown_user_fetch
+
+                    await queue_unknown_user_fetch(username)
+                return None
+            return policy
 
         warning_logger.debug(f"⚠️ Checking {len(self.warnings)} active warnings for persistent violations")
 
@@ -755,53 +792,30 @@ class EnhancedWarningSystem:
         # raise "dictionary changed size during iteration" and abandon every remaining
         # offender for that cycle.
         for username, warning in list(self.warnings.items()):
-            if username in (protected_users or ()):
+            if not monitoring_is_current():
+                break
+            if username in protected_users:
                 continue
             if refresh_user_evidence is not None and not refresh_user_evidence(username):
                 continue
             if not warning.is_monitoring_active():
                 warning_logger.debug(f"⚠️ Monitoring ended for {username}")
+                policy = (user_policies or {}).get(username)
+                if policy is not None and not policy.eligible:
+                    protected_users.add(username)
+                    if not policy.known:
+                        from utils.user_sync import queue_unknown_user_fetch
 
-                if username in excepted:
-                    # The caller's main loop skips whitelisted users before they can
-                    # ever be warned. This path had no equivalent check, so a user the
-                    # operator excepted while they were already under monitoring could
-                    # still be disabled here.
-                    warning_logger.info(
-                        f"✅ {username} is whitelisted - dropping the monitoring record instead of judging it"
-                    )
-                    users_to_remove.append(username)
+                        await queue_unknown_user_fetch(username)
                     continue
-
-                if known_users is not None and username not in known_users:
-                    # Their limit is unknown this cycle, and resolve_effective_limit
-                    # would quietly fall back to the general limit - stricter than most
-                    # group limits, so it disables users who are inside their real one.
-                    # Leave the record untouched and judge it when the data is back.
-                    warning_logger.warning(
-                        f"⚠️ Limit unknown for {username} this cycle - the monitoring "
-                        f"record is left as it is rather than judged against the general "
-                        f"fallback limit"
-                    )
+                policy = await current_policy(username)
+                if policy is None or self.warnings.get(username) is not warning:
                     continue
-
-                if warning.active_monitoring_task and not warning.active_monitoring_task.done():
-                    warning.active_monitoring_task.cancel()
-
-                from utils.check_usage import resolve_effective_limit
-                from utils.user_sync import USER_METADATA_CACHE
-
-                cached_meta = USER_METADATA_CACHE.get(username)
-                user_limit_number = await resolve_effective_limit(
-                    username=username,
-                    config=config_data,
-                    metadata=cached_meta,
-                    special_limit=special_limit,
-                    group_limits=batched_group_limits,
-                )
-
                 if refresh_user_evidence is not None and not refresh_user_evidence(username):
                     continue
+                user_limit_number = policy.limit
+                if warning.active_monitoring_task and not warning.active_monitoring_task.done():
+                    warning.active_monitoring_task.cancel()
                 trust_score = warning.trust_score
                 trust_level = warning.get_trust_level()
 
@@ -823,51 +837,6 @@ class EnhancedWarningSystem:
                     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                     if device_count > user_limit_number and warning.consecutive_violations >= required_violations:
-                        # ===== DOUBLE-CHECK BEFORE BAN (O(1) FAST RAM CHECK) =====
-                        try:
-                            if username in USER_METADATA_CACHE:
-                                user_meta = USER_METADATA_CACHE[username]
-                                if user_meta.get("is_excepted"):
-                                    warning_logger.info(
-                                        f"✅ Double-Check ABORTED ban for user {username}: user is excepted/whitelisted"
-                                    )
-                                    users_to_remove.append(username)
-                                    continue
-
-                                eff_limit = user_meta.get("effective_ip_limit")
-                                spec_limit = user_meta.get("special_limit")
-                                if spec_limit is not None and spec_limit > 0:
-                                    user_limit_number = spec_limit
-                                elif eff_limit is not None and eff_limit > 0:
-                                    user_limit_number = eff_limit
-                                else:
-                                    # Direct safety check for group limits
-                                    gids = user_meta.get("group_ids", [])
-                                    cfg_group_limits = config_data.get("group_limits", {})
-                                    if gids and cfg_group_limits:
-                                        from utils.user_sync import get_max_group_limit
-
-                                        glim = get_max_group_limit(gids, cfg_group_limits)
-                                        if glim is not None and glim > user_limit_number:
-                                            user_limit_number = glim
-
-                                if device_count <= user_limit_number:
-                                    warning_logger.info(
-                                        f"✅ Double-Check ABORTED ban for user {username}: limit updated to {user_limit_number}"
-                                    )
-                                    log_monitoring_event(
-                                        "double_check_aborted",
-                                        username,
-                                        {"devices": device_count, "limit": user_limit_number},
-                                    )
-                                    users_to_remove.append(username)
-                                    continue
-                        except Exception as dc_err:
-                            warning_logger.warning(f"⚠️ Double-check verification error for {username}: {dc_err}")
-
-                        warning_logger.warning(
-                            f"🚫 User {username} exceeds limit after double-check: {device_count} > {user_limit_number}"
-                        )
                         try:
                             punishment_result = await safe_disable_user_with_punishment(
                                 panel_data, UserType(name=username, ip=[])
@@ -984,6 +953,7 @@ class EnhancedWarningSystem:
                             await safe_send_logs(f"❌ <b>Error:</b> Failed to disable user {username}: {e}")
 
                     elif device_count <= user_limit_number:
+                        normalized_users.add(username)
                         warning_logger.info(
                             f"✅ User {username} is now within limits ({device_count} IPs, limit: {user_limit_number})"
                         )
@@ -991,21 +961,28 @@ class EnhancedWarningSystem:
                             "monitoring_ended", username, {"devices": device_count, "limit": user_limit_number}
                         )
                 else:
+                    normalized_users.add(username)
                     warning_logger.info(f"ℹ️ User {username} not found in current logs - monitoring ended")
                     log_monitoring_event("monitoring_ended", username, {"reason": "user_inactive"})
 
-                users_to_remove.append(username)
+                users_to_remove[username] = warning
 
-        for username in users_to_remove:
+        for username, warning in users_to_remove.items():
+            if self.warnings.get(username) is not warning:
+                continue
             # Earlier absence/normalization decisions may have waited behind a
             # later user's preparation. Preserve them if the sample was retired.
             # Already-applied punishments still consume their warning record.
-            if (
-                refresh_user_evidence is not None
-                and username not in disabled_users | warned_users
-                and not refresh_user_evidence(username)
-            ):
-                continue
+            if username not in disabled_users | warned_users:
+                policy = await current_policy(username)
+                if policy is None or self.warnings.get(username) is not warning:
+                    continue
+                if refresh_user_evidence is not None and not refresh_user_evidence(username):
+                    continue
+                if username in normalized_users:
+                    count = (device_counts or {}).get(username, len(all_users_actual_ips.get(username, ())))
+                    if count > policy.limit:
+                        continue
             # pop, not del: clear_user_trust_data may already have removed the key
             # while this function was awaiting a panel call or a Telegram send.
             self.warnings.pop(username, None)
@@ -1040,7 +1017,12 @@ class EnhancedWarningSystem:
         return username in self.warnings and self.warnings[username].is_monitoring_active()
 
     async def cleanup_expired_warnings(
-        self, sample_is_trustworthy: bool = True, protected_users: Optional[Set[str]] = None
+        self,
+        sample_is_trustworthy: bool = True,
+        protected_users: Optional[Set[str]] = None,
+        *,
+        expected_warnings: Mapping[str, UserLimitWarning] | None = None,
+        authorize_clear: Callable[[str], Awaitable[bool]] | None = None,
     ):
         """
         Delete monitoring records whose window has closed.
@@ -1051,8 +1033,13 @@ class EnhancedWarningSystem:
         anything when the sample is partial. Running unconditionally afterwards deleted
         precisely the records it had just preserved, so a partial sample still wiped
         real offenders' counters - the failure those guards exist to prevent.
+
+        The caller can capture ``expected_warnings`` before reporting and provide
+        ``authorize_clear`` to refresh current policy, evidence, and device count.
+        Direct callers refresh canonical eligibility before each expired removal.
         """
-        if not sample_is_trustworthy:
+        monitoring_is_current = capture_monitoring_guard()
+        if not sample_is_trustworthy or not monitoring_is_current():
             if self.warnings:
                 warning_logger.warning(
                     f"⏳ Keeping {len(self.warnings)} monitoring record(s): the sample "
@@ -1061,13 +1048,56 @@ class EnhancedWarningSystem:
                 )
             return
 
-        expired_users = []
-        for username, warning in self.warnings.items():
-            if username not in (protected_users or ()) and not warning.is_monitoring_active():
-                expired_users.append(username)
+        candidates = dict(self.warnings if expected_warnings is None else expected_warnings)
+        if not candidates:
+            return
+        if authorize_clear is None:
+            from utils.read_config import get_config_revision, read_config_snapshot
+            from utils.settings_service import read_user_policy
 
-        for username in expired_users:
-            del self.warnings[username]
+            try:
+                snapshot = await read_config_snapshot(usernames=candidates)
+            except Exception as error:
+                warning_logger.error(f"Expired cleanup waiting: {error}")
+                return
+            if snapshot.config.get("config_degraded"):
+                return
+
+            async def authorize_clear(username: str) -> bool:
+                if get_config_revision() != snapshot.local_revision:
+                    return False
+                policy = await read_user_policy(username, expected_db_revision=snapshot.db_revision)
+                return bool(
+                    get_config_revision() == snapshot.local_revision
+                    and policy is not None
+                    and policy.known
+                    and policy.eligible
+                )
+
+        expired_users = []
+        for username, warning in candidates.items():
+            if not monitoring_is_current():
+                break
+            if (
+                username in (protected_users or ())
+                or self.warnings.get(username) is not warning
+                or warning.is_monitoring_active()
+            ):
+                continue
+            try:
+                authorized = await authorize_clear(username)
+            except Exception as error:
+                warning_logger.error(f"Expired cleanup unavailable for {username}: {error}")
+                continue
+            if (
+                not authorized
+                or not monitoring_is_current()
+                or self.warnings.get(username) is not warning
+                or warning.is_monitoring_active()
+            ):
+                continue
+            self.warnings.pop(username, None)
+            expired_users.append(username)
 
         if expired_users:
             await self.save_warnings()
