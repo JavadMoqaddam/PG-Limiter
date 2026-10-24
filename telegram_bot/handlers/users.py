@@ -3,6 +3,7 @@ User management handlers for the Telegram bot.
 Includes functions for except users, disabled users management, and cleanup.
 """
 
+import html
 import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -206,8 +207,10 @@ async def set_except_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_except_users_handler(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     """Write the except users to the config file."""
     except_user = update.message.text.strip()
-    await add_except_user(except_user)
-    await update.message.reply_html(f"Except user <code>{except_user}</code> added successfully!")
+    if await add_except_user(except_user):
+        await update.message.reply_html(f"Except user <code>{html.escape(except_user)}</code> added successfully!")
+    else:
+        await update.message.reply_html("❌ Could not save whitelist membership; check the username and try again.")
     return ConversationHandler.END
 
 
@@ -936,10 +939,15 @@ async def handle_except_user_input(update: Update, context: ContextTypes.DEFAULT
     Called from the main text_message_handler when waiting_for == "except_user".
     """
     text = update.message.text.strip()
-    await add_except_user(text)
+    result = await add_except_user(text)
     context.user_data["waiting_for"] = None
     await update.message.reply_html(
-        text=f"✅ Except user <b>{text}</b> added successfully!", reply_markup=create_back_to_users_keyboard()
+        text=(
+            f"✅ Except user <b>{html.escape(text)}</b> added successfully!"
+            if result
+            else "❌ Could not save whitelist membership; check the username and try again."
+        ),
+        reply_markup=create_back_to_users_keyboard(),
     )
 
 
