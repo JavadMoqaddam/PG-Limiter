@@ -50,7 +50,6 @@ LOCAL_ID_CACHE = TTLCache(maxsize=30000, ttl=600)
 # API endpoints with fallback order (from most reliable to least)
 API_ENDPOINTS = [
     {"url": "http://ip-api.com/json/{ip}?fields=countryCode", "key": "countryCode", "name": "ip-api.com"},
-    {"url": "https://ipinfo.io/{ip}/json", "key": "country", "name": "ipinfo.io"},
     {"url": "https://api.iplocation.net/?ip={ip}", "key": "country_code2", "name": "iplocation.net"},
     {"url": "https://ipapi.co/{ip}/country", "key": None, "name": "ipapi.co"},
 ]
@@ -358,6 +357,10 @@ async def parse_logs(
             return ACTIVE_USERS
         if LOG_OBSERVATIONS.configure(data):
             ACTIVE_USERS.clear()
+        # An excluded stream may still finish a pending read. Reject its records
+        # before timezone conversion or any preparation can affect Logs evidence.
+        if not LOG_OBSERVATIONS.monitors(current_node_id):
+            return ACTIVE_USERS
         generation = LOG_OBSERVATIONS.generation
     if data.get("INVALID_IPS"):
         INVALID_IPS.update(data.get("INVALID_IPS"))
@@ -481,6 +484,7 @@ async def parse_logs(
             if (
                 generation != LOG_OBSERVATIONS.generation
                 or revision != get_config_revision()
+                or not LOG_OBSERVATIONS.monitors(current_node_id)
                 or not monitoring_is_current(admission)
             ):
                 continue

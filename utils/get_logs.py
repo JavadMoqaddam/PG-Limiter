@@ -10,6 +10,7 @@ from asyncio import Task
 from datetime import datetime
 from contextlib import asynccontextmanager
 
+from utils.device_count import COUNT_MODE_INBOUND
 from utils.parse_logs import INVALID_IPS
 from utils.log_observations import LOG_OBSERVATIONS
 from utils.monitoring_gate import (
@@ -27,7 +28,7 @@ except ImportError as exc:
 from telegram_bot.send_message import send_logs, edit_message
 from utils.logs import logger  # pylint: disable=ungrouped-imports
 from utils.panel_api import get_nodes, get_token
-from utils.parse_logs import parse_logs, set_current_node_info
+from utils.parse_logs import clear_node_active_connections, parse_logs, set_current_node_info
 from utils.shared_state import (
     clear_node_events,
     forget_node_event,
@@ -214,8 +215,20 @@ async def _update_node_status(
                 _status_initializing = False
 
 
+async def _refresh_log_config() -> None:
+    """Apply committed scope changes before registering or opening node streams."""
+    from utils.read_config import read_config, get_config_revision
+    from utils.shared_state import ACTIVE_USERS, ACTIVE_USERS_LOCK
+
+    config = await read_config()
+    async with ACTIVE_USERS_LOCK:
+        if config.get("_revision", get_config_revision()) == get_config_revision():
+            if LOG_OBSERVATIONS.configure(config):
+                ACTIVE_USERS.clear()
+
+
 async def init_node_status_message(nodes: list, admission: MonitoringAdmission | None = None) -> None:
-    """Initialize the status message with all nodes showing as connecting."""
+    """Initialize the status message with monitored nodes showing as connecting."""
     global \
         _node_connection_status, \
         _node_status_message_id, \
@@ -228,22 +241,15 @@ async def init_node_status_message(nodes: list, admission: MonitoringAdmission |
     await synchronize_monitoring()
     if not monitoring_is_current(admission):
         return
-    from utils.read_config import read_config, get_config_revision
-    from utils.shared_state import ACTIVE_USERS, ACTIVE_USERS_LOCK
-
-    config = await read_config()
-    async with ACTIVE_USERS_LOCK:
-        if not monitoring_is_current(admission):
-            return
-        LOG_OBSERVATIONS.register_fleet(nodes)
-        if config.get("_revision", get_config_revision()) == get_config_revision():
-            if LOG_OBSERVATIONS.configure(config):
-                ACTIVE_USERS.clear()
+    await _refresh_log_config()
+    if not monitoring_is_current(admission):
+        return
+    LOG_OBSERVATIONS.register_fleet(nodes)
     _node_connection_status = {}
     _node_status_message_id = None
 
     for node in nodes:
-        if node.status == "connected":
+        if node.status == "connected" and LOG_OBSERVATIONS.monitors(node.node_id):
             _node_connection_status[node.node_id] = {"name": node.node_name, "status": "⏳ Connecting..."}
 
     if _node_connection_status:
@@ -285,6 +291,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
         ValueError: If there is an issue with getting the panel token.
     """
     from utils.panel_api.request_helper import wait_for_panel, is_panel_available
+    from utils.read_config import get_config_revision
 
     global _node_connection_status
 
@@ -303,6 +310,14 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
     while True:
         await synchronize_monitoring()
         if not monitoring_is_current(admission):
+            return
+        await _refresh_log_config()
+        config_revision = get_config_revision()
+        if (
+            not monitoring_is_current(admission)
+            or node.status != "connected"
+            or not LOG_OBSERVATIONS.monitors(node.node_id)
+        ):
             return
         # API mode owns the IP collection, so the SSE stream must stay closed;
         # otherwise both writers would feed ACTIVE_USERS and double-count
@@ -417,18 +432,36 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
                         # alive", not "did a user connect". Counting only parsed
                         # events would read a busy node whose lines are all
                         # filtered out as dead.
-                        note_node_event(node.node_id, now)
                         if now >= next_mode_check:
                             next_mode_check = now + _IP_SOURCE_RECHECK_SECONDS
+                            # Refresh mutable settings only after a committed change;
+                            # ordinary stream pings keep the cheap scalar source read.
+                            if config_revision != get_config_revision():
+                                await _refresh_log_config()
+                                config_revision = get_config_revision()
+                            if not LOG_OBSERVATIONS.monitors(node.node_id):
+                                break
                             if await _ip_source_is_api():
                                 logger.info(
                                     f"🛰️ IP source switched to API, closing SSE stream "
                                     f"for node {node.node_id} ({node.node_name})"
                                 )
+                                from utils.read_config import read_config_scalar
+
+                                # API cannot supply inbound tags. Preserve this
+                                # unevaluated sample while that combination pauses
+                                # enforcement instead of discarding it on shutdown.
+                                count_mode = (
+                                    str(await read_config_scalar("device_count_mode", "device")).strip().lower()
+                                )
+                                if count_mode != COUNT_MODE_INBOUND:
+                                    await clear_node_active_connections(node.node_id)
                                 forget_node_event(node.node_id)
                                 break
                             if not monitoring_is_current(admission):
                                 return
+
+                        note_node_event(node.node_id, now)
 
                         if line.startswith("data: "):
                             log_data = line[6:]  # Remove "data: " prefix
@@ -506,7 +539,6 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
     """
     global _node_connection_status
 
-    deactivate_nodes = {}  # task_name -> node_id
     while True:
         admission = await synchronize_monitoring()
         if not monitoring_is_current(admission):
@@ -532,6 +564,9 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
             nodes_list = await get_nodes(panel_data, force_refresh=True, enabled_only=False)
             if not monitoring_is_current(admission):
                 continue
+            await _refresh_log_config()
+            if not monitoring_is_current(admission):
+                continue
             LOG_OBSERVATIONS.register_fleet(nodes_list)
         except Exception as error:  # pylint: disable=broad-except
             LOG_OBSERVATIONS.register_fleet(None)
@@ -542,10 +577,11 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
             await asyncio.sleep(poll_interval)
             continue
         silence_window = poll_interval
+        deactivate_nodes = {}  # Current poll only; excluded nodes may have no task yet.
         event_ages = get_node_event_ages()
         for node in nodes_list or []:
             task_name = f"Task-{node.node_id}-{node.node_name}"
-            if node.status != "connected":
+            if node.status != "connected" or not LOG_OBSERVATIONS.monitors(node.node_id):
                 deactivate_nodes[task_name] = node.node_id
                 continue
             # The panel says this node is fine, so panel-to-node is healthy - but the
@@ -566,6 +602,9 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
 
         for task in list(tasks):
             task_name = task.get_name()
+            task_node = task_node_mapping.get(task)
+            if task_node is not None and not LOG_OBSERVATIONS.monitors(task_node.node_id):
+                deactivate_nodes[task_name] = task_node.node_id
             if task_name in deactivate_nodes:
                 node_id = deactivate_nodes[task_name]
                 logger.info(f"Cancelling disconnected node task: {task_name}")
@@ -724,12 +763,19 @@ async def check_and_add_new_nodes(panel_data: PanelType, tg: asyncio.TaskGroup) 
             all_nodes = await get_nodes(panel_data, force_refresh=True, enabled_only=False)
             if not monitoring_is_current(admission):
                 continue
+            await _refresh_log_config()
+            if not monitoring_is_current(admission):
+                continue
             LOG_OBSERVATIONS.register_fleet(all_nodes)
             if all_nodes and not isinstance(all_nodes, ValueError):
                 for node in all_nodes:
                     if not monitoring_is_current(admission):
                         break
-                    if node.node_id not in active_node_ids and node.status == "connected":
+                    if (
+                        node.node_id not in active_node_ids
+                        and node.status == "connected"
+                        and LOG_OBSERVATIONS.monitors(node.node_id)
+                    ):
                         _node_connection_status[node.node_id] = {"name": node.node_name, "status": "⏳ Connecting..."}
 
                         logger.info(f"Add a new node. id: {node.node_id} name: {node.node_name}")
@@ -764,6 +810,13 @@ async def create_node_task(
         admission = monitoring_snapshot()
     await synchronize_monitoring()
     if not monitoring_is_current(admission):
+        return
+    await _refresh_log_config()
+    if (
+        not monitoring_is_current(admission)
+        or node.status != "connected"
+        or not LOG_OBSERVATIONS.monitors(node.node_id)
+    ):
         return
     INVALID_IPS.add(node.node_ip)
     task = tg.create_task(get_nodes_logs(panel_data, node, admission), name=f"Task-{node.node_id}-{node.node_name}")
