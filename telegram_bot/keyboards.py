@@ -12,11 +12,10 @@ def create_main_menu_keyboard():
     keyboard = [
         [
             InlineKeyboardButton("⚙️ Settings", callback_data=CallbackData.SETTINGS_MENU),
-            InlineKeyboardButton("📊 Reports", callback_data=CallbackData.REPORTS_MENU),
+            InlineKeyboardButton("📊 Status & Reports", callback_data=CallbackData.STATUS_REPORTS),
         ],
         [
             InlineKeyboardButton("👥 Users", callback_data=CallbackData.USERS_MENU),
-            InlineKeyboardButton("📡 Monitoring", callback_data=CallbackData.MONITORING_MENU),
         ],
         [
             InlineKeyboardButton("👑 Admins", callback_data=CallbackData.ADMIN_MENU),
@@ -145,42 +144,32 @@ def create_special_limits_menu_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
+def create_status_reports_keyboard(*, health: bool = False):
+    """Keep status and health navigation in one read-only tree."""
+    if health:
+        keyboard = [
+            [InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.HEALTH_REPORT)],
+            [InlineKeyboardButton("🔙 Back to status", callback_data=CallbackData.STATUS_REPORTS)],
+        ]
+    else:
+        keyboard = [
+            [
+                InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.STATUS_REPORTS),
+                InlineKeyboardButton("📊 Health report", callback_data=CallbackData.HEALTH_REPORT),
+            ],
+            [InlineKeyboardButton("🔙 Back", callback_data=CallbackData.BACK_MAIN)],
+        ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 def create_monitoring_menu_keyboard():
     """Create the monitoring menu inline keyboard."""
-    keyboard = [
-        [
-            InlineKeyboardButton("📊 Status", callback_data=CallbackData.MONITORING_STATUS),
-            InlineKeyboardButton("📈 Details", callback_data=CallbackData.MONITORING_DETAILS),
-        ],
-        [
-            InlineKeyboardButton("🗑️ Clear All", callback_data=CallbackData.MONITORING_CLEAR),
-        ],
-        [
-            InlineKeyboardButton("🔙 Back", callback_data=CallbackData.BACK_MAIN),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    return create_status_reports_keyboard()
 
 
 def create_reports_menu_keyboard():
     """Create the reports menu inline keyboard."""
-    keyboard = [
-        [
-            InlineKeyboardButton("📊 Connection Report", callback_data=CallbackData.REPORT_CONNECTION),
-            InlineKeyboardButton("🖥️ Node Usage", callback_data=CallbackData.REPORT_NODE_USAGE),
-        ],
-        [
-            InlineKeyboardButton("📱 Multi-Device", callback_data=CallbackData.REPORT_MULTI_DEVICE),
-        ],
-        [
-            InlineKeyboardButton("🕐 IP History 12h", callback_data=CallbackData.REPORT_IP_12H),
-            InlineKeyboardButton("🕐 IP History 48h", callback_data=CallbackData.REPORT_IP_48H),
-        ],
-        [
-            InlineKeyboardButton("🔙 Back", callback_data=CallbackData.BACK_MAIN),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    return create_status_reports_keyboard()
 
 
 def create_admin_menu_keyboard():
@@ -214,22 +203,26 @@ def create_enhanced_details_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-def create_disable_method_keyboard(current_method: str = "status", disabled_group_name: str = None, fallback_group_name: str = None):
+def create_disable_method_keyboard(
+    current_method: str = "status", disabled_group_name: str = None, fallback_group_name: str = None
+):
     """Create disable method selection keyboard with current selection highlighted."""
     status_prefix = "✅" if current_method == "status" else "⬜"
     group_prefix = "✅" if current_method == "group" else "⬜"
-    
+
     group_label = "📁 By Group"
     if current_method == "group" and disabled_group_name:
         group_label = f"📁 By Group ({disabled_group_name})"
-    
+
     fallback_label = "🔄 Fallback Group"
     if fallback_group_name:
         fallback_label = f"🔄 Fallback: {fallback_group_name}"
-    
+
     keyboard = [
         [
-            InlineKeyboardButton(f"{status_prefix} 🚫 By Status (disabled)", callback_data=CallbackData.DISABLE_BY_STATUS),
+            InlineKeyboardButton(
+                f"{status_prefix} 🚫 By Status (disabled)", callback_data=CallbackData.DISABLE_BY_STATUS
+            ),
         ],
         [
             InlineKeyboardButton(f"{group_prefix} {group_label}", callback_data=CallbackData.DISABLE_BY_GROUP),

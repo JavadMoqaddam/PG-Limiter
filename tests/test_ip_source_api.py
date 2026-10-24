@@ -138,7 +138,7 @@ def api_config():
 
 
 @pytest.fixture(autouse=True)
-def clean_collector_state():
+def clean_collector_state(operational_topics):
     """Reset collector globals, shared maps and the IP caches per test."""
     import utils.ip_source_api as api_mod
     from utils.ip_facts import BLOCKED_IPS, COUNTRY_CACHE, VERDICT_CACHE

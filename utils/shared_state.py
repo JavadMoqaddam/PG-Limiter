@@ -88,8 +88,11 @@ def refresh_api_user(user: UserType, freshness_seconds: int) -> bool:
 async def publish_api_snapshot(users: dict[str, UserType], evidence: APISampleEvidence) -> bool:
     """Publish only a current sample, isolated from log tasks winding down."""
     global _api_snapshot
+    from utils.monitoring_gate import monitoring_is_current, monitoring_snapshot
+
+    admission = monitoring_snapshot()
     async with ACTIVE_USERS_LOCK:
-        if not api_evidence_is_current(evidence):
+        if not api_evidence_is_current(evidence) or not monitoring_is_current(admission):
             return False
         snapshot = _clone_user_map(users)
         snapshot.api_evidence = evidence
@@ -268,12 +271,17 @@ async def merge_active_users_snapshot(batch: dict[str, UserType]) -> int:
 
     Returns the number of users actually restored (those without a newer observation).
     """
-    if not batch or getattr(batch, "api_evidence", None) is not None:
+    from utils.monitoring_gate import monitoring_is_current, monitoring_snapshot
+
+    admission = monitoring_snapshot()
+    if not batch or getattr(batch, "api_evidence", None) is not None or not monitoring_is_current(admission):
         # API observations belong to exactly one cycle; only Logs are requeued.
         return 0
     restored = 0
     async with ACTIVE_USERS_LOCK:
-        if not LOG_OBSERVATIONS.is_current(getattr(batch, "log_evidence", None)):
+        if not monitoring_is_current(admission) or not LOG_OBSERVATIONS.is_current(
+            getattr(batch, "log_evidence", None)
+        ):
             return 0
         retain_log_interval(batch, max(LOG_OBSERVATIONS.floor, time.time() - LOG_OBSERVATIONS.interval), time.time())
         for email, user in batch.items():

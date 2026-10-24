@@ -171,7 +171,41 @@ def pytest_addoption(parser):
 
 
 @pytest.fixture
-def completed_logs_evidence():
+def operational_topics(monkeypatch, tmp_path):
+    """Use a real, isolated Topics destination for tests exercising monitoring."""
+    import telegram_bot.topics as topics
+
+    monkeypatch.setattr(topics, "TOPICS_FILE", str(tmp_path / "topics.json"))
+    monkeypatch.setattr(topics, "MESSAGE_CACHE_FILE", str(tmp_path / "topic-cache.json"))
+    manager = topics.TopicsManager()
+    manager._enabled = True
+    manager._group_id = -1001234567890
+    monkeypatch.setattr(topics, "_topics_manager", manager)
+    import utils.monitoring_gate as gate
+
+    monkeypatch.setattr(gate, "_synchronized_admission", None)
+    monkeypatch.setattr(gate, "_sync_lock", asyncio.Lock())
+    monkeypatch.setattr(gate, "_warning_attempt", None)
+    monkeypatch.setattr(gate, "_last_completed_scan", None)
+    monkeypatch.setattr(gate, "_last_cycle_outcome", None)
+    import utils.shared_state as state
+    import utils.parse_logs as parser
+
+    active_lock = asyncio.Lock()
+    monkeypatch.setattr(state, "ACTIVE_USERS_LOCK", active_lock)
+    monkeypatch.setattr(parser, "ACTIVE_USERS_LOCK", active_lock)
+    import utils.get_logs as logs
+
+    monkeypatch.setattr(logs, "TASKS", [])
+    monkeypatch.setattr(logs, "task_node_mapping", {})
+    monkeypatch.setattr(logs, "task_monitoring_admissions", {})
+    monkeypatch.setattr(logs, "_pending_status_update_task", None)
+    monkeypatch.setattr(logs, "_status_lock", asyncio.Lock())
+    yield manager
+
+
+@pytest.fixture
+def completed_logs_evidence(operational_topics):
     """Build current completed evidence for tests focused on policy, not collection."""
     import time
     from utils.log_observations import LOG_OBSERVATIONS

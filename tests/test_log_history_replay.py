@@ -19,7 +19,7 @@ def record(stamp="2026/10/23 10:00:20.123456", *, user="alice", ip="5.6.7.8", po
 
 
 @pytest.fixture
-async def logs(monkeypatch):
+async def logs(monkeypatch, operational_topics):
     import utils.parse_logs as parser
 
     clock = [EPOCH]
@@ -414,13 +414,13 @@ async def test_metadata_failure_after_source_change_does_not_requeue_old_log_dat
     await parse_logs(record(), 1, "node", api_cycle.config)
 
     async def fail(*args, **kwargs):
-        if not kwargs.get("strict"):
-            return {}
         await discard_source_observations()
         ACTIVE_USERS["api-only"] = UserType(name="api-only", ip=["9.9.9.9"])
-        raise usage.MetadataUnavailable("temporary")
+        from utils.read_config import ConfigSnapshot, get_config_revision
 
-    monkeypatch.setattr(usage, "get_group_limits_batch", fail)
+        return ConfigSnapshot({"config_degraded": True}, -1, get_config_revision(), {})
+
+    monkeypatch.setattr(usage, "read_config_snapshot", fail)
     await usage.check_users_usage(api_cycle.panel, api_cycle.config)
     assert set(ACTIVE_USERS) == {"api-only"}
 
@@ -458,6 +458,7 @@ async def test_recovered_fleet_waits_for_complete_interval(logs):
 
 async def test_persistent_pending_clear_rechecks_evidence_after_later_await(api_cycle, logs, monkeypatch):
     import utils.check_usage as usage
+    import utils.settings_service as policies
     from utils.log_observations import LOG_OBSERVATIONS
     from utils.shared_state import discard_source_observations
 
@@ -469,14 +470,14 @@ async def test_persistent_pending_clear_rechecks_evidence_after_later_await(api_
     for warning in api_cycle.warning.warnings.values():
         warning.monitoring_end_time -= 1000
     evidence = LOG_OBSERVATIONS.evidence()
-    original = usage.resolve_effective_limit
+    original = policies.read_user_policy
 
-    async def changed_limit(*args, **kwargs):
-        if kwargs["username"] == "bob":
+    async def changed_limit(username, **kwargs):
+        if username == "bob":
             await discard_source_observations()
-        return await original(*args, **kwargs)
+        return await original(username, **kwargs)
 
-    monkeypatch.setattr(usage, "resolve_effective_limit", changed_limit)
+    monkeypatch.setattr(policies, "read_user_policy", changed_limit)
     await api_cycle.warning.check_persistent_violations(
         api_cycle.panel,
         {},
