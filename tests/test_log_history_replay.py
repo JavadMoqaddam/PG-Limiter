@@ -53,6 +53,7 @@ async def test_history_before_current_interval_never_becomes_fresh(logs):
 
 
 async def test_same_timestamp_distinct_records_and_nodes_remain_distinct(logs):
+    ready_fleet(1, 2)
     await parse_logs(record(), 1, "node", logs.config)
     await parse_logs(record(port=54321), 1, "node", logs.config)
     await parse_logs(record(), 1, "node", logs.config)
@@ -288,6 +289,7 @@ async def test_reconnect_preserves_pending_observation_and_ignores_history(logs,
     monkeypatch.setattr(streams, "get_token", AsyncMock(return_value=SimpleNamespace(panel_token="test")))
     monkeypatch.setattr(streams, "_ip_source_is_api", AsyncMock(return_value=False))
     monkeypatch.setattr(streams, "_update_node_status", AsyncMock())
+    monkeypatch.setattr("utils.read_config.read_config", AsyncMock(return_value=logs.config))
     monkeypatch.setattr("utils.parse_logs.get_cached_parser_config", AsyncMock(return_value=logs.config))
     with pytest.raises(asyncio.CancelledError):
         await streams.get_nodes_logs(PanelType("a", "b", "panel.local"), NodeType(1, "node", "192.0.2.1", "connected"))
@@ -306,6 +308,7 @@ async def test_node_registration_precedes_status_notification_and_access(logs, m
         observed.append(LOG_OBSERVATIONS.required_nodes)
 
     monkeypatch.setattr(streams, "send_logs", notify)
+    monkeypatch.setattr("utils.read_config.read_config", AsyncMock(return_value=logs.config))
     await streams.init_node_status_message([NodeType(1, "node", "192.0.2.1", "connected")])
     assert observed == [{1: True}]
 
@@ -612,6 +615,7 @@ async def test_real_reconnect_heartbeat_cannot_clear_warning_before_full_interva
     monkeypatch.setattr(streams, "get_token", AsyncMock(return_value=SimpleNamespace(panel_token="test")))
     monkeypatch.setattr(streams, "_ip_source_is_api", AsyncMock(return_value=False))
     monkeypatch.setattr(streams, "_update_node_status", AsyncMock())
+    monkeypatch.setattr("utils.read_config.read_config", AsyncMock(return_value=api_cycle.config))
     with pytest.raises(asyncio.CancelledError):
         await streams.get_nodes_logs(api_cycle.panel, NodeType(1, "node", "192.0.2.1", "connected"))
     assert verdicts == [True, True, True]
