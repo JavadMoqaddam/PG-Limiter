@@ -6,6 +6,7 @@ user, which replaced a Redis ZSET per user (one pipeline each) and removed the
 last reason for the project to depend on Redis at all.
 """
 
+import asyncio
 import time
 from datetime import datetime
 from typing import Dict, List, Set, Tuple
@@ -30,30 +31,73 @@ class IPHistoryTracker:
         """
         Record the IPs of every user of the current cycle in one statement.
 
+        Once admitted, the transaction finishes before caller cancellation is
+        propagated, keeping its commit and cleanup ahead of Topics changes.
+
         Args:
             users_ips: ``{username: {ip, ...}}`` as collected this cycle.
 
         Returns:
             Number of user/IP pairs written.
         """
+        from utils.monitoring_gate import monitoring_admission_fence, monitoring_is_current, monitoring_snapshot
+
+        admission = monitoring_snapshot()
+        if not monitoring_is_current(admission):
+            return 0
         pairs = [(username, ip) for username, ips in users_ips.items() for ip in ips]
         if not pairs:
             return 0
 
-        try:
-            from db.crud.ip_history import IPHistoryCRUD
-            from db.database import get_db
+        transaction_owned = False
 
-            async with get_db() as db:
-                written = await IPHistoryCRUD.bulk_record(db, pairs)
-                now = time.time()
-                if now - self._last_prune >= _PRUNE_INTERVAL_SECONDS:
-                    self._last_prune = now
-                    await IPHistoryCRUD.cleanup_older_than_hours(db, RETENTION_HOURS)
-            return written
-        except Exception as error:
-            logger.warning(f"Failed to record IP history: {error}")
-            return 0
+        async def record_admitted() -> int:
+            nonlocal transaction_owned
+            pruned_at = None
+            try:
+                from db.crud.ip_history import IPHistoryCRUD
+                from db.database import get_db
+
+                async with monitoring_admission_fence(admission) as admitted:
+                    if not admitted:
+                        return 0
+                    # Claim ownership before the first database await. Cancellation
+                    # may stop a queued task, but cannot interrupt its transaction.
+                    transaction_owned = True
+                    async with get_db() as db:
+                        if not monitoring_is_current(admission):
+                            return 0
+                        written = await IPHistoryCRUD.bulk_record(db, pairs)
+                        if not monitoring_is_current(admission):
+                            await db.rollback()
+                            return 0
+                        now = time.time()
+                        if now - self._last_prune >= _PRUNE_INTERVAL_SECONDS:
+                            await IPHistoryCRUD.cleanup_older_than_hours(db, RETENTION_HOURS)
+                            if not monitoring_is_current(admission):
+                                await db.rollback()
+                                return 0
+                            pruned_at = now
+                    if pruned_at is not None:
+                        self._last_prune = pruned_at
+                    return written
+            except Exception as error:
+                logger.warning(f"Failed to record IP history: {error}")
+                return 0
+
+        owner = asyncio.create_task(record_admitted())
+        cancellation: asyncio.CancelledError | None = None
+        while not owner.done():
+            try:
+                await asyncio.shield(owner)
+            except asyncio.CancelledError as error:
+                cancellation = error
+                if not transaction_owned:
+                    owner.cancel()
+        written = owner.result()
+        if cancellation is not None:
+            raise cancellation
+        return written
 
     async def record_user_ips(self, username: str, ips: Set[str]) -> None:
         """Record the IPs of a single user (prefer record_many for a whole cycle)."""
@@ -73,9 +117,7 @@ class IPHistoryTracker:
             logger.warning(f"Error fetching IP history for {username}: {error}")
             return set()
 
-    async def get_users_exceeding_limits(
-        self, hours: int, config_data: dict
-    ) -> List[Tuple[str, int, int, Set[str]]]:
+    async def get_users_exceeding_limits(self, hours: int, config_data: dict) -> List[Tuple[str, int, int, Set[str]]]:
         """
         Get users whose unique-IP count over the window exceeds their limit.
 
@@ -158,9 +200,7 @@ class IPHistoryTracker:
             for ip in sorted(unique_ips):
                 info = isp_info_batch.get(ip)
                 if info:
-                    ip_list.append(
-                        f"{ip} ({info.get('isp', 'Unknown')}, {info.get('country', 'Unknown')})"
-                    )
+                    ip_list.append(f"{ip} ({info.get('isp', 'Unknown')}, {info.get('country', 'Unknown')})")
                 else:
                     ip_list.append(ip)
 

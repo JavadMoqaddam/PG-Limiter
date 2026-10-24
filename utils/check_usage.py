@@ -11,7 +11,7 @@ import time
 
 from telegram_bot.send_message import send_logs, send_user_message
 from utils.logs import logger
-from utils.read_config import read_config, get_config_value
+from utils.read_config import read_config, get_config_value, get_config_revision
 from utils.types import PanelType, UserType, EnhancedUserInfo
 from utils.device_count import (
     DeviceCountingConfig,
@@ -21,6 +21,15 @@ from utils.device_count import (
     group_ips_by_subnet,
 )
 from utils.log_observations import LOG_OBSERVATIONS
+from utils.monitoring_gate import (
+    get_last_completed_scan,
+    monitoring_is_current,
+    monitoring_snapshot,
+    record_completed_scan,
+    record_cycle_outcome,
+    synchronize_monitoring,
+    wait_for_monitoring_change,
+)
 from utils.warning_system import warning_system  # global shared instance
 from utils.isp_detector import ISPDetector
 from utils.ip_history_tracker import ip_history_tracker
@@ -418,8 +427,15 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     """
     global isp_detector
 
+    admission = monitoring_snapshot()
+    await synchronize_monitoring()
+    if not monitoring_is_current(admission):
+        return {}
+
     if config_data is None:
         config_data = await read_config()
+    if not monitoring_is_current(admission):
+        return {}
     general_limit = config_data.get("limits", {}).get("general", 2)
     except_users = config_data.get("except_users", [])  # except_users is at root level
     # read_config exposes this as a root-level bool named "enhanced_details" (the key the
@@ -436,6 +452,8 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
 
     async with get_db() as db:
         special_limit = await UserCRUD.get_all_special_limits(db)
+    if not monitoring_is_current(admission):
+        return {}
 
     # Get panel data for filter checks
     panel_config = config_data.get("panel", {})
@@ -445,9 +463,13 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
 
     # Initialize or update ISP detector with token from config
     isp_detector = await _ensure_isp_detector(config_data)
+    if not monitoring_is_current(admission):
+        return {}
 
     if active_users_snapshot is None:
         active_users_snapshot = await get_active_users_snapshot()
+    if not monitoring_is_current(admission):
+        return {}
     logger.info(f"📊 Processing {len(active_users_snapshot)} active users...")
 
     all_users_log = {}
@@ -487,6 +509,8 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     if all_ips:
         logger.info(f"🔍 Looking up ISP info for {len(all_ips)} IPs...")
         isp_info_batch = await isp_detector.get_multiple_isp_info(list(all_ips))
+        if not monitoring_is_current(admission):
+            return {}
         logger.info(f"✅ ISP lookup complete: {len(isp_info_batch)} results")
     else:
         isp_info_batch = {}
@@ -496,6 +520,8 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     logger.debug("🔍 Applying user filters (In-Memory Batch)...")
     active_usernames_list = [u for u in active_users_snapshot.keys() if u and u.strip()]
     users_metadata = await get_active_users_metadata_batch(active_usernames_list)
+    if not monitoring_is_current(admission):
+        return {}
 
     group_filter = config_data.get("group_filter", {})
     group_filter_enabled = group_filter.get("enabled", False)
@@ -718,6 +744,8 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
         await asyncio.sleep(0.5)
 
         for user_data in users_needing_limit:
+            if not monitoring_is_current(admission):
+                return {}
             email = user_data["email"]
             device_count = user_data["device_count"]
             ip_count = user_data["ip_count"]
@@ -751,7 +779,8 @@ async def dispatch_chunked_warnings(
         total_monitored: Total count of users currently in monitoring
         max_warnings: Configurable max warning cycles before disable
     """
-    if not new_warnings:
+    admission = monitoring_snapshot()
+    if not new_warnings or not monitoring_is_current(admission):
         return
 
     from telegram_bot.send_message import send_warning_log
@@ -766,6 +795,8 @@ async def dispatch_chunked_warnings(
 
     period_min = max(1, round(check_interval * max_warnings / 60))
     for idx in range(0, total_violators, chunk_size):
+        if not monitoring_is_current(admission):
+            return
         chunk = new_warnings[idx : idx + chunk_size]
         batch_num = (idx // chunk_size) + 1
 
@@ -869,11 +900,18 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     """
     global isp_detector
 
+    admission = monitoring_snapshot()
+    await synchronize_monitoring()
+    if not monitoring_is_current(admission):
+        return
+
     if config_data is None:
         config_data = await read_config()
+    if not monitoring_is_current(admission):
+        return
     api_mode = config_data.get("ip_source") == "api"
     active_users_snapshot = await pop_api_users_snapshot() if api_mode else await pop_active_users_snapshot(config_data)
-    if active_users_snapshot is None:
+    if active_users_snapshot is None or not monitoring_is_current(admission):
         return
     api_evidence = getattr(active_users_snapshot, "api_evidence", None)
     log_evidence = getattr(active_users_snapshot, "log_evidence", None)
@@ -883,10 +921,15 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         return
 
     def cycle_is_current():
-        return api_evidence_is_current(api_evidence) if api_evidence else LOG_OBSERVATIONS.is_current(log_evidence)
+        return monitoring_is_current(admission) and (
+            api_evidence_is_current(api_evidence) if api_evidence else LOG_OBSERVATIONS.is_current(log_evidence)
+        )
 
     protected_users = set(api_evidence.unknown_users) if api_evidence else set()
     all_users_log = await check_ip_used(config_data=config_data, active_users_snapshot=active_users_snapshot)
+    if not cycle_is_current():
+        await synchronize_monitoring()
+        return
 
     # Use new config format
     limits_config = config_data.get("limits", {})
@@ -901,9 +944,13 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
 
     async with get_db() as db:
         special_limit = await UserCRUD.get_all_special_limits(db)
+    if not cycle_is_current():
+        return
 
     # Initialize or update ISP detector
     isp_detector = await _ensure_isp_detector(config_data)
+    if not cycle_is_current():
+        return
 
     # Sync dynamic check interval and max warning count to warning system
     check_interval = config_data.get("check_interval", 60)
@@ -933,11 +980,15 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # Batch fetch ISP info for all IPs
     logger.info(f"🔍 Looking up ISP info for {len(all_ips_for_isp_lookup)} IPs...")
     isp_info_batch = await isp_detector.get_multiple_isp_info(list(all_ips_for_isp_lookup))
+    if not cycle_is_current():
+        return
     logger.info(f"✅ ISP lookup complete")
 
     # Record IPs to history for the long-term reports (one statement per cycle)
     logger.debug("📝 Recording IPs to history tracker...")
     await ip_history_tracker.record_many(all_users_actual_ips)
+    if not cycle_is_current():
+        return
 
     # Batch fetch group limits & metadata for active users.
     #
@@ -959,12 +1010,14 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         all_users_log.clear()
         # The batch was consumed by pop_active_users_snapshot() but never evaluated;
         # requeue it so still-connected users are not treated as absent next cycle.
-        await merge_active_users_snapshot(active_users_snapshot)
+        if cycle_is_current():
+            await merge_active_users_snapshot(active_users_snapshot)
         return
     except BaseException:
         # Cancellation or an unexpected failure while resolving limits/metadata: the
         # batch is still unevaluated, so give it back rather than dropping it.
-        await merge_active_users_snapshot(active_users_snapshot)
+        if cycle_is_current():
+            await merge_active_users_snapshot(active_users_snapshot)
         raise
 
     if not cycle_is_current():
@@ -1347,6 +1400,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         from utils.user_sync import queue_unknown_user_fetch
 
         for username in sorted(unknown_metadata_users):
+            if not cycle_is_current():
+                return
             await queue_unknown_user_fetch(username)
 
     # Clear the records of users who came back inside their limit or went away.
@@ -1427,6 +1482,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         else 60.0
     )
     total_monitored = len(warning_system.get_monitoring_users())
+    if not cycle_is_current():
+        return
     if cycle_new_warnings:
         await dispatch_chunked_warnings(
             cycle_new_warnings, check_interval, total_monitored, max_warnings=int(max_warning_count)
@@ -1442,6 +1499,16 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         **({"protected_users": protected_users} if api_evidence else {}),
     )
 
+    if cycle_is_current():
+        record_completed_scan(
+            admission,
+            "api" if api_mode else "logs",
+            len(all_users_device_counts),
+            protected_users_count=len(protected_users),
+            metadata_unknown_users_count=len(unknown_metadata_users),
+            failed_users_count=len(failed_users),
+        )
+
     all_users_log.clear()
 
 
@@ -1450,6 +1517,11 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
     while True:
         cycle_start = time.monotonic()
         config_data = await read_config(refresh=True)
+        config_revision = config_data.get("_revision", get_config_revision())
+        admission = await synchronize_monitoring()
+        source = str(config_data.get("ip_source") or "logs")
+        skip_reason = ""
+        failure_reason = ""
 
         # In API mode the connected IPs are collected right here, immediately
         # before enforcement, instead of being streamed in continuously by the
@@ -1457,7 +1529,10 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
         # cycle is skipped entirely: feeding partial data to check_users_usage
         # would clear the consecutive-violation counters of real offenders.
         run_enforcement = True
-        if config_data.get("config_degraded"):
+        if not monitoring_is_current(admission):
+            run_enforcement = False
+            skip_reason = admission.reason or "Topics monitoring changed"
+        elif config_data.get("config_degraded"):
             # read_config could not reach the database, so the whitelist, the special
             # limits and the group limits are all unknown - and a group_filter that
             # reads as disabled means "limit every user". Enforcing on that would ban
@@ -1467,16 +1542,24 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
                 "enforcement this cycle. Counters keep their values."
             )
             run_enforcement = False
+            skip_reason = "Database configuration is unavailable"
         elif str(config_data.get("ip_source") or "logs") == "api":
             from utils.ip_source_api import collect_active_users_from_api
 
             try:
                 run_enforcement = await collect_active_users_from_api(panel_data, config_data)
+                if not run_enforcement:
+                    from utils.ip_source_api import get_last_cycle_stats
+
+                    skip_reason = (
+                        get_last_cycle_stats().get("skipped_reason") or "API sample unavailable or source changed"
+                    )
             except Exception as error:  # pylint: disable=broad-except
                 logger.error(f"🛰️ API IP collection failed: {error}")
                 run_enforcement = False
+                failure_reason = str(error)
 
-        if run_enforcement:
+        if run_enforcement and monitoring_is_current(admission):
             # One cycle must not be able to end the process. check_users_usage is
             # awaited directly inside limiter.py's TaskGroup, so anything raising
             # here - one malformed user, one Telegram error, one DB hiccup - used to
@@ -1486,13 +1569,25 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
             # walk a user from first sighting to ban far faster than
             # check_interval * max_warnings.
             try:
+                previous_receipt = get_last_completed_scan()
                 await check_users_usage(panel_data, config_data=config_data)
+                if get_last_completed_scan() is previous_receipt:
+                    skip_reason = "Scan did not complete: source evidence or policy unavailable"
             except Exception as error:  # pylint: disable=broad-except
                 logger.error(
                     f"❌ Enforcement cycle failed and was abandoned: {error}. "
                     f"Counters keep their values; the next cycle re-evaluates everyone.",
                     exc_info=True,
                 )
+                failure_reason = str(error)
+
+        if not monitoring_is_current(admission):
+            current = monitoring_snapshot()
+            skip_reason = current.reason or "Topics monitoring changed during the scan"
+        if failure_reason:
+            record_cycle_outcome(admission, source, "failed", failure_reason, config_revision=config_revision)
+        elif skip_reason:
+            record_cycle_outcome(admission, source, "skipped", skip_reason, config_revision=config_revision)
 
         check_interval = int(
             config_data.get("check_interval") or config_data.get("monitoring", {}).get("check_interval", 60)
@@ -1509,4 +1604,4 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
                 f"Consecutive-scan timing is degraded - lower the API fan-out cost or raise "
                 f"the interval."
             )
-        await asyncio.sleep(max(5.0, check_interval - elapsed))
+        await wait_for_monitoring_change(admission, max(5.0, check_interval - elapsed))

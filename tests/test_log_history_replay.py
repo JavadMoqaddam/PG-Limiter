@@ -19,7 +19,7 @@ def record(stamp="2026/10/23 10:00:20.123456", *, user="alice", ip="5.6.7.8", po
 
 
 @pytest.fixture
-async def logs(monkeypatch):
+async def logs(monkeypatch, operational_topics):
     import utils.parse_logs as parser
 
     clock = [EPOCH]
