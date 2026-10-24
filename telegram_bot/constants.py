@@ -76,6 +76,8 @@ class CallbackData:
     USERS_MENU = "users_menu"
     MONITORING_MENU = "monitoring_menu"
     REPORTS_MENU = "reports_menu"
+    STATUS_REPORTS = "status_reports"
+    HEALTH_REPORT = "health_report"
     ADMIN_MENU = "admin_menu"
 
     # Special limit options
@@ -305,9 +307,11 @@ Settings → IP Source - Switch between node logs (SSE) and the panel API
 <b>🧮 Device Counting:</b>
 Settings → Device Counting - Count per device (by inbound) or per IP
 
-<b>📡 Monitoring:</b>
-/monitoring_status - Current monitoring status
-/monitoring_details - Detailed analytics
+<b>📊 Status &amp; Reports:</b>
+/status - Limiter status
+/health_report - Aggregate health report
+/monitoring_status - Limiter status (legacy shortcut)
+/monitoring_details - Aggregate health report (legacy shortcut)
 /clear_monitoring - Clear all warnings
 
 <b>⚖️ Punishment:</b>
@@ -333,14 +337,10 @@ Settings → Device Counting - Count per device (by inbound) or per IP
 /admin_filter_add - Add one admin username
 /admin_filter_remove - Remove one admin username
 
-<b>📊 Reports:</b>
-/connection_report - Connection analysis
-/node_usage - Node usage report
-/users_by_node - Active users grouped by node
-/users_by_protocol - Active users grouped by inbound
-/multi_device_users - Multi-device detection
-/ip_history_12h - 12-hour IP history
-/ip_history_48h - 48-hour IP history
+<b>📊 Legacy report shortcuts:</b>
+/connection_report, /node_usage, /users_by_node, /users_by_protocol,
+/multi_device_users, /ip_history_12h, /ip_history_48h - Aggregate health report
+Inspect individual connection activity in Topics.
 
 <b>👑 Admin Management:</b>
 /add_admin - Add new admin
