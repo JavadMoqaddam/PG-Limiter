@@ -11,6 +11,7 @@ from telegram.ext import (
     ConversationHandler,
 )
 
+from telegram_bot.input_owner import reply_input_prompt
 from telegram_bot.constants import (
     SET_EXCEPT_USERS,
     REMOVE_EXCEPT_USER,
@@ -192,12 +193,14 @@ def create_disabled_users_keyboard(disabled_users: dict, page: int = 0, per_page
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-async def set_except_users(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def set_except_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set the except users for the bot."""
     check = await check_admin_privilege(update)
     if check is not None:
         return check
-    await update.message.reply_html("Send the except (<code>users in this list have no limitation</code>) user:")
+    await reply_input_prompt(
+        context, update.message.reply_html("Send the except (<code>users in this list have no limitation</code>) user:")
+    )
     return SET_EXCEPT_USERS
 
 
@@ -211,12 +214,12 @@ async def set_except_users_handler(update: Update, _context: ContextTypes.DEFAUL
     return ConversationHandler.END
 
 
-async def remove_except_user(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def remove_except_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remove the except users for the bot."""
     check = await check_admin_privilege(update)
     if check is not None:
         return check
-    await update.message.reply_html("Send the except user to remove:")
+    await reply_input_prompt(context, update.message.reply_html("Send the except user to remove:"))
     return REMOVE_EXCEPT_USER
 
 
