@@ -14,7 +14,8 @@ from telegram.ext import (
 from telegram_bot.handlers.admin import check_admin_privilege
 from telegram_bot.constants import CallbackData
 from utils.logs import get_logger
-from utils.read_config import read_config, config_write_transaction
+from utils import settings_service
+from utils.settings_service import read_settings as read_config
 
 punishment_handler_logger = get_logger("punishment_handler")
 
@@ -28,12 +29,7 @@ async def _save_punishment_setting(key: str, value) -> bool:
     re-rendered the menu, showing the admin a change that was never written.
     """
     try:
-        from db.database import get_db
-        from db.crud import ConfigCRUD
-
-        async with config_write_transaction(), get_db() as db:
-            await ConfigCRUD.set(db, key, value)
-            await db.commit()
+        await settings_service.write_settings({key: value})
         return True
     except Exception as error:  # pylint: disable=broad-except
         punishment_handler_logger.exception(
@@ -300,7 +296,9 @@ async def punishment_set_window_hours(update: Update, context: ContextTypes.DEFA
         return check
 
     try:
-        await _save_punishment_setting("punishment_window_hours", str(hours))
+        if not await _save_punishment_setting("punishment_window_hours", str(hours)):
+            await _send_response(update, "❌ Could not save the punishment setting; try again.")
+            return ConversationHandler.END
 
         # Return to punishment menu
         await punishment_status(update, context)
@@ -380,7 +378,9 @@ async def punishment_add_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Add new step
         steps.append({"type": step_type, "duration": duration})
 
-        await _save_punishment_steps(steps)
+        if not await _save_punishment_steps(steps):
+            await _send_response(update, "❌ Could not save the punishment steps; try again.")
+            return ConversationHandler.END
 
         # Return to steps menu
         await punishment_set_steps(update, context)
@@ -403,7 +403,9 @@ async def punishment_remove_step(update: Update, context: ContextTypes.DEFAULT_T
 
         if 0 <= step_index < len(steps):
             steps.pop(step_index)
-            await _save_punishment_steps(steps)
+            if not await _save_punishment_steps(steps):
+                await _send_response(update, "❌ Could not save the punishment steps; try again.")
+                return ConversationHandler.END
 
         # Return to steps menu
         await punishment_set_steps(update, context)
@@ -485,7 +487,9 @@ async def punishment_update_step(
 
         if 0 <= step_index < len(steps):
             steps[step_index] = {"type": step_type, "duration": duration}
-            await _save_punishment_steps(steps)
+            if not await _save_punishment_steps(steps):
+                await _send_response(update, "❌ Could not save the punishment steps; try again.")
+                return ConversationHandler.END
 
         # Return to steps menu
         await punishment_set_steps(update, context)
@@ -511,7 +515,9 @@ async def punishment_reset_steps(update: Update, context: ContextTypes.DEFAULT_T
             {"type": "disable", "duration": 0},
         ]
 
-        await _save_punishment_steps(default_steps)
+        if not await _save_punishment_steps(default_steps):
+            await _send_response(update, "❌ Could not save the punishment steps; try again.")
+            return ConversationHandler.END
 
         # Return to steps menu
         await punishment_set_steps(update, context)
