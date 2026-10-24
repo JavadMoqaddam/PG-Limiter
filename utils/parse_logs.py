@@ -15,7 +15,9 @@ from utils.ip_facts import (
     is_ip_accepted,
     is_public_ip,
 )
-from utils.read_config import read_config
+from utils.read_config import read_config, get_config_revision
+from utils.log_observations import LOG_OBSERVATIONS
+from utils.monitoring_gate import monitoring_is_current, monitoring_snapshot, synchronize_monitoring
 from utils.types import ConnectionInfo, DeviceInfo, UserType
 from utils.logs import get_logger
 
@@ -48,7 +50,6 @@ LOCAL_ID_CACHE = TTLCache(maxsize=30000, ttl=600)
 # API endpoints with fallback order (from most reliable to least)
 API_ENDPOINTS = [
     {"url": "http://ip-api.com/json/{ip}?fields=countryCode", "key": "countryCode", "name": "ip-api.com"},
-    {"url": "https://ipinfo.io/{ip}/json", "key": "country", "name": "ipinfo.io"},
     {"url": "https://api.iplocation.net/?ip={ip}", "key": "country_code2", "name": "iplocation.net"},
     {"url": "https://ipapi.co/{ip}/country", "key": None, "name": "ipapi.co"},
 ]
@@ -113,20 +114,20 @@ async def lookup_country(ip_address: str) -> None | str:
         API_ENDPOINTS,
         key=lambda e: (
             _endpoint_failures.get(e["name"], 0),
-            -(current_time - _endpoint_last_success.get(e["name"], 0))
-        )
+            -(current_time - _endpoint_last_success.get(e["name"], 0)),
+        ),
     )
-    
+
     last_error = None
     client = await get_geo_client()
     for endpoint in sorted_endpoints:
         url = endpoint["url"].format(ip=ip_address)
         key = endpoint["key"]
         name = endpoint["name"]
-        
+
         try:
             resp = await client.get(url, timeout=3)
-            
+
             if resp.status_code == 200:
                 if key is None:
                     # Direct text response (like ipapi.co/country)
@@ -134,7 +135,7 @@ async def lookup_country(ip_address: str) -> None | str:
                 else:
                     info = resp.json()
                     country = info.get(key)
-                
+
                 if country and len(country) == 2:  # Valid country code
                     COUNTRY_CACHE[ip_address] = country
                     _endpoint_failures[name] = max(0, _endpoint_failures.get(name, 0) - 1)
@@ -145,14 +146,14 @@ async def lookup_country(ip_address: str) -> None | str:
                 _endpoint_failures[name] = _endpoint_failures.get(name, 0) + 3
             else:
                 _endpoint_failures[name] = _endpoint_failures.get(name, 0) + 1
-                
+
         except httpx.TimeoutException:
             _endpoint_failures[name] = _endpoint_failures.get(name, 0) + 2
             last_error = f"Timeout on {name}"
         except Exception as e:
             _endpoint_failures[name] = _endpoint_failures.get(name, 0) + 1
             last_error = f"{name}: {type(e).__name__}"
-    
+
     # All endpoints failed
     return None
 
@@ -180,7 +181,7 @@ async def is_valid_ip(ip: str) -> bool:
 IP_V6_REGEX = re.compile(r"\[([0-9a-fA-F:]+)\]:\d+\s+accepted")
 IP_V4_REGEX = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
 EMAIL_REGEX = re.compile(r"email:\s*([A-Za-z0-9._%+-]+)")
-INBOUND_REGEX = re.compile(r"\[([^\]]+)\s+>>\s+[^\]]+\]")
+INBOUND_REGEX = re.compile(r"\[([^\]]+)\s+(?:>>|->)\s+[^\]]+\]")
 # Regex for X-Forwarded-For header in logs (Cloudflare and other CDNs)
 # Format examples:
 #   xForwardedFor: 1.2.3.4
@@ -198,7 +199,7 @@ CURRENT_NODE_INFO = {"node_id": None, "node_name": None}
 CDN_CONFIG = {
     "cdn_inbounds": [],  # List of inbound names that use CDN
     "cdn_provider": "cloudflare",  # CDN provider type
-    "use_xff": True  # Whether to extract real IP from X-Forwarded-For
+    "use_xff": True,  # Whether to extract real IP from X-Forwarded-For
 }
 
 
@@ -216,16 +217,22 @@ async def set_current_node_info(node_id: int, node_name: str) -> None:
 
 _PARSER_CONFIG_CACHE: dict | None = None
 _PARSER_CONFIG_CACHE_TIME: float = 0.0
+_PARSER_CONFIG_REVISION: int = -1
 
 
 async def get_cached_parser_config() -> dict:
     """Get configuration cached in memory with a 30-second TTL to avoid per-log I/O."""
-    global _PARSER_CONFIG_CACHE, _PARSER_CONFIG_CACHE_TIME
+    global _PARSER_CONFIG_CACHE, _PARSER_CONFIG_CACHE_TIME, _PARSER_CONFIG_REVISION
     current_time = time.time()
-    if _PARSER_CONFIG_CACHE is None or (current_time - _PARSER_CONFIG_CACHE_TIME > 30):
+    if (
+        _PARSER_CONFIG_CACHE is None
+        or _PARSER_CONFIG_REVISION != get_config_revision()
+        or current_time - _PARSER_CONFIG_CACHE_TIME > 30
+    ):
         try:
             _PARSER_CONFIG_CACHE = await read_config()
             _PARSER_CONFIG_CACHE_TIME = current_time
+            _PARSER_CONFIG_REVISION = get_config_revision()
         except Exception:
             if _PARSER_CONFIG_CACHE is None:
                 _PARSER_CONFIG_CACHE = {}
@@ -249,7 +256,9 @@ async def update_cdn_config() -> None:
         pass  # Keep existing config on error
 
 
-async def update_user_device_info_with_node(user: UserType, ip: str, inbound_protocol: str, node_id: int, node_name: str) -> None:
+async def update_user_device_info_with_node(
+    user: UserType, ip: str, inbound_protocol: str, node_id: int, node_name: str, observed_at: float | None = None
+) -> None:
     """
     Update user's device information with new connection data using specific node info.
 
@@ -260,7 +269,7 @@ async def update_user_device_info_with_node(user: UserType, ip: str, inbound_pro
         node_id (int): The ID of the node
         node_name (str): The name of the node
     """
-    current_time = time.time()
+    current_time = time.time() if observed_at is None else observed_at
 
     # Check if this connection already exists
     existing_connection = None
@@ -271,16 +280,12 @@ async def update_user_device_info_with_node(user: UserType, ip: str, inbound_pro
 
     if existing_connection:
         # Update existing connection
-        existing_connection.last_seen = current_time
+        existing_connection.last_seen = max(existing_connection.last_seen, current_time)
         existing_connection.connection_count += 1
     else:
         # Create new connection
         new_connection = ConnectionInfo(
-            ip=ip,
-            node_id=node_id,
-            node_name=node_name,
-            inbound_protocol=inbound_protocol,
-            last_seen=current_time
+            ip=ip, node_id=node_id, node_name=node_name, inbound_protocol=inbound_protocol, last_seen=current_time
         )
         user.device_info.connections.append(new_connection)
 
@@ -295,9 +300,9 @@ async def update_user_device_info_with_node(user: UserType, ip: str, inbound_pro
     # 2. Using different inbound protocols simultaneously, or
     # 3. Active connections from different nodes at the same time
     user.device_info.is_multi_device = (
-        len(user.device_info.unique_ips) > 2 or
-        len(user.device_info.inbound_protocols) > 1 or
-        len(user.device_info.unique_nodes) > 1
+        len(user.device_info.unique_ips) > 2
+        or len(user.device_info.inbound_protocols) > 1
+        or len(user.device_info.unique_nodes) > 1
     )
 
 
@@ -313,7 +318,7 @@ async def update_user_device_info(user: UserType, ip: str, inbound_protocol: str
     # Use global node info (backward compatibility)
     node_id = CURRENT_NODE_INFO["node_id"]
     node_name = CURRENT_NODE_INFO["node_name"]
-    
+
     await update_user_device_info_with_node(user, ip, inbound_protocol, node_id, node_name)
 
 
@@ -335,23 +340,50 @@ async def parse_logs(
     Returns:
         dict[str, UserType]: Dictionary of users with their connection information
     """
+    admission = monitoring_snapshot()
+    await synchronize_monitoring()
+    if not monitoring_is_current(admission):
+        return ACTIVE_USERS
     # Use provided node info or fall back to global (for backward compatibility)
     current_node_id = node_id if node_id is not None else CURRENT_NODE_INFO.get("node_id")
     current_node_name = node_name if node_name is not None else CURRENT_NODE_INFO.get("node_name")
-    
+
     data = config_data if config_data is not None else await get_cached_parser_config()
+    revision = get_config_revision()
+    if data.get("_revision", revision) != revision or data.get("ip_source", "logs") != "logs":
+        return ACTIVE_USERS
+    async with ACTIVE_USERS_LOCK:
+        if revision != get_config_revision() or not monitoring_is_current(admission):
+            return ACTIVE_USERS
+        if LOG_OBSERVATIONS.configure(data):
+            ACTIVE_USERS.clear()
+        # An excluded stream may still finish a pending read. Reject its records
+        # before timezone conversion or any preparation can affect Logs evidence.
+        if not LOG_OBSERVATIONS.monitors(current_node_id):
+            return ACTIVE_USERS
+        generation = LOG_OBSERVATIONS.generation
     if data.get("INVALID_IPS"):
         INVALID_IPS.update(data.get("INVALID_IPS"))
-    
+
     # Update CDN config from settings
     cdn_inbounds = data.get("cdn_inbounds", [])
     use_xff = data.get("cdn_use_xff", True)
-    
+
     from db.database import get_db
     from db.crud.users import UserCRUD
-    
+
     lines = log.splitlines()
-    
+    observed_times = {}
+    for line in lines:
+        if "accepted" not in line or "BLOCK]" in line or not EMAIL_REGEX.search(line):
+            continue
+        if not (IP_V6_REGEX.search(line) or IP_V4_REGEX.search(line)):
+            continue
+        try:
+            observed_times[line] = LOG_OBSERVATIONS.timestamp(line, current_node_id)
+        except ValueError:
+            observed_times[line] = None
+
     # Pre-resolve unknown numeric IDs in a single DB query to avoid per-line sessions
     unknown_ids = set()
     for line in lines:
@@ -362,41 +394,47 @@ async def parse_logs(
             email = email_match.group(1)
             if email.isdigit() and email not in LOCAL_ID_CACHE:
                 unknown_ids.add(email)
-    
+
     if unknown_ids:
         try:
             async with get_db() as db:
+                if not monitoring_is_current(admission):
+                    return ACTIVE_USERS
                 for numeric_id in unknown_ids:
                     real_username = await UserCRUD.get_username_by_panel_id(db, int(numeric_id))
+                    if not monitoring_is_current(admission):
+                        return ACTIVE_USERS
                     if real_username:
                         LOCAL_ID_CACHE[numeric_id] = real_username
         except Exception as e:
             parse_logger.error(f"Error batch-resolving numeric IDs: {e}")
-    
+
     for line in lines:
+        if not monitoring_is_current(admission):
+            return ACTIVE_USERS
         if "accepted" not in line:
             continue
         if "BLOCK]" in line:
             continue
-        
+
         # Extract inbound protocol first (needed for CDN check)
         inbound_match = INBOUND_REGEX.search(line)
         inbound_protocol = "Unknown"
         if inbound_match:
             inbound_protocol = inbound_match.group(1).strip()
-        
+
         # Extract IP address
         ip_v6_match = IP_V6_REGEX.search(line)
         ip_v4_match = IP_V4_REGEX.search(line)
         email_match = EMAIL_REGEX.search(line)
-        
+
         if ip_v6_match:
             ip = ip_v6_match.group(1)
         elif ip_v4_match:
             ip = ip_v4_match.group(1)
         else:
             continue
-        
+
         # Check if this inbound is a CDN inbound - if so, try to get real IP from X-Forwarded-For
         is_cdn_inbound = inbound_protocol in cdn_inbounds
         if is_cdn_inbound and use_xff:
@@ -411,12 +449,12 @@ async def parse_logs(
                 real_ip_match = XRAY_REAL_IP_REGEX.search(line)
                 if real_ip_match:
                     ip = real_ip_match.group(1)
-        
+
         # Admission decision (validity, node blocklist, country) - shared with
         # API mode so both sources accept exactly the same addresses.
         if not await is_ip_accepted(ip, data):
             continue
-        
+
         # Extract email
         if email_match:
             raw_email = email_match.group(1)
@@ -439,19 +477,37 @@ async def parse_logs(
         else:
             continue
 
-        # Update user information safely under lock
+        observed_at = observed_times.get(line)
+        # Preparation may have awaited country or numeric-user resolution. Commit
+        # the fingerprint only now, under the same lock as the observation.
         async with ACTIVE_USERS_LOCK:
+            if (
+                generation != LOG_OBSERVATIONS.generation
+                or revision != get_config_revision()
+                or not LOG_OBSERVATIONS.monitors(current_node_id)
+                or not monitoring_is_current(admission)
+            ):
+                continue
+            if observed_at is None:
+                LOG_OBSERVATIONS.mark_uncertain()
+                continue
+            if not LOG_OBSERVATIONS.admit(current_node_id, line, observed_at):
+                continue
             user = ACTIVE_USERS.get(email)
             if user:
                 # Add IP if not already present
                 if ip not in user.ip:
                     user.ip.append(ip)
                 # Update device info with the specific node info
-                await update_user_device_info_with_node(user, ip, inbound_protocol, current_node_id, current_node_name)
+                await update_user_device_info_with_node(
+                    user, ip, inbound_protocol, current_node_id, current_node_name, observed_at
+                )
             else:
                 # Create new user
                 user = UserType(name=email, ip=[ip])
-                await update_user_device_info_with_node(user, ip, inbound_protocol, current_node_id, current_node_name)
+                await update_user_device_info_with_node(
+                    user, ip, inbound_protocol, current_node_id, current_node_name, observed_at
+                )
                 ACTIVE_USERS[email] = user
 
     return ACTIVE_USERS
@@ -461,54 +517,51 @@ async def clear_node_active_connections(node_id: int) -> int:
     """
     Atomically clear active connections belonging to a specific node_id from ACTIVE_USERS.
     This prevents ghost connections when an SSE connection drops or reconnects.
-    
+
     Args:
         node_id (int): The ID of the node to clear connections for.
-        
+
     Returns:
         int: Number of connections removed.
     """
     if node_id is None:
         return 0
-        
+
     removed_count = 0
     users_to_cleanup = []
-    
+
     async with ACTIVE_USERS_LOCK:
         for username, user in list(ACTIVE_USERS.items()):
             if not hasattr(user, "device_info") or not user.device_info or not user.device_info.connections:
                 continue
-                
+
             # Build new connection list atomically
-            new_connections = [
-                conn for conn in user.device_info.connections 
-                if conn.node_id != node_id
-            ]
-            
+            new_connections = [conn for conn in user.device_info.connections if conn.node_id != node_id]
+
             removed_from_user = len(user.device_info.connections) - len(new_connections)
             if removed_from_user > 0:
                 removed_count += removed_from_user
-                
+
                 if new_connections:
                     # Recompute sets atomically
                     new_ips = {conn.ip for conn in new_connections}
                     new_nodes = {conn.node_id for conn in new_connections if conn.node_id is not None}
-                    new_protocols = {conn.inbound_protocol for conn in new_connections if conn.inbound_protocol is not None}
-                    
+                    new_protocols = {
+                        conn.inbound_protocol for conn in new_connections if conn.inbound_protocol is not None
+                    }
+
                     # Atomic assignment
                     user.device_info.connections = new_connections
                     user.device_info.unique_ips = new_ips
                     user.device_info.unique_nodes = new_nodes
                     user.device_info.inbound_protocols = new_protocols
-                    user.device_info.is_multi_device = (
-                        len(new_ips) > 2 or len(new_protocols) > 1 or len(new_nodes) > 1
-                    )
+                    user.device_info.is_multi_device = len(new_ips) > 2 or len(new_protocols) > 1 or len(new_nodes) > 1
                     user.ip = list(new_ips)
                 else:
                     users_to_cleanup.append(username)
-                    
+
         for username in users_to_cleanup:
             if username in ACTIVE_USERS:
                 del ACTIVE_USERS[username]
-                
+
     return removed_count

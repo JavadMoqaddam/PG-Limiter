@@ -85,6 +85,12 @@ async def test_freshness_callback_and_text_router_recheck_admin(monkeypatch):
     monkeypatch.setattr(main, "check_admin", AsyncMock(return_value=[1]))
     update = MagicMock()
     update.effective_user.id = 1
+    update.effective_chat.id = -100
+    update.message.message_id = 50
+    update.message.message_thread_id = None
+    update.message.reply_to_message = None
+    update.effective_message = update.message
+    update.callback_query.message = update.message
     update.callback_query.data = "ip_source_set_freshness"
     update.callback_query.answer = AsyncMock()
     update.callback_query.edit_message_text = AsyncMock()
@@ -98,8 +104,8 @@ async def test_freshness_callback_and_text_router_recheck_admin(monkeypatch):
     await main.text_message_handler(update, context)
     assert not context.user_data.get("waiting_for")
     assert save.call_count == 0
-    context.user_data["waiting_for"] = "ip_source_freshness"
     monkeypatch.setattr(main, "check_admin_privilege", AsyncMock(return_value=None))
+    await main.callback_query_handler(update, context)
     await main.text_message_handler(update, context)
     assert save.call_args.args == ("api_ip_freshness", "25")
 

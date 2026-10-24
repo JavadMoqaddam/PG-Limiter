@@ -8,7 +8,7 @@ import pytest
 
 
 @pytest.fixture
-async def api_cycle(tmp_path, monkeypatch):
+async def api_cycle(tmp_path, monkeypatch, operational_topics):
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
     import db.database as database
@@ -33,6 +33,8 @@ async def api_cycle(tmp_path, monkeypatch):
     import asyncio
 
     monkeypatch.setattr(api, "_collection_lock", asyncio.Lock())
+    monkeypatch.setattr(api, "_consecutive_dead_cycles", 0)
+    monkeypatch.setattr(api, "_failure_revision", None)
     state.ACTIVE_USERS.clear()
     sync.USER_METADATA_CACHE.clear()
     async with database.get_db() as db:
@@ -92,7 +94,9 @@ async def api_cycle(tmp_path, monkeypatch):
             await usage.check_users_usage(panel, config)
         return ready
 
-    yield SimpleNamespace(run=run, bodies=bodies, warning=warning, config=config, now=now, panel=panel)
+    yield SimpleNamespace(
+        run=run, bodies=bodies, warning=warning, config=config, now=now, panel=panel, topics=operational_topics
+    )
     state.ACTIVE_USERS.clear()
     sync.USER_METADATA_CACHE.clear()
     await engine.dispose()
@@ -120,6 +124,23 @@ async def test_all_valid_expired_observations_clear_pending_warnings(api_cycle):
         api_cycle.bodies[name] = {"nodes": {"1": {"ips": {"5.6.7.8": api_cycle.now - 100}}}}
     assert await api_cycle.run()
     assert api_cycle.warning.warnings == {}
+
+
+async def test_completed_scan_receipt_records_actual_count_and_protective_skips(api_cycle):
+    from utils.monitoring_gate import get_last_completed_scan, get_last_cycle_outcome
+
+    api_cycle.bodies["alice"] = None
+    assert await api_cycle.run() is True
+    receipt = get_last_completed_scan()
+    assert receipt.source == "api"
+    assert receipt.users_counted == 1
+    assert receipt.protected_users_count == 1
+    assert receipt.metadata_unknown_users_count == 0
+    assert receipt.failed_users_count == 0
+    assert get_last_cycle_outcome().outcome == "completed"
+    await api_cycle.topics.set_enabled(False)
+    assert await api_cycle.run() is False
+    assert get_last_completed_scan() is receipt
 
 
 async def test_expired_unknown_warning_survives_persistent_and_cleanup_paths(api_cycle):
@@ -219,6 +240,65 @@ async def test_missing_node_list_skips_enforcement(api_cycle, monkeypatch):
     monkeypatch.setattr(nodes, "get_nodes", AsyncMock(side_effect=RuntimeError("unavailable")))
     assert await api_cycle.run() is False
     assert api_cycle.warning.warnings == {}
+
+
+@pytest.mark.parametrize("status", ["error", "connecting"])
+@pytest.mark.parametrize("sample", ["empty_ips", "nonempty_ips", "no_candidates", "omitted_warning_user"])
+async def test_unavailable_enabled_node_preserves_entire_warning_cycle(api_cycle, monkeypatch, status, sample):
+    import utils.ip_source_api as api
+    import utils.panel_api.nodes as nodes
+    from utils.types import NodeType
+
+    assert await api_cycle.run()
+    warnings = dict(api_cycle.warning.warnings)
+    before = {name: record.consecutive_violations for name, record in warnings.items()}
+    monkeypatch.setattr(time, "time", lambda: api_cycle.now + 60)
+    monkeypatch.setattr(
+        nodes,
+        "get_nodes",
+        AsyncMock(
+            return_value=[NodeType(1, "healthy", "192.0.2.1", "connected"), NodeType(2, "other", "192.0.2.2", status)]
+        ),
+    )
+    if sample == "empty_ips":
+        for name in api_cycle.bodies:
+            api_cycle.bodies[name] = {"nodes": {"1": {"ips": {}}}}
+        # Unknown empty observations must protect persistent/cleanup paths too.
+        for record in warnings.values():
+            record.monitoring_end_time -= 1000
+    elif sample == "no_candidates":
+        api_cycle.bodies.clear()
+    elif sample == "omitted_warning_user":
+        api_cycle.bodies.pop("alice")
+
+    ready = await api_cycle.run()
+    assert api_cycle.warning.warnings == warnings
+    assert {name: record.consecutive_violations for name, record in warnings.items()} == before
+    assert ready is False
+    assert api.get_last_cycle_stats()["collection_outcome"] == "failure"
+    assert api.get_last_cycle_stats()["skipped_reason"] == "node availability unknown"
+
+
+@pytest.mark.parametrize("status", ["error", "connecting"])
+async def test_operator_excluded_unavailable_node_allows_valid_empty_cycle(api_cycle, monkeypatch, status):
+    import utils.ip_source_api as api
+    import utils.panel_api.nodes as nodes
+    from utils.types import NodeType
+
+    assert await api_cycle.run()
+    monkeypatch.setattr(
+        nodes,
+        "get_nodes",
+        AsyncMock(
+            return_value=[NodeType(1, "healthy", "192.0.2.1", "connected"), NodeType(2, "other", "192.0.2.2", status)]
+        ),
+    )
+    api_cycle.config["disabled_nodes"] = [2]
+    for name in api_cycle.bodies:
+        api_cycle.bodies[name] = {"nodes": {"1": {"ips": {}}}}
+    assert await api_cycle.run()
+    assert api_cycle.warning.warnings == {}
+    assert api.get_last_cycle_stats()["collection_outcome"] == "success"
 
 
 async def test_deleted_user_is_valid_absence(api_cycle, monkeypatch):

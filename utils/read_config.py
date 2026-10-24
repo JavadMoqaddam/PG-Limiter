@@ -4,8 +4,9 @@ Reads settings from:
 - Environment variables (.env) for static settings
 - Database for dynamic settings that can be changed via Telegram
 
-The merged result is held in a single process-wide dict and rebuilt only when a
-setting is written. ``read_config`` hands out a deep copy of it, so a caller that
+The merged result is held in a single process-wide dict and rebuilt when a local
+write commits or a refresh discovers another process's write. ``read_config``
+hands out a deep copy of it, so a caller that
 edits what it got cannot reach the shared configuration every other task is
 reading - see the note on the cache below.
 """
@@ -16,6 +17,8 @@ import math
 import os
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from collections.abc import Iterable
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from utils.logs import get_logger
@@ -42,6 +45,8 @@ except ImportError:
 # ``read_config_scalar`` for the one case that does not need a copy.
 _config_cache: Optional[Dict[str, Any]] = None
 _config_revision = 0
+_config_cache_db_revision: int | None = None
+MAX_CONFIG_LOAD_ATTEMPTS = 3
 _config_read_lock = asyncio.Lock()
 _config_write_lock = asyncio.Lock()
 
@@ -57,12 +62,17 @@ DB_FAILURE_LOG_INTERVAL = 60.0
 _db_failure_logged_at = -DB_FAILURE_LOG_INTERVAL
 
 
-async def invalidate_config_cache():
-    """Drop the cached configuration so the next read rebuilds it from ENV + DB."""
-    global _config_cache, _config_revision
-
+def _invalidate_config_cache() -> None:
+    """Drop local data synchronously after a committed root transaction."""
+    global _config_cache, _config_revision, _config_cache_db_revision
     _config_revision += 1
     _config_cache = None
+    _config_cache_db_revision = None
+
+
+async def invalidate_config_cache():
+    """Drop local settings and retire the process's previous evidence generation."""
+    _invalidate_config_cache()
     config_logger.info("🔧 Configuration cache invalidated")
 
 
@@ -215,6 +225,11 @@ def load_env_config() -> Dict[str, Any]:
             "country_code": _get_env("COUNTRY_CODE", ""),
         },
         "check_interval": _get_env("CHECK_INTERVAL", 60, int),
+        # These describe the Xray process/container clock, never the limiter host.
+        # Preserve invalid input so Logs readiness fails closed instead of guessing.
+        "log_timezone": os.environ.get("LOG_TIMEZONE"),
+        "log_node_timezones": os.environ.get("LOG_NODE_TIMEZONES", "{}"),
+        "log_replay_cache_size": os.environ.get("LOG_REPLAY_CACHE_SIZE", "10000"),
         "max_warning_count": _get_env("MAX_WARNING_COUNT", 3, int),
         "time_to_active_users": _get_env("TIME_TO_ACTIVE_USERS", 900, int),
         "country_code": _get_env("COUNTRY_CODE", ""),
@@ -242,13 +257,21 @@ def load_env_config() -> Dict[str, Any]:
     }
 
 
-async def load_db_config() -> Dict[str, Any]:
+async def load_db_config(usernames: Iterable[str] = ()) -> Dict[str, Any]:
     """Load dynamic configuration from database."""
     if not DB_AVAILABLE:
         return {}
 
     try:
         async with get_db() as session:
+            from sqlalchemy import text
+            from db.crud.config_revision import ConfigRevisionCRUD
+
+            # sqlite3 legacy SELECTs do not begin a physical read transaction.
+            if session.get_bind().dialect.name == "sqlite":
+                await session.execute(text("BEGIN"))
+            db_revision = await ConfigRevisionCRUD.read(session)
+            user_facts = await UserCRUD.get_policy_facts(session, usernames)
             # Load all config from database
             db_config = await ConfigCRUD.get_all(session)
 
@@ -260,6 +283,8 @@ async def load_db_config() -> Dict[str, Any]:
 
         return {
             "db_config": db_config,
+            "db_revision": db_revision,
+            "user_facts": user_facts,
             "special_limits": special_limits,
             "except_users": except_users,
         }
@@ -298,38 +323,102 @@ def get_config_sync() -> Dict[str, Any]:
     return load_env_config()
 
 
-async def read_config(check_required_elements: bool = False) -> Dict[str, Any]:
-    """Read an isolated configuration, serializing one-time legacy migration."""
+@dataclass(frozen=True)
+class ConfigSnapshot:
+    """Private settings and user facts read from one committed database view."""
+
+    config: dict[str, Any]
+    db_revision: int
+    local_revision: int
+    user_facts: dict[str, dict[str, Any]]
+
+
+async def _read_db_revision() -> int:
+    from db.crud.config_revision import ConfigRevisionCRUD
+
+    async with get_db() as session:
+        return await ConfigRevisionCRUD.read(session)
+
+
+async def read_config(check_required_elements: bool = False, *, refresh: bool = False) -> Dict[str, Any]:
+    """Read private settings, optionally checking other processes' commits."""
     async with _config_read_lock:
-        return await _load_config(check_required_elements)
+        return await _load_config(check_required_elements, refresh=refresh)
 
 
-async def _load_config(check_required_elements: bool = False) -> Dict[str, Any]:
-    """
-    Read and return the merged configuration from ENV and the database.
+async def read_config_snapshot(*, usernames: Iterable[str] = ()) -> ConfigSnapshot:
+    """Read coherent current settings and facts for a scan or final policy check."""
+    async with _config_read_lock:
+        return await _load_config(refresh=True, usernames=tuple(usernames), snapshot=True)
 
-    The result is cached in-process until a write invalidates it, so this is
-    cheap enough to call from hot paths.
 
-    The returned dict is a **deep copy**: editing it, or any list or dict inside it,
-    affects nobody else. Writes still have to go through ``save_config_value`` to
-    become durable, exactly as before - the copy only stops an edit from leaking
-    into the shared cache on its way there.
-    """
-    global _config_cache
+async def _load_config(check_required_elements=False, *, refresh=False, usernames=(), snapshot=False):
+    global _config_cache, _config_cache_db_revision
 
-    if _config_cache is not None and not check_required_elements:
-        return copy.deepcopy(_config_cache)
+    if _config_cache is not None and not check_required_elements and not snapshot:
+        if not refresh:
+            return copy.deepcopy(_config_cache)
+        cached = _config_cache
+        cached_db_revision = _config_cache_db_revision
+        cached_local_revision = get_config_revision()
+        try:
+            current_db_revision = await _read_db_revision()
+            if (
+                cached_db_revision == current_db_revision
+                and _config_cache is cached
+                and cached_local_revision == get_config_revision()
+            ):
+                return copy.deepcopy(cached)
+        except Exception:
+            # Never serve cached policy as current when shared state is unavailable.
+            pass
+        if _config_cache is not None:
+            _invalidate_config_cache()
 
-    loaded_revision = get_config_revision()
-    config_logger.debug("🔧 Loading fresh configuration...")
+    config = None
+    db_data = {}
+    for _attempt in range(MAX_CONFIG_LOAD_ATTEMPTS):
+        loaded_revision = get_config_revision()
+        # Ordinary calls keep the no-argument loader contract used by callers/tests.
+        db_data = await load_db_config(usernames) if usernames else await load_db_config()
+        config = await _merge_loaded_config(load_env_config(), db_data, check_required_elements)
+        if config.get("config_degraded"):
+            break
+        db_revision = db_data.get("db_revision")
+        if snapshot and _config_cache_db_revision is not None and _config_cache_db_revision != db_revision:
+            # A factual snapshot must retire evidence from the previous settings too.
+            _invalidate_config_cache()
+        if loaded_revision != get_config_revision():
+            continue
+        if db_revision is not None:
+            try:
+                if db_revision != await _read_db_revision():
+                    _invalidate_config_cache()
+                    continue
+            except Exception:
+                config["config_degraded"] = True
+                break
+        if loaded_revision != get_config_revision():
+            continue
+        config["_revision"] = loaded_revision
+        _config_cache = config
+        _config_cache_db_revision = db_revision
+        if snapshot:
+            return ConfigSnapshot(
+                copy.deepcopy(config), db_revision or 0, loaded_revision, copy.deepcopy(db_data.get("user_facts", {}))
+            )
+        return copy.deepcopy(config)
+    config["config_degraded"] = True
+    _config_cache = None
+    _config_cache_db_revision = None
+    config_logger.error("Configuration unavailable or changed repeatedly; enforcement must wait")
+    if snapshot:
+        return ConfigSnapshot(config, db_data.get("db_revision", -1), get_config_revision(), {})
+    return config
 
-    # Load ENV config
-    env_config = load_env_config()
 
-    # Load DB config
-    db_data = await load_db_config()
-
+async def _merge_loaded_config(env_config, db_data, check_required_elements=False):
+    """Preserve existing ENV/DB normalization without publishing a partial load."""
     # Merge configurations
     config = env_config.copy()
 
@@ -651,17 +740,7 @@ async def _load_config(check_required_elements: bool = False) -> Dict[str, Any]:
         # private to this caller and nobody else holds a reference to it.
         return config
 
-    if loaded_revision != get_config_revision():
-        # A setting changed while the DB was being read (including materializing
-        # Auto). Re-read before publishing a configuration with a newer revision.
-        return await _load_config(check_required_elements)
-    config["_revision"] = loaded_revision
-    _config_cache = config
-    # The dict just built becomes the cache, so this exit has to copy as well. Missing
-    # it would leave the shared object exposed to the first caller after every
-    # invalidation - which is routinely the Telegram handler that just wrote a setting
-    # and is now re-rendering its menu.
-    return copy.deepcopy(config)
+    return config
 
 
 async def read_config_scalar(key: str, default: Any = None) -> Any:
@@ -746,9 +825,16 @@ async def save_config_value(key: str, value: Any, *, expected_revision: int | No
             config_logger.error(f"❌ Cannot save configuration {key!r}: the database module is unavailable")
             return False
 
+        expected_db_revision = _config_cache_db_revision if expected_revision is not None else None
+        if expected_revision is not None and expected_db_revision is None:
+            # There is no committed configuration version for this evidence to compare.
+            return None
         try:
             async with get_db() as session:
-                await ConfigCRUD.set(session, key, str(value))
+                if expected_db_revision is None:
+                    await ConfigCRUD.set(session, key, str(value))
+                elif await ConfigCRUD.set(session, key, str(value), expected_db_revision=expected_db_revision) is None:
+                    return None
         except Exception as error:  # pylint: disable=broad-except
             config_logger.exception(
                 f"❌ Failed to save configuration {key!r}: {error}. The previous value is still in effect."

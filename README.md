@@ -187,24 +187,37 @@ The connected IPs of each user can come from either of two sources, switchable a
 | | 📜 **Node Logs (SSE)** — default | 🛰️ **Panel API** |
 |---|---|---|
 | Transport | One persistent SSE stream per node | `GET /api/node/online_stats/{id}/ip`, once per online user per cycle |
-| Timing | Continuous, accumulated between cycles | One instant snapshot taken immediately before enforcement |
+| Timing | Original Xray printed timestamps within a completed `CHECK_INTERVAL` | Original Xray IP timestamps checked against the editable Last seen threshold |
 | Inbound detail | Real inbound name per connection | Single sentinel inbound (`API`) |
-| Requires | Node logs reachable over SSE | Panel account with the `nodes:stats` permission |
+| Requires | Reachable SSE, explicit Xray process timezones and a ready fleet/complete interval | Panel account with `nodes:stats` and complete evidence from relevant enabled nodes |
 
-Both modes write into the same `ACTIVE_USERS` structure, so device counting, subnet/CDN/high-trust grouping, the 3-cycle warning system, trust scoring and punishment behave identically.
+Both modes publish source-specific snapshots through the shared `ACTIVE_USERS` structure. Existing device counting, subnet/CDN/high-trust grouping, trust scoring and punishment continue to apply, with configurable `CHECK_INTERVAL` and `MAX_WARNING_COUNT`. API observations carry no real inbound names; inbound-only monitoring requires Logs.
 
 **How API mode keeps a cycle safe:**
-* **Candidate narrowing.** `GET /api/users` is filtered panel-side by `status=active` and by an online-freshness window equal to `CHECK_INTERVAL + 30s`, so only the handful of currently-online users is queried. A group filter in **include** mode narrows it further, because that setting is what makes users outside those groups unmonitored in the first place. Group Limits deliberately do *not* narrow the query: a group limit is a limit, not a monitoring scope, and users in no limited group are still judged against the general limit.
-* **Coverage gate.** If fewer than `API_IP_MIN_COVERAGE` (default **80%**, set as a percentage in `.env`) of the candidates answered, the whole cycle is skipped rather than enforced on partial data — an under-covered snapshot could otherwise clear the counters of real offenders.
-* **Never a false positive.** A snapshot can only report *fewer* IPs than continuous log streaming, never more, and a failed candidate query leaves the previous state untouched instead of wiping pending warnings.
-* **Auto-fallback.** After 3 consecutive cycles with no usable data (for example a missing `nodes:stats` permission) the IP source reverts to logs automatically and a Telegram alert is sent.
+* **Candidate narrowing.** `GET /api/users` uses `status=active` and `online=true`, independently of `CHECK_INTERVAL`. Include group IDs are sent together; empty Include selects nobody. Exclusions, administrator filters and exceptions still apply. Group Limits set limits and never replace the Group Filter.
+* **Exact Last seen threshold.** Edit a positive whole number of seconds T in **Settings → IP Source → Last seen**. An IP qualifies only when `0 <= evaluation time - original Xray timestamp < T`, including after asynchronous preparation. Receipt time never makes an observation fresh, and no 30-second buffer is added. Xray updates this timestamp when a tracked connection opens, so a long-lived connection can have an old timestamp. API and Logs counts can differ.
+* **Unknown evidence protection.** Failed requests, malformed bodies, invalid timestamps and missing expected node responses protect affected users from warnings, punishment and false clearing. Incomplete candidate/node lists or a relevant enabled node in `error`/`connecting` skip the whole cycle, including an empty candidate list, preserving existing warnings. Explicitly operator-disabled nodes are excluded. The configurable coverage gates (user coverage defaults to **80%**) can skip collection; a high answer rate never makes missing evidence known. Healthy empty maps, valid expired observations and confirmed deleted users can clear warnings.
+* **Auto-fallback.** With automatic fallback enabled, exactly two consecutive unsuccessful completed API collection cycles persist the source as Logs and attempt one Telegram alert. A complete successful cycle, including a genuinely empty one, resets the streak. Logs then waits for its timezone/readiness requirements and a completed interval.
 * **Per-inbound CDN grouping is inactive** in API mode because the panel reports no inbound names — use **CDN Nodes** (per-node) instead of CDN Inbounds.
 
 Switching to API mode runs a pre-flight probe against a real online user first, and refuses to switch if the endpoint is not reachable. **Settings → 🛰️ IP Source → 📊 Last API Cycle** shows the last cycle's candidate narrowing, coverage, 403/404 counts and duration.
 
+Logs preserves Xray's original printed process-local time and rejects retained replay records across reconnects. Configure `LOG_NODE_TIMEZONES` and/or an explicit `LOG_TIMEZONE` for the Xray process/container; host or panel timezone alone does not establish it. Unknown zones, fleet or transport readiness preserve warnings while enforcement waits. A source/settings change or transport recovery requires a full ordinary `CHECK_INTERVAL` before Logs resumes. See [Panel API IP source](docs/API_IP_SOURCE.md) and [Node Logs source and readiness](docs/LOG_SOURCE.md) for configuration, recovery and protocol limits.
+
 ---
 
 ## ⚙️ Configuration
+
+Telegram, CLI, and API settings share the same stored configuration. Saved changes
+take effect on the next usable monitoring scan without restarting the daemon.
+User limits follow special limit → highest matching group limit → general limit.
+Whitelist, group, and admin filters apply to both ongoing and expired warnings.
+
+Before punishment, the limiter checks the user's current groups, owner, eligibility,
+and limit again. If settings or the IP source change during a scan, or current user
+facts are unavailable, punishment waits and existing warnings are retained. A user
+who becomes whitelisted or falls outside the configured filters also keeps their
+existing warning until they can be assessed within the monitoring scope again.
 
 ### Environment Variables (`/etc/opt/pg-limiter/.env`)
 

@@ -8,6 +8,9 @@ the only way to tell a healthy cycle from a skipped one.
 """
 
 import time
+from html import escape
+
+from utils.log_observations import LOG_OBSERVATIONS
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -67,12 +70,18 @@ def _build_ip_source_text(config_data: dict) -> str:
         )
     else:
         active = "📜 <b>Node Logs (SSE)</b>"
-        active_note = "IPs are streamed continuously from each node's log endpoint, which is the original behaviour."
+        active_note = "IPs use the original Xray log timestamp and explicit node process timezones."
+    logs_reason = LOG_OBSERVATIONS.unavailable_reason()
+    logs_readiness = escape(logs_reason) if logs_reason else "ready"
 
     return (
         "🛰️ <b>IP Source</b>\n\n"
         f"<b>Active:</b> {active}\n"
         f"<i>{active_note}</i>\n\n"
+        f"<b>Logs evidence:</b> {logs_readiness}\n"
+        "Set <code>LOG_NODE_TIMEZONES</code> (or explicit <code>LOG_TIMEZONE</code>) for Xray containers. "
+        "Missing zones, incomplete fleet or replay uncertainty preserve warning history. "
+        "A source/settings change requires one complete check interval.\n\n"
         "<b>API mode settings:</b>\n"
         f"• Check interval: <code>{interval}s</code>\n"
         "• Candidates: active users with <code>online=true</code> and Group Filter\n"
@@ -257,9 +266,10 @@ async def ip_source_concurrency_handler(update: Update, context: ContextTypes.DE
     try:
         value = int(text)
     except ValueError:
-        await update.message.reply_html("❌ Please send a whole number between <code>1</code> and <code>40</code>.")
         context.user_data["waiting_for"] = "ip_source_concurrency"
-        return
+        return await update.message.reply_html(
+            "❌ Please send a whole number between <code>1</code> and <code>40</code>."
+        )
 
     clamped = max(1, min(40, value))
     await save_config_value("api_ip_concurrency", str(clamped))
@@ -311,13 +321,11 @@ async def ip_source_freshness_handler(update: Update, context: ContextTypes.DEFA
         return
     if not text.isascii() or not text.isdecimal() or int(text) <= 0:
         context.user_data["waiting_for"] = "ip_source_freshness"
-        await update.message.reply_html("❌ Send a positive whole number of seconds.")
-        return
+        return await update.message.reply_html("❌ Send a positive whole number of seconds.")
     value = int(text)
     if not await save_config_value("api_ip_freshness", str(value)):
         context.user_data["waiting_for"] = "ip_source_freshness"
-        await update.message.reply_html("❌ Could not save Last seen. Try again or /cancel.")
-        return
+        return await update.message.reply_html("❌ Could not save Last seen. Try again or /cancel.")
     await update.message.reply_html(
         f"✅ Last seen set to <code>{value}s</code>.",
         reply_markup=create_ip_source_keyboard(source, concurrency, value),

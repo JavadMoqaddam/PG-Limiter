@@ -1,134 +1,116 @@
-"""Delivery-coupled deduplication tests for send_logs.
-
-A dedup key must be marked as sent only once the message is actually delivered,
-so a failed/expired/lost send does not suppress the next legitimate attempt.
-"""
+"""Delivery-coupled batch deduplication through the real dispatcher."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+from telegram.error import BadRequest
+
+import telegram_bot.dispatcher as dm
 import telegram_bot.send_message as sm
+from telegram_bot.dispatcher import TelegramDispatcher
 from telegram_bot.topics import TopicType
 
 
-def _fake_topics_manager():
-    tm = MagicMock()
-    tm.group_id = -1001234567890
-    tm.enabled = True
-    tm.is_message_sent.return_value = False
-    tm.set_enabled = AsyncMock()
-    tm.mark_message_sent = AsyncMock()
-    return tm
-
-
-async def _settle():
-    # Let any background marking task observe the resolved futures.
-    for _ in range(3):
-        await asyncio.sleep(0)
-
-
-async def test_success_marks_key_after_delivery(monkeypatch):
-    tm = _fake_topics_manager()
-    monkeypatch.setattr(sm, "get_topics_manager", lambda: tm)
-
-    loop = asyncio.get_running_loop()
-    delivered = loop.create_future()
-    dispatcher = MagicMock()
-
-    async def fake_enqueue(**kwargs):
-        return delivered
-
-    dispatcher.enqueue_send = fake_enqueue
+@pytest.fixture
+async def sending(tmp_path, monkeypatch):
+    monkeypatch.setattr(dm, "PENDING_NOTIFICATIONS_FILE", str(tmp_path / "pending.json"))
+    topics = MagicMock()
+    topics.group_id = -1001234567890
+    topics.enabled = True
+    topics.monitoring_revision = 0
+    topics.destination_revision = 0
+    topics.get_topic_id.return_value = 5
+    topics.is_message_sent.return_value = False
+    topics.mark_message_sent = AsyncMock()
+    monkeypatch.setattr(sm, "get_topics_manager", lambda: topics)
+    monkeypatch.setattr(dm, "get_topics_manager", lambda: topics)
+    dispatcher = TelegramDispatcher()
     monkeypatch.setattr(sm, "get_dispatcher", lambda: dispatcher)
+    bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=123)))
+    dispatcher.set_bot(bot)
+    yield dispatcher, topics, bot
+    await dispatcher.stop(wait_seconds=0.1)
 
+
+async def _drain(dispatcher, worker):
+    await asyncio.sleep(0)
+    await asyncio.wait_for(dispatcher.queue.join(), timeout=1)
+    await dispatcher.stop(wait_seconds=0.1)
+    await worker
+
+
+async def test_success_marks_key_after_delivery(sending):
+    dispatcher, topics, bot = sending
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def send(**_kwargs):
+        entered.set()
+        await release.wait()
+        return SimpleNamespace(message_id=123)
+
+    bot.send_message.side_effect = send
     await sm.send_logs("hello", topic_type=TopicType.NO_LIMIT, message_key="no_limit:u")
+    topics.mark_message_sent.assert_not_awaited()
+    worker = asyncio.create_task(dispatcher.start_worker())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    topics.mark_message_sent.assert_not_awaited()
+    release.set()
+    await _drain(dispatcher, worker)
+    topics.mark_message_sent.assert_awaited_once_with(
+        TopicType.NO_LIMIT,
+        "no_limit:u",
+        chat_id=-1001234567890,
+        message_thread_id=5,
+        monitoring_revision=0,
+        destination_revision=0,
+    )
 
-    # Delivery has not happened yet, so nothing may be marked.
-    tm.mark_message_sent.assert_not_called()
 
-    delivered.set_result((123, -1001234567890))
-    await _settle()
-    tm.mark_message_sent.assert_awaited_once_with(TopicType.NO_LIMIT, "no_limit:u")
-
-
-async def test_failed_delivery_does_not_mark_dedup_key(monkeypatch):
-    tm = _fake_topics_manager()
-    monkeypatch.setattr(sm, "get_topics_manager", lambda: tm)
-
-    loop = asyncio.get_running_loop()
-    dropped = loop.create_future()
-    dispatcher = MagicMock()
-
-    async def fake_enqueue(**kwargs):
-        return dropped
-
-    dispatcher.enqueue_send = fake_enqueue
-    monkeypatch.setattr(sm, "get_dispatcher", lambda: dispatcher)
-
+async def test_failed_delivery_does_not_mark_dedup_key(sending):
+    dispatcher, topics, bot = sending
+    bot.send_message.side_effect = BadRequest("Can't parse entities")
     await sm.send_logs("hello", topic_type=TopicType.NO_LIMIT, message_key="no_limit:u")
-
-    # Dispatcher reports the message was not delivered (None).
-    dropped.set_result(None)
-    await _settle()
-    tm.mark_message_sent.assert_not_called()
+    worker = asyncio.create_task(dispatcher.start_worker())
+    await _drain(dispatcher, worker)
+    topics.mark_message_sent.assert_not_awaited()
 
 
-async def test_split_message_marks_only_after_all_chunks_succeed(monkeypatch):
-    tm = _fake_topics_manager()
-    monkeypatch.setattr(sm, "get_topics_manager", lambda: tm)
+async def test_split_message_marks_only_after_all_chunks_succeed(sending):
+    dispatcher, topics, bot = sending
+    calls = 0
 
-    loop = asyncio.get_running_loop()
-    futures = []
-    dispatcher = MagicMock()
+    async def send(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise BadRequest("Can't parse entities")
+        return SimpleNamespace(message_id=calls)
 
-    async def fake_enqueue(**kwargs):
-        fut = loop.create_future()
-        futures.append(fut)
-        return fut
-
-    dispatcher.enqueue_send = fake_enqueue
-    monkeypatch.setattr(sm, "get_dispatcher", lambda: dispatcher)
-
-    long_msg = "A" * 8000  # exceeds the 3900 split threshold -> multiple chunks
-    await sm.send_logs(long_msg, topic_type=TopicType.WARNINGS, message_key="warn:batch")
-
-    assert len(futures) >= 2
-
-    # One chunk fails to deliver; the rest succeed.
-    futures[0].set_result((1, -1001234567890))
-    futures[1].set_result(None)
-    for fut in futures[2:]:
-        fut.set_result((2, -1001234567890))
-
-    await _settle()
-    tm.mark_message_sent.assert_not_called()
+    bot.send_message.side_effect = send
+    await sm.send_logs("A" * 8000, topic_type=TopicType.WARNINGS, message_key="warn:batch")
+    worker = asyncio.create_task(dispatcher.start_worker())
+    await _drain(dispatcher, worker)
+    assert calls == 3
+    topics.mark_message_sent.assert_not_awaited()
 
 
-async def test_dedup_mark_task_is_retained_until_complete(monkeypatch):
-    """The background dedup-mark task must be strongly referenced, or it can be
-    garbage-collected before delivery and the key would never be marked."""
-    tm = _fake_topics_manager()
-    monkeypatch.setattr(sm, "get_topics_manager", lambda: tm)
-
-    loop = asyncio.get_running_loop()
-    pending = loop.create_future()
-    dispatcher = MagicMock()
-
-    async def fake_enqueue(**kwargs):
-        return pending
-
-    dispatcher.enqueue_send = fake_enqueue
-    monkeypatch.setattr(sm, "get_dispatcher", lambda: dispatcher)
-    sm._pending_dedup_tasks.clear()
-
+async def test_dedup_reservation_is_retained_until_complete(sending):
+    dispatcher, topics, bot = sending
     await sm.send_logs("hi", topic_type=TopicType.NO_LIMIT, message_key="k")
-
-    # Retained while in flight...
-    assert len(sm._pending_dedup_tasks) == 1
-
-    pending.set_result((1, -1001234567890))
-    await _settle()
-
-    # ...and released once complete.
-    assert len(sm._pending_dedup_tasks) == 0
-    tm.mark_message_sent.assert_awaited_once()
+    await sm.send_logs("hi", topic_type=TopicType.NO_LIMIT, message_key="k")
+    assert dispatcher.queue.qsize() == 1
+    topics.mark_message_sent.assert_not_awaited()
+    worker = asyncio.create_task(dispatcher.start_worker())
+    await _drain(dispatcher, worker)
+    assert bot.send_message.await_count == 1
+    topics.mark_message_sent.assert_awaited_once_with(
+        TopicType.NO_LIMIT,
+        "k",
+        chat_id=-1001234567890,
+        message_thread_id=5,
+        monitoring_revision=0,
+        destination_revision=0,
+    )

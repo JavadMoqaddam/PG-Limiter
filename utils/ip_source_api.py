@@ -34,6 +34,7 @@ from utils.shared_state import (
     api_evidence_is_current,
     publish_api_snapshot,
 )
+from utils.monitoring_gate import monitoring_is_current, monitoring_snapshot, synchronize_monitoring
 from utils.types import ConnectionInfo, PanelType, UserType
 
 api_ip_logger = get_logger("ip_source_api")
@@ -98,6 +99,8 @@ def get_last_cycle_stats() -> dict:
 async def _notify(message: str) -> None:
     """Best-effort Telegram notification; never raises into the collector."""
     try:
+        if not monitoring_snapshot().allowed:
+            return
         from telegram_bot.send_message import send_logs
 
         await send_logs(message)
@@ -120,12 +123,15 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
     the set that ought to show up in a healthy cycle. Without it there is no way
     to tell "users are concentrated on 16 nodes" from "33 nodes stopped
     reporting", and the two have opposite meanings for the device counts.
+    Every relevant enabled node must be connected before even an empty candidate
+    list can establish known absence; the panel IP producer omits unhealthy nodes.
     """
     from utils.ip_facts import register_node_ips
     from utils.panel_api.nodes import get_nodes
 
     node_name_map: dict[int, str] = {}
     connected_node_ids: set = set()
+    disabled_nodes = set(config_data.get("disabled_nodes") or [])
     try:
         nodes = await get_nodes(panel_data)
     except Exception as error:
@@ -138,10 +144,11 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
             node_name_map[node.node_id] = node.node_name
             if getattr(node, "status", None) == "connected":
                 connected_node_ids.add(node.node_id)
+            elif node.node_id not in disabled_nodes:
+                raise ValueError("Enabled node availability is unknown")
 
     if nodes is None or isinstance(nodes, ValueError):
         raise ValueError("Node availability is unknown")
-    disabled_nodes = set(config_data.get("disabled_nodes") or [])
     return node_name_map, disabled_nodes, connected_node_ids - disabled_nodes
 
 
@@ -312,13 +319,14 @@ async def _fetch_all_online_ips(
     )
 
     counters = {"ok": 0, "failed": 0, "not_found": 0, "forbidden": 0, "unauthorized": 0}
+    admission = monitoring_snapshot()
     payloads = OnlineIPResults()
     fetch_times: dict[str, float] = {}
-    if not targets:
+    if not targets or not monitoring_is_current(admission):
         return payloads, counters, fetch_times
 
     token = await resolve_panel_token(panel_data)
-    if not token:
+    if not token or not monitoring_is_current(admission):
         counters["failed"] = len(targets)
         return payloads, counters, fetch_times
 
@@ -326,7 +334,11 @@ async def _fetch_all_online_ips(
 
     async def _one(username: str, user_id: int, active_token: str):
         async with semaphore:
+            if not monitoring_is_current(admission):
+                return None
             payload, outcome = await fetch_user_online_ips(panel_data, user_id, active_token, timeout=timeout)
+            if not monitoring_is_current(admission):
+                return None
             return username, user_id, payload, outcome, time.time()
 
     async def _run(batch: list[tuple[str, int]], active_token: str) -> list[tuple[str, int]]:
@@ -364,7 +376,7 @@ async def _fetch_all_online_ips(
 
     # A token can expire mid-cycle; refresh once and replay only the 401s so a
     # whole cycle is not lost to an expiry.
-    if retry_batch:
+    if retry_batch and monitoring_is_current(admission):
         api_ip_logger.info(f"🔑 Refreshing token and replaying {len(retry_batch)} unauthorized lookups")
         fresh_token = await resolve_panel_token(panel_data, force_refresh=True)
         if fresh_token:
@@ -515,6 +527,22 @@ def _reset_cycle_stats() -> None:
     LAST_CYCLE_STATS["collection_outcome"] = "failure"
 
 
+def retire_api_collection_state(reason: str = "") -> None:
+    """Do not carry old source failures or observations through a Topics pause."""
+    global _consecutive_dead_cycles, _failure_revision, _consecutive_coverage_skips
+    global _coverage_alert_sent, _forbidden_alert_sent
+
+    _consecutive_dead_cycles = 0
+    _failure_revision = None
+    _consecutive_coverage_skips = 0
+    _coverage_alert_sent = False
+    _forbidden_alert_sent = False
+    _reset_cycle_stats()
+    LAST_CYCLE_STATS.update(
+        ran_at=0, collection_outcome="superseded", skipped_reason=reason or "Topics monitoring changed"
+    )
+
+
 @dataclass(frozen=True)
 class _CollectionResult:
     """A cycle owns its health outcome independently of the diagnostic stats."""
@@ -625,7 +653,13 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
     A committed fallback discards the sample and returns False. Cancellation,
     degraded local settings and superseded evidence never count as API outages.
     """
+    admission = monitoring_snapshot()
+    await synchronize_monitoring()
+    if not monitoring_is_current(admission):
+        return False
     async with _collection_lock:
+        if not monitoring_is_current(admission):
+            return False
         source_config = config_data
         config_data = copy.deepcopy(config_data)
         if config_data.get("config_degraded") or config_data.get("ip_source", "api") != "api":
@@ -638,6 +672,9 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
             _resolve_freshness_window(config_data),
         )
         result = await _collect_api_cycle(panel_data, config_data, source_config, evidence)
+        if not monitoring_is_current(admission):
+            await synchronize_monitoring()
+            return False
         if not api_evidence_is_current(result.evidence) or source_config != config_data:
             LAST_CYCLE_STATS.update(
                 collection_outcome="superseded", skipped_reason="configuration or collection changed"
@@ -659,8 +696,9 @@ async def _collect_api_cycle(
     from utils.panel_api.request_helper import is_panel_available
 
     started = time.perf_counter()
+    admission = monitoring_snapshot()
     _reset_cycle_stats()
-    if not api_evidence_is_current(evidence):
+    if not api_evidence_is_current(evidence) or not monitoring_is_current(admission):
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration changed")
         return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
 
@@ -676,6 +714,9 @@ async def _collect_api_cycle(
         LAST_CYCLE_STATS["skipped_reason"] = "node availability unknown"
         return _CollectionResult("failure", False, "node availability unknown", evidence)
 
+    if not monitoring_is_current(admission):
+        return _CollectionResult("superseded", False, "Topics monitoring paused or changed", evidence)
+
     online_window = _resolve_online_window(config_data)
 
     candidates = await fetch_online_candidates(
@@ -686,7 +727,7 @@ async def _collect_api_cycle(
         online_window=online_window,
         page_size=int(config_data.get("api_ip_page_size") or 500),
     )
-    if not api_evidence_is_current(evidence) or source_config != config_data:
+    if not api_evidence_is_current(evidence) or source_config != config_data or not monitoring_is_current(admission):
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
         return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
     # None means the candidate query itself failed. Treating that as "nobody is
@@ -724,7 +765,7 @@ async def _collect_api_cycle(
         timeout=float(config_data.get("api_ip_timeout") or 8.0),
     )
 
-    if not api_evidence_is_current(evidence) or source_config != config_data:
+    if not api_evidence_is_current(evidence) or source_config != config_data or not monitoring_is_current(admission):
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
         return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
 
@@ -745,6 +786,8 @@ async def _collect_api_cycle(
 
     if counters["forbidden"]:
         await _alert_forbidden_once()
+        if not monitoring_is_current(admission):
+            return _CollectionResult("superseded", False, "Topics monitoring paused or changed", evidence)
 
     if answered == 0:
         LAST_CYCLE_STATS["skipped_reason"] = "no successful lookups"
@@ -798,7 +841,7 @@ async def _collect_api_cycle(
 
     answered_users = set(payloads) | getattr(payloads, "not_found_users", set())
     unknown_users = (set(raw_by_name) - answered_users) | set(new_users.unknown_users)
-    if not api_evidence_is_current(evidence) or source_config != config_data:
+    if not api_evidence_is_current(evidence) or source_config != config_data or not monitoring_is_current(admission):
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
         return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
     LAST_CYCLE_STATS["unknown_users"] = len(unknown_users)
