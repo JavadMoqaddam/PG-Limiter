@@ -10,8 +10,16 @@ from asyncio import Task
 from datetime import datetime
 from contextlib import asynccontextmanager
 
+from utils.device_count import COUNT_MODE_INBOUND
 from utils.parse_logs import INVALID_IPS
 from utils.log_observations import LOG_OBSERVATIONS
+from utils.monitoring_gate import (
+    MonitoringAdmission,
+    monitoring_is_current,
+    monitoring_snapshot,
+    synchronize_monitoring,
+    wait_for_monitoring_change,
+)
 
 try:
     import httpx
@@ -20,7 +28,7 @@ except ImportError as exc:
 from telegram_bot.send_message import send_logs, edit_message
 from utils.logs import logger  # pylint: disable=ungrouped-imports
 from utils.panel_api import get_nodes, get_token
-from utils.parse_logs import parse_logs, set_current_node_info
+from utils.parse_logs import clear_node_active_connections, parse_logs, set_current_node_info
 from utils.shared_state import (
     clear_node_events,
     forget_node_event,
@@ -33,6 +41,7 @@ from utils.types import NodeType, PanelType
 TASKS = []
 
 task_node_mapping = {}
+task_monitoring_admissions = {}
 
 # Track the status message for node connections
 _node_status_message_id = None
@@ -124,13 +133,15 @@ async def _get_node_poll_interval() -> float:
     return node_silence_window(await _get_status_throttle_interval())
 
 
-async def _delayed_status_update(delay: float) -> None:
+async def _delayed_status_update(delay: float, admission: MonitoringAdmission) -> None:
     """Flush the latest node connection status to Telegram after the throttle window ends."""
     global _last_status_edit_time, _last_status_text, _node_status_message_id
     try:
         await asyncio.sleep(delay)
+        if not monitoring_is_current(admission):
+            return
         message = await _build_node_status_message()
-        if message != _last_status_text and _node_status_message_id:
+        if monitoring_is_current(admission) and message != _last_status_text and _node_status_message_id:
             _last_status_edit_time = time.time()
             _last_status_text = message
             await edit_message(_node_status_message_id, message)
@@ -144,7 +155,9 @@ _status_lock = asyncio.Lock()
 _status_initializing: bool = False
 
 
-async def _update_node_status(node_id: int, node_name: str, status: str) -> None:
+async def _update_node_status(
+    node_id: int, node_name: str, status: str, admission: MonitoringAdmission | None = None
+) -> None:
     """Update the status of a node in memory and refresh the message with rate throttling and trailing flush."""
     global \
         _node_connection_status, \
@@ -154,11 +167,17 @@ async def _update_node_status(node_id: int, node_name: str, status: str) -> None
         _pending_status_update_task, \
         _status_initializing
 
+    if admission is None:
+        admission = monitoring_snapshot()
+    if not monitoring_is_current(admission):
+        return
     _node_connection_status[node_id] = {"name": node_name, "status": status}
 
     # Throttle edits: sync with check_interval (default 60s)
     now = time.time()
     throttle_interval = await _get_status_throttle_interval()
+    if not monitoring_is_current(admission):
+        return
     elapsed = now - _last_status_edit_time
 
     if _status_initializing:
@@ -168,12 +187,14 @@ async def _update_node_status(node_id: int, node_name: str, status: str) -> None
     if _node_status_message_id and elapsed < throttle_interval:
         # Schedule trailing update so latest states are flushed at the end of the throttle window
         if _pending_status_update_task is None or _pending_status_update_task.done():
-            _pending_status_update_task = asyncio.create_task(_delayed_status_update(throttle_interval - elapsed))
+            _pending_status_update_task = asyncio.create_task(
+                _delayed_status_update(throttle_interval - elapsed, admission)
+            )
         return
 
     async with _status_lock:
         message = await _build_node_status_message()
-        if message == _last_status_text:
+        if not monitoring_is_current(admission) or message == _last_status_text:
             return
 
         _last_status_edit_time = now
@@ -182,7 +203,7 @@ async def _update_node_status(node_id: int, node_name: str, status: str) -> None
         if _node_status_message_id:
             # Try to edit the existing message
             result = await edit_message(_node_status_message_id, message)
-            if not result:
+            if not result and monitoring_is_current(admission):
                 # If edit fails, send a new message
                 _node_status_message_id = await send_logs(message, return_message_id=True)
         else:
@@ -206,7 +227,7 @@ async def _refresh_log_config() -> None:
                 ACTIVE_USERS.clear()
 
 
-async def init_node_status_message(nodes: list) -> None:
+async def init_node_status_message(nodes: list, admission: MonitoringAdmission | None = None) -> None:
     """Initialize the status message with monitored nodes showing as connecting."""
     global \
         _node_connection_status, \
@@ -215,7 +236,14 @@ async def init_node_status_message(nodes: list) -> None:
         _last_status_edit_time, \
         _last_status_text
 
+    if admission is None:
+        admission = monitoring_snapshot()
+    await synchronize_monitoring()
+    if not monitoring_is_current(admission):
+        return
     await _refresh_log_config()
+    if not monitoring_is_current(admission):
+        return
     LOG_OBSERVATIONS.register_fleet(nodes)
     _node_connection_status = {}
     _node_status_message_id = None
@@ -226,6 +254,8 @@ async def init_node_status_message(nodes: list) -> None:
 
     if _node_connection_status:
         message = await _build_node_status_message()
+        if not monitoring_is_current(admission):
+            return
         _last_status_edit_time = time.time()
         _last_status_text = message
         _status_initializing = True
@@ -247,7 +277,7 @@ async def _track_log_transport(node_id: int):
         forget_node_event(node_id)
 
 
-async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
+async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: MonitoringAdmission | None = None) -> None:
     """
     This function establishes an SSE connection to a specific node and retrieves logs.
     Automatically waits for panel to be available during restarts.
@@ -255,6 +285,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
     Args:
         panel_data (PanelType): The credentials for the panel.
         node (NodeType): The specific node to connect to.
+        admission: Original owner's Topics admission, when scheduled by a node poll.
 
     Raises:
         ValueError: If there is an issue with getting the panel token.
@@ -264,6 +295,12 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
 
     global _node_connection_status
 
+    if admission is None:
+        admission = monitoring_snapshot()
+    await synchronize_monitoring()
+    if not monitoring_is_current(admission):
+        return
+
     # Set current node information for log parsing
     await set_current_node_info(node.node_id, node.node_name)
 
@@ -271,22 +308,34 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
     max_failures_before_wait = 3  # Wait for panel after 3 consecutive connection failures
 
     while True:
+        await synchronize_monitoring()
+        if not monitoring_is_current(admission):
+            return
         await _refresh_log_config()
         config_revision = get_config_revision()
-        if node.status != "connected" or not LOG_OBSERVATIONS.monitors(node.node_id):
+        if (
+            not monitoring_is_current(admission)
+            or node.status != "connected"
+            or not LOG_OBSERVATIONS.monitors(node.node_id)
+        ):
             return
         # API mode owns the IP collection, so the SSE stream must stay closed;
         # otherwise both writers would feed ACTIVE_USERS and double-count
         # devices. The task idles instead of exiting so that switching back to
         # log mode from Telegram resumes streaming without a restart.
-        if await _ip_source_is_api():
-            await _update_node_status(node.node_id, node.node_name, "🛰️ API mode")
+        api_mode = await _ip_source_is_api()
+        if not monitoring_is_current(admission):
+            return
+        if api_mode:
+            await _update_node_status(node.node_id, node.node_name, "🛰️ API mode", admission)
             await asyncio.sleep(10)
             continue
+        if not monitoring_is_current(admission):
+            return
 
         # If we've had multiple consecutive failures, panel might be restarting
         if consecutive_failures >= max_failures_before_wait:
-            await _update_node_status(node.node_id, node.node_name, "⏳ Waiting for panel...")
+            await _update_node_status(node.node_id, node.node_name, "⏳ Waiting for panel...", admission)
             logger.warning(
                 f"Node {node.node_id} had {consecutive_failures} failures, waiting for panel to be available..."
             )
@@ -299,6 +348,8 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
                 consecutive_failures = 0  # Reset and try again
                 await asyncio.sleep(30)
                 continue
+        if not monitoring_is_current(admission):
+            return
 
         # get_token raises on failure. This call sat outside the try below, so a panel
         # that refused to authenticate killed this node's task - and with it, being a
@@ -311,6 +362,8 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
             await asyncio.sleep(30)
             continue
         token = get_panel_token.panel_token
+        if not monitoring_is_current(admission):
+            return
 
         # Determine the scheme based on the domain
         scheme = "http" if panel_data.panel_domain.startswith("http://") else "https"
@@ -351,9 +404,13 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
 
                     # Connection successful, reset failure counter
                     consecutive_failures = 0
+                    if not monitoring_is_current(admission):
+                        return
 
                     # Update status to connected
-                    await _update_node_status(node.node_id, node.node_name, "✅ Connected")
+                    await _update_node_status(node.node_id, node.node_name, "✅ Connected", admission)
+                    if not monitoring_is_current(admission):
+                        return
 
                     # Seed transport liveness, while starting a complete-interval
                     # warmup. HTTP 200 cannot certify the missing preceding logs.
@@ -365,6 +422,8 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
 
                     next_mode_check = time.time() + _IP_SOURCE_RECHECK_SECONDS
                     async for line in response.aiter_lines():
+                        if not monitoring_is_current(admission):
+                            return
                         # Honour a runtime switch to API mode: the stream is
                         # abandoned so the outer loop can park the task.
                         now = time.time()
@@ -387,8 +446,20 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
                                     f"🛰️ IP source switched to API, closing SSE stream "
                                     f"for node {node.node_id} ({node.node_name})"
                                 )
+                                from utils.read_config import read_config_scalar
+
+                                # API cannot supply inbound tags. Preserve this
+                                # unevaluated sample while that combination pauses
+                                # enforcement instead of discarding it on shutdown.
+                                count_mode = (
+                                    str(await read_config_scalar("device_count_mode", "device")).strip().lower()
+                                )
+                                if count_mode != COUNT_MODE_INBOUND:
+                                    await clear_node_active_connections(node.node_id)
                                 forget_node_event(node.node_id)
                                 break
+                            if not monitoring_is_current(admission):
+                                return
 
                         note_node_event(node.node_id, now)
 
@@ -399,16 +470,16 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
 
         except httpx.HTTPStatusError as error:
             consecutive_failures += 1
-            await _update_node_status(node.node_id, node.node_name, "❌ HTTP Error")
+            await _update_node_status(node.node_id, node.node_name, "❌ HTTP Error", admission)
             logger.error(f"HTTP error connecting to node {node.node_id}: {error}")
             retry_delay = min(60, 5 * (2 ** min(consecutive_failures - 1, 4)))
             await asyncio.sleep(retry_delay)
-            await _update_node_status(node.node_id, node.node_name, "⏳ Reconnecting...")
+            await _update_node_status(node.node_id, node.node_name, "⏳ Reconnecting...", admission)
             continue
 
         except httpx.ConnectError as error:
             consecutive_failures += 1
-            await _update_node_status(node.node_id, node.node_name, "❌ Connection Error")
+            await _update_node_status(node.node_id, node.node_name, "❌ Connection Error", admission)
             logger.error(f"Connection error for node {node.node_id}: {error}")
             # Shorter sleep if panel might be restarting
             retry_delay = (
@@ -417,17 +488,45 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType) -> None:
                 else 2
             )
             await asyncio.sleep(retry_delay)
-            await _update_node_status(node.node_id, node.node_name, "⏳ Reconnecting...")
+            await _update_node_status(node.node_id, node.node_name, "⏳ Reconnecting...", admission)
             continue
 
         except Exception as error:  # pylint: disable=broad-except
             consecutive_failures += 1
-            await _update_node_status(node.node_id, node.node_name, "❌ Failed")
+            await _update_node_status(node.node_id, node.node_name, "❌ Failed", admission)
             logger.error(f"Failed to connect to node {node.node_id}: {error}")
             retry_delay = min(60, 5 * (2 ** min(consecutive_failures - 1, 4)))
             await asyncio.sleep(retry_delay)
-            await _update_node_status(node.node_id, node.node_name, "⏳ Reconnecting...")
+            await _update_node_status(node.node_id, node.node_name, "⏳ Reconnecting...", admission)
             continue
+
+
+async def retire_log_streams(admission=None) -> None:
+    """Close all owned SSE transports and abandon their pending status report."""
+    global _pending_status_update_task, _node_status_message_id, _last_status_text, _last_status_edit_time
+    tasks = [
+        task
+        for task in list(TASKS)
+        if admission is None or task_monitoring_admissions.get(task) != admission or not admission.allowed
+    ]
+    if _pending_status_update_task is not None:
+        tasks.append(_pending_status_update_task)
+        _pending_status_update_task = None
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    for task in tasks:
+        if task in TASKS:
+            TASKS.remove(task)
+        task_node_mapping.pop(task, None)
+        task_monitoring_admissions.pop(task, None)
+    surviving_ids = {node.node_id for task, node in task_node_mapping.items() if not task.done()}
+    for node_id in set(_node_connection_status) - surviving_ids:
+        _node_connection_status.pop(node_id, None)
+    _node_status_message_id = None
+    _last_status_text = ""
+    _last_status_edit_time = 0.0
 
 
 async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
@@ -441,7 +540,13 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
     global _node_connection_status
 
     while True:
+        admission = await synchronize_monitoring()
+        if not monitoring_is_current(admission):
+            await wait_for_monitoring_change(admission, 60)
+            continue
         poll_interval = await _get_node_poll_interval()
+        if not monitoring_is_current(admission):
+            continue
         # get_nodes RAISES ValueError when the panel is unreachable or the circuit
         # breaker is open - it never returns one, despite the isinstance() guards
         # scattered around the codebase. This coroutine is a TaskGroup child, so an
@@ -457,7 +562,11 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
         # node's stream was never cancelled at all.
         try:
             nodes_list = await get_nodes(panel_data, force_refresh=True, enabled_only=False)
+            if not monitoring_is_current(admission):
+                continue
             await _refresh_log_config()
+            if not monitoring_is_current(admission):
+                continue
             LOG_OBSERVATIONS.register_fleet(nodes_list)
         except Exception as error:  # pylint: disable=broad-except
             LOG_OBSERVATIONS.register_fleet(None)
@@ -502,7 +611,11 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
 
                 # Update status to show disconnected
                 if node_id in _node_connection_status:
-                    await _update_node_status(node_id, _node_connection_status[node_id]["name"], "⚫ Disconnected")
+                    await _update_node_status(
+                        node_id, _node_connection_status[node_id]["name"], "⚫ Disconnected", admission
+                    )
+                if not monitoring_is_current(admission):
+                    break
 
                 # The panel says this node is gone, so drop its heartbeat rather
                 # than leaving a stale timestamp behind. A stale entry is the
@@ -515,7 +628,8 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
                 tasks.remove(task)
                 if task in task_node_mapping:
                     task_node_mapping.pop(task)
-        await asyncio.sleep(poll_interval)
+                task_monitoring_admissions.pop(task, None)
+        await wait_for_monitoring_change(admission, poll_interval)
 
 
 async def handle_cancel_one(tasks: list[Task]) -> None:
@@ -553,13 +667,18 @@ async def handle_cancel_all(tasks: list[Task], panel_data: PanelType, tg: asynci
         # Nothing to refresh in API mode — the node tasks are parked and no
         # stream is open, so a restart would only produce a misleading
         # "SSE Refresh" notification.
-        if await _ip_source_is_api():
+        admission = await synchronize_monitoring()
+        if not monitoring_is_current(admission) or await _ip_source_is_api():
             logger.debug("🛰️ Skipping SSE refresh: IP source is API mode")
+            continue
+        if not monitoring_is_current(admission):
             continue
 
         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"[{time_str}] Restarting all SSE connections (2-hour refresh)")
         await send_logs(f"🔄 <b>SSE Refresh</b> - {time_str}\n\nRestarting all node connections...")
+        if not monitoring_is_current(admission):
+            continue
 
         # Cancel all existing node tasks
         for task in list(tasks):
@@ -568,6 +687,7 @@ async def handle_cancel_all(tasks: list[Task], panel_data: PanelType, tg: asynci
                 tasks.remove(task)
                 if task in task_node_mapping:
                     task_node_mapping.pop(task)
+                task_monitoring_admissions.pop(task, None)
 
         # Reset status tracking
         _node_status_message_id = None
@@ -581,6 +701,8 @@ async def handle_cancel_all(tasks: list[Task], panel_data: PanelType, tg: asynci
 
         # Small delay to let tasks clean up
         await asyncio.sleep(2)
+        if not monitoring_is_current(admission):
+            continue
 
         # Fetch fresh node list. get_nodes raises on failure rather than returning a
         # ValueError, so an unguarded call here could take the whole TaskGroup - and
@@ -593,14 +715,16 @@ async def handle_cancel_all(tasks: list[Task], panel_data: PanelType, tg: asynci
                 f"No streams were recreated on this pass."
             )
             nodes_list = None
-        if nodes_list:
+        if nodes_list and monitoring_is_current(admission):
             # Initialize status message for all nodes
-            await init_node_status_message(nodes_list)
+            await init_node_status_message(nodes_list, admission)
 
             # Create new tasks for all connected nodes
             for node in nodes_list:
+                if not monitoring_is_current(admission):
+                    break
                 if node.status == "connected":
-                    await create_node_task(panel_data, tg, node)
+                    await create_node_task(panel_data, tg, node, admission)
                     await asyncio.sleep(1)  # Small delay between node connections
 
         logger.info(f"SSE connections restarted. Active tasks: {len(tasks)}")
@@ -617,12 +741,17 @@ async def check_and_add_new_nodes(panel_data: PanelType, tg: asyncio.TaskGroup) 
     global _node_connection_status
 
     while True:
+        admission = await synchronize_monitoring()
+        if not monitoring_is_current(admission):
+            await wait_for_monitoring_change(admission, 60)
+            continue
         try:
             # Clean up completed or cancelled tasks from mapping
             dead_tasks = [t for t in list(TASKS) if t.done()]
             for t in dead_tasks:
                 TASKS.remove(t)
                 task_node_mapping.pop(t, None)
+                task_monitoring_admissions.pop(t, None)
 
             active_node_ids = {n.node_id for t, n in task_node_mapping.items() if not t.done()}
 
@@ -632,10 +761,16 @@ async def check_and_add_new_nodes(panel_data: PanelType, tg: asyncio.TaskGroup) 
             # authoritative for every node instead of silently omitting disabled ones -
             # the "connected" test below is what decides whether to reconnect.
             all_nodes = await get_nodes(panel_data, force_refresh=True, enabled_only=False)
+            if not monitoring_is_current(admission):
+                continue
             await _refresh_log_config()
+            if not monitoring_is_current(admission):
+                continue
             LOG_OBSERVATIONS.register_fleet(all_nodes)
             if all_nodes and not isinstance(all_nodes, ValueError):
                 for node in all_nodes:
+                    if not monitoring_is_current(admission):
+                        break
                     if (
                         node.node_id not in active_node_ids
                         and node.status == "connected"
@@ -645,10 +780,10 @@ async def check_and_add_new_nodes(panel_data: PanelType, tg: asyncio.TaskGroup) 
 
                         logger.info(f"Add a new node. id: {node.node_id} name: {node.node_name}")
                         try:
-                            await _update_node_status(node.node_id, node.node_name, "⏳ Connecting...")
+                            await _update_node_status(node.node_id, node.node_name, "⏳ Connecting...", admission)
                         except Exception as update_err:
                             logger.warning(f"Failed updating node status: {update_err}")
-                        await create_node_task(panel_data, tg, node)
+                        await create_node_task(panel_data, tg, node, admission)
                         active_node_ids.add(node.node_id)
         except asyncio.CancelledError:
             break
@@ -656,10 +791,12 @@ async def check_and_add_new_nodes(panel_data: PanelType, tg: asyncio.TaskGroup) 
             LOG_OBSERVATIONS.register_fleet(None)
             logger.error(f"Error in check_and_add_new_nodes: {e}")
 
-        await asyncio.sleep(await _get_node_poll_interval())
+        await wait_for_monitoring_change(admission, await _get_node_poll_interval())
 
 
-async def create_node_task(panel_data: PanelType, tg: asyncio.TaskGroup, node: NodeType) -> None:
+async def create_node_task(
+    panel_data: PanelType, tg: asyncio.TaskGroup, node: NodeType, admission: MonitoringAdmission | None = None
+) -> None:
     """
     An asynchronous coroutine that creates a new task for a node and adds it to the TASKS list.
 
@@ -667,11 +804,22 @@ async def create_node_task(panel_data: PanelType, tg: asyncio.TaskGroup, node: N
         panel_data (PanelType): The credentials for the panel.
         tg (asyncio.TaskGroup): The TaskGroup to which the new task will be added.
         node (NodeType): The node for which the new task will be created.
+        admission: Original owner's Topics admission, when the node list was fetched.
     """
+    if admission is None:
+        admission = monitoring_snapshot()
+    await synchronize_monitoring()
+    if not monitoring_is_current(admission):
+        return
     await _refresh_log_config()
-    if node.status != "connected" or not LOG_OBSERVATIONS.monitors(node.node_id):
+    if (
+        not monitoring_is_current(admission)
+        or node.status != "connected"
+        or not LOG_OBSERVATIONS.monitors(node.node_id)
+    ):
         return
     INVALID_IPS.add(node.node_ip)
-    task = tg.create_task(get_nodes_logs(panel_data, node), name=f"Task-{node.node_id}-{node.node_name}")
+    task = tg.create_task(get_nodes_logs(panel_data, node, admission), name=f"Task-{node.node_id}-{node.node_name}")
     TASKS.append(task)
     task_node_mapping[task] = node
+    task_monitoring_admissions[task] = admission

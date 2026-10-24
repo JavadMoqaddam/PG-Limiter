@@ -17,6 +17,7 @@ from utils.ip_facts import (
 )
 from utils.read_config import read_config, get_config_revision
 from utils.log_observations import LOG_OBSERVATIONS
+from utils.monitoring_gate import monitoring_is_current, monitoring_snapshot, synchronize_monitoring
 from utils.types import ConnectionInfo, DeviceInfo, UserType
 from utils.logs import get_logger
 
@@ -49,7 +50,6 @@ LOCAL_ID_CACHE = TTLCache(maxsize=30000, ttl=600)
 # API endpoints with fallback order (from most reliable to least)
 API_ENDPOINTS = [
     {"url": "http://ip-api.com/json/{ip}?fields=countryCode", "key": "countryCode", "name": "ip-api.com"},
-    {"url": "https://ipinfo.io/{ip}/json", "key": "country", "name": "ipinfo.io"},
     {"url": "https://api.iplocation.net/?ip={ip}", "key": "country_code2", "name": "iplocation.net"},
     {"url": "https://ipapi.co/{ip}/country", "key": None, "name": "ipapi.co"},
 ]
@@ -340,6 +340,10 @@ async def parse_logs(
     Returns:
         dict[str, UserType]: Dictionary of users with their connection information
     """
+    admission = monitoring_snapshot()
+    await synchronize_monitoring()
+    if not monitoring_is_current(admission):
+        return ACTIVE_USERS
     # Use provided node info or fall back to global (for backward compatibility)
     current_node_id = node_id if node_id is not None else CURRENT_NODE_INFO.get("node_id")
     current_node_name = node_name if node_name is not None else CURRENT_NODE_INFO.get("node_name")
@@ -349,7 +353,7 @@ async def parse_logs(
     if data.get("_revision", revision) != revision or data.get("ip_source", "logs") != "logs":
         return ACTIVE_USERS
     async with ACTIVE_USERS_LOCK:
-        if revision != get_config_revision():
+        if revision != get_config_revision() or not monitoring_is_current(admission):
             return ACTIVE_USERS
         if LOG_OBSERVATIONS.configure(data):
             ACTIVE_USERS.clear()
@@ -394,14 +398,20 @@ async def parse_logs(
     if unknown_ids:
         try:
             async with get_db() as db:
+                if not monitoring_is_current(admission):
+                    return ACTIVE_USERS
                 for numeric_id in unknown_ids:
                     real_username = await UserCRUD.get_username_by_panel_id(db, int(numeric_id))
+                    if not monitoring_is_current(admission):
+                        return ACTIVE_USERS
                     if real_username:
                         LOCAL_ID_CACHE[numeric_id] = real_username
         except Exception as e:
             parse_logger.error(f"Error batch-resolving numeric IDs: {e}")
 
     for line in lines:
+        if not monitoring_is_current(admission):
+            return ACTIVE_USERS
         if "accepted" not in line:
             continue
         if "BLOCK]" in line:
@@ -475,6 +485,7 @@ async def parse_logs(
                 generation != LOG_OBSERVATIONS.generation
                 or revision != get_config_revision()
                 or not LOG_OBSERVATIONS.monitors(current_node_id)
+                or not monitoring_is_current(admission)
             ):
                 continue
             if observed_at is None:
