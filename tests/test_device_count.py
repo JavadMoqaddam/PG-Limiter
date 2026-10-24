@@ -3,7 +3,7 @@
 Unit tests for device counting.
 
 This is the number every ban is decided on, so each counting rule is pinned
-down here: the two counting modes, CDN collapsing, disabled nodes, subnet
+down here: the three counting modes, CDN collapsing, disabled nodes, subnet
 grouping, High Trust grouping and the no-connection fallback.
 """
 
@@ -19,7 +19,6 @@ from utils.device_count import (
     count_devices_from_ips,
     group_ips_by_subnet,
     subnet_key,
-    wide_subnet_key,
 )
 from utils.types import ConnectionInfo, DeviceInfo, EnhancedUserInfo, UserType
 
@@ -96,6 +95,69 @@ class TestCountingModes:
     def test_ip_mode_still_counts_distinct_ips(self, ip_mode):
         user = make_user([("5.6.7.8", "Vless", 1), ("9.9.9.9", "Vmess", 2)])
         assert count_devices(user, ip_mode) == 2
+
+
+class TestInboundCounting:
+    """Inbound counting measures observed tags, independent of client addresses."""
+
+    def test_distinct_ips_on_the_same_inbound_count_once(self):
+        user = make_user([("5.6.7.8", "Vless", 1), ("9.9.9.9", "Vless", 2)])
+        assert count_devices(user, DeviceCountingConfig(count_mode="inbound")) == 1
+
+    def test_tags_are_trimmed_but_case_sensitive(self):
+        user = make_user([("5.6.7.8", " Vless ", 1), ("9.9.9.9", "Vless", 2), ("4.4.4.4", "vless", 3)])
+        assert count_devices(user, DeviceCountingConfig(count_mode="inbound")) == 2
+
+    def test_distinct_inbounds_on_one_ip_count_separately(self):
+        user = make_user([("5.6.7.8", "Vless TCP", 1), ("5.6.7.8", "Vless WS", 1)])
+        assert count_devices(user, DeviceCountingConfig(count_mode="inbound")) == 2
+
+    def test_ip_grouping_rules_cannot_merge_distinct_inbounds(self):
+        config = DeviceCountingConfig(
+            count_mode="inbound",
+            cdn_nodes=[1, 2],
+            cdn_inbounds=["Vless", "Vmess"],
+            subnet_ip_grouping=True,
+            subnet_grouping_mode="/16",
+            high_trust_ip_grouping=True,
+        )
+        user = make_user([("5.6.7.8", "Vless", 1), ("9.9.9.9", "Vless", 3), ("5.6.8.8", "Vmess", 2)])
+        assert count_devices(user, config, trust_score=90) == 2
+
+    def test_disabled_nodes_do_not_add_inbounds(self):
+        config = DeviceCountingConfig(count_mode="inbound", disabled_nodes=[9])
+        user = make_user([("5.6.7.8", "Vless", 9), ("9.9.9.9", "Vmess", 1)])
+        assert count_devices(user, config) == 1
+
+    @pytest.mark.parametrize("inbound", ["", "  ", "Unknown", " Unknown ", None])
+    def test_missing_inbound_information_does_not_add_a_device(self, inbound):
+        user = make_user([("5.6.7.8", inbound, 1)])
+        assert count_devices(user, DeviceCountingConfig(count_mode="inbound"), fallback_count=7) == 0
+
+    @pytest.mark.parametrize("user", [None, UserType(name="user1", ip=["5.6.7.8", "9.9.9.9"])])
+    def test_connectionless_users_ignore_ip_fallback(self, user):
+        assert count_devices(user, DeviceCountingConfig(count_mode="inbound"), fallback_count=7) == 0
+
+    def test_bare_addresses_cannot_establish_an_inbound_count(self):
+        assert count_devices_from_ips(["5.6.7.8", "9.9.9.9"], DeviceCountingConfig(count_mode="inbound")) == 0
+
+    @pytest.mark.parametrize("ips", [[], ["5.6.7.8", "9.9.9.9"]])
+    def test_report_does_not_fall_back_to_ip_or_display_counts(self, ips):
+        user = UserType(name="user1", ip=ips)
+        info = EnhancedUserInfo(user=user, formatted_ips=["5.6.7.8", "9.9.9.9"])
+        assert count_devices_and_details(info, user, device_config=DeviceCountingConfig(count_mode="inbound")) == (
+            [],
+            0,
+        )
+
+    def test_report_counts_inbounds_even_with_ip_details_enabled(self):
+        user = make_user([("5.6.7.8", "Vless", 1), ("9.9.9.9", "Vless", 2)])
+        info = EnhancedUserInfo(user=user, formatted_ips=["5.6.7.8", "9.9.9.9"])
+        details, count = count_devices_and_details(
+            info, user, True, device_config=DeviceCountingConfig(count_mode="inbound")
+        )
+        assert count == 1
+        assert len(details) == 2
 
 
 class TestCdnCollapsing:
@@ -301,39 +363,25 @@ class TestSubnetGrouping:
         user = make_user([("5.6.7.10", "Vless", 1), ("5.6.7.99", "Vmess", 2)])
         assert count_devices(user, config) == 1
 
-    def test_wide_mode_groups_a_16_when_the_isp_matches(self):
-        config = DeviceCountingConfig(subnet_ip_grouping=True, subnet_grouping_mode="/16")
-        user = make_user([("5.6.7.10", "Vless", 1), ("5.6.200.4", "Vless", 1)])
-        isp_info = {
-            "5.6.7.10": {"isp": "Irancell"},
-            "5.6.200.4": {"isp": "Irancell"},
-        }
-        assert count_devices(user, config, isp_info=isp_info) == 1
-
-    def test_wide_mode_keeps_different_isps_apart(self):
-        config = DeviceCountingConfig(subnet_ip_grouping=True, subnet_grouping_mode="/16")
-        user = make_user([("5.6.7.10", "Vless", 1), ("5.6.200.4", "Vless", 1)])
-        isp_info = {
-            "5.6.7.10": {"isp": "Irancell"},
-            "5.6.200.4": {"isp": "Mobinnet"},
-        }
-        assert count_devices(user, config, isp_info=isp_info) == 2
-
-    def test_wide_mode_without_isp_info_falls_back_to_24(self):
-        # Grouping a whole /16 of unrelated customers would hide real sharing,
-        # so an unknown ISP narrows the key instead of widening it.
+    def test_legacy_wide_mode_keeps_different_24s_separate(self):
         config = DeviceCountingConfig(subnet_ip_grouping=True, subnet_grouping_mode="/16")
         user = make_user([("5.6.7.10", "Vless", 1), ("5.6.200.4", "Vless", 1)])
         assert count_devices(user, config) == 2
 
-    def test_org_is_used_when_isp_is_missing(self):
+    def test_legacy_wide_mode_groups_same_24_without_isp_dependency(self):
         config = DeviceCountingConfig(subnet_ip_grouping=True, subnet_grouping_mode="/16")
+        user = make_user([("5.6.7.10", "Vless", 1), ("5.6.7.20", "Vless", 1)])
+        assert count_devices(user, config) == 1
+
+    def test_legacy_wide_mode_in_ip_mode_keeps_different_24s_separate(self):
+        config = DeviceCountingConfig(count_mode=COUNT_MODE_IP, subnet_ip_grouping=True, subnet_grouping_mode="/16")
         user = make_user([("5.6.7.10", "Vless", 1), ("5.6.200.4", "Vless", 1)])
-        isp_info = {
-            "5.6.7.10": {"org": "AS44244 Irancell"},
-            "5.6.200.4": {"isp": "", "org": "AS44244 Irancell"},
-        }
-        assert count_devices(user, config, isp_info=isp_info) == 1
+        assert count_devices(user, config) == 2
+
+    def test_legacy_wide_mode_still_splits_different_inbounds_inside_one_24(self):
+        config = DeviceCountingConfig(subnet_ip_grouping=True, subnet_grouping_mode="/16")
+        user = make_user([("5.6.7.10", "Vless", 1), ("5.6.7.20", "Vmess", 1)])
+        assert count_devices(user, config) == 2
 
 
 class TestHighTrustGrouping:
@@ -419,10 +467,9 @@ class TestCountDevicesFromIps:
         config = DeviceCountingConfig(subnet_ip_grouping=True)
         assert count_devices_from_ips(["5.6.7.10", "5.6.9.10"], config) == 2
 
-    def test_wide_mode_uses_the_isp(self):
+    def test_legacy_wide_mode_fallback_keeps_different_24s_separate(self):
         config = DeviceCountingConfig(subnet_ip_grouping=True, subnet_grouping_mode="/16")
-        isp_info = {"5.6.7.10": {"isp": "Irancell"}, "5.6.200.4": {"isp": "Irancell"}}
-        assert count_devices_from_ips(["5.6.7.10", "5.6.200.4"], config, isp_info) == 1
+        assert count_devices_from_ips(["5.6.7.10", "5.6.200.4"], config) == 2
 
     def test_count_mode_makes_no_difference(self):
         # The inbound is unknown here, so "device" mode has nothing extra to split
@@ -498,7 +545,7 @@ class TestFromConfig:
         assert config.cdn_inbounds == ["CDN_WS"]
         assert config.cdn_nodes == [5]
         assert config.disabled_nodes == [9]
-        assert config.subnet_grouping_mode == "/16"
+        assert config.subnet_grouping_mode == "/24"
         assert config.high_trust_threshold == 35
 
     def test_null_lists_become_empty_lists(self):
@@ -507,22 +554,17 @@ class TestFromConfig:
 
 
 class TestSubnetKeys:
-    """The two subnet widths used by the grouping rules."""
+    """The /24 subnet keys used by the grouping rules."""
 
     def test_24_key_drops_the_last_octet(self):
         assert subnet_key("5.6.7.8") == "5.6.7"
 
-    def test_16_key_keeps_two_octets(self):
-        assert wide_subnet_key("5.6.7.8") == "5.6"
-
     def test_malformed_address_is_its_own_key(self):
         assert subnet_key("not-an-ip") == "not-an-ip"
-        assert wide_subnet_key("not-an-ip") == "not-an-ip"
 
     def test_ipv6_is_never_truncated(self):
         address = "2a01:5ec0:5011:9962:d8ed:c723:c32:ac2a"
         assert subnet_key(address) == address
-        assert wide_subnet_key(address) == address
 
 
 class TestGroupIpsBySubnet:

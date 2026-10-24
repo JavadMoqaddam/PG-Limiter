@@ -1,43 +1,48 @@
-"""Retention has an owner: one pass prunes both the violation history and the ISP
-subnet cache that otherwise grew unbounded with no live caller."""
+"""Retention prunes violation history without touching the retired ISP cache."""
 
-import contextlib
+import time
+from contextlib import asynccontextmanager
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import utils.maintenance as maintenance
+from db.models import Base, ViolationHistory
 
 
-async def test_run_retention_once_prunes_both_stores(monkeypatch):
-    calls = []
+async def test_retention_removes_only_expired_violations(tmp_path, monkeypatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'retention.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with sessions() as session:
+        session.add_all(
+            [
+                ViolationHistory(
+                    username="old", timestamp=time.time() - 31 * 86400, step_applied=1, disable_duration=30
+                ),
+                ViolationHistory(username="recent", timestamp=time.time(), step_applied=1, disable_duration=30),
+            ]
+        )
+        await session.commit()
 
-    class FakeViolations:
-        @staticmethod
-        async def cleanup_old(db, days):
-            calls.append(("violations", days))
-            return 3
+    @asynccontextmanager
+    async def get_test_db():
+        async with sessions() as session:
+            yield session
+            await session.commit()
 
-    class FakeSubnet:
-        @staticmethod
-        async def cleanup_old(db, days):
-            calls.append(("subnet", days))
-            return 5
-
-    @contextlib.asynccontextmanager
-    async def fake_get_db():
-        yield object()
-
+    monkeypatch.setattr(maintenance, "get_db", get_test_db)
     monkeypatch.setattr(maintenance, "DB_AVAILABLE", True)
-    monkeypatch.setattr(maintenance, "get_db", fake_get_db)
-    monkeypatch.setattr(maintenance, "ViolationHistoryCRUD", FakeViolations)
-    monkeypatch.setattr(maintenance, "SubnetISPCRUD", FakeSubnet)
-
-    result = await maintenance.run_retention_once(days=30)
-
-    assert result == {"violations": 3, "subnet_isp": 5}
-    assert ("violations", 30) in calls
-    assert ("subnet", 30) in calls
+    try:
+        assert await maintenance.run_retention_once(days=30) == {"violations": 1}
+        async with sessions() as session:
+            assert list(await session.scalars(select(ViolationHistory.username))) == ["recent"]
+    finally:
+        await engine.dispose()
 
 
 async def test_run_retention_once_noop_without_db(monkeypatch):
     monkeypatch.setattr(maintenance, "DB_AVAILABLE", False)
     result = await maintenance.run_retention_once(days=30)
-    assert result == {"violations": 0, "subnet_isp": 0}
+    assert result == {"violations": 0}

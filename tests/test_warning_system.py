@@ -179,34 +179,24 @@ class TestTrustScore:
         
         assert expected_trust <= 0
     
-    def test_subnet_penalty_16_range(self):
-        """When multiple /24 subnets fall inside same /16 with same ISP,
-        they should not trigger extra subnet penalties beyond one group.
-        Previously the logic would penalize each /24 separately which
-        produced unexpectedly low trust scores for legitimate users.
-        """
+    def test_legacy_isp_fields_do_not_influence_trust(self):
+        """Old persisted ISP names must not change the IP/inbound trust calculation."""
         from utils.warning_system.user_warning import UserWarning
         
-        # create a warning representing two ips from same /16 but different
-        # /24s
         warning = UserWarning(
             username="user",
             ip_count=2,
-            ips={"173.135.1.1", "173.135.2.2"},
+            ips={"173.135.1.1", "174.136.2.2"},
             warning_time=time.time(),
-            monitoring_end_time=time.time() + 180
+            monitoring_end_time=time.time() + 180,
         )
         warning.isp_names = {"GoodISP"}
-        # ip_subnets is normally filled by EnhancedWarningSystem._extract_subnets
-        warning.ip_subnets = {"173.135.1.x", "173.135.2.x"}
+        warning.ip_subnets = {"173.135.1.x", "174.136.2.x"}
         warning.inbound_protocols = set()
         warning.previous_warnings_12h = 0
         warning.previous_warnings_24h = 0
-        # calculate trust
         score = warning.calculate_trust_score()
-        # with two subnets in same /16 and only one ISP there is no
-        # subnet penalty (50 base - 10 excess ip penalty = 40)
-        assert score >= 40
+        assert score == 40
 
 
 class TestSubnetGrouping:

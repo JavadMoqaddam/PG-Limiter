@@ -1,6 +1,6 @@
 """
 PG-Limiter Database Package
-SQLite database for storing users, limits, ISP cache, and violation history.
+SQLite database for storing users, limits, and violation history.
 """
 
 from db.database import (
@@ -19,7 +19,6 @@ from db.models import (
     UserLimit,
     ExceptUser,
     DisabledUser,
-    SubnetISP,
     ViolationHistory,
     Config,
     IPHistory,
@@ -30,7 +29,6 @@ from db.crud import (
     UserLimitCRUD,
     ExceptUserCRUD,
     DisabledUserCRUD,
-    SubnetISPCRUD,
     ViolationHistoryCRUD,
     ConfigCRUD,
     IPHistoryCRUD,
@@ -51,7 +49,6 @@ __all__ = [
     "UserLimit",
     "ExceptUser",
     "DisabledUser",
-    "SubnetISP",
     "ViolationHistory",
     "Config",
     "IPHistory",
@@ -60,7 +57,6 @@ __all__ = [
     "UserLimitCRUD",
     "ExceptUserCRUD",
     "DisabledUserCRUD",
-    "SubnetISPCRUD",
     "ViolationHistoryCRUD",
     "ConfigCRUD",
     "IPHistoryCRUD",

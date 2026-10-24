@@ -157,8 +157,8 @@ async def main():
             _supervise("dispatcher_worker", dispatcher.start_worker), name="dispatcher_worker"
         )
         bot_task = asyncio.create_task(run_telegram_bot(), name="telegram_bot_runner")
-        # Supervised retention: prune old violation history and ISP cache, which
-        # otherwise grew without bound because their cleanup had no live caller.
+        # Supervised retention: prune old violation history, which otherwise
+        # grew without bound because its cleanup had no live caller.
         from utils.maintenance import retention_maintenance_loop
 
         retention_task = asyncio.create_task(
