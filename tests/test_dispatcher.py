@@ -134,6 +134,7 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
         now = time.time()
         self.assertTrue(item.ttl and (now - item.created_at) > item.ttl)
 
+    @pytest.mark.usefixtures("operational_topics")
     async def test_dispatch_chunked_warnings_formatting(self):
         """Test chunked warning aggregation into batches of 10 with item-level error handling."""
         sample_warnings = [
@@ -202,6 +203,7 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
         cancelled = await dispatcher.cancel_pending("disable:john_doe")
         self.assertTrue(cancelled)
 
+    @pytest.mark.usefixtures("operational_topics")
     async def test_trailing_node_status_update(self):
         """Test that delayed trailing task flushes latest status to Telegram."""
         import utils.get_logs as gl

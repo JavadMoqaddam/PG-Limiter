@@ -448,7 +448,7 @@ async def test_version_read_failure_drops_warm_cache(settings_db, monkeypatch):
     assert config._config_cache_db_revision is None
 
 
-async def test_scanner_refreshes_external_commit_on_next_iteration(settings_db, monkeypatch):
+async def test_scanner_refreshes_external_commit_on_next_iteration(settings_db, monkeypatch, operational_topics):
     import utils.check_usage as usage
 
     await config.read_config()

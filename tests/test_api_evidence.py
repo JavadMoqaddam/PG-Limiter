@@ -8,7 +8,7 @@ import pytest
 
 
 @pytest.fixture
-async def api_cycle(tmp_path, monkeypatch):
+async def api_cycle(tmp_path, monkeypatch, operational_topics):
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
     import db.database as database
@@ -94,7 +94,9 @@ async def api_cycle(tmp_path, monkeypatch):
             await usage.check_users_usage(panel, config)
         return ready
 
-    yield SimpleNamespace(run=run, bodies=bodies, warning=warning, config=config, now=now, panel=panel)
+    yield SimpleNamespace(
+        run=run, bodies=bodies, warning=warning, config=config, now=now, panel=panel, topics=operational_topics
+    )
     state.ACTIVE_USERS.clear()
     sync.USER_METADATA_CACHE.clear()
     await engine.dispose()
@@ -122,6 +124,23 @@ async def test_all_valid_expired_observations_clear_pending_warnings(api_cycle):
         api_cycle.bodies[name] = {"nodes": {"1": {"ips": {"5.6.7.8": api_cycle.now - 100}}}}
     assert await api_cycle.run()
     assert api_cycle.warning.warnings == {}
+
+
+async def test_completed_scan_receipt_records_actual_count_and_protective_skips(api_cycle):
+    from utils.monitoring_gate import get_last_completed_scan, get_last_cycle_outcome
+
+    api_cycle.bodies["alice"] = None
+    assert await api_cycle.run() is True
+    receipt = get_last_completed_scan()
+    assert receipt.source == "api"
+    assert receipt.users_counted == 1
+    assert receipt.protected_users_count == 1
+    assert receipt.metadata_unknown_users_count == 0
+    assert receipt.failed_users_count == 0
+    assert get_last_cycle_outcome().outcome == "completed"
+    await api_cycle.topics.set_enabled(False)
+    assert await api_cycle.run() is False
+    assert get_last_completed_scan() is receipt
 
 
 async def test_expired_unknown_warning_survives_persistent_and_cleanup_paths(api_cycle):
