@@ -45,10 +45,13 @@ class DeviceCountingConfig:
     cdn_nodes: list[int] = field(default_factory=list)
     disabled_nodes: list[int] = field(default_factory=list)
     subnet_ip_grouping: bool = False
-    subnet_grouping_mode: str = "/24"  # "/24" (standard) or "/16" (wide + ISP)
+    subnet_grouping_mode: str = "/24"  # Historical /16 settings now use /24.
     high_trust_ip_grouping: bool = False
     high_trust_threshold: int = 20
     count_mode: str = COUNT_MODE_DEVICE
+
+    def __post_init__(self) -> None:
+        self.subnet_grouping_mode = "/24"
 
     @classmethod
     def from_config(cls, config_data: dict) -> "DeviceCountingConfig":
@@ -77,37 +80,8 @@ def subnet_key(ip: str) -> str:
     return network.network_address.exploded.rsplit(".", 1)[0]
 
 
-def wide_subnet_key(ip: str) -> str:
-    """Return the /16 subnet (first two octets) of an IPv4 address."""
-    try:
-        ip_obj = ipaddress.ip_address(ip)
-    except ValueError:
-        return ip
-    if ip_obj.version != 4:
-        return ip  # IPv6: the full address is the key
-    network = ipaddress.ip_network(f"{ip}/16", strict=False)
-    parts = network.network_address.exploded.split(".")
-    return f"{parts[0]}.{parts[1]}"
-
-
-def isp_name_of(ip: str, isp_info: dict | None) -> str:
-    """Return the ISP (or org) name known for an IP, or "" when unknown."""
-    info = (isp_info or {}).get(ip) or {}
-    return info.get("isp", "") or info.get("org", "") or ""
-
-
-def _subnet_parts(ip: str, config: DeviceCountingConfig, isp_info: dict | None) -> tuple:
-    """
-    Return the grouping key of an IP when subnet grouping is enabled.
-
-    In "/16" mode the ISP has to be known, otherwise a whole /16 of unrelated
-    customers would collapse into one device; without it the address falls back
-    to the narrower /24 key.
-    """
-    if config.subnet_grouping_mode == "/16":
-        ip_isp = isp_name_of(ip, isp_info)
-        if ip_isp:
-            return ("SUBNET_ISP_GROUP", wide_subnet_key(ip), ip_isp)
+def _subnet_parts(ip: str) -> tuple:
+    """Return the /24 key used by optional device-count grouping."""
     return ("SUBNET_GROUP", subnet_key(ip))
 
 
@@ -115,7 +89,6 @@ def device_key(
     conn: ConnectionInfo,
     config: DeviceCountingConfig,
     apply_high_trust: bool = False,
-    isp_info: dict | None = None,
 ) -> tuple | None:
     """
     Return the identity of the device behind a single connection.
@@ -127,7 +100,6 @@ def device_key(
         conn: One connection of the user.
         config: Counting and grouping rules.
         apply_high_trust: Whether High Trust grouping is active for this user.
-        isp_info: ``{ip: isp_info}`` used by "/16" subnet grouping.
 
     Returns:
         tuple | None: The device key, or None for connections that are ignored.
@@ -157,9 +129,9 @@ def device_key(
 
     if config.count_mode == COUNT_MODE_IP:
         # One client IP is one device, whatever it connects to. Subnet grouping
-        # still applies, so a whole /24 (or /16 + ISP) collapses into one.
+        # still applies, so a whole /24 collapses into one.
         if config.subnet_ip_grouping:
-            return _subnet_parts(conn.ip, config, isp_info)
+            return _subnet_parts(conn.ip)
         return ("IP_ONLY", conn.ip)
 
     if apply_high_trust:
@@ -168,7 +140,7 @@ def device_key(
         return ("HIGH_TRUST", conn.inbound_protocol)
 
     if config.subnet_ip_grouping:
-        return _subnet_parts(conn.ip, config, isp_info) + (conn.inbound_protocol,)
+        return _subnet_parts(conn.ip) + (conn.inbound_protocol,)
 
     return (conn.ip, conn.inbound_protocol)
 
@@ -183,7 +155,6 @@ def _connections_of(user: UserType | None) -> list[ConnectionInfo]:
 def count_devices_from_ips(
     ips: set[str] | list[str] | None,
     config: DeviceCountingConfig | None = None,
-    isp_info: dict | None = None,
 ) -> int:
     """
     Count devices from bare addresses, with no per-connection detail.
@@ -204,7 +175,6 @@ def count_devices_from_ips(
     Args:
         ips: The user's unique addresses.
         config: Counting and grouping rules; defaults are used when omitted.
-        isp_info: ``{ip: isp_info}`` used by "/16" subnet grouping.
 
     Returns:
         int: Number of distinct devices these addresses represent.
@@ -220,7 +190,7 @@ def count_devices_from_ips(
         if not ip:
             continue
         if config.subnet_ip_grouping:
-            keys.add(_subnet_parts(ip, config, isp_info))
+            keys.add(_subnet_parts(ip))
         else:
             keys.add(("IP_ONLY", ip))
     return len(keys)
@@ -230,7 +200,6 @@ def count_devices(
     user: UserType | None,
     config: DeviceCountingConfig | None = None,
     trust_score: float = 0.0,
-    isp_info: dict | None = None,
     fallback_count: int = 0,
 ) -> int:
     """
@@ -240,7 +209,6 @@ def count_devices(
         user: The user whose connections are counted.
         config: Counting and grouping rules; defaults are used when omitted.
         trust_score: Current trust score, for High Trust grouping.
-        isp_info: ``{ip: isp_info}`` used by "/16" subnet grouping.
         fallback_count: Returned in "device" or "ip" mode when there is no connection information at all
             (log or API collection gave IPs but no inbound/node detail); the
             caller passes the user's grouped-IP count there. "inbound" mode ignores
@@ -262,7 +230,7 @@ def count_devices(
 
     unique_devices = set()
     for conn in connections:
-        key = device_key(conn, config, apply_high_trust=apply_high_trust, isp_info=isp_info)
+        key = device_key(conn, config, apply_high_trust=apply_high_trust)
         if key is not None:
             unique_devices.add(key)
     return len(unique_devices)
@@ -320,7 +288,6 @@ def count_devices_and_details(
     show_enhanced_details: bool = False,
     device_config: DeviceCountingConfig | None = None,
     user_trust_score: float = 0.0,
-    isp_info: dict | None = None,
 ) -> tuple[list[str], int]:
     """
     Count devices and optionally render the per-IP display lines in one pass.
@@ -345,13 +312,12 @@ def count_devices_and_details(
             # Nothing but display strings to go on; keep the old behaviour rather
             # than report a zero that would read as "no devices".
             return [], len(user_info.formatted_ips)
-        return [], count_devices_from_ips(raw_ips, device_config, isp_info)
+        return [], count_devices_from_ips(raw_ips, device_config)
 
     device_count = count_devices(
         original_user,
         device_config,
         trust_score=user_trust_score,
-        isp_info=isp_info,
     )
     if not show_enhanced_details:
         return [], device_count
