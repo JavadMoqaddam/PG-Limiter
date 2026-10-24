@@ -138,7 +138,7 @@ def api_config():
 
 
 @pytest.fixture(autouse=True)
-def clean_collector_state():
+def clean_collector_state(operational_topics):
     """Reset collector globals, shared maps and the IP caches per test."""
     import utils.ip_source_api as api_mod
     from utils.ip_facts import BLOCKED_IPS, COUNTRY_CACHE, VERDICT_CACHE
@@ -152,6 +152,7 @@ def clean_collector_state():
     VERDICT_CACHE.clear()
     COUNTRY_CACHE.clear()
     api_mod._consecutive_dead_cycles = 0
+    api_mod._failure_revision = None
     api_mod._forbidden_alert_sent = False
     api_mod._consecutive_coverage_skips = 0
     api_mod._coverage_alert_sent = False
@@ -165,6 +166,7 @@ def clean_collector_state():
     BLOCKED_IPS.clear()
     BLOCKED_IPS.update(blocklist_seed)
     api_mod._consecutive_dead_cycles = 0
+    api_mod._failure_revision = None
     api_mod._forbidden_alert_sent = False
     api_mod._consecutive_coverage_skips = 0
     api_mod._coverage_alert_sent = False
@@ -823,18 +825,16 @@ class TestCollectFailSafe:
         assert get_last_cycle_stats()["skipped_reason"] == ""
 
     @pytest.mark.asyncio
-    async def test_low_coverage_does_not_count_as_a_dead_cycle(self, panel, api_config, monkeypatch):
+    async def test_low_coverage_counts_as_one_unsuccessful_cycle(self, panel, api_config, monkeypatch):
         import utils.ip_source_api as api_mod
 
-        api_mod._consecutive_dead_cycles = 2
         _patch_collector(
             monkeypatch,
             candidates=[{"username": f"u{i}", "id": i} for i in range(1, 5)],
             counters={"ok": 1, "failed": 3, "not_found": 0, "forbidden": 0, "unauthorized": 0},
         )
         assert await api_mod.collect_active_users_from_api(panel, api_config) is False
-        # The panel answered, so the auto-fallback streak resets.
-        assert api_mod._consecutive_dead_cycles == 0
+        assert api_mod._consecutive_dead_cycles == 1
 
     @pytest.mark.asyncio
     async def test_repeated_coverage_skips_raise_one_alert(self, panel, api_config, monkeypatch):
@@ -844,8 +844,8 @@ class TestCollectFailSafe:
         One skip is the correct, safe outcome. Three in a row means nobody is being
         warned or banned at all, and the only trace used to be one WARNING per cycle
         that reads exactly like the previous one. Reverting to log mode is not the
-        remedy here - the panel is answering, just incompletely - so this is an
-        alarm, not a mode change.
+        remedy when disabled by the operator, so this test keeps automatic
+        fallback off and checks the separate enforcement alarm.
         """
         import utils.ip_source_api as api_mod
 
@@ -880,13 +880,14 @@ class TestCollectFailSafe:
         assert "nodes:stats" in notifications[0]
 
     @pytest.mark.asyncio
-    async def test_auto_fallback_reverts_after_three_dead_cycles(self, panel, api_config, monkeypatch):
+    async def test_auto_fallback_reverts_after_two_unsuccessful_cycles(self, panel, api_config, monkeypatch):
         import utils.ip_source_api as api_mod
         import utils.read_config as read_config_mod
 
         saved: list[tuple[str, str]] = []
 
-        async def fake_save(key, value):
+        async def fake_save(key, value, *, expected_revision):
+            assert expected_revision == read_config_mod.get_config_revision()
             saved.append((key, value))
             return True
 
@@ -894,8 +895,7 @@ class TestCollectFailSafe:
         api_config["api_ip_auto_fallback"] = True
         _patch_collector(monkeypatch, candidates=None)
 
-        for _ in range(2):
-            assert await api_mod.collect_active_users_from_api(panel, api_config) is False
+        assert await api_mod.collect_active_users_from_api(panel, api_config) is False
         assert saved == []
 
         assert await api_mod.collect_active_users_from_api(panel, api_config) is False

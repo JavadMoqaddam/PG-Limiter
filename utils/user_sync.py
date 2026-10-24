@@ -9,6 +9,9 @@ from typing import Optional
 
 from utils.logs import get_logger
 from utils.types import PanelType
+from utils.user_policy import evaluate_user_policy
+from utils.user_policy import get_max_group_limit as get_max_group_limit
+from utils.user_policy import resolve_group_limit as resolve_group_limit
 
 sync_logger = get_logger("user_sync")
 
@@ -17,7 +20,7 @@ _last_sync_time: Optional[datetime] = None
 _sync_lock: asyncio.Lock = asyncio.Lock()
 
 # In-Memory User Metadata Cache populated during User Sync
-# Format: {username: {"group_ids": [...], "owner_username": "...", "is_excepted": bool, "special_limit": int, "is_monitored": bool, "effective_ip_limit": int}}
+# Factual entries: {username: {"group_ids": [...], "owner_username": "..."}}
 USER_METADATA_CACHE: dict[str, dict] = {}
 # Lock to guard write operations on USER_METADATA_CACHE (reads are lock-free)
 _metadata_cache_lock: asyncio.Lock = asyncio.Lock()
@@ -41,183 +44,62 @@ def get_unknown_users_queue() -> asyncio.Queue:
     return _UNKNOWN_USERS_QUEUE
 
 
-def resolve_group_limit(gid: int | str, group_limits: dict) -> int | None:
-    """
-    Safely resolve limit for a single group ID against group_limits dict,
-    handling int, str, and raw key types seamlessly.
-    """
-    if not group_limits or gid is None:
-        return None
-    try:
-        gid_int = int(gid)
-    except (ValueError, TypeError):
-        gid_int = None
-    gid_str = str(gid)
-    
-    limit = None
-    if gid_int is not None and gid_int in group_limits:
-        limit = group_limits[gid_int]
-    elif gid_str in group_limits:
-        limit = group_limits[gid_str]
-    elif gid in group_limits:
-        limit = group_limits[gid]
-        
-    if limit is not None:
-        try:
-            return int(limit)
-        except (ValueError, TypeError):
-            return None
-    return None
-
-
-def get_max_group_limit(group_ids: list[int | str], group_limits: dict) -> int | None:
-    """
-    Calculate the maximum effective limit from a list of group IDs.
-    Returns None if no matching limit found.
-    """
-    if not group_limits or not group_ids:
-        return None
-    matching = []
-    for gid in group_ids:
-        lim = resolve_group_limit(gid, group_limits)
-        if lim is not None:
-            matching.append(lim)
-    return max(matching) if matching else None
-
-
 def calculate_user_effective_limit_and_monitoring(
     username: str,
     group_ids: list[int],
     is_excepted: bool = False,
     special_limit: int | None = None,
-    config: dict = None,
+    config: dict | None = None,
 ) -> tuple[bool, int | None]:
+    """Compatibility display result, with None marking the general fallback.
+
+    Legacy is_excepted/special_limit inputs are ignored: current canonical config
+    supplies whitelist membership and special overrides.
     """
-    Pre-compute is_monitored and effective_ip_limit for a user in O(1) time.
-    
-    Returns:
-        (is_monitored: bool, effective_ip_limit: int | None)
-    """
-    if config is None:
-        config = {}
-        
-    # 1. Exception / Whitelist check
-    if is_excepted:
-        return (False, None)
-    
-    # 2. Group Filter check
-    group_filter = config.get("group_filter", {})
-    is_monitored = True
-    
-    if group_filter.get("enabled", False):
-        filter_mode = group_filter.get("mode", "include")
-        filter_group_ids = [str(x) for x in group_filter.get("group_ids", [])]
-        user_group_ids_str = [str(x) for x in (group_ids or [])]
-        user_in_filter = any(g in filter_group_ids for g in user_group_ids_str)
-        
-        if filter_mode == "include":
-            is_monitored = user_in_filter
-        else:
-            is_monitored = not user_in_filter
-
-    if not is_monitored:
-        return (False, None)
-
-    # 3. Effective Limit Calculation
-    # Priority A: Special limit set specifically for this user
-    if special_limit is not None and special_limit > 0:
-        return (True, special_limit)
-
-    # Priority B: Group Limits from config
-    group_limits = config.get("group_limits", {})
-    if group_limits and group_ids:
-        max_glim = get_max_group_limit(group_ids, group_limits)
-        if max_glim is not None:
-            return (True, max_glim)
-
-    # Priority C: Default to General Limit (None indicates use default general limit)
-    return (True, None)
-
-
-async def _load_local_user_state(
-    db, username: str | None = None
-) -> dict[str, tuple[bool, int | None]]:
-    """
-    Read the local-only user state the panel knows nothing about.
-
-    Returns ``{username: (is_excepted, special_limit)}`` and deliberately selects only
-    the rows that carry non-default state, because everyone else is ``(False, None)``
-    anyway. On ~15000 users that is a handful of rows rather than a full table scan.
-
-    Pass ``username`` to narrow it to one row. The single-user sync path runs once per
-    unknown user and up to five of those run concurrently, so it should not re-read the
-    whole whitelist each time to answer a question about one account.
-
-    The panel's user dict has no whitelist flag and no per-user limit, so a parser
-    working from the panel dict alone has to assume the defaults - and those two
-    assumptions are what decide ``is_monitored`` and ``effective_ip_limit``.
-    """
-    from db.models import User
-    from sqlalchemy import or_, select
-
-    stmt = select(User.username, User.is_excepted, User.special_limit).where(
-        or_(User.is_excepted.is_(True), User.special_limit.isnot(None))
+    policy = evaluate_user_policy(
+        username=username,
+        config=config or {},
+        facts={"group_ids": group_ids, "owner_username": None},
     )
-    if username is not None:
-        stmt = stmt.where(User.username == username)
-    result = await db.execute(stmt)
-    return {row.username: (bool(row.is_excepted), row.special_limit) for row in result}
+    limit = policy.limit if policy.eligible and policy.limit_source != "general" else None
+    return policy.eligible, limit
 
 
 def _parse_panel_user_dict(
     user_data: dict,
-    config: dict | None,
+    config: dict | None = None,
     *,
-    is_excepted: bool,
-    special_limit: int | None,
+    is_excepted: bool = False,
+    special_limit: int | None = None,
 ) -> dict | None:
-    """
-    Parse raw user dictionary from panel API into structured database/cache fields.
-    Single source of truth for parsing panel user dicts across sync loops and single-user sync.
-
-    ``is_excepted`` and ``special_limit`` are local database state that the panel
-    payload does not contain, so callers have to supply them; see
-    [_load_local_user_state](utils/user_sync.py). They are only used to derive
-    ``is_monitored`` and ``effective_ip_limit`` and are not returned, because the bulk
-    upsert must not write the two columns it is not the source of truth for.
-
-    All three of those inputs are required rather than defaulted. Defaulting them is
-    exactly how this function came to assume ``is_excepted=False, special_limit=None``
-    and mark whitelisted users as monitored: a caller that forgets one now fails
-    loudly instead of silently getting the wrong premise back.
-    """
+    """Parse only panel-owned facts; legacy policy arguments are ignored."""
     if not isinstance(user_data, dict):
         return None
     username = user_data.get("username")
     if not username:
         return None
-    
+
     panel_id = user_data.get("id")
     status = user_data.get("status", "active")
-    
+
     admin_info = user_data.get("admin", {}) or {}
     owner_id = admin_info.get("id") if isinstance(admin_info, dict) else None
     owner_username = admin_info.get("username") if isinstance(admin_info, dict) else None
     if not owner_username:
         owner_username = user_data.get("created_by")
-    
+
     group_ids = user_data.get("group_ids") or user_data.get("groups") or []
     if isinstance(group_ids, str):
         group_ids = [int(g.strip()) for g in group_ids.split(",") if g.strip()]
-    
+
     data_limit = user_data.get("data_limit")
     if data_limit:
-        data_limit = data_limit / (1024 ** 3)
-    
+        data_limit = data_limit / (1024**3)
+
     used_traffic = user_data.get("used_traffic", 0)
     if used_traffic:
-        used_traffic = used_traffic / (1024 ** 3)
-    
+        used_traffic = used_traffic / (1024**3)
+
     expire_at = None
     expire_value = user_data.get("expire")
     if expire_value:
@@ -229,17 +111,9 @@ def _parse_panel_user_dict(
                 expire_at = datetime.fromisoformat(expire_value.replace("Z", "+00:00"))
             except ValueError:
                 pass
-    
+
     note = user_data.get("note")
-    
-    is_monitored, effective_limit = calculate_user_effective_limit_and_monitoring(
-        username=username,
-        group_ids=group_ids,
-        is_excepted=is_excepted,
-        special_limit=special_limit,
-        config=config,
-    )
-    
+
     return {
         "username": username,
         "panel_id": panel_id,
@@ -251,20 +125,19 @@ def _parse_panel_user_dict(
         "used_traffic": used_traffic,
         "expire_at": expire_at,
         "note": note,
-        "is_monitored": is_monitored,
-        "effective_ip_limit": effective_limit,
     }
 
 
 async def recompute_all_user_limits(config: dict = None):
     """
-    Instantly recompute is_monitored and effective_ip_limit for all users in RAM cache
-    without making ANY network API calls to Pasargad panel.
+    Recompute legacy display fields from current configuration and factual cache entries.
+    These fields are not authoritative inputs to policy evaluation.
     """
     global USER_METADATA_CACHE
     if config is None:
         try:
             from utils.read_config import read_config
+
             config = await read_config()
         except Exception as e:
             # Falling back to {} here used to be the same hazard as a degraded config:
@@ -288,20 +161,14 @@ async def recompute_all_user_limits(config: dict = None):
             "The existing flags are kept until a database read succeeds."
         )
         return
-    
+
     recomputed_count = 0
     for username, data in list(USER_METADATA_CACHE.items()):
-        is_monitored, effective_limit = calculate_user_effective_limit_and_monitoring(
-            username=username,
-            group_ids=data.get("group_ids", []),
-            is_excepted=data.get("is_excepted", False),
-            special_limit=data.get("special_limit"),
-            config=config,
-        )
-        data["is_monitored"] = is_monitored
-        data["effective_ip_limit"] = effective_limit
+        policy = evaluate_user_policy(username=username, config=config, facts=data)
+        data["is_monitored"] = policy.eligible
+        data["effective_ip_limit"] = policy.limit if policy.limit_source != "general" else None
         recomputed_count += 1
-    
+
     sync_logger.info(f"⚡ Recomputed effective limits in RAM for {recomputed_count} users (0ms network calls)")
 
 
@@ -326,16 +193,12 @@ async def refresh_user_metadata_cache(db=None):
     try:
         from db.models import User
         from sqlalchemy import select
-        
+
         async def _fetch(session):
             stmt = select(
                 User.username,
                 User.group_ids,
                 User.owner_username,
-                User.is_excepted,
-                User.special_limit,
-                User.is_monitored,
-                User.effective_ip_limit
             )
             result = await session.execute(stmt)
             new_cache = {}
@@ -343,10 +206,6 @@ async def refresh_user_metadata_cache(db=None):
                 new_cache[row.username] = {
                     "group_ids": row.group_ids or [],
                     "owner_username": row.owner_username,
-                    "is_excepted": bool(row.is_excepted),
-                    "special_limit": row.special_limit,
-                    "is_monitored": bool(row.is_monitored) if row.is_monitored is not None else True,
-                    "effective_ip_limit": row.effective_ip_limit
                 }
             return new_cache
 
@@ -354,9 +213,10 @@ async def refresh_user_metadata_cache(db=None):
             USER_METADATA_CACHE = await _fetch(db)
         else:
             from db.database import get_db
+
             async with get_db() as session:
                 USER_METADATA_CACHE = await _fetch(session)
-                
+
         sync_logger.info(f"🧠 USER_METADATA_CACHE updated in RAM with {len(USER_METADATA_CACHE)} users")
     except Exception as e:
         sync_logger.error(f"Failed to refresh USER_METADATA_CACHE: {e}")
@@ -373,7 +233,7 @@ async def queue_unknown_user_fetch(username: str):
 async def run_unknown_user_worker(panel_data: PanelType):
     """Worker task that processes unknown users with a semaphore to prevent API throttling."""
     semaphore = asyncio.Semaphore(5)  # Max 5 concurrent API fetches
-    
+
     async def _fetch(u: str):
         async with semaphore:
             try:
@@ -382,7 +242,7 @@ async def run_unknown_user_worker(panel_data: PanelType):
                 sync_logger.error(f"Error fetching unknown user {u}: {ex}")
             finally:
                 _UNKNOWN_USERS_FETCHING.discard(u)
-    
+
     queue = get_unknown_users_queue()
     while True:
         try:
@@ -400,16 +260,17 @@ async def get_all_users_with_details(panel_data: PanelType, status: str | None =
     """
     Fetch all users from panel with their full details (groups, owner, etc.).
     Uses centralized parallel pagination with persistent connection pooling for high throughput.
-    
+
     Args:
         panel_data: Panel connection data
         status: Filter by user status (active/disabled/limited/expired/on_hold).
                 Default is None to fetch ALL users (recommended for sync).
-        
+
     Returns:
         List of user dictionaries with full details
     """
     from utils.panel_api.users import fetch_all_users_raw
+
     try:
         return await fetch_all_users_raw(panel_data, status=status)
     except Exception as e:
@@ -421,108 +282,91 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
     """
     Sync all users from panel to local database.
     Also detects users deleted from panel and removes them from limiter.
-    
+
     Args:
         panel_data: Panel connection data
-        
+
     Returns:
         Tuple of (synced_count, error_count, deleted_count)
     """
     global _last_sync_time
-    
+
     if _sync_lock.locked():
         sync_logger.warning("Sync already in progress, skipping")
         return (0, 0, 0)
-    
+
     async with _sync_lock:
         synced = 0
         errors = 0
         deleted = 0
         deleted_usernames = []
-        
+
         try:
             sync_logger.info("🔄 Starting user sync from panel to database...")
             start_time = datetime.now(timezone.utc)
-            
+
             # Fetch ALL users from panel (all statuses) to avoid losing disabled users
             users = await get_all_users_with_details(panel_data, status=None)
-            
+
             if not users:
                 sync_logger.warning("⚠️ No users fetched from panel - skipping sync entirely")
                 return (0, 0, 0)
-            
+
             sync_logger.info(f"📥 Processing {len(users)} users...")
-            
+
             # Build set of usernames from panel
             panel_usernames = {u.get("username") for u in users if u.get("username")}
-            
+
             if not panel_usernames:
                 sync_logger.warning("⚠️ No valid usernames in panel response - skipping sync")
                 return (0, 0, 0)
-            
+
             # Import database modules here to avoid circular imports
             sync_logger.info("📂 Importing database modules...")
             from db.database import get_db
             from db.crud.users import UserCRUD
-            
+
             sync_logger.info("📂 Opening database connection for sync...")
-            
+
             from utils.read_config import read_config
+
             config = await read_config()
-            
+
             async with get_db() as db:
                 sync_logger.info("✅ Database connection opened")
                 # Get existing usernames in local DB
                 local_usernames = await UserCRUD.get_all_usernames(db)
                 sync_logger.info(f"📊 Found {len(local_usernames)} existing users in local DB")
 
-                # The whitelist and the per-user limits live only here, so read them
-                # before parsing: without them every excepted user is upserted with
-                # is_monitored=True and every special-limit user with the group or
-                # general limit, which is the direction that over-restricts.
-                local_state = await _load_local_user_state(db)
-                sync_logger.info(
-                    f"📊 {len(local_state)} users carry a whitelist flag or a special limit"
-                )
-
                 # Sync users from panel using native Bulk Upsert
                 users_to_upsert = []
                 for user_data in users:
                     try:
-                        excepted, special = local_state.get(
-                            user_data.get("username"), (False, None)
-                        )
-                        parsed = _parse_panel_user_dict(
-                            user_data,
-                            config=config,
-                            is_excepted=excepted,
-                            special_limit=special,
-                        )
+                        parsed = _parse_panel_user_dict(user_data)
                         if parsed:
                             users_to_upsert.append(parsed)
                     except Exception as e:
                         sync_logger.error(f"Error parsing user {user_data.get('username', '?')}: {e}")
                         errors += 1
-                
+
                 # Execute Native SQLite Bulk Upsert
                 synced = await UserCRUD.bulk_upsert_users(db, users_to_upsert)
                 await db.commit()
                 sync_logger.info(f"✅ Native Bulk Upsert committed: {synced} synced in single transaction")
-                
+
                 # Refresh in-memory RAM metadata cache
                 await refresh_user_metadata_cache(db)
-                await recompute_all_user_limits(config)
-                
+
                 # SAFETY CHECKS before deleting users
                 # Only delete if sync was mostly successful (less than 10% errors)
                 # and we received a reasonable number of users from panel
                 potentially_deleted = list(local_usernames - panel_usernames)
                 error_rate = errors / max(len(users), 1)
-                
+
                 if potentially_deleted:
                     # Check if auto-deletion is enabled in config
                     auto_delete_enabled = config.get("user_sync", {}).get("auto_delete_users", False)
-                    
+
                     if not auto_delete_enabled:
                         sync_logger.info(
                             f"ℹ️ Auto-deletion disabled. {len(potentially_deleted)} users not in panel but kept in local DB. "
@@ -533,7 +377,7 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
                             sync_logger.info(f"Users not in panel: {', '.join(potentially_deleted)}")
                         else:
                             sync_logger.info(f"Users not in panel (first 20): {', '.join(potentially_deleted[:20])}...")
-                    
+
                     # Safety check 1: Don't delete if there were too many sync errors
                     elif error_rate > 0.1:  # More than 10% errors
                         sync_logger.warning(
@@ -552,7 +396,7 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
                         sync_logger.warning(
                             f"⚠️ Skipping deletion: too many users to delete "
                             f"({len(potentially_deleted)}/{len(local_usernames)} = "
-                            f"{len(potentially_deleted)/len(local_usernames):.1%}). "
+                            f"{len(potentially_deleted) / len(local_usernames):.1%}). "
                             f"Manual review recommended via Telegram bot."
                         )
                     # Safety check 4: Don't delete more than 50 users at once
@@ -566,26 +410,26 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
                         sync_logger.info(f"🗑️ Deleting {len(potentially_deleted)} users removed from panel")
                         deleted_usernames = potentially_deleted
                         deleted = await UserCRUD.delete_many(db, deleted_usernames)
-                
+
                 await db.commit()
-            
+
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
             _last_sync_time = datetime.now(timezone.utc)
-            
+
             sync_logger.info(
-                f"✅ User sync completed: {synced} synced, {deleted} deleted, "
-                f"{errors} errors in {elapsed:.1f}s"
+                f"✅ User sync completed: {synced} synced, {deleted} deleted, {errors} errors in {elapsed:.1f}s"
             )
-            
+
             # Send Telegram notification for deleted users
             if deleted_usernames:
                 await _notify_deleted_users(deleted_usernames)
-            
+
         except Exception as e:
             import traceback
+
             sync_logger.error(f"❌ User sync failed: {type(e).__name__}: {e}")
             sync_logger.error(f"Traceback: {traceback.format_exc()}")
-        
+
         return (synced, errors, deleted)
 
 
@@ -593,13 +437,13 @@ async def _notify_deleted_users(usernames: list[str]) -> None:
     """Send Telegram notification for users deleted from panel."""
     try:
         from telegram_bot.send_message import send_logs
-        
+
         if len(usernames) <= 10:
             user_list = "\n".join(f"• <code>{u}</code>" for u in usernames)
         else:
             user_list = "\n".join(f"• <code>{u}</code>" for u in usernames[:10])
             user_list += f"\n... and {len(usernames) - 10} more"
-        
+
         message = (
             "🗑️ <b>Users Deleted from Panel</b>\n\n"
             "The following users were deleted from panel and "
@@ -607,10 +451,10 @@ async def _notify_deleted_users(usernames: list[str]) -> None:
             f"{user_list}\n\n"
             f"📊 Total: {len(usernames)} users"
         )
-        
+
         await send_logs(message)
         sync_logger.info(f"📤 Sent notification for {len(usernames)} deleted users")
-        
+
     except Exception as e:
         sync_logger.error(f"Failed to send deletion notification: {e}")
 
@@ -618,17 +462,17 @@ async def _notify_deleted_users(usernames: list[str]) -> None:
 async def get_user_from_cache(username: str) -> Optional[dict]:
     """
     Get user data from local database cache.
-    
+
     Args:
         username: The username to look up
-        
+
     Returns:
         User dict with group_ids and owner_username, or None if not found
     """
     try:
         from db.database import get_db
         from db.crud.users import UserCRUD
-        
+
         async with get_db() as db:
             user = await UserCRUD.get_by_username(db, username)
             if user:
@@ -653,25 +497,26 @@ async def fetch_and_sync_single_user(username: str, panel_data: Optional[PanelTy
     """
     Fetch a single user from the panel API and sync to local database.
     This is useful when a new user appears in active connections before the regular sync.
-    
+
     Args:
         username: The username to fetch
         panel_data: Panel connection data (will be fetched from config if not provided)
-        
+
     Returns:
         User dict if found and synced, None otherwise
     """
     try:
         sync_logger.info(f"🔄 Fetching single user from panel: {username}")
-        
+
         # Validate username
         if not username or not username.strip():
             sync_logger.warning("⚠️ Cannot fetch user with empty username")
             return None
-        
+
         # Get panel_data from config if not provided
         if panel_data is None:
             from utils.read_config import read_config
+
             config = await read_config()
             panel_config = config.get("panel", {})
             panel_data = PanelType(
@@ -679,51 +524,31 @@ async def fetch_and_sync_single_user(username: str, panel_data: Optional[PanelTy
                 panel_password=panel_config.get("password", ""),
                 panel_domain=panel_config.get("domain", ""),
             )
-        
+
         # Validate panel_data has required fields
         if not panel_data.panel_domain:
             sync_logger.error("❌ Panel domain is not configured - cannot fetch user from panel")
             return None
-        
+
         # Fetch user details from panel
         from utils.panel_api import get_user_details
+
         user_data = await get_user_details(panel_data, username)
-        
+
         if user_data is None:
             sync_logger.warning(f"⚠️ User {username} not found in panel")
             return None
-        
+
         if isinstance(user_data, ValueError):
             sync_logger.error(f"❌ Error fetching user {username}: {user_data}")
             return None
-        
+
         # Save to database
         from db.database import get_db
         from db.crud.users import UserCRUD
-        from utils.read_config import read_config as _read_config
-
-        # Imported and called here rather than reusing the ``config`` above: that one is
-        # only assigned when panel_data was not supplied, so reading it would be an
-        # UnboundLocalError on the path where the caller passed panel_data in.
-        parse_config = await _read_config()
 
         async with get_db() as db:
-            # Parse inside the session so the whitelist flag and the special limit come
-            # from the database rather than being assumed. create_or_update below does
-            # not write the two derived columns, so this only keeps the parser from
-            # being handed a wrong premise - but leaving the premise wrong here is how
-            # the bug would come back the day someone starts persisting them. The same
-            # reasoning applies to config: without it the group filter and the group
-            # limits are silently absent from the calculation.
-            excepted, special = (await _load_local_user_state(db, username)).get(
-                username, (False, None)
-            )
-            parsed = _parse_panel_user_dict(
-                user_data,
-                config=parse_config,
-                is_excepted=excepted,
-                special_limit=special,
-            )
+            parsed = _parse_panel_user_dict(user_data)
             if not parsed:
                 sync_logger.error(f"❌ Failed to parse user data for {username}")
                 return None
@@ -742,9 +567,9 @@ async def fetch_and_sync_single_user(username: str, panel_data: Optional[PanelTy
                 note=parsed["note"],
             )
             await db.commit()
-            
+
             sync_logger.info(f"✅ User {username} synced from panel to database")
-            
+
             return {
                 "username": user.username,
                 "status": user.status,
@@ -755,10 +580,11 @@ async def fetch_and_sync_single_user(username: str, panel_data: Optional[PanelTy
                 "used_traffic": user.used_traffic,
                 "expire_at": user.expire_at,
             }
-            
+
     except Exception as e:
         sync_logger.error(f"❌ Error fetching/syncing user {username}: {e}")
         import traceback
+
         sync_logger.error(f"Traceback: {traceback.format_exc()}")
         return None
 
@@ -771,16 +597,16 @@ async def get_last_sync_time() -> Optional[datetime]:
 async def is_sync_needed(sync_interval_minutes: int) -> bool:
     """
     Check if a sync is needed based on interval.
-    
+
     Args:
         sync_interval_minutes: Sync interval in minutes
-        
+
     Returns:
         True if sync is needed
     """
     if _last_sync_time is None:
         return True
-    
+
     elapsed = (datetime.now(timezone.utc) - _last_sync_time).total_seconds()
     return elapsed >= sync_interval_minutes * 60
 
@@ -788,35 +614,35 @@ async def is_sync_needed(sync_interval_minutes: int) -> bool:
 async def run_user_sync_loop(panel_data: PanelType):
     """
     Run the user sync loop. This should be started as a background task.
-    
+
     Args:
         panel_data: Panel connection data
     """
     from utils.read_config import read_config
-    
+
     sync_logger.info("🚀 Starting user sync background loop...")
-    
+
     # Delay initial sync to allow other startup operations to complete
     # This reduces memory pressure during startup
     sync_logger.info("⏳ Waiting 30 seconds before initial user sync...")
     await asyncio.sleep(30)
-    
+
     # Initial sync
     sync_logger.info("🔄 Running initial user sync...")
     await sync_users_to_database(panel_data)
-    
+
     while True:
         try:
             config = await read_config()
             sync_interval = config.get("user_sync_interval", 5)  # Default 5 minutes
-            
+
             # Wait for interval
             await asyncio.sleep(sync_interval * 60)
-            
+
             # Check if sync is needed
             if await is_sync_needed(sync_interval):
                 await sync_users_to_database(panel_data)
-                
+
         except asyncio.CancelledError:
             sync_logger.info("User sync loop cancelled")
             break
@@ -829,10 +655,10 @@ async def get_pending_deletions(panel_data: PanelType) -> dict:
     """
     Get the list of users that would be deleted during sync.
     This allows manual review before force-deleting.
-    
+
     Args:
         panel_data: Panel connection data
-        
+
     Returns:
         Dictionary with pending deletions info:
         {
@@ -846,48 +672,50 @@ async def get_pending_deletions(panel_data: PanelType) -> dict:
     """
     from db.database import get_db
     from db.crud import UserCRUD
-    
+
     result = {
         "pending_deletions": [],
         "local_count": 0,
         "panel_count": 0,
         "deletion_percentage": 0.0,
         "safe_to_delete": True,
-        "reason": ""
+        "reason": "",
     }
-    
+
     try:
         # Get ALL users from panel (not just active) for proper deletion comparison
         users = await get_all_users_with_details(panel_data, status=None)
         panel_usernames = {u.get("username") for u in users if u.get("username")}
         result["panel_count"] = len(panel_usernames)
-        
+
         # Get local users
         async with get_db() as db:
             local_users = await UserCRUD.get_all(db)
             local_usernames = {u.username for u in local_users}
             result["local_count"] = len(local_usernames)
-        
+
         # Find users to delete
         pending = list(local_usernames - panel_usernames)
         result["pending_deletions"] = sorted(pending)
-        
+
         if local_usernames:
             result["deletion_percentage"] = (len(pending) / len(local_usernames)) * 100
-        
+
         # Check safety
         if len(pending) > len(local_usernames) * 0.2:
             result["safe_to_delete"] = False
             result["reason"] = f"Would delete more than 20% of users ({result['deletion_percentage']:.1f}%)"
         elif len(panel_usernames) < len(local_usernames) * 0.5:
             result["safe_to_delete"] = False
-            result["reason"] = f"Panel returned significantly fewer users ({len(panel_usernames)} vs {len(local_usernames)})"
-            
+            result["reason"] = (
+                f"Panel returned significantly fewer users ({len(panel_usernames)} vs {len(local_usernames)})"
+            )
+
     except Exception as e:
         sync_logger.error(f"Error getting pending deletions: {e}")
         result["reason"] = f"Error: {e}"
         result["safe_to_delete"] = False
-    
+
     return result
 
 
@@ -895,19 +723,19 @@ async def force_delete_users(usernames: list[str]) -> tuple[int, list[str]]:
     """
     Force delete specific users from local database.
     Use after manual review of pending deletions.
-    
+
     Args:
         usernames: List of usernames to delete
-        
+
     Returns:
         Tuple of (deleted_count, errors)
     """
     from db.database import get_db
     from db.crud import UserCRUD
-    
+
     deleted = 0
     errors = []
-    
+
     async with get_db() as db:
         for username in usernames:
             try:
@@ -918,10 +746,10 @@ async def force_delete_users(usernames: list[str]) -> tuple[int, list[str]]:
                     errors.append(f"{username}: not found")
             except Exception as e:
                 errors.append(f"{username}: {e}")
-        
+
         await db.commit()
-    
+
     if deleted:
         await _notify_deleted_users(usernames[:deleted])
-    
+
     return deleted, errors

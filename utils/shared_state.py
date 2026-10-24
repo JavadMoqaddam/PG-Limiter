@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 
 from utils.types import UserType
+from utils.log_observations import LOG_OBSERVATIONS, LogSampleEvidence
 
 # Global state of currently active connected users
 ACTIVE_USERS: dict[str, UserType] = {}
@@ -28,10 +29,11 @@ class APISampleEvidence:
 
 
 class ActiveUsersSnapshot(dict[str, UserType]):
-    """A normal user mapping with evidence attached to API observations only."""
+    """A normal user mapping with source-specific collection evidence attached."""
 
     api_evidence: APISampleEvidence | None = None
     unknown_users: frozenset[str] = frozenset()
+    log_evidence: LogSampleEvidence | None = None
 
 
 _api_generation = 0
@@ -46,6 +48,16 @@ def begin_api_collection() -> int:
         ACTIVE_USERS.clear()
     _api_snapshot = None
     return _api_generation
+
+
+async def discard_source_observations() -> None:
+    """Discard previous-source samples without touching user warning history."""
+    global _api_generation, _api_snapshot
+    async with ACTIVE_USERS_LOCK:
+        _api_generation += 1
+        LOG_OBSERVATIONS.invalidate()
+        _api_snapshot = None
+        ACTIVE_USERS.clear()
 
 
 def api_evidence_is_current(evidence: APISampleEvidence) -> bool:
@@ -76,8 +88,11 @@ def refresh_api_user(user: UserType, freshness_seconds: int) -> bool:
 async def publish_api_snapshot(users: dict[str, UserType], evidence: APISampleEvidence) -> bool:
     """Publish only a current sample, isolated from log tasks winding down."""
     global _api_snapshot
+    from utils.monitoring_gate import monitoring_is_current, monitoring_snapshot
+
+    admission = monitoring_snapshot()
     async with ACTIVE_USERS_LOCK:
-        if not api_evidence_is_current(evidence):
+        if not api_evidence_is_current(evidence) or not monitoring_is_current(admission):
             return False
         snapshot = _clone_user_map(users)
         snapshot.api_evidence = evidence
@@ -132,20 +147,29 @@ def node_silence_window(check_interval: float) -> float:
 
 def note_node_event(node_id: int | None, when: float | None = None) -> None:
     """Record that ``node_id`` produced a log event."""
-    if node_id is None:
+    if node_id is None or not LOG_OBSERVATIONS.monitors(node_id):
         return
-    NODE_LAST_EVENT[node_id] = time.time() if when is None else when
+    now = time.time() if when is None else when
+    previous = NODE_LAST_EVENT.get(node_id)
+    if previous is None or now - previous > node_silence_window(LOG_OBSERVATIONS.interval) or now < previous:
+        # Detect the gap on receipt too: no enforcement/status poll need have
+        # observed the stale heartbeat before it was replaced by this one.
+        LOG_OBSERVATIONS.note_transport_gap(now)
+    NODE_LAST_EVENT[node_id] = now
 
 
 def forget_node_event(node_id: int | None) -> None:
     """Drop a node's heartbeat when its task is cancelled or the node disappears."""
     if node_id is None:
         return
-    NODE_LAST_EVENT.pop(node_id, None)
+    if NODE_LAST_EVENT.pop(node_id, None) is not None and LOG_OBSERVATIONS.monitors(node_id):
+        LOG_OBSERVATIONS.note_transport_gap(time.time())
 
 
 def clear_node_events() -> None:
     """Forget every heartbeat, for the periodic full rebuild of the node tasks."""
+    if any(LOG_OBSERVATIONS.monitors(node_id) for node_id in NODE_LAST_EVENT):
+        LOG_OBSERVATIONS.note_transport_gap(time.time())
     NODE_LAST_EVENT.clear()
 
 
@@ -170,6 +194,7 @@ def _clone_user_map(users: dict[str, UserType]) -> ActiveUsersSnapshot:
     """Clone mapping of active users to guarantee point-in-time isolation."""
     snapshot = ActiveUsersSnapshot()
     snapshot.api_evidence = getattr(users, "api_evidence", None)
+    snapshot.log_evidence = getattr(users, "log_evidence", None)
     snapshot.unknown_users = getattr(users, "unknown_users", frozenset())
     for email, user in users.items():
         if not email or not user:
@@ -210,19 +235,27 @@ async def get_active_users_snapshot() -> dict[str, UserType]:
         return _clone_user_map(ACTIVE_USERS)
 
 
-async def pop_active_users_snapshot() -> dict[str, UserType]:
+async def pop_active_users_snapshot(config_data: dict | None = None) -> ActiveUsersSnapshot:
     """
     Atomically take an isolated point-in-time snapshot of ACTIVE_USERS and clear the collection.
     Guarantees that new connections arriving during cycle analysis are preserved for the next cycle
     and never orphaned or dropped by a delayed clear.
     """
     global _api_snapshot
+    from utils.read_config import get_config_revision
+
     async with ACTIVE_USERS_LOCK:
+        if config_data is not None and config_data.get("_revision", get_config_revision()) != get_config_revision():
+            return ActiveUsersSnapshot()
         if _api_snapshot is not None:
             _api_snapshot = None
             ACTIVE_USERS.clear()
             return ActiveUsersSnapshot()
+        if config_data is not None and LOG_OBSERVATIONS.configure(config_data):
+            ACTIVE_USERS.clear()
         snapshot = _clone_user_map(ACTIVE_USERS)
+        snapshot.log_evidence = LOG_OBSERVATIONS.evidence()
+        retain_log_interval(snapshot, snapshot.log_evidence.interval_start, snapshot.log_evidence.interval_end)
         ACTIVE_USERS.clear()
         return snapshot
 
@@ -238,11 +271,19 @@ async def merge_active_users_snapshot(batch: dict[str, UserType]) -> int:
 
     Returns the number of users actually restored (those without a newer observation).
     """
-    if not batch or getattr(batch, "api_evidence", None) is not None:
+    from utils.monitoring_gate import monitoring_is_current, monitoring_snapshot
+
+    admission = monitoring_snapshot()
+    if not batch or getattr(batch, "api_evidence", None) is not None or not monitoring_is_current(admission):
         # API observations belong to exactly one cycle; only Logs are requeued.
         return 0
     restored = 0
     async with ACTIVE_USERS_LOCK:
+        if not monitoring_is_current(admission) or not LOG_OBSERVATIONS.is_current(
+            getattr(batch, "log_evidence", None)
+        ):
+            return 0
+        retain_log_interval(batch, max(LOG_OBSERVATIONS.floor, time.time() - LOG_OBSERVATIONS.interval), time.time())
         for email, user in batch.items():
             if not email or not user:
                 continue
@@ -252,3 +293,23 @@ async def merge_active_users_snapshot(batch: dict[str, UserType]) -> int:
             ACTIVE_USERS[email] = user
             restored += 1
     return restored
+
+
+def retain_log_interval(users: dict[str, UserType], start: float, end: float) -> None:
+    """Retain original-time observations only from the current monitoring scope."""
+    for name, user in list(users.items()):
+        connections = [
+            c
+            for c in user.device_info.connections
+            if start < c.last_seen <= end and LOG_OBSERVATIONS.monitors(c.node_id)
+        ]
+        user.device_info.connections = connections
+        user.ip = sorted({c.ip for c in connections})
+        user.device_info.unique_ips = set(user.ip)
+        user.device_info.unique_nodes = {c.node_id for c in connections}
+        user.device_info.inbound_protocols = {c.inbound_protocol for c in connections}
+        user.device_info.is_multi_device = (
+            len(user.ip) > 2 or len(user.device_info.unique_nodes) > 1 or len(user.device_info.inbound_protocols) > 1
+        )
+        if not connections:
+            del users[name]

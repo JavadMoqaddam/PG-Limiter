@@ -11,6 +11,7 @@ from telegram.ext import (
     ConversationHandler,
 )
 
+from telegram_bot.input_owner import reply_input_prompt
 from telegram_bot.utils import (
     LastAdminError,
     add_admin_to_config,
@@ -28,7 +29,7 @@ def create_admins_list_keyboard(admins: list, page: int = 0, per_page: int = 5):
     """
     Create a keyboard with admins as glass-style buttons.
     Each admin gets a delete button.
-    
+
     Args:
         admins: List of admin chat IDs
         page: Current page number (0-indexed)
@@ -37,51 +38,53 @@ def create_admins_list_keyboard(admins: list, page: int = 0, per_page: int = 5):
     keyboard = []
     total_admins = len(admins)
     total_pages = max(1, (total_admins + per_page - 1) // per_page)
-    
+
     # Get current page admins
     start_idx = page * per_page
     end_idx = min(start_idx + per_page, total_admins)
     page_admins = admins[start_idx:end_idx]
-    
+
     # Add admin buttons with glass-style appearance
     for admin_id in page_admins:
-        keyboard.append([
-            InlineKeyboardButton(
-                f"👤 {admin_id}",
-                callback_data=f"admin_info:{admin_id}"
-            ),
-            InlineKeyboardButton(
-                "🗑️ Delete",
-                callback_data=f"delete_admin:{admin_id}"
-            )
-        ])
-    
+        keyboard.append(
+            [
+                InlineKeyboardButton(f"👤 {admin_id}", callback_data=f"admin_info:{admin_id}"),
+                InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_admin:{admin_id}"),
+            ]
+        )
+
     # Pagination buttons
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admins_page:{page-1}"))
-    
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admins_page:{page - 1}"))
+
     # Page indicator
-    nav_buttons.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="noop"))
-    
+    nav_buttons.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+
     if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"admins_page:{page+1}"))
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"admins_page:{page + 1}"))
     if nav_buttons:
         keyboard.append(nav_buttons)
-    
+
     # Add admin button
-    keyboard.append([
-        InlineKeyboardButton("➕ Add Admin", callback_data=CallbackData.ADD_ADMIN),
-    ])
-    
+    keyboard.append(
+        [
+            InlineKeyboardButton("➕ Add Admin", callback_data=CallbackData.ADD_ADMIN),
+        ]
+    )
+
     # Refresh and back buttons
-    keyboard.append([
-        InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.LIST_ADMINS),
-    ])
-    keyboard.append([
-        InlineKeyboardButton("« Back to Admin Menu", callback_data=CallbackData.ADMIN_MENU),
-    ])
-    
+    keyboard.append(
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.LIST_ADMINS),
+        ]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton("« Back to Admin Menu", callback_data=CallbackData.ADMIN_MENU),
+        ]
+    )
+
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -99,6 +102,7 @@ async def _send_response(update: Update, text: str, reply_markup=None):
     Helper to send response in both message and callback query contexts.
     """
     from telegram_bot.utils import send_response
+
     await send_response(update, text=text, reply_markup=reply_markup, parse_mode="HTML")
 
 
@@ -110,18 +114,12 @@ async def check_admin_privilege(update: Update):
     """
     user_id = update.effective_user.id if update.effective_user else None
     if not user_id:
-        await _send_response(
-            update,
-            "Sorry, you do not have permission to use this bot."
-        )
+        await _send_response(update, "Sorry, you do not have permission to use this bot.")
         return ConversationHandler.END
-    
+
     admins = await check_admin()
     if not admins or user_id not in admins:
-        await _send_response(
-            update,
-            "⚠️ Sorry, you do not have permission to use this bot (unauthorized)."
-        )
+        await _send_response(update, "⚠️ Sorry, you do not have permission to use this bot (unauthorized).")
         return ConversationHandler.END
     return None
 
@@ -133,6 +131,7 @@ def require_admin_continuation(handler):
     cannot finish a mutation begun while they were still authorized. On failure the
     conversation state is cleared and the flow ends.
     """
+
     @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         if await check_admin_privilege(update) is not None:
@@ -145,7 +144,7 @@ def require_admin_continuation(handler):
     return wrapper
 
 
-async def add_admin(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Adds an admin to the bot.
     At first checks if the user has admin privileges.
@@ -160,7 +159,7 @@ async def add_admin(update: Update, _context: ContextTypes.DEFAULT_TYPE):
             + "you can delete with /remove_admin command"
         )
         return ConversationHandler.END
-    await update.message.reply_html(text="Send chat id: ")
+    await reply_input_prompt(context, update.message.reply_html(text="Send chat id: "))
     return GET_CHAT_ID
 
 
@@ -171,17 +170,12 @@ async def get_chat_id(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     new_admin_id = update.message.text.strip()
     try:
         if await add_admin_to_config(new_admin_id):
-            await update.message.reply_html(
-                text=f"Admin <code>{new_admin_id}</code> added successfully!"
-            )
+            await update.message.reply_html(text=f"Admin <code>{new_admin_id}</code> added successfully!")
         else:
-            await update.message.reply_html(
-                text=f"Admin <code>{new_admin_id}</code> already exists!"
-            )
+            await update.message.reply_html(text=f"Admin <code>{new_admin_id}</code> already exists!")
     except ValueError:
         await update.message.reply_html(
-            text=f"Wrong input: <code>{update.message.text.strip()}"
-            + "</code>\ntry again <b>/add_admin</b>"
+            text=f"Wrong input: <code>{update.message.text.strip()}" + "</code>\ntry again <b>/add_admin</b>"
         )
     return ConversationHandler.END
 
@@ -193,9 +187,9 @@ async def admins_list(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     check = await check_admin_privilege(update)
     if check is not None:
         return check
-    
+
     admins = await check_admin()
-    
+
     if admins:
         total = len(admins)
         text = f"👥 <b>Bot Admins</b> ({total} admin{'s' if total != 1 else ''})\n\n"
@@ -204,23 +198,19 @@ async def admins_list(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     else:
         text = "👥 <b>Bot Admins</b>\n\nNo admins found!"
         keyboard = create_back_to_admins_keyboard()
-    
+
     if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
+        await update.callback_query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
     elif update.message:
         await update.message.reply_html(text=text, reply_markup=keyboard)
-    
+
     return ConversationHandler.END
 
 
 async def handle_admins_list_callback(query, _context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     """Handle callback for showing admins list with pagination."""
     admins = await check_admin()
-    
+
     if admins:
         total = len(admins)
         text = f"👥 <b>Bot Admins</b> ({total} admin{'s' if total != 1 else ''})\n\n"
@@ -229,12 +219,8 @@ async def handle_admins_list_callback(query, _context: ContextTypes.DEFAULT_TYPE
     else:
         text = "👥 <b>Bot Admins</b>\n\nNo admins found!"
         keyboard = create_back_to_admins_keyboard()
-    
-    await query.edit_message_text(
-        text=text,
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
+
+    await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
 
 
 async def handle_admins_page_callback(query, _context: ContextTypes.DEFAULT_TYPE, page: int):
@@ -244,38 +230,38 @@ async def handle_admins_page_callback(query, _context: ContextTypes.DEFAULT_TYPE
 
 async def handle_admin_info_callback(query, _context: ContextTypes.DEFAULT_TYPE, admin_id: str):
     """Handle callback for showing admin info."""
-    keyboard = InlineKeyboardMarkup([
+    keyboard = InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("🗑️ Delete Admin", callback_data=f"delete_admin:{admin_id}")
-        ],
-        [InlineKeyboardButton("« Back to List", callback_data=CallbackData.LIST_ADMINS)]
-    ])
-    
+            [InlineKeyboardButton("🗑️ Delete Admin", callback_data=f"delete_admin:{admin_id}")],
+            [InlineKeyboardButton("« Back to List", callback_data=CallbackData.LIST_ADMINS)],
+        ]
+    )
+
     await query.edit_message_text(
         text=f"👤 <b>Admin Info</b>\n\n"
-             f"<b>Chat ID:</b> <code>{admin_id}</code>\n\n"
-             f"This user has full admin access to the bot.",
+        f"<b>Chat ID:</b> <code>{admin_id}</code>\n\n"
+        f"This user has full admin access to the bot.",
         reply_markup=keyboard,
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
 async def handle_delete_admin_callback(query, _context: ContextTypes.DEFAULT_TYPE, admin_id: str):
     """Handle callback for deleting an admin."""
     admins = await check_admin()
-    
+
     # Check if this is the last admin
     if len(admins) <= 1:
         await query.edit_message_text(
             text="⚠️ <b>Cannot delete last admin!</b>\n\n"
-                 "There must be at least one admin. Add another admin first before removing this one.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("« Back to List", callback_data=CallbackData.LIST_ADMINS)]
-            ]),
-            parse_mode="HTML"
+            "There must be at least one admin. Add another admin first before removing this one.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« Back to List", callback_data=CallbackData.LIST_ADMINS)]]
+            ),
+            parse_mode="HTML",
         )
         return
-    
+
     try:
         admin_id_int = int(admin_id)
         result = await remove_admin_from_config(admin_id_int)
@@ -288,17 +274,17 @@ async def handle_delete_admin_callback(query, _context: ContextTypes.DEFAULT_TYP
         text = "⚠️ <b>Cannot delete last admin!</b> Add another admin first."
     except ValueError:
         text = f"❌ Invalid admin ID: <code>{admin_id}</code>"
-    
+
     await query.edit_message_text(
         text=text,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("« Back to List", callback_data=CallbackData.LIST_ADMINS)]
-        ]),
-        parse_mode="HTML"
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Back to List", callback_data=CallbackData.LIST_ADMINS)]]
+        ),
+        parse_mode="HTML",
     )
 
 
-async def remove_admin(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Removes an admin from admin list"""
     check = await check_admin_privilege(update)
     if check is not None:
@@ -310,7 +296,7 @@ async def remove_admin(update: Update, _context: ContextTypes.DEFAULT_TYPE):
             + " <b>if you delete this chat id, then first person start bot "
             + "is new admin</b> or <b>add admin chat id</b> in <code>ADMIN_IDS</code> environment variable"
         )
-    await update.message.reply_html(text="Send chat id of the admin to remove: ")
+    await reply_input_prompt(context, update.message.reply_html(text="Send chat id of the admin to remove: "))
     return GET_CHAT_ID_TO_REMOVE
 
 
@@ -320,23 +306,16 @@ async def get_chat_id_to_remove(update: Update, _context: ContextTypes.DEFAULT_T
         admin_id_to_remove = int(update.message.text.strip())
     except ValueError:
         await update.message.reply_html(
-            text=f"Wrong input: <code>{update.message.text.strip()}"
-            + "</code>\ntry again <b>/remove_admin</b>"
+            text=f"Wrong input: <code>{update.message.text.strip()}" + "</code>\ntry again <b>/remove_admin</b>"
         )
         return ConversationHandler.END
     try:
         removed = await remove_admin_from_config(admin_id_to_remove)
     except LastAdminError:
-        await update.message.reply_html(
-            text="⚠️ <b>Cannot remove the last admin.</b> Add another admin first."
-        )
+        await update.message.reply_html(text="⚠️ <b>Cannot remove the last admin.</b> Add another admin first.")
         return ConversationHandler.END
     if removed:
-        await update.message.reply_html(
-            text=f"Admin <code>{admin_id_to_remove}</code> removed successfully!"
-        )
+        await update.message.reply_html(text=f"Admin <code>{admin_id_to_remove}</code> removed successfully!")
     else:
-        await update.message.reply_html(
-            text=f"Admin <code>{admin_id_to_remove}</code> does not exist!"
-        )
+        await update.message.reply_html(text=f"Admin <code>{admin_id_to_remove}</code> does not exist!")
     return ConversationHandler.END

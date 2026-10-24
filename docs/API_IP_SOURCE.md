@@ -34,8 +34,8 @@ you need inbound-specific observations.
 
 ## Incomplete evidence
 
-A failed request, malformed body, unavailable node, missing expected node or
-invalid timestamp protects the affected user for that cycle: no warning, ban
+A failed request, malformed body, missing expected node or invalid timestamp
+protects the affected user for that cycle: no warning, ban
 or normalization decision is made, and existing warning counters remain.
 Successfully observed users can still be evaluated when the configured global
 coverage gates allow the cycle. An 80% answer rate never makes the remaining
@@ -43,10 +43,46 @@ coverage gates allow the cycle. An 80% answer rate never makes the remaining
 
 A valid empty IP map and a map containing only valid expired timestamps are
 successful observations and can clear warnings. Failure to obtain a complete
-candidate list or the node list skips enforcement. API batches are never merged
-with earlier cycles or Logs, and a settings change invalidates an in-flight
-batch without resetting warnings. **Last API Cycle** shows whether the sample
+candidate list or the node list skips enforcement. Every relevant panel-enabled
+node must be connected after excluding the limiter's explicit disabled nodes.
+An enabled `error` or `connecting` node makes the whole cycle unavailable, even
+when the online candidate list is empty: the panel omits unhealthy nodes from
+its IP response, so their absence cannot establish that users disconnected.
+This preserves warnings for users omitted from the online query as well as its
+candidates. Existing expected-connected-node checks still protect individual
+users when an otherwise healthy node response is missing.
+
+API batches are never merged with earlier cycles or Logs, and a settings change
+invalidates an in-flight batch without resetting warnings. **Last API Cycle** shows whether the sample
 was complete, partially usable, or skipped.
+
+## Automatic fallback and recovery
+
+With `api_ip_auto_fallback` enabled (the default), two consecutive unsuccessful
+API collection cycles switch the source to Logs. Each cycle counts once,
+regardless of the number of failed user requests. Both failed and partial
+collections count, including unreachable panels, incomplete candidate or node
+queries, malformed responses and missing user evidence. Known users may still
+be evaluated on the first partial cycle when the coverage gates allow it.
+
+A complete collection resets the failure streak. Valid empty results, all-valid
+expired timestamps and confirmed deleted users count as success. Only the
+panel's explicit `{"detail": "User not found"}` response confirms deletion;
+a generic route or proxy HTTP 404 remains unknown evidence. Cancellation,
+degraded local configuration and superseded settings do not count as outages.
+
+Logs must be saved successfully before the switch takes effect. A failed save
+keeps API selected and retries on the next unsuccessful cycle. A manual source
+or settings change starts a new failure streak and prevents an older collection
+from overwriting that choice. Successful source writes discard previous-source
+observations, including pending API batches, while preserving warning history.
+The second failed cycle cannot enforce its old API sample after switching.
+
+A committed fallback attempts one Telegram notification. Delivery failure does
+not undo or repeat the switch. Logs remains selected until you choose Panel API
+again in Settings; that manual choice runs the existing permission preflight.
+When automatic fallback is disabled, API remains selected and the existing
+coverage diagnostics continue to report skipped enforcement.
 
 ## Configuration and upgrades
 

@@ -14,7 +14,8 @@ from telegram.ext import (
 from telegram_bot.handlers.admin import check_admin_privilege
 from telegram_bot.constants import CallbackData
 from utils.logs import get_logger
-from utils.read_config import read_config, invalidate_config_cache
+from utils import settings_service
+from utils.settings_service import read_settings as read_config
 
 punishment_handler_logger = get_logger("punishment_handler")
 
@@ -28,23 +29,13 @@ async def _save_punishment_setting(key: str, value) -> bool:
     re-rendered the menu, showing the admin a change that was never written.
     """
     try:
-        from db.database import get_db
-        from db.crud import ConfigCRUD
-
-        async with get_db() as db:
-            await ConfigCRUD.set(db, key, value)
-            await db.commit()
+        await settings_service.write_settings({key: value})
         return True
     except Exception as error:  # pylint: disable=broad-except
         punishment_handler_logger.exception(
-            f"❌ Failed to save punishment setting {key!r}: {error}. The previous value "
-            f"is still in effect."
+            f"❌ Failed to save punishment setting {key!r}: {error}. The previous value is still in effect."
         )
         return False
-    finally:
-        # Unconditionally: see the note on save_config_value. A partially applied write
-        # that left the cache holding the old ladder would keep banning by it.
-        await invalidate_config_cache()
 
 
 async def _save_punishment_steps(steps: list) -> bool:
@@ -69,10 +60,11 @@ def create_punishment_menu_keyboard(enabled: bool = True):
 
 def create_window_selection_keyboard(current_hours: int = 72):
     """Create window hours selection keyboard."""
+
     def btn(hours: int, callback: str):
         mark = "✓ " if hours == current_hours else ""
         return InlineKeyboardButton(f"{mark}{hours}h", callback_data=callback)
-    
+
     keyboard = [
         [
             btn(24, CallbackData.PUNISHMENT_WINDOW_24),
@@ -90,36 +82,38 @@ def create_window_selection_keyboard(current_hours: int = 72):
 def create_steps_menu_keyboard(steps: list):
     """Create steps configuration menu keyboard."""
     keyboard = []
-    
+
     # Show current steps
     for i, step in enumerate(steps):
         step_type = step.get("type", "disable")
         duration = step.get("duration", 0)
-        
+
         if step_type == "warning":
-            text = f"{i+1}. ⚠️ Warning"
+            text = f"{i + 1}. ⚠️ Warning"
         elif step_type == "revoke":
-            text = f"{i+1}. 🔄 Revoke + Disable"
+            text = f"{i + 1}. 🔄 Revoke + Disable"
         elif duration == 0:
-            text = f"{i+1}. 🚫 Unlimited"
+            text = f"{i + 1}. 🚫 Unlimited"
         else:
-            text = f"{i+1}. 🔒 {duration}m"
-        
+            text = f"{i + 1}. 🔒 {duration}m"
+
         # Each step is clickable to edit, with a delete button
-        keyboard.append([
-            InlineKeyboardButton(text, callback_data=f"punishment_edit_step:{i}"),
-            InlineKeyboardButton("🗑️", callback_data=f"punishment_remove_step:{i}")
-        ])
-    
+        keyboard.append(
+            [
+                InlineKeyboardButton(text, callback_data=f"punishment_edit_step:{i}"),
+                InlineKeyboardButton("🗑️", callback_data=f"punishment_remove_step:{i}"),
+            ]
+        )
+
     # Add step button
     if len(steps) < 10:  # Max 10 steps
         keyboard.append([InlineKeyboardButton("➕ Add Step", callback_data=CallbackData.PUNISHMENT_ADD_STEP)])
-    
+
     # Reset to defaults
     keyboard.append([InlineKeyboardButton("🔄 Reset to Defaults", callback_data=CallbackData.PUNISHMENT_STEPS_RESET)])
-    
+
     keyboard.append([InlineKeyboardButton("« Back", callback_data=CallbackData.PUNISHMENT_MENU)])
-    
+
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -146,7 +140,7 @@ def create_edit_step_keyboard(step_index: int, step: dict):
     """Create keyboard for editing a specific step."""
     step_type = step.get("type", "disable")
     duration = step.get("duration", 0)
-    
+
     # Show current value with checkmark
     current_text = ""
     if step_type == "warning":
@@ -157,44 +151,50 @@ def create_edit_step_keyboard(step_index: int, step: dict):
         current_text = "Current: 🚫 Unlimited"
     else:
         current_text = f"Current: 🔒 {duration}m"
-    
+
     keyboard = [
         # Warning option
-        [InlineKeyboardButton(
-            "✅ ⚠️ Warning" if step_type == "warning" else "⚠️ Warning",
-            callback_data=f"punishment_update_step:{step_index}:warning:0"
-        )],
+        [
+            InlineKeyboardButton(
+                "✅ ⚠️ Warning" if step_type == "warning" else "⚠️ Warning",
+                callback_data=f"punishment_update_step:{step_index}:warning:0",
+            )
+        ],
         # Timed disable options
         [
             InlineKeyboardButton(
                 "✅ 🔒 10m" if (step_type == "disable" and duration == 10) else "🔒 10m",
-                callback_data=f"punishment_update_step:{step_index}:disable:10"
+                callback_data=f"punishment_update_step:{step_index}:disable:10",
             ),
             InlineKeyboardButton(
                 "✅ 🔒 30m" if (step_type == "disable" and duration == 30) else "🔒 30m",
-                callback_data=f"punishment_update_step:{step_index}:disable:30"
+                callback_data=f"punishment_update_step:{step_index}:disable:30",
             ),
         ],
         [
             InlineKeyboardButton(
                 "✅ 🔒 60m" if (step_type == "disable" and duration == 60) else "🔒 60m",
-                callback_data=f"punishment_update_step:{step_index}:disable:60"
+                callback_data=f"punishment_update_step:{step_index}:disable:60",
             ),
             InlineKeyboardButton(
                 "✅ 🔒 240m" if (step_type == "disable" and duration == 240) else "🔒 240m",
-                callback_data=f"punishment_update_step:{step_index}:disable:240"
+                callback_data=f"punishment_update_step:{step_index}:disable:240",
             ),
         ],
         # Unlimited option
-        [InlineKeyboardButton(
-            "✅ 🚫 Unlimited" if (step_type == "disable" and duration == 0) else "🚫 Unlimited",
-            callback_data=f"punishment_update_step:{step_index}:disable:0"
-        )],
+        [
+            InlineKeyboardButton(
+                "✅ 🚫 Unlimited" if (step_type == "disable" and duration == 0) else "🚫 Unlimited",
+                callback_data=f"punishment_update_step:{step_index}:disable:0",
+            )
+        ],
         # Revoke subscription option
-        [InlineKeyboardButton(
-            "✅ 🔄 Revoke Sub + Disable" if step_type == "revoke" else "🔄 Revoke Sub + Disable",
-            callback_data=f"punishment_update_step:{step_index}:revoke:0"
-        )],
+        [
+            InlineKeyboardButton(
+                "✅ 🔄 Revoke Sub + Disable" if step_type == "revoke" else "🔄 Revoke Sub + Disable",
+                callback_data=f"punishment_update_step:{step_index}:revoke:0",
+            )
+        ],
         # Delete this step
         [InlineKeyboardButton("🗑️ Delete This Step", callback_data=f"punishment_remove_step:{step_index}")],
         # Back to steps list
@@ -273,14 +273,14 @@ async def punishment_set_window(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         config_data = await read_config()
         current_hours = config_data.get("punishment", {}).get("window_hours", 72)
-        
+
         message = (
             "⏰ <b>Set Punishment Time Window</b>\n\n"
             f"Current: <code>{current_hours} hours</code>\n\n"
             "Select how long violations should be remembered.\n"
             "Older violations won't count toward punishment steps."
         )
-        
+
         await _send_response(update, message, create_window_selection_keyboard(current_hours))
 
     except Exception as e:
@@ -296,8 +296,10 @@ async def punishment_set_window_hours(update: Update, context: ContextTypes.DEFA
         return check
 
     try:
-        await _save_punishment_setting("punishment_window_hours", str(hours))
-        
+        if not await _save_punishment_setting("punishment_window_hours", str(hours)):
+            await _send_response(update, "❌ Could not save the punishment setting; try again.")
+            return ConversationHandler.END
+
         # Return to punishment menu
         await punishment_status(update, context)
 
@@ -316,7 +318,7 @@ async def punishment_set_steps(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         config_data = await read_config()
         steps = config_data.get("punishment", {}).get("steps", [])
-        
+
         if not steps:
             # Use default steps for display
             steps = [
@@ -324,16 +326,16 @@ async def punishment_set_steps(update: Update, context: ContextTypes.DEFAULT_TYP
                 {"type": "disable", "duration": 10},
                 {"type": "disable", "duration": 30},
                 {"type": "disable", "duration": 60},
-                {"type": "disable", "duration": 0}
+                {"type": "disable", "duration": 0},
             ]
-        
+
         message = (
             "📋 <b>Configure Punishment Steps</b>\n\n"
             "Steps are applied in order for each violation.\n"
             "Click ➕ to add a step, or 🗑️ to remove one.\n\n"
             "<b>Current Steps:</b>"
         )
-        
+
         await _send_response(update, message, create_steps_menu_keyboard(steps))
 
     except Exception as e:
@@ -356,7 +358,7 @@ async def punishment_add_step_menu(update: Update, context: ContextTypes.DEFAULT
         "• <b>Unlimited</b> - Disable until manual enable\n"
         "• <b>Revoke + Disable</b> - Revoke subscription, reset vless/vmess UUID, and permanently disable"
     )
-    
+
     await _send_response(update, message, create_add_step_keyboard())
     return ConversationHandler.END
 
@@ -372,12 +374,14 @@ async def punishment_add_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         steps = config_data.get("punishment", {}).get("steps", [])
         if not steps:
             steps = []
-        
+
         # Add new step
         steps.append({"type": step_type, "duration": duration})
-        
-        await _save_punishment_steps(steps)
-        
+
+        if not await _save_punishment_steps(steps):
+            await _send_response(update, "❌ Could not save the punishment steps; try again.")
+            return ConversationHandler.END
+
         # Return to steps menu
         await punishment_set_steps(update, context)
 
@@ -396,11 +400,13 @@ async def punishment_remove_step(update: Update, context: ContextTypes.DEFAULT_T
     try:
         config_data = await read_config()
         steps = config_data.get("punishment", {}).get("steps", [])
-        
+
         if 0 <= step_index < len(steps):
             steps.pop(step_index)
-            await _save_punishment_steps(steps)
-        
+            if not await _save_punishment_steps(steps):
+                await _send_response(update, "❌ Could not save the punishment steps; try again.")
+                return ConversationHandler.END
+
         # Return to steps menu
         await punishment_set_steps(update, context)
 
@@ -419,7 +425,7 @@ async def punishment_edit_step(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         config_data = await read_config()
         steps = config_data.get("punishment", {}).get("steps", [])
-        
+
         # Use default steps if none are configured
         if not steps:
             steps = [
@@ -427,14 +433,14 @@ async def punishment_edit_step(update: Update, context: ContextTypes.DEFAULT_TYP
                 {"type": "disable", "duration": 10},
                 {"type": "disable", "duration": 30},
                 {"type": "disable", "duration": 60},
-                {"type": "disable", "duration": 0}
+                {"type": "disable", "duration": 0},
             ]
-        
+
         if 0 <= step_index < len(steps):
             step = steps[step_index]
             step_type = step.get("type", "disable")
             duration = step.get("duration", 0)
-            
+
             # Show current value description
             if step_type == "warning":
                 current_desc = "⚠️ Warning (no disable)"
@@ -444,13 +450,9 @@ async def punishment_edit_step(update: Update, context: ContextTypes.DEFAULT_TYP
                 current_desc = "🚫 Unlimited disable"
             else:
                 current_desc = f"🔒 Disable for {duration} minutes"
-            
-            message = (
-                f"✏️ <b>Edit Step {step_index + 1}</b>\n\n"
-                f"Current: {current_desc}\n\n"
-                f"Select a new punishment type:"
-            )
-            
+
+            message = f"✏️ <b>Edit Step {step_index + 1}</b>\n\nCurrent: {current_desc}\n\nSelect a new punishment type:"
+
             await _send_response(update, message, create_edit_step_keyboard(step_index, step))
         else:
             await _send_response(update, "❌ Invalid step index")
@@ -461,7 +463,9 @@ async def punishment_edit_step(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-async def punishment_update_step(update: Update, context: ContextTypes.DEFAULT_TYPE, step_index: int, step_type: str, duration: int):
+async def punishment_update_step(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, step_index: int, step_type: str, duration: int
+):
     """Update an existing punishment step."""
     check = await check_admin_privilege(update)
     if check:
@@ -470,7 +474,7 @@ async def punishment_update_step(update: Update, context: ContextTypes.DEFAULT_T
     try:
         config_data = await read_config()
         steps = config_data.get("punishment", {}).get("steps", [])
-        
+
         # Use default steps if none are configured
         if not steps:
             steps = [
@@ -478,13 +482,15 @@ async def punishment_update_step(update: Update, context: ContextTypes.DEFAULT_T
                 {"type": "disable", "duration": 10},
                 {"type": "disable", "duration": 30},
                 {"type": "disable", "duration": 60},
-                {"type": "disable", "duration": 0}
+                {"type": "disable", "duration": 0},
             ]
-        
+
         if 0 <= step_index < len(steps):
             steps[step_index] = {"type": step_type, "duration": duration}
-            await _save_punishment_steps(steps)
-        
+            if not await _save_punishment_steps(steps):
+                await _send_response(update, "❌ Could not save the punishment steps; try again.")
+                return ConversationHandler.END
+
         # Return to steps menu
         await punishment_set_steps(update, context)
 
@@ -506,11 +512,13 @@ async def punishment_reset_steps(update: Update, context: ContextTypes.DEFAULT_T
             {"type": "disable", "duration": 10},
             {"type": "disable", "duration": 30},
             {"type": "disable", "duration": 60},
-            {"type": "disable", "duration": 0}
+            {"type": "disable", "duration": 0},
         ]
-        
-        await _save_punishment_steps(default_steps)
-        
+
+        if not await _save_punishment_steps(default_steps):
+            await _send_response(update, "❌ Could not save the punishment steps; try again.")
+            return ConversationHandler.END
+
         # Return to steps menu
         await punishment_set_steps(update, context)
 
@@ -527,11 +535,7 @@ async def user_violations(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return check
 
     if not context.args:
-        await _send_response(
-            update,
-            "❌ Please provide a username.\n"
-            "Example: <code>/user_violations username</code>"
-        )
+        await _send_response(update, "❌ Please provide a username.\nExample: <code>/user_violations username</code>")
         return ConversationHandler.END
 
     username = context.args[0]
@@ -550,14 +554,19 @@ async def user_violations(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if status["violation_count"] == 0:
             await _send_response(
-                update,
-                f"✅ User <code>{username}</code> has no violations in the last {status['window_hours']} hours."
+                update, f"✅ User <code>{username}</code> has no violations in the last {status['window_hours']} hours."
             )
             return ConversationHandler.END
 
         violations_text = []
         for v in status["recent_violations"]:
-            step_type = "⚠️ Warning" if v["duration"] == 0 and v["step"] == 0 else f"🔒 {v['duration']}m" if v["duration"] > 0 else "🚫 Unlimited"
+            step_type = (
+                "⚠️ Warning"
+                if v["duration"] == 0 and v["step"] == 0
+                else f"🔒 {v['duration']}m"
+                if v["duration"] > 0
+                else "🚫 Unlimited"
+            )
             violations_text.append(f"  • {v['time_ago']} - Step {v['step'] + 1} ({step_type})")
 
         message = (
@@ -589,7 +598,7 @@ async def clear_user_violations(update: Update, context: ContextTypes.DEFAULT_TY
             update,
             "❌ Please provide a username.\n"
             "Example: <code>/clear_user_violations username</code>\n\n"
-            "Use <code>/clear_user_violations ALL</code> to clear all history."
+            "Use <code>/clear_user_violations ALL</code> to clear all history.",
         )
         return ConversationHandler.END
 
@@ -602,16 +611,10 @@ async def clear_user_violations(update: Update, context: ContextTypes.DEFAULT_TY
 
         if username.upper() == "ALL":
             await system.clear_all_history()
-            await _send_response(
-                update,
-                "✅ Cleared all violation history."
-            )
+            await _send_response(update, "✅ Cleared all violation history.")
         else:
             await system.clear_user_history(username)
-            await _send_response(
-                update,
-                f"✅ Cleared violation history for <code>{username}</code>"
-            )
+            await _send_response(update, f"✅ Cleared violation history for <code>{username}</code>")
 
     except Exception as e:
         await _send_response(update, f"❌ Error: {str(e)}")

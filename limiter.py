@@ -19,6 +19,7 @@ from utils.get_logs import (
     init_node_status_message,
 )
 from utils.logs import get_logger, log_startup_info, log_shutdown_info, log_crash_info
+from utils.monitoring_gate import monitoring_is_current, synchronize_monitoring, watch_monitoring_admission
 from utils.panel_api import get_nodes
 from utils.parse_logs import close_geo_client
 from utils.read_config import read_config
@@ -32,15 +33,14 @@ main_logger = get_logger("limiter.main")
 # Strong references container for root background tasks
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
+
 def parse_args(argv=None):
     """Parse CLI arguments. Called from __main__, not at import.
 
     Parsing at import time meant any tool that imported limiter (a test, a linter,
     another entry point) inherited its argv and exited on an unknown flag.
     """
-    parser = argparse.ArgumentParser(
-        description="Limiter - IP connection limiter for PasarGuard panel"
-    )
+    parser = argparse.ArgumentParser(description="Limiter - IP connection limiter for PasarGuard panel")
     parser.add_argument("--version", action="version", version=f"Limiter v{VERSION}")
     return parser.parse_args(argv)
 
@@ -65,9 +65,7 @@ async def _supervise(name: str, factory, restart_delay: float = 10.0) -> None:
             raise
         except Exception as error:  # pylint: disable=broad-except
             attempt += 1
-            main_logger.error(
-                f"❌ Background task '{name}' crashed (#{attempt}): {error}", exc_info=True
-            )
+            main_logger.error(f"❌ Background task '{name}' crashed (#{attempt}): {error}", exc_info=True)
         await asyncio.sleep(min(restart_delay * max(1, min(attempt, 6)), 120.0))
 
 
@@ -112,14 +110,14 @@ async def _telegram_watchdog(interval: float = 60.0) -> None:
                 )
             try:
                 from telegram_bot.dispatcher import get_dispatcher
+
                 get_dispatcher().set_bot(application.bot)
             except Exception as inject_error:  # pylint: disable=broad-except
                 main_logger.debug(f"Dispatcher bot re-injection note: {inject_error}")
             main_logger.info("✓ Telegram polling restarted by watchdog")
         except Exception as error:  # pylint: disable=broad-except
             main_logger.error(
-                f"❌ Telegram watchdog could not restore polling: {error}. "
-                f"A container restart is required.",
+                f"❌ Telegram watchdog could not restore polling: {error}. A container restart is required.",
                 exc_info=True,
             )
 
@@ -129,10 +127,11 @@ async def main():
     log_startup_info("Limiter", f"v{VERSION}")
     main_logger.info(f"🚀 Starting Limiter v{VERSION}")
     main_logger.info("=" * 50)
-    
+
     try:
         # Ensure database tables and columns are initialized
         from db.database import init_db
+
         try:
             await init_db()
             main_logger.info("✓ Database initialized")
@@ -148,10 +147,11 @@ async def main():
                 exc_info=True,
             )
             raise SystemExit(1) from db_err
-        
+
         # Start Telegram bot and message dispatcher in background tasks (keep strong references)
         main_logger.debug("Starting Telegram bot and dispatcher tasks...")
         from telegram_bot.dispatcher import get_dispatcher
+
         dispatcher = get_dispatcher()
         dispatcher_task = asyncio.create_task(
             _supervise("dispatcher_worker", dispatcher.start_worker), name="dispatcher_worker"
@@ -160,6 +160,7 @@ async def main():
         # Supervised retention: prune old violation history and ISP cache, which
         # otherwise grew without bound because their cleanup had no live caller.
         from utils.maintenance import retention_maintenance_loop
+
         retention_task = asyncio.create_task(
             _supervise("retention_maintenance", retention_maintenance_loop),
             name="retention_maintenance",
@@ -209,7 +210,7 @@ async def main():
                     "Retrying in <b>60 seconds</b>..."
                 )
                 await asyncio.sleep(60)
-        
+
         # Initialize panel connection
         panel_data = PanelType(
             config_file["panel"]["username"],
@@ -217,18 +218,22 @@ async def main():
             config_file["panel"]["domain"],
         )
         main_logger.info(f"✓ Panel configured: {config_file['panel']['domain']}")
-        
+
         # Preserve disabled users across restarts (enable_dis_user background loop handles expired bans)
         main_logger.info("✓ Disabled users state preserved across restarts")
-        
+
         async with asyncio.TaskGroup() as tg:
             # Start unknown user background worker
             from utils.user_sync import run_unknown_user_worker
+
             tg.create_task(run_unknown_user_worker(panel_data), name="unknown_user_worker")
             main_logger.info("✓ Unknown user worker registered in TaskGroup")
 
             tg.create_task(_telegram_watchdog(), name="telegram_watchdog")
             main_logger.info("✓ Telegram polling watchdog registered in TaskGroup")
+
+            tg.create_task(watch_monitoring_admission(), name="monitoring_admission")
+            admission = await synchronize_monitoring()
 
             main_logger.debug("Fetching available nodes...")
             # get_nodes raises when the panel cannot be reached; the `else` branch below
@@ -236,7 +241,7 @@ async def main():
             # briefly down during boot used to abort the TaskGroup instead of starting
             # with no streams and letting check_and_add_new_nodes pick them up later.
             try:
-                nodes_list = await get_nodes(panel_data)
+                nodes_list = await get_nodes(panel_data) if monitoring_is_current(admission) else None
             except Exception as nodes_error:  # pylint: disable=broad-except
                 main_logger.exception(
                     f"Could not fetch the node list at startup: {nodes_error}. "
@@ -245,18 +250,18 @@ async def main():
                 )
                 nodes_list = None
 
-            if nodes_list:
-                await init_node_status_message(nodes_list)
+            if nodes_list and monitoring_is_current(admission):
+                await init_node_status_message(nodes_list, admission)
                 connected_nodes = [n for n in nodes_list if n.status == "connected"]
                 main_logger.info(f"🖥️ Found {len(nodes_list)} nodes ({len(connected_nodes)} connected)")
-                
+
                 for node in nodes_list:
                     if node.status == "connected":
                         main_logger.debug(f"Connecting to node: {node.node_name} (id={node.node_id})")
-                        await create_node_task(panel_data, tg, node)
-                
+                        await create_node_task(panel_data, tg, node, admission)
+
                 main_logger.info(f"✓ Connected to {len(connected_nodes)} nodes")
-            else:
+            elif monitoring_is_current(admission):
                 main_logger.warning("No nodes available or error fetching nodes")
 
             # Start background management tasks
@@ -264,21 +269,27 @@ async def main():
             tg.create_task(check_and_add_new_nodes(panel_data, tg), name="add_new_nodes")
             tg.create_task(handle_cancel(panel_data, TASKS), name="cancel_disable_nodes")
             tg.create_task(handle_cancel_all(TASKS, panel_data, tg), name="cancel_all")
-            
+
             from utils.panel_api import enable_dis_user
+
             tg.create_task(enable_dis_user(panel_data), name="enable_disabled_users")
-            
+
             from utils.user_sync import run_user_sync_loop
+
             tg.create_task(run_user_sync_loop(panel_data), name="user_sync")
-            
+
             main_logger.info("✓ All background tasks registered in TaskGroup")
             main_logger.info("=" * 50)
-            main_logger.info("🟢 Limiter is now running and monitoring connections")
-            
+            if monitoring_is_current(admission):
+                main_logger.info("🟢 Limiter is now running and monitoring connections")
+            else:
+                main_logger.info(f"Limiter management is running; user monitoring is paused: {admission.reason}")
+
             from utils.user_sync import refresh_user_metadata_cache, recompute_all_user_limits
+
             await refresh_user_metadata_cache()
             await recompute_all_user_limits()
-            
+
             await run_check_users_usage(panel_data)
     finally:
         await cleanup_resources()
@@ -296,6 +307,7 @@ async def cleanup_resources():
     # 2. Close database connections
     try:
         from db.database import close_db
+
         await close_db()
     except Exception as e:
         main_logger.debug(f"Error closing DB: {e}")
@@ -303,6 +315,7 @@ async def cleanup_resources():
     # 3. Close Panel API shared HTTP client
     try:
         from utils.panel_api.request_helper import close_panel_client
+
         await close_panel_client()
         main_logger.debug("✓ Panel HTTP client closed")
     except Exception as e:
@@ -311,6 +324,7 @@ async def cleanup_resources():
     # 3b. Close the ISP detector's shared HTTP client and background lookups.
     try:
         import utils.check_usage as check_usage_mod
+
         if check_usage_mod.isp_detector is not None:
             await check_usage_mod.isp_detector.close()
             main_logger.debug("✓ ISP detector closed")
@@ -320,6 +334,7 @@ async def cleanup_resources():
     # 4. Stop Telegram Dispatcher cleanly
     try:
         from telegram_bot.dispatcher import get_dispatcher
+
         dispatcher = get_dispatcher()
         await dispatcher.stop(wait_seconds=3.0)
         main_logger.debug("✓ Telegram Dispatcher stopped")

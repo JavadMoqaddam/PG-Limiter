@@ -11,15 +11,19 @@ from utils.shared_state import (
     merge_active_users_snapshot,
     pop_active_users_snapshot,
 )
-from utils.types import UserType
+from utils.types import UserType, ConnectionInfo
+import time
 
 
-async def test_metadata_failure_requeues_consumed_batch_without_overwriting_new_events():
+async def test_metadata_failure_requeues_consumed_batch_without_overwriting_new_events(completed_logs_evidence):
+    completed_logs_evidence()
     ACTIVE_USERS.clear()
     ACTIVE_USERS["alice"] = UserType(name="alice", ip=["1.1.1.1"])
     ACTIVE_USERS["bob"] = UserType(name="bob", ip=["2.2.2.2"])
 
     # The cycle consumes the batch.
+    for user in ACTIVE_USERS.values():
+        user.device_info.connections = [ConnectionInfo(ip, 1, "node", "Vless", time.time() - 1) for ip in user.ip]
     batch = await pop_active_users_snapshot()
     assert set(batch) == {"alice", "bob"}
     assert ACTIVE_USERS == {}
@@ -38,10 +42,13 @@ async def test_metadata_failure_requeues_consumed_batch_without_overwriting_new_
     assert ACTIVE_USERS["bob"].ip == ["9.9.9.9"]
 
 
-async def test_requeue_is_noop_when_every_user_has_a_newer_event():
+async def test_requeue_is_noop_when_every_user_has_a_newer_event(completed_logs_evidence):
+    completed_logs_evidence()
     ACTIVE_USERS.clear()
     ACTIVE_USERS["carol"] = UserType(name="carol", ip=["1.1.1.1"])
 
+    for user in ACTIVE_USERS.values():
+        user.device_info.connections = [ConnectionInfo(ip, 1, "node", "Vless", time.time() - 1) for ip in user.ip]
     batch = await pop_active_users_snapshot()
 
     # Both users reconnect during the cycle before the requeue runs.
@@ -53,7 +60,7 @@ async def test_requeue_is_noop_when_every_user_has_a_newer_event():
     assert ACTIVE_USERS["carol"].ip == ["5.5.5.5"]
 
 
-async def test_api_batch_is_never_merged_back_after_failed_preparation():
+async def test_api_batch_is_never_merged_back_after_failed_preparation(operational_topics):
     from utils.read_config import get_config_revision
     from utils.shared_state import APISampleEvidence, begin_api_collection, pop_api_users_snapshot, publish_api_snapshot
     from utils.types import ConnectionInfo
