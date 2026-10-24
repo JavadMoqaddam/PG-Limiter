@@ -16,6 +16,31 @@ db_violations_logger = get_logger("db.violations")
 
 class ViolationHistoryCRUD:
     """CRUD operations for ViolationHistory table."""
+
+    @staticmethod
+    async def is_persisted(
+        db: AsyncSession,
+        violation_id: int,
+        username: str,
+        timestamp: float,
+        step_applied: int,
+        disable_duration: int,
+    ) -> bool:
+        """Confirm the flushed row after a commit callback raises.
+
+        Match its values as well as its ID because SQLite can reuse an ID from
+        a rolled-back insert. The caller supplies a separate read-only session.
+        """
+        result = await db.execute(
+            select(ViolationHistory.id).where(
+                ViolationHistory.id == violation_id,
+                ViolationHistory.username == username,
+                ViolationHistory.timestamp == timestamp,
+                ViolationHistory.step_applied == step_applied,
+                ViolationHistory.disable_duration == disable_duration,
+            )
+        )
+        return result.scalar_one_or_none() is not None
     
     @staticmethod
     async def add(

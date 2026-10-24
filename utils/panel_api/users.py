@@ -1202,13 +1202,12 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
             
             # Then permanently disable the user
             await disable_user(panel_data, username, 0, permanent=True)
-            # The panel side effects above already happened; if recording fails, mark
-            # the incident unrecorded so the next attempt reconciles the record rather
-            # than revoking and disabling a second time.
+            # Keep the applied incident before recording can fail or be cancelled.
+            # The next attempt reconciles it without repeating the panel actions.
+            system.mark_unrecorded(username.name, step_index, 0)
             try:
                 await record_user_violation(username.name, step_index, 0)
             except ViolationRecordError:
-                system.mark_unrecorded(username.name, step_index, 0)
                 return {
                     "action": "applied_unrecorded",
                     "step_index": step_index,
@@ -1218,6 +1217,7 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
                     "uuid_reset_success": uuid_reset_success,
                     "message": f"User {username.name} revoked + disabled; violation not yet recorded",
                 }
+            system.pop_unrecorded_incident(username.name)
 
             # Build status message
             status_parts = []
@@ -1258,12 +1258,12 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
     
     try:
         await disable_user(panel_data, username, duration_seconds, permanent=is_permanent)
-        # The disable already happened; a record failure is reconciled next attempt,
-        # never by disabling again.
+        # Preserve the completed panel action before the recording await, including
+        # cancellation and unexpected recording errors.
+        system.mark_unrecorded(username.name, step_index, punishment.duration_minutes)
         try:
             await record_user_violation(username.name, step_index, punishment.duration_minutes)
         except ViolationRecordError:
-            system.mark_unrecorded(username.name, step_index, punishment.duration_minutes)
             return {
                 "action": "applied_unrecorded",
                 "step_index": step_index,
@@ -1271,6 +1271,7 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
                 "duration_minutes": punishment.duration_minutes,
                 "message": f"User {username.name} disabled; violation not yet recorded",
             }
+        system.pop_unrecorded_incident(username.name)
 
         if is_permanent:
             message = f"🚫 User {username.name} disabled permanently (violation #{violation_count + 1})"
