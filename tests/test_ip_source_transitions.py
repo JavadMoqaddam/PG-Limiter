@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 
 @pytest.fixture
-async def source_runtime(monkeypatch, tmp_path):
+async def source_runtime(monkeypatch, tmp_path, operational_topics):
     import utils.ip_source_api as api
     import utils.read_config as config
     import utils.shared_state as state

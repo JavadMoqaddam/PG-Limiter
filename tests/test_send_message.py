@@ -19,6 +19,8 @@ async def sending(tmp_path, monkeypatch):
     topics = MagicMock()
     topics.group_id = -1001234567890
     topics.enabled = True
+    topics.monitoring_revision = 0
+    topics.destination_revision = 0
     topics.get_topic_id.return_value = 5
     topics.is_message_sent.return_value = False
     topics.mark_message_sent = AsyncMock()
@@ -57,7 +59,14 @@ async def test_success_marks_key_after_delivery(sending):
     topics.mark_message_sent.assert_not_awaited()
     release.set()
     await _drain(dispatcher, worker)
-    topics.mark_message_sent.assert_awaited_once_with(TopicType.NO_LIMIT, "no_limit:u")
+    topics.mark_message_sent.assert_awaited_once_with(
+        TopicType.NO_LIMIT,
+        "no_limit:u",
+        chat_id=-1001234567890,
+        message_thread_id=5,
+        monitoring_revision=0,
+        destination_revision=0,
+    )
 
 
 async def test_failed_delivery_does_not_mark_dedup_key(sending):
@@ -97,4 +106,11 @@ async def test_dedup_reservation_is_retained_until_complete(sending):
     worker = asyncio.create_task(dispatcher.start_worker())
     await _drain(dispatcher, worker)
     assert bot.send_message.await_count == 1
-    topics.mark_message_sent.assert_awaited_once_with(TopicType.NO_LIMIT, "k")
+    topics.mark_message_sent.assert_awaited_once_with(
+        TopicType.NO_LIMIT,
+        "k",
+        chat_id=-1001234567890,
+        message_thread_id=5,
+        monitoring_revision=0,
+        destination_revision=0,
+    )

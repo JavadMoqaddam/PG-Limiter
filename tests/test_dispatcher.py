@@ -32,6 +32,9 @@ def isolated_dispatcher(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatcher_mod, "PENDING_NOTIFICATIONS_FILE", str(tmp_path / "pending.json"))
     topics = MagicMock()
     topics.group_id = -100123456
+    topics.enabled = True
+    topics.monitoring_revision = 0
+    topics.destination_revision = 0
     topics.get_topic_id.return_value = 10
     topics.mark_message_sent = AsyncMock()
     monkeypatch.setattr(dispatcher_mod, "get_topics_manager", lambda: topics)
@@ -131,6 +134,7 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
         now = time.time()
         self.assertTrue(item.ttl and (now - item.created_at) > item.ttl)
 
+    @pytest.mark.usefixtures("operational_topics")
     async def test_dispatch_chunked_warnings_formatting(self):
         """Test chunked warning aggregation into batches of 10 with item-level error handling."""
         sample_warnings = [
@@ -199,6 +203,7 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
         cancelled = await dispatcher.cancel_pending("disable:john_doe")
         self.assertTrue(cancelled)
 
+    @pytest.mark.usefixtures("operational_topics")
     async def test_trailing_node_status_update(self):
         """Test that delayed trailing task flushes latest status to Telegram."""
         import utils.get_logs as gl
