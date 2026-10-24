@@ -8,10 +8,11 @@ import asyncio
 import html
 import re
 import time
+from collections.abc import Mapping
 
 from telegram_bot.send_message import send_logs, send_user_message
 from utils.logs import logger
-from utils.read_config import read_config, get_config_value
+from utils.read_config import read_config, read_config_snapshot, get_config_revision, get_config_value
 from utils.types import PanelType, UserType, EnhancedUserInfo
 from utils.device_count import (
     DeviceCountingConfig,
@@ -22,9 +23,16 @@ from utils.device_count import (
 )
 from utils.log_observations import LOG_OBSERVATIONS
 from utils.warning_system import warning_system  # global shared instance
+from utils.warning_system.helpers import capture_monitoring_guard
 from utils.isp_detector import ISPDetector
 from utils.ip_history_tracker import ip_history_tracker
-from utils.user_policy import DEFAULT_GENERAL_LIMIT, MIN_EFFECTIVE_LIMIT, _calculate_user_limit
+from utils.user_policy import (
+    DEFAULT_GENERAL_LIMIT,
+    MIN_EFFECTIVE_LIMIT,
+    UserPolicy,
+    _calculate_user_limit,
+    evaluate_user_policy,
+)
 from utils.user_group_filter import should_limit_user, get_filter_status_text
 
 from utils.shared_state import (
@@ -285,7 +293,12 @@ async def get_active_users_metadata_batch(
     return metadata
 
 
-async def check_ip_used(config_data: dict | None = None, active_users_snapshot: dict | None = None) -> dict:
+async def check_ip_used(
+    config_data: dict | None = None,
+    active_users_snapshot: dict | None = None,
+    *,
+    user_policies: Mapping[str, UserPolicy] | None = None,
+) -> dict:
     """
     Check active users and display them.
     1. Shows all active users with device count >= general_limit in ONE combined message
@@ -298,7 +311,6 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     if config_data is None:
         config_data = await read_config()
     general_limit = config_data.get("limits", {}).get("general", 2)
-    except_users = config_data.get("except_users", [])  # except_users is at root level
     # read_config exposes this as a root-level bool named "enhanced_details" (the key the
     # Telegram toggle writes). This used to read config["display"]["show_enhanced_details"],
     # a path read_config never creates, so it always fell back to True and the toggle did
@@ -307,24 +319,19 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     show_enhanced_details = bool(config_data.get("enhanced_details", True))
     device_config = DeviceCountingConfig.from_config(config_data)
 
-    # Read special limits from database instead of config
-    from db.database import get_db
-    from db.crud import UserCRUD
-
-    async with get_db() as db:
-        special_limit = await UserCRUD.get_all_special_limits(db)
-
-    # Get panel data for filter checks
-    panel_config = config_data.get("panel", {})
-    panel_data = PanelType(
-        panel_config.get("username", ""), panel_config.get("password", ""), panel_config.get("domain", "")
-    )
-
     # Initialize or update ISP detector with token from config
     isp_detector = await _ensure_isp_detector(config_data)
 
     if active_users_snapshot is None:
         active_users_snapshot = await get_active_users_snapshot()
+    if user_policies is None:
+        snapshot = await read_config_snapshot(usernames=active_users_snapshot)
+        if snapshot.config.get("config_degraded"):
+            return {}
+        user_policies = {
+            name: evaluate_user_policy(username=name, config=snapshot.config, facts=snapshot.user_facts.get(name))
+            for name in active_users_snapshot
+        }
     logger.info(f"📊 Processing {len(active_users_snapshot)} active users...")
 
     all_users_log = {}
@@ -372,47 +379,10 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     # Pre-filter users based on group and admin filter settings (In-Memory Batch)
     logger.debug("🔍 Applying user filters (In-Memory Batch)...")
     active_usernames_list = [u for u in active_users_snapshot.keys() if u and u.strip()]
-    users_metadata = await get_active_users_metadata_batch(active_usernames_list)
-
-    group_filter = config_data.get("group_filter", {})
-    group_filter_enabled = group_filter.get("enabled", False)
-    group_filter_mode = group_filter.get("mode", "include")
-    group_filter_ids = [str(x) for x in group_filter.get("group_ids", [])]
-
-    admin_filter = config_data.get("admin_filter", {})
-    admin_filter_enabled = admin_filter.get("enabled", False)
-    admin_filter_mode = admin_filter.get("mode", "include")
-    admin_filter_names = admin_filter.get("admin_usernames", [])
-
     for email in active_usernames_list:
-        user_meta = users_metadata.get(email, {})
-
-        # Check group filter. Gated on `enabled` alone, not on `enabled and ids`: an
-        # enabled include filter with an empty group list makes NOBODY monitored, and
-        # requiring a non-empty list here made this report show every user as monitored
-        # while enforcement skipped all of them - the report contradicting the thing it
-        # is meant to describe.
-        if group_filter_enabled:
-            user_gids = [str(x) for x in user_meta.get("group_ids", [])]
-            user_in_group = any(g in group_filter_ids for g in user_gids)
-            if group_filter_mode == "include" and not user_in_group:
-                filtered_users.add(email)
-                continue
-            elif group_filter_mode == "exclude" and user_in_group:
-                filtered_users.add(email)
-                continue
-
-        # Check admin filter
-        if admin_filter_enabled and admin_filter_names:
-            user_admin = user_meta.get("owner_username")
-            if user_admin is not None:
-                user_in_admin = user_admin in admin_filter_names
-                if admin_filter_mode == "include" and not user_in_admin:
-                    filtered_users.add(email)
-                    continue
-                elif admin_filter_mode == "exclude" and user_in_admin:
-                    filtered_users.add(email)
-                    continue
+        policy = user_policies.get(email)
+        if policy is None or not policy.known or (not policy.eligible and policy.reason != "whitelisted"):
+            filtered_users.add(email)
 
     if filtered_users:
         logger.info(f"Filters applied: {len(filtered_users)} users excluded from monitoring")
@@ -517,10 +487,6 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     # Sort users by device count (descending)
     sorted_users = sorted(enhanced_users_info.items(), key=lambda x: all_user_device_counts.get(x[0], 0), reverse=True)
 
-    # ---- NEW: Get Group Limits in ONE Query (Batching) ----
-    active_usernames_for_batch = [email for email in active_users_snapshot.keys() if email and email.strip()]
-    batched_group_limits = await get_group_limits_batch(active_usernames_for_batch, config_data, panel_data)
-    # -------------------------------------------------------
     # Build combined message for all users with >= general_limit devices
     combined_message_parts = []
     users_needing_limit = []  # Users without special limit who need action messages
@@ -534,19 +500,11 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
         ip_count = len(user_info.formatted_ips)
         device_count = all_user_device_counts.get(email, 0)
 
-        is_except = email in except_users
-        has_special_limit_before = email in special_limit
-        user_limit = await resolve_effective_limit(
-            username=email,
-            config=config_data,
-            metadata=None,
-            special_limit=special_limit,
-            group_limits=batched_group_limits,
-        )
-        has_special_limit = email in special_limit
-        has_group_limit = (not has_special_limit_before) and bool(
-            batched_group_limits and email in batched_group_limits
-        )
+        policy = user_policies[email]
+        is_except = policy.reason == "whitelisted"
+        user_limit = policy.limit
+        has_special_limit = policy.limit_source == "special"
+        has_group_limit = policy.limit_source == "group"
 
         # Skip users who are not exceeding their limit
         # A user violates when device_count > user_limit
@@ -746,6 +704,9 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     """
     global isp_detector
 
+    monitoring_is_current = capture_monitoring_guard()
+    if not monitoring_is_current():
+        return
     if config_data is None:
         config_data = await read_config()
     api_mode = config_data.get("ip_source") == "api"
@@ -760,24 +721,38 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         return
 
     def cycle_is_current():
-        return api_evidence_is_current(api_evidence) if api_evidence else LOG_OBSERVATIONS.is_current(log_evidence)
+        return monitoring_is_current() and (
+            api_evidence_is_current(api_evidence) if api_evidence else LOG_OBSERVATIONS.is_current(log_evidence)
+        )
 
     protected_users = set(api_evidence.unknown_users) if api_evidence else set()
-    all_users_log = await check_ip_used(config_data=config_data, active_users_snapshot=active_users_snapshot)
-
-    # Use new config format
-    limits_config = config_data.get("limits", {})
-    api_config = config_data.get("api", {})
-
-    except_users = config_data.get("except_users", [])  # except_users is at root level
-    limit_number = limits_config.get("general", 2)
-
-    # Read special limits from database instead of config
-    from db.database import get_db
-    from db.crud import UserCRUD
-
-    async with get_db() as db:
-        special_limit = await UserCRUD.get_all_special_limits(db)
+    cycle_warning_candidates = dict(warning_system.warnings)
+    policy_names = set(active_users_snapshot) | set(warning_system.warnings)
+    try:
+        cycle_snapshot = await read_config_snapshot(usernames=policy_names)
+    except BaseException:
+        # Restore only a current, unevaluated Logs batch. The merge helper rejects
+        # retired generations and API evidence.
+        await merge_active_users_snapshot(active_users_snapshot)
+        raise
+    evidence = api_evidence or log_evidence
+    if cycle_snapshot.config.get("config_degraded"):
+        logger.error("Enforcement waiting: current settings and user facts are unavailable")
+        await merge_active_users_snapshot(active_users_snapshot)
+        return
+    if not cycle_is_current() or cycle_snapshot.local_revision != evidence.config_revision:
+        return
+    user_policies = {
+        name: evaluate_user_policy(
+            username=name, config=cycle_snapshot.config, facts=cycle_snapshot.user_facts.get(name)
+        )
+        for name in policy_names
+    }
+    unknown_metadata_users = {name for name, policy in user_policies.items() if not policy.known}
+    protected_users.update(name for name, policy in user_policies.items() if not policy.eligible)
+    all_users_log = await check_ip_used(
+        config_data=config_data, active_users_snapshot=active_users_snapshot, user_policies=user_policies
+    )
 
     # Initialize or update ISP detector
     isp_detector = await _ensure_isp_detector(config_data)
@@ -815,34 +790,6 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # Record IPs to history for the long-term reports (one statement per cycle)
     logger.debug("📝 Recording IPs to history tracker...")
     await ip_history_tracker.record_many(all_users_actual_ips)
-
-    # Batch fetch group limits & metadata for active users.
-    #
-    # Strict here on purpose. A partial read used to be indistinguishable from
-    # "this user has no group limit", which resolve_effective_limit turns into the
-    # general limit - and that is stricter than most group limits, so a single
-    # database hiccup warned and then banned users who were inside their real
-    # limit. Skipping the cycle costs nothing: no counter is touched, and the next
-    # cycle re-evaluates everyone from scratch.
-    active_usernames = list(all_users_actual_ips.keys())
-    try:
-        batched_group_limits = await get_group_limits_batch(active_usernames, config_data, panel_data, strict=True)
-        users_metadata_usage = await get_active_users_metadata_batch(active_usernames, strict=True)
-    except MetadataUnavailable as error:
-        logger.error(
-            f"⛔ Enforcement skipped this cycle: {error}. Nobody is warned, banned "
-            f"or cleared while limits and monitoring flags are unknown."
-        )
-        all_users_log.clear()
-        # The batch was consumed by pop_active_users_snapshot() but never evaluated;
-        # requeue it so still-connected users are not treated as absent next cycle.
-        await merge_active_users_snapshot(active_users_snapshot)
-        return
-    except BaseException:
-        # Cancellation or an unexpected failure while resolving limits/metadata: the
-        # batch is still unevaluated, so give it back rather than dropping it.
-        await merge_active_users_snapshot(active_users_snapshot)
-        raise
 
     if not cycle_is_current():
         return
@@ -910,6 +857,30 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         )
         return True
 
+    async def refresh_current_policy(username: str) -> UserPolicy | None:
+        """Recheck factual eligibility and evidence after every preparation await."""
+        from utils.settings_service import SettingsUnavailable, read_user_policy
+
+        if not cycle_is_current():
+            return None
+        try:
+            policy = await read_user_policy(username, expected_db_revision=cycle_snapshot.db_revision)
+        except SettingsUnavailable as error:
+            protected_users.add(username)
+            logger.error(f"Current policy unavailable for {username}: {error}")
+            return None
+        if not cycle_is_current() or get_config_revision() != cycle_snapshot.local_revision:
+            return None
+        if policy is None or not policy.eligible:
+            protected_users.add(username)
+            if policy is not None and not policy.known:
+                unknown_metadata_users.add(username)
+            return None
+        user_policies[username] = policy
+        if not refresh_user_evidence(username):
+            return None
+        return policy
+
     total_devices_cycle = sum(all_users_device_counts.values())
     total_ips_cycle = sum(len(v) for v in all_users_actual_ips.values())
     # Deliberately spelled out, because this number is larger than the report's and
@@ -929,50 +900,26 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # ran too late to protect the records that path touches.
     counters_are_trustworthy = cycle_is_current()
 
-    # Check for users who still violate limits after warning period.
-    # Pass the actual IPs, group limits and the cycle's unified device counts, plus
-    # the three facts this path was missing: whether the sample can be trusted, who
-    # is whitelisted, and whose limit is actually known this cycle.
-    from utils.user_sync import USER_METADATA_CACHE as _metadata_cache
-
     disabled_users, warned_users = await warning_system.check_persistent_violations(
         panel_data,
         all_users_actual_ips,
         config_data,
-        batched_group_limits,
         device_counts=all_users_device_counts,
         sample_is_trustworthy=counters_are_trustworthy,
-        except_users=except_users,
-        # "Known" has to mean "this user's limit can be resolved", which is what the
-        # guard downstream actually needs. The metadata batch only covers users active
-        # THIS cycle, so passing it alone made every offline monitored user look
-        # unresolvable: each one logged a warning saying its record was being kept, and
-        # cleanup_expired_warnings then deleted it anyway. The RAM cache holds every
-        # synced user, so an offline user is resolvable and gets judged normally - with
-        # no IPs their device count is 0, so the record is dropped without a ban.
-        known_users=set(users_metadata_usage) | set(_metadata_cache),
         protected_users=protected_users,
         refresh_user_evidence=refresh_user_evidence,
+        user_policies=user_policies,
+        refresh_user_policy=refresh_current_policy,
     )
 
     # Combine disabled and warned users to skip them in the loop
     processed_users = disabled_users | warned_users
 
-    group_filter_data = config_data.get("group_filter", {})
-    group_filter_enabled_u = group_filter_data.get("enabled", False)
-    group_filter_mode_u = group_filter_data.get("mode", "include")
-    group_filter_ids_u = [str(x) for x in group_filter_data.get("group_ids", [])]
-
-    admin_filter_data = config_data.get("admin_filter", {})
-    admin_filter_enabled_u = admin_filter_data.get("enabled", False)
-    admin_filter_mode_u = admin_filter_data.get("mode", "include")
-    admin_filter_names_u = admin_filter_data.get("admin_usernames", [])
     # -------------------------------------------------------
     # Check current violations for ALL users (not just those in all_users_log)
     # Track users skipped due to group filter or admin filter
-    group_filtered_users = set()
-    admin_filtered_users = set()
-    unknown_metadata_users = set()
+    group_filtered_users = {name for name, policy in user_policies.items() if policy.reason == "group_filtered"}
+    admin_filtered_users = {name for name, policy in user_policies.items() if policy.reason == "admin_filtered"}
     failed_users = set()
     cycle_new_warnings = []
 
@@ -984,44 +931,12 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         # unchanged and un-reindented on purpose: a single exception in here used to
         # abandon the whole cycle for every remaining user, and hand-reindenting 130
         # lines to fix that is how silent bugs get made.
-        if user_name in except_users or user_name in processed_users:
+        if user_name in processed_users or user_name in protected_users:
             continue
 
         try:
-            if user_name not in users_metadata_usage:
-                # No local row for this user, so neither their monitoring flag nor
-                # their limit is known. Enforcing on defaults would judge somebody
-                # the operator never asked us to watch against the general limit;
-                # the unknown-user worker syncs them within a cycle or two.
-                unknown_metadata_users.add(user_name)
-                continue
-
-            user_meta = users_metadata_usage[user_name]
-
-            # Check group filter (In-Memory)
-            # Check pre-computed group_filter status (O(1) RAM lookup)
-            if not user_meta.get("is_monitored", True):
-                group_filtered_users.add(user_name)
-                continue
-
-            # Check admin filter (In-Memory)
-            if admin_filter_enabled_u and admin_filter_names_u:
-                user_admin = user_meta.get("owner_username")
-                if user_admin is not None:
-                    user_in_admin = user_admin in admin_filter_names_u
-                    should_limit_admin = user_in_admin if admin_filter_mode_u == "include" else not user_in_admin
-                    if not should_limit_admin:
-                        admin_filtered_users.add(user_name)
-                        continue
-
-            # Resolve effective IP limit using single source of truth
-            user_limit_number = await resolve_effective_limit(
-                username=user_name,
-                config=config_data,
-                metadata=user_meta,
-                special_limit=special_limit,
-                group_limits=batched_group_limits,
-            )
+            policy = user_policies[user_name]
+            user_limit_number = policy.limit
 
             if api_evidence or log_evidence:
                 if not refresh_user_evidence(user_name):
@@ -1041,6 +956,10 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                 # "already monitored" so that its consecutive counter keeps growing
                 # and a reached limit can never be silently dropped.
                 was_monitored = user_name in warning_system.warnings
+                observed_warning = warning_system.warnings.get(user_name)
+                if was_monitored and observed_warning is not cycle_warning_candidates.get(user_name):
+                    protected_users.add(user_name)
+                    continue
 
                 result = await warning_system.add_warning(
                     user_name,
@@ -1061,10 +980,25 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
 
                 if not cycle_is_current():
                     return
+                current_warning = warning_system.warnings.get(user_name)
+                if was_monitored and current_warning is not observed_warning:
+                    protected_users.add(user_name)
+                    continue
+                if current_warning is not None:
+                    cycle_warning_candidates[user_name] = current_warning
                 if result == "violation_limit_reached":
-                    if (api_evidence or log_evidence) and (
-                        not refresh_user_evidence(user_name) or all_users_device_counts[user_name] <= user_limit_number
+                    candidate_warning = warning_system.warnings.get(user_name)
+                    if candidate_warning is None or candidate_warning.consecutive_violations < (
+                        warning_system.effective_max_warnings(candidate_warning)
                     ):
+                        continue
+                    current_policy = await refresh_current_policy(user_name)
+                    if current_policy is None or warning_system.warnings.get(user_name) is not candidate_warning:
+                        continue
+                    user_limit_number = current_policy.limit
+                    effective_device_count = all_users_device_counts[user_name]
+                    unique_ips = all_users_actual_ips[user_name]
+                    if effective_device_count <= user_limit_number:
                         continue
                     from utils.warning_system import (
                         safe_disable_user_with_punishment,
@@ -1153,7 +1087,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     # the threshold: the next cycle returned "violation_limit_reached"
                     # again and record_violation advanced the escalation a second time,
                     # jumping the user a punishment step for a single offence.
-                    await warning_system.clear_user_trust_data(user_name)
+                    await warning_system.clear_user_trust_data(user_name, expected_warning=candidate_warning)
                     await safe_send_disable_notification(msg, user_name)
                     if ban_action in ("error", "skipped"):
                         logger.error(
@@ -1235,37 +1169,29 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
             break
         if not cycle_is_current():
             return
-        if api_evidence and not refresh_user_evidence(monitored_user):
-            continue
         if monitored_user in protected_users or monitored_user in failed_users:
             # Their evaluation raised an exception this cycle, so nothing about
             # them is known well enough to justify clearing their record.
             continue
+        candidate_warning = cycle_warning_candidates.get(monitored_user)
+        if candidate_warning is None or warning_system.warnings.get(monitored_user) is not candidate_warning:
+            continue
+        current_policy = await refresh_current_policy(monitored_user)
+        if current_policy is None or warning_system.warnings.get(monitored_user) is not candidate_warning:
+            continue
         if monitored_user not in all_users_actual_ips:
-            await warning_system.clear_user_trust_data(monitored_user)
+            await warning_system.clear_user_trust_data(monitored_user, expected_warning=candidate_warning)
             logger.info(f"✅ User {monitored_user} inactive, monitoring cleared")
         else:
             user_current_ips = all_users_actual_ips.get(monitored_user, set())
-            if monitored_user not in users_metadata_usage:
-                # Their limit is unknown, so "within limit" cannot be established.
-                # Clearing on a guess would hand a real offender a fresh start
-                # every cycle, so the record is left exactly as it is.
-                continue
-            user_meta = users_metadata_usage[monitored_user]
-            u_lim = await resolve_effective_limit(
-                username=monitored_user,
-                config=config_data,
-                metadata=user_meta,
-                special_limit=special_limit,
-                group_limits=batched_group_limits,
-            )
+            u_lim = current_policy.limit
             # Use the same unified device count the warning path used, so a
             # warning issued this cycle cannot be cleared in the same cycle.
             user_device_count = all_users_device_counts.get(monitored_user, len(user_current_ips))
             if not cycle_is_current():
                 return
             if user_device_count <= u_lim:
-                await warning_system.clear_user_trust_data(monitored_user)
+                await warning_system.clear_user_trust_data(monitored_user, expected_warning=candidate_warning)
                 logger.info(
                     f"✅ User {monitored_user} normalized usage "
                     f"({user_device_count} devices / {len(user_current_ips)} IPs <= {u_lim}), monitoring cleared"
@@ -1314,9 +1240,16 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # that function had just preserved.
     if not cycle_is_current():
         return
+
+    async def authorize_expired_clear(username: str) -> bool:
+        policy = await refresh_current_policy(username)
+        return policy is not None and all_users_device_counts.get(username, 0) <= policy.limit
+
     await warning_system.cleanup_expired_warnings(
         sample_is_trustworthy=counters_are_trustworthy,
-        **({"protected_users": protected_users} if api_evidence else {}),
+        protected_users=protected_users | failed_users,
+        expected_warnings=cycle_warning_candidates,
+        authorize_clear=authorize_expired_clear,
     )
 
     all_users_log.clear()

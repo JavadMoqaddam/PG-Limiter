@@ -208,6 +208,17 @@ Logs preserves Xray's original printed process-local time and rejects retained r
 
 ## ⚙️ Configuration
 
+Telegram, CLI, and API settings share the same stored configuration. Saved changes
+take effect on the next usable monitoring scan without restarting the daemon.
+User limits follow special limit → highest matching group limit → general limit.
+Whitelist, group, and admin filters apply to both ongoing and expired warnings.
+
+Before punishment, the limiter checks the user's current groups, owner, eligibility,
+and limit again. If settings or the IP source change during a scan, or current user
+facts are unavailable, punishment waits and existing warnings are retained. A user
+who becomes whitelisted or falls outside the configured filters also keeps their
+existing warning until they can be assessed within the monitoring scope again.
+
 ### Environment Variables (`/etc/opt/pg-limiter/.env`)
 
 ```bash
