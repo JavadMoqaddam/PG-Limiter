@@ -18,10 +18,11 @@ from telegram.ext import (
     ConversationHandler,
 )
 from utils.atomic_io import atomic_write_json
-from utils.read_config import invalidate_config_cache
+from utils.read_config import config_write_transaction
 from utils.backup import create_backup, runtime_layout, stage_backup
 from utils.backup_paths import AUTO_BACKUP_CONFIG_FILE
 
+from telegram_bot.input_owner import reply_input_prompt
 from telegram_bot.constants import RESTORE_CONFIG
 from telegram_bot.handlers.admin import check_admin_privilege
 from utils.logs import get_logger
@@ -31,6 +32,35 @@ RESTORE_STAGING_DIR = "/var/lib/pg-limiter/restore-staging"
 
 # Conversation state for migration
 MIGRATE_WAITING_FILE = 100
+
+
+def _validated_import_limit(value) -> int:
+    """Reject an invalid import value before a user CRUD mutation can flush."""
+    try:
+        limit = int(value)
+    except (ValueError, TypeError, OverflowError) as error:
+        raise ValueError("A special limit must be an integer of 1 or greater") from error
+    if isinstance(value, bool) or limit < 1:
+        raise ValueError("A special limit must be an integer of 1 or greater")
+    return limit
+
+
+async def _prefetch_settings_users(data: dict) -> None:
+    """Mirror missing settings users before the caller owns the write transaction."""
+    from db.database import get_db
+    from db.crud.users import UserCRUD
+    from utils.user_sync import fetch_and_sync_single_user
+
+    limits = data.get("limits", {})
+    usernames = set(limits.get("special", {}))
+    usernames.update(limits.get("except_users", []))
+    usernames.update(data.get("except_users", []))
+    if not usernames:
+        return
+    async with get_db() as db:
+        missing = [username for username in usernames if await UserCRUD.get_by_username(db, username) is None]
+    for username in missing:
+        await fetch_and_sync_single_user(username)
 
 
 def _sync_create_backup_zip() -> tuple[str, str, str]:
@@ -84,16 +114,19 @@ async def send_backup(update: Update, _context: ContextTypes.DEFAULT_TYPE):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-async def restore_config(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def restore_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the restore process by asking for the backup file."""
     check = await check_admin_privilege(update)
     if check is not None:
         return check
 
-    await update.message.reply_html(
-        "📥 <b>Restore from Backup</b>\n\n"
-        "Please send your backup file (zip or json format).\n\n"
-        "The bot validates and stages it. Apply it offline with the host command shown afterward."
+    await reply_input_prompt(
+        context,
+        update.message.reply_html(
+            "📥 <b>Restore from Backup</b>\n\n"
+            "Please send your backup file (zip or json format).\n\n"
+            "The bot validates and stages it. Apply it offline with the host command shown afterward."
+        ),
     )
     return RESTORE_CONFIG
 
@@ -137,7 +170,7 @@ async def restore_config_handler(update: Update, context: ContextTypes.DEFAULT_T
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-async def migrate_backup_start(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def migrate_backup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the backup migration process."""
     backup_logger.info(f"migrate_backup_start called by user {update.effective_user.id}")
 
@@ -148,16 +181,19 @@ async def migrate_backup_start(update: Update, _context: ContextTypes.DEFAULT_TY
 
     message = update.message or update.callback_query.message
 
-    await message.reply_html(
-        "📥 <b>Migrate JSON Backup to Database</b>\n\n"
-        "This will import data from your old JSON backup files into the SQLite database.\n\n"
-        "<b>Supported files:</b>\n"
-        "• <code>config.json</code> - Configuration, limits, except users\n"
-        "• <code>.disable_users.json</code> - Disabled users list\n"
-        "• <code>.violation_history.json</code> - Violation records\n"
-        "• Any JSON file with the above format\n\n"
-        "📤 <b>Please send your JSON file now</b>\n\n"
-        "<i>Send /cancel to abort</i>"
+    await reply_input_prompt(
+        context,
+        message.reply_html(
+            "📥 <b>Migrate JSON Backup to Database</b>\n\n"
+            "This will import data from your old JSON backup files into the SQLite database.\n\n"
+            "<b>Supported files:</b>\n"
+            "• <code>config.json</code> - Configuration, limits, except users\n"
+            "• <code>.disable_users.json</code> - Disabled users list\n"
+            "• <code>.violation_history.json</code> - Violation records\n"
+            "• Any JSON file with the above format\n\n"
+            "📤 <b>Please send your JSON file now</b>\n\n"
+            "<i>Send /cancel to abort</i>"
+        ),
     )
     backup_logger.info("Waiting for user to send JSON file...")
     return MIGRATE_WAITING_FILE
@@ -177,10 +213,13 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         if not update.message.document:
             backup_logger.warning("No document in message - prompting user again")
-            await update.message.reply_html(
-                "❌ Please send a <b>JSON file</b> (not text).\n\n"
-                "Make sure to send the file as a document attachment.\n"
-                "Use /cancel to abort."
+            await reply_input_prompt(
+                context,
+                update.message.reply_html(
+                    "❌ Please send a <b>JSON file</b> (not text).\n\n"
+                    "Make sure to send the file as a document attachment.\n"
+                    "Use /cancel to abort."
+                ),
             )
             return MIGRATE_WAITING_FILE  # Stay in the conversation
 
@@ -231,7 +270,8 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
             return ConversationHandler.END
 
         try:
-            async with get_db() as db:
+            await _prefetch_settings_users(data)
+            async with config_write_transaction(), get_db() as db:
                 # ─────────────────────────────────────────────────────────
                 # Detect file type and migrate accordingly
                 # ─────────────────────────────────────────────────────────
@@ -260,28 +300,39 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
                         special = limits.get("special", {})
                         for username, limit in special.items():
                             try:
-                                await UserCRUD.set_special_limit(db, username, int(limit))
-                                stats["special_limits"] += 1
-                            except Exception as e:
+                                validated_limit = _validated_import_limit(limit)
+                            except ValueError as e:
                                 stats["errors"].append(f"Special limit {username}: {e}")
+                                continue
+                            result = await UserCRUD.set_special_limit(
+                                db, username, validated_limit, fetch_from_panel=False
+                            )
+                            if result is None:
+                                stats["errors"].append(f"Special limit {username}: user not found")
+                            else:
+                                stats["special_limits"] += 1
 
                         # Except users from limits
                         except_list = limits.get("except_users", [])
                         for username in except_list:
-                            try:
-                                await UserCRUD.set_excepted(db, username, True, reason="Migrated from config.json")
+                            result = await UserCRUD.set_excepted(
+                                db, username, True, reason="Migrated from config.json", fetch_from_panel=False
+                            )
+                            if result is None:
+                                stats["errors"].append(f"Except user {username}: user not found")
+                            else:
                                 stats["except_users"] += 1
-                            except Exception as e:
-                                stats["errors"].append(f"Except user {username}: {e}")
 
                 # Root-level except_users
                 if "except_users" in data and isinstance(data["except_users"], list):
                     for username in data["except_users"]:
-                        try:
-                            await UserCRUD.set_excepted(db, username, True, reason="Migrated from config.json")
+                        result = await UserCRUD.set_excepted(
+                            db, username, True, reason="Migrated from config.json", fetch_from_panel=False
+                        )
+                        if result is None:
+                            stats["errors"].append(f"Except user {username}: user not found")
+                        else:
                             stats["except_users"] += 1
-                        except Exception:
-                            pass  # May already exist
 
                 # Timing settings. read_config reads the flat check_interval and
                 # time_to_active_users keys, never a "timing" blob, so writing the blob
@@ -419,11 +470,6 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
             backup_logger.error(f"Database error during migration: {db_err}")
             await update.message.reply_html(f"❌ Database error:\n<code>{str(db_err)}</code>")
             return ConversationHandler.END
-
-        # The configuration cache has no expiry: it is rebuilt only when a write
-        # invalidates it. Without this call the migrated settings stay invisible to the
-        # running limiter, which would make the "no restart needed" line below false.
-        await invalidate_config_cache()
 
         # Build result message
         total = (
