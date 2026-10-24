@@ -21,6 +21,7 @@ from telegram.ext import (
 from utils.atomic_io import atomic_write_json
 from utils.read_config import config_write_transaction
 
+from telegram_bot.input_owner import reply_input_prompt
 from telegram_bot.constants import RESTORE_CONFIG
 from telegram_bot.handlers.admin import check_admin_privilege
 from utils.logs import get_logger
@@ -141,16 +142,19 @@ async def send_backup(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html(f"❌ <b>Error creating backup:</b>\n<code>{str(e)}</code>")
 
 
-async def restore_config(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def restore_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the restore process by asking for the backup file."""
     check = await check_admin_privilege(update)
     if check is not None:
         return check
 
-    await update.message.reply_html(
-        "📥 <b>Restore from Backup</b>\n\n"
-        "Please send your backup file (zip or json format).\n\n"
-        "<b>⚠️ Warning:</b> This will replace your current data!"
+    await reply_input_prompt(
+        context,
+        update.message.reply_html(
+            "📥 <b>Restore from Backup</b>\n\n"
+            "Please send your backup file (zip or json format).\n\n"
+            "<b>⚠️ Warning:</b> This will replace your current data!"
+        ),
     )
     return RESTORE_CONFIG
 
@@ -317,7 +321,7 @@ async def restore_config_handler(update: Update, context: ContextTypes.DEFAULT_T
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-async def migrate_backup_start(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def migrate_backup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the backup migration process."""
     backup_logger.info(f"migrate_backup_start called by user {update.effective_user.id}")
 
@@ -328,16 +332,19 @@ async def migrate_backup_start(update: Update, _context: ContextTypes.DEFAULT_TY
 
     message = update.message or update.callback_query.message
 
-    await message.reply_html(
-        "📥 <b>Migrate JSON Backup to Database</b>\n\n"
-        "This will import data from your old JSON backup files into the SQLite database.\n\n"
-        "<b>Supported files:</b>\n"
-        "• <code>config.json</code> - Configuration, limits, except users\n"
-        "• <code>.disable_users.json</code> - Disabled users list\n"
-        "• <code>.violation_history.json</code> - Violation records\n"
-        "• Any JSON file with the above format\n\n"
-        "📤 <b>Please send your JSON file now</b>\n\n"
-        "<i>Send /cancel to abort</i>"
+    await reply_input_prompt(
+        context,
+        message.reply_html(
+            "📥 <b>Migrate JSON Backup to Database</b>\n\n"
+            "This will import data from your old JSON backup files into the SQLite database.\n\n"
+            "<b>Supported files:</b>\n"
+            "• <code>config.json</code> - Configuration, limits, except users\n"
+            "• <code>.disable_users.json</code> - Disabled users list\n"
+            "• <code>.violation_history.json</code> - Violation records\n"
+            "• Any JSON file with the above format\n\n"
+            "📤 <b>Please send your JSON file now</b>\n\n"
+            "<i>Send /cancel to abort</i>"
+        ),
     )
     backup_logger.info("Waiting for user to send JSON file...")
     return MIGRATE_WAITING_FILE
@@ -357,10 +364,13 @@ async def migrate_backup_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         if not update.message.document:
             backup_logger.warning("No document in message - prompting user again")
-            await update.message.reply_html(
-                "❌ Please send a <b>JSON file</b> (not text).\n\n"
-                "Make sure to send the file as a document attachment.\n"
-                "Use /cancel to abort."
+            await reply_input_prompt(
+                context,
+                update.message.reply_html(
+                    "❌ Please send a <b>JSON file</b> (not text).\n\n"
+                    "Make sure to send the file as a document attachment.\n"
+                    "Use /cancel to abort."
+                ),
             )
             return MIGRATE_WAITING_FILE  # Stay in the conversation
 

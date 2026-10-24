@@ -3,12 +3,15 @@ Limit management handlers for the Telegram bot.
 Includes functions for setting special limits, general limits, and viewing limits.
 """
 
+import html
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
 
+from telegram_bot.input_owner import reply_input_prompt
 from telegram_bot.constants import (
     GET_SPECIAL_LIMIT,
     GET_LIMIT_NUMBER,
@@ -40,7 +43,7 @@ from utils.read_config import read_config
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-async def set_special_limit(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def set_special_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Set a special limit for a user (command handler).
     This starts the conversation flow for setting a special limit.
@@ -48,7 +51,9 @@ async def set_special_limit(update: Update, _context: ContextTypes.DEFAULT_TYPE)
     check = await check_admin_privilege(update)
     if check is not None:
         return check
-    await update.message.reply_html(text="Please send the username. For example: <code>Test_User</code>")
+    await reply_input_prompt(
+        context, update.message.reply_html(text="Please send the username. For example: <code>Test_User</code>")
+    )
     return GET_SPECIAL_LIMIT
 
 
@@ -57,8 +62,11 @@ async def get_special_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Get the username for special limit setting (conversation step).
     """
     context.user_data["selected_user"] = update.message.text.strip()
-    await update.message.reply_html(
-        text="Please send the Number of limit. For example: <code>4</code> or <code>2</code>"
+    await reply_input_prompt(
+        context,
+        update.message.reply_html(
+            text="Please send the Number of limit. For example: <code>4</code> or <code>2</code>"
+        ),
     )
     return GET_LIMIT_NUMBER
 
@@ -112,12 +120,12 @@ async def show_special_limit_function(update: Update, _context: ContextTypes.DEF
     return ConversationHandler.END
 
 
-async def get_general_limit_number(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def get_general_limit_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Get the general limit number for the bot (command handler)."""
     check = await check_admin_privilege(update)
     if check is not None:
         return check
-    await update.message.reply_text("Please send the general limit number:")
+    await reply_input_prompt(context, update.message.reply_text("Please send the general limit number:"))
     return GET_GENERAL_LIMIT_NUMBER
 
 
@@ -387,8 +395,8 @@ async def handle_special_limit_username_input(update: Update, context: ContextTy
     text = update.message.text.strip()
     context.user_data["selected_user"] = text
     context.user_data["waiting_for"] = None
-    await update.message.reply_html(
-        text=f"🎯 <b>Set limit for: {text}</b>\n\nChoose the device limit:",
+    return await update.message.reply_html(
+        text=f"🎯 <b>Set limit for: {html.escape(text)}</b>\n\nChoose the device limit:",
         reply_markup=create_special_limit_options_keyboard(),
     )
 

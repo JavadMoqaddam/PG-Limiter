@@ -8,6 +8,7 @@ the file stays the single source of truth.
 from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler
 
+from telegram_bot.input_owner import reply_input_prompt
 from telegram_bot.constants import (
     GET_DOMAIN,
     GET_USERNAME,
@@ -17,7 +18,7 @@ from telegram_bot.handlers.admin import check_admin_privilege
 from telegram_bot.utils import add_base_information
 
 
-async def set_panel_domain(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def set_panel_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add panel domain, username, and password to the config file."""
     check = await check_admin_privilege(update)
     if check is not None:
@@ -25,6 +26,7 @@ async def set_panel_domain(update: Update, _context: ContextTypes.DEFAULT_TYPE):
 
     # Check if environment variables are already set
     from utils.read_config import load_env_config
+
     env_config = load_env_config()
     panel_config = env_config.get("panel", {})
     domain = panel_config.get("domain")
@@ -39,10 +41,13 @@ async def set_panel_domain(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    await update.message.reply_html(
-        text="Send your <b>panel address</b>\n"
-        + "Format: <code>sub.domain.com:8333</code>\n"
-        + "<b>without</b> <code>https://</code> or <code>http://</code>",
+    await reply_input_prompt(
+        context,
+        update.message.reply_html(
+            text="Send your <b>panel address</b>\n"
+            + "Format: <code>sub.domain.com:8333</code>\n"
+            + "<b>without</b> <code>https://</code> or <code>http://</code>",
+        ),
     )
     return GET_DOMAIN
 
@@ -50,14 +55,14 @@ async def set_panel_domain(update: Update, _context: ContextTypes.DEFAULT_TYPE):
 async def get_domain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Get panel domain from user"""
     context.user_data["domain"] = update.message.text.strip()
-    await update.message.reply_text("Send Your Username: (For example: 'admin')")
+    await reply_input_prompt(context, update.message.reply_text("Send Your Username: (For example: 'admin')"))
     return GET_USERNAME
 
 
 async def get_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Get panel username from user"""
     context.user_data["username"] = update.message.text.strip()
-    await update.message.reply_text("Send Your Password:")
+    await reply_input_prompt(context, update.message.reply_text("Send Your Password:"))
     return GET_PASSWORD
 
 

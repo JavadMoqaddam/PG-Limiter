@@ -10,6 +10,7 @@ from telegram.ext import (
     ConversationHandler,
 )
 
+from telegram_bot.input_owner import reply_input_prompt
 from telegram_bot.constants import (
     SET_EXCEPT_USERS,
     REMOVE_EXCEPT_USER,
@@ -45,7 +46,7 @@ def create_whitelist_keyboard(whitelist_users: list, page: int = 0, per_page: in
     """
     Create a keyboard with whitelist users as glass-style buttons.
     Each user gets a delete button.
-    
+
     Args:
         whitelist_users: List of usernames in the whitelist
         page: Current page number (0-indexed)
@@ -54,51 +55,53 @@ def create_whitelist_keyboard(whitelist_users: list, page: int = 0, per_page: in
     keyboard = []
     total_users = len(whitelist_users)
     total_pages = max(1, (total_users + per_page - 1) // per_page)
-    
+
     # Get current page users
     start_idx = page * per_page
     end_idx = min(start_idx + per_page, total_users)
     page_users = whitelist_users[start_idx:end_idx]
-    
+
     # Add user buttons with glass-style appearance
     for username in page_users:
-        keyboard.append([
-            InlineKeyboardButton(
-                f"✅ {username}",
-                callback_data=f"whitelist_info:{username}"
-            ),
-            InlineKeyboardButton(
-                "🗑️ Delete",
-                callback_data=f"delete_whitelist:{username}"
-            )
-        ])
-    
+        keyboard.append(
+            [
+                InlineKeyboardButton(f"✅ {username}", callback_data=f"whitelist_info:{username}"),
+                InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_whitelist:{username}"),
+            ]
+        )
+
     # Pagination buttons
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"whitelist_page:{page-1}"))
-    
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"whitelist_page:{page - 1}"))
+
     # Page indicator
-    nav_buttons.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="noop"))
-    
+    nav_buttons.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+
     if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"whitelist_page:{page+1}"))
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"whitelist_page:{page + 1}"))
     if nav_buttons:
         keyboard.append(nav_buttons)
-    
+
     # Add user button
-    keyboard.append([
-        InlineKeyboardButton("➕ Add User", callback_data=CallbackData.SET_EXCEPT_USER),
-    ])
-    
+    keyboard.append(
+        [
+            InlineKeyboardButton("➕ Add User", callback_data=CallbackData.SET_EXCEPT_USER),
+        ]
+    )
+
     # Refresh and back buttons
-    keyboard.append([
-        InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.SHOW_EXCEPT_USERS),
-    ])
-    keyboard.append([
-        InlineKeyboardButton("« Back to Users", callback_data=CallbackData.BACK_USERS),
-    ])
-    
+    keyboard.append(
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.SHOW_EXCEPT_USERS),
+        ]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton("« Back to Users", callback_data=CallbackData.BACK_USERS),
+        ]
+    )
+
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -106,7 +109,7 @@ def create_disabled_users_keyboard(disabled_users: dict, page: int = 0, per_page
     """
     Create a keyboard with disabled users as glass-style buttons.
     Each user gets an enable button.
-    
+
     Args:
         disabled_users: Dict of username -> disabled_timestamp
         page: Current page number (0-indexed)
@@ -116,14 +119,14 @@ def create_disabled_users_keyboard(disabled_users: dict, page: int = 0, per_page
     users_list = list(disabled_users.items())
     total_users = len(users_list)
     total_pages = max(1, (total_users + per_page - 1) // per_page)
-    
+
     # Get current page users
     start_idx = page * per_page
     end_idx = min(start_idx + per_page, total_users)
     page_users = users_list[start_idx:end_idx]
-    
+
     current_time = time.time()
-    
+
     # Add user buttons with glass-style appearance
     for username, disabled_time in page_users:
         elapsed = int(current_time - disabled_time)
@@ -133,61 +136,54 @@ def create_disabled_users_keyboard(disabled_users: dict, page: int = 0, per_page
             time_str = f"{hours}h ago"
         else:
             time_str = f"{minutes}m ago"
-        
+
         # Glass-style button with user info and enable action
-        keyboard.append([
-            InlineKeyboardButton(
-                f"🔴 {username} ({time_str})",
-                callback_data=f"user_info:{username}"
-            ),
-            InlineKeyboardButton(
-                "✅ Enable",
-                callback_data=f"enable_user:{username}"
-            )
-        ])
-    
+        keyboard.append(
+            [
+                InlineKeyboardButton(f"🔴 {username} ({time_str})", callback_data=f"user_info:{username}"),
+                InlineKeyboardButton("✅ Enable", callback_data=f"enable_user:{username}"),
+            ]
+        )
+
     # Pagination buttons
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"disabled_page:{page-1}"))
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"disabled_page:{page - 1}"))
     if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"disabled_page:{page+1}"))
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"disabled_page:{page + 1}"))
     if nav_buttons:
         keyboard.append(nav_buttons)
-    
+
     # Enable all button (only show if there are disabled users)
     if total_users > 0:
-        keyboard.append([
-            InlineKeyboardButton(
-                f"✅ Enable All ({total_users} users)",
-                callback_data=CallbackData.ENABLE_ALL_DISABLED
-            )
-        ])
-    
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"✅ Enable All ({total_users} users)", callback_data=CallbackData.ENABLE_ALL_DISABLED
+                )
+            ]
+        )
+
     # View users in disabled group button
-    keyboard.append([
-        InlineKeyboardButton(
-            "👥 View Users in Disabled Group",
-            callback_data="view_users_in_disabled_group"
-        )
-    ])
-    
+    keyboard.append(
+        [InlineKeyboardButton("👥 View Users in Disabled Group", callback_data="view_users_in_disabled_group")]
+    )
+
     # Fix stuck users button - for users stuck in disabled group
-    keyboard.append([
-        InlineKeyboardButton(
-            "🔧 Fix All Stuck Users",
-            callback_data="fix_stuck_users"
-        )
-    ])
-    
+    keyboard.append([InlineKeyboardButton("🔧 Fix All Stuck Users", callback_data="fix_stuck_users")])
+
     # Refresh and back buttons
-    keyboard.append([
-        InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.SHOW_DISABLED_USERS),
-    ])
-    keyboard.append([
-        InlineKeyboardButton("« Back to Users", callback_data=CallbackData.BACK_USERS),
-    ])
-    
+    keyboard.append(
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.SHOW_DISABLED_USERS),
+        ]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton("« Back to Users", callback_data=CallbackData.BACK_USERS),
+        ]
+    )
+
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -196,13 +192,13 @@ def create_disabled_users_keyboard(disabled_users: dict, page: int = 0, per_page
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-async def set_except_users(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def set_except_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set the except users for the bot."""
     check = await check_admin_privilege(update)
     if check is not None:
         return check
-    await update.message.reply_html(
-        "Send the except (<code>users in this list have no limitation</code>) user:"
+    await reply_input_prompt(
+        context, update.message.reply_html("Send the except (<code>users in this list have no limitation</code>) user:")
     )
     return SET_EXCEPT_USERS
 
@@ -211,34 +207,26 @@ async def set_except_users_handler(update: Update, _context: ContextTypes.DEFAUL
     """Write the except users to the config file."""
     except_user = update.message.text.strip()
     await add_except_user(except_user)
-    await update.message.reply_html(
-        f"Except user <code>{except_user}</code> added successfully!"
-    )
+    await update.message.reply_html(f"Except user <code>{except_user}</code> added successfully!")
     return ConversationHandler.END
 
 
-async def remove_except_user(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+async def remove_except_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remove the except users for the bot."""
     check = await check_admin_privilege(update)
     if check is not None:
         return check
-    await update.message.reply_html("Send the except user to remove:")
+    await reply_input_prompt(context, update.message.reply_html("Send the except user to remove:"))
     return REMOVE_EXCEPT_USER
 
 
-async def remove_except_user_handler(
-    update: Update, _context: ContextTypes.DEFAULT_TYPE
-):
+async def remove_except_user_handler(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     """Remove the except users from the config file."""
     except_user = await remove_except_user_from_config(update.message.text.strip())
     if except_user:
-        await update.message.reply_html(
-            f"Except user <code>{except_user}</code> removed successfully!"
-        )
+        await update.message.reply_html(f"Except user <code>{except_user}</code> removed successfully!")
     else:
-        await update.message.reply_html(
-            f"Except user <code>{update.message.text.strip()}</code> not found!"
-        )
+        await update.message.reply_html(f"Except user <code>{update.message.text.strip()}</code> not found!")
     return ConversationHandler.END
 
 
@@ -247,9 +235,9 @@ async def show_except_users(update: Update, _context: ContextTypes.DEFAULT_TYPE)
     check = await check_admin_privilege(update)
     if check is not None:
         return check
-    
+
     whitelist_users = await get_except_users_list()
-    
+
     if whitelist_users:
         total = len(whitelist_users)
         text = f"✅ <b>Whitelist (Except Users)</b> ({total} user{'s' if total != 1 else ''})\n\n"
@@ -258,7 +246,7 @@ async def show_except_users(update: Update, _context: ContextTypes.DEFAULT_TYPE)
     else:
         text = "✅ <b>Whitelist (Except Users)</b>\n\nNo users in the whitelist."
         keyboard = create_back_to_users_keyboard()
-    
+
     await update.message.reply_html(text=text, reply_markup=keyboard)
     return ConversationHandler.END
 
@@ -271,7 +259,7 @@ async def show_except_users(update: Update, _context: ContextTypes.DEFAULT_TYPE)
 async def show_disabled_users_menu(query, page: int = 0):
     """Display the disabled users menu with enable buttons."""
     from utils import handel_dis_users as dis_registry
-    
+
     try:
         # Load disabled users
         disabled_dict = await dis_registry.disabled_at_map()
@@ -286,14 +274,8 @@ async def show_disabled_users_menu(query, page: int = 0):
             )
             # Create keyboard with the important buttons even when no tracked users
             keyboard = [
-                [InlineKeyboardButton(
-                    "👥 View Users in Disabled Group",
-                    callback_data="view_users_in_disabled_group"
-                )],
-                [InlineKeyboardButton(
-                    "🔧 Fix All Stuck Users",
-                    callback_data="fix_stuck_users"
-                )],
+                [InlineKeyboardButton("👥 View Users in Disabled Group", callback_data="view_users_in_disabled_group")],
+                [InlineKeyboardButton("🔧 Fix All Stuck Users", callback_data="fix_stuck_users")],
                 [InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.SHOW_DISABLED_USERS)],
                 [InlineKeyboardButton("« Back to Users", callback_data=CallbackData.BACK_USERS)],
                 [InlineKeyboardButton("« Back to Main Menu", callback_data=CallbackData.MAIN_MENU)],
@@ -306,7 +288,7 @@ async def show_disabled_users_menu(query, page: int = 0):
                 time_to_active = config.get("timing", {}).get("time_to_active_users", 300)
             except Exception:
                 time_to_active = 300
-            
+
             total_users = len(disabled_dict)
             text = (
                 f"🚫 <b>Disabled Users</b>\n\n"
@@ -315,13 +297,9 @@ async def show_disabled_users_menu(query, page: int = 0):
                 f"<i>Click the ✅ button to manually enable a user:</i>"
             )
             keyboard = create_disabled_users_keyboard(disabled_dict, page=page)
-        
+
         try:
-            await query.edit_message_text(
-                text=text,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
+            await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
         except Exception as edit_err:
             if "Message is not modified" in str(edit_err):
                 try:
@@ -340,7 +318,7 @@ async def show_disabled_users_menu(query, page: int = 0):
         await query.edit_message_text(
             text=f"❌ Error loading disabled users: {e}",
             reply_markup=create_back_to_users_keyboard(),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
 
@@ -354,21 +332,21 @@ async def enable_single_user(query, username: str):
     from utils.panel_api import enable_selected_users
     from utils.types import PanelType
     from telegram_bot.send_message import remove_disable_message_tracking
-    
+
     try:
         is_user_disabled = await dis_registry.is_disabled(username)
-        
+
         # Check if callback is from an inline disable notification in the topic
         msg_text = getattr(query.message, "text", "") or ""
         msg_text_upper = msg_text.upper()
         is_notification_button = (
-            "DISABLED" in msg_text_upper or 
-            "REVOKED" in msg_text_upper or 
-            "VIOLATION" in msg_text_upper or
-            "LIMIT" in msg_text_upper or
-            "NODE" in msg_text_upper
+            "DISABLED" in msg_text_upper
+            or "REVOKED" in msg_text_upper
+            or "VIOLATION" in msg_text_upper
+            or "LIMIT" in msg_text_upper
+            or "NODE" in msg_text_upper
         )
-        
+
         # If user is already active (not in disabled list)
         if is_notification_button and not is_user_disabled:
             await query.answer(f"ℹ️ User {username} is already active!", show_alert=False)
@@ -384,22 +362,23 @@ async def enable_single_user(query, username: str):
         panel_data = PanelType(
             panel_username=panel_config.get("username", ""),
             panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", "")
+            panel_domain=panel_config.get("domain", ""),
         )
-        
+
         # Enable user on panel
         result = await enable_selected_users(panel_data, {username})
         enabled = result.get("enabled", [])
         failed = result.get("failed", [])
         not_found = result.get("not_found", [])
-        
+
         if username in enabled or username in not_found:
             await dis_registry.enable(username)
             await remove_disable_message_tracking(username)
-            
+
             # Send standard enable notification to Disable/Enable topic
             try:
                 from telegram_bot.send_message import send_enable_notification
+
                 await send_enable_notification(username, delete_disable_msg=False)
             except Exception as notify_err:
                 users_logger.warning(f"Could not send enable notification for {username}: {notify_err}")
@@ -422,7 +401,7 @@ async def enable_single_user(query, username: str):
             await query.answer(f"⚠️ Unknown result for {username}")
             if not is_notification_button:
                 await show_disabled_users_menu(query)
-        
+
     except Exception as e:
         users_logger.error(f"Error in enable_single_user for {username}: {e}")
         try:
@@ -436,51 +415,49 @@ async def enable_all_disabled_users(query):
     from utils import handel_dis_users as dis_registry
     from utils.panel_api import enable_selected_users
     from utils.types import PanelType
-    
+
     try:
         # Load disabled users
         disabled_dict = await dis_registry.disabled_at_map()
-        
+
         if not disabled_dict:
             await query.answer("No disabled users to enable!")
             return
-        
+
         usernames = set(disabled_dict.keys())
         count = len(usernames)
-        
-        await query.edit_message_text(
-            text=f"⏳ Enabling {count} users...",
-            parse_mode="HTML"
-        )
-        
+
+        await query.edit_message_text(text=f"⏳ Enabling {count} users...", parse_mode="HTML")
+
         # Load config for panel data
         config = await read_config()
         panel_config = config.get("panel", {})
         panel_data = PanelType(
             panel_username=panel_config.get("username", ""),
             panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", "")
+            panel_domain=panel_config.get("domain", ""),
         )
-        
+
         # Enable all users on panel
         result = await enable_selected_users(panel_data, usernames)
         enabled = result.get("enabled", [])
         failed = result.get("failed", [])
         not_found = result.get("not_found", [])
-        
+
         # Only remove successfully enabled users from list
         for username in enabled:
             await dis_registry.enable(username)
             try:
                 from telegram_bot.send_message import send_enable_notification
+
                 await send_enable_notification(username, delete_disable_msg=False)
             except Exception as notify_err:
                 users_logger.warning(f"Could not send enable notification for {username}: {notify_err}")
-        
+
         # Also remove users that were deleted from panel
         for username in not_found:
             await dis_registry.enable(username)
-        
+
         if failed or not_found:
             message = f"⚠️ <b>Results</b>\n\n"
             message += f"✅ <b>{len(enabled)}</b> users enabled successfully\n"
@@ -489,25 +466,19 @@ async def enable_all_disabled_users(query):
             if failed:
                 message += f"❌ <b>{len(failed)}</b> users failed to enable\n"
                 message += f"\n<i>Failed users: {', '.join(failed[:10])}{'...' if len(failed) > 10 else ''}</i>"
-            
-            await query.edit_message_text(
-                text=message,
-                reply_markup=create_back_to_users_keyboard(),
-                parse_mode="HTML"
-            )
+
+            await query.edit_message_text(text=message, reply_markup=create_back_to_users_keyboard(), parse_mode="HTML")
         else:
             await query.edit_message_text(
                 text=f"✅ <b>Successfully enabled {len(enabled)} users!</b>\n\n"
-                     f"All disabled users have been re-enabled on the panel.",
+                f"All disabled users have been re-enabled on the panel.",
                 reply_markup=create_back_to_users_keyboard(),
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
-        
+
     except Exception as e:
         await query.edit_message_text(
-            text=f"❌ Error enabling users: {e}",
-            reply_markup=create_back_to_users_keyboard(),
-            parse_mode="HTML"
+            text=f"❌ Error enabling users: {e}", reply_markup=create_back_to_users_keyboard(), parse_mode="HTML"
         )
 
 
@@ -515,49 +486,49 @@ async def fix_stuck_users_handler(query):
     """Fix users that are stuck in the disabled group but not properly tracked."""
     from utils.panel_api import fix_stuck_disabled_users, get_users_in_disabled_group
     from utils.types import PanelType
-    
+
     try:
         await query.edit_message_text(
             text="🔍 <b>Scanning for stuck users...</b>\n\n"
-                 "Looking for users in the disabled group that need to be fixed...",
-            parse_mode="HTML"
+            "Looking for users in the disabled group that need to be fixed...",
+            parse_mode="HTML",
         )
-        
+
         # Load config for panel data
         config = await read_config()
         panel_config = config.get("panel", {})
         panel_data = PanelType(
             panel_username=panel_config.get("username", ""),
             panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", "")
+            panel_domain=panel_config.get("domain", ""),
         )
-        
+
         # First, show how many users are in disabled group
         stuck_usernames = await get_users_in_disabled_group(panel_data)
-        
+
         if not stuck_usernames:
             await query.edit_message_text(
                 text="✅ <b>No Stuck Users Found</b>\n\n"
-                     "No users are currently in the disabled group.\n"
-                     "Everything looks good!",
+                "No users are currently in the disabled group.\n"
+                "Everything looks good!",
                 reply_markup=create_back_to_users_keyboard(),
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
             return
-        
+
         await query.edit_message_text(
             text=f"⏳ <b>Found {len(stuck_usernames)} users in disabled group</b>\n\n"
-                 f"Now attempting to fix and restore their groups...\n\n"
-                 f"Users: {', '.join(stuck_usernames[:10])}{'...' if len(stuck_usernames) > 10 else ''}",
-            parse_mode="HTML"
+            f"Now attempting to fix and restore their groups...\n\n"
+            f"Users: {', '.join(stuck_usernames[:10])}{'...' if len(stuck_usernames) > 10 else ''}",
+            parse_mode="HTML",
         )
-        
+
         # Fix all stuck users
         result = await fix_stuck_disabled_users(panel_data)
-        
+
         fixed = result.get("fixed", [])
         failed = result.get("failed", [])
-        
+
         if failed:
             text = (
                 f"⚠️ <b>Partial Fix Complete</b>\n\n"
@@ -575,18 +546,12 @@ async def fix_stuck_users_handler(query):
             )
             if fixed:
                 text += f"\n\n<b>Fixed users:</b>\n{', '.join(fixed[:15])}{'...' if len(fixed) > 15 else ''}"
-        
-        await query.edit_message_text(
-            text=text,
-            reply_markup=create_back_to_users_keyboard(),
-            parse_mode="HTML"
-        )
-        
+
+        await query.edit_message_text(text=text, reply_markup=create_back_to_users_keyboard(), parse_mode="HTML")
+
     except Exception as e:
         await query.edit_message_text(
-            text=f"❌ Error fixing stuck users: {e}",
-            reply_markup=create_back_to_users_keyboard(),
-            parse_mode="HTML"
+            text=f"❌ Error fixing stuck users: {e}", reply_markup=create_back_to_users_keyboard(), parse_mode="HTML"
         )
 
 
@@ -594,46 +559,42 @@ async def show_users_in_disabled_group(query, page: int = 0):
     """Show all users currently in the disabled group from the panel."""
     from utils.panel_api import get_users_in_disabled_group
     from utils.types import PanelType
-    
+
     try:
-        await query.edit_message_text(
-            text="🔍 <b>Scanning panel for users in disabled group...</b>",
-            parse_mode="HTML"
-        )
-        
+        await query.edit_message_text(text="🔍 <b>Scanning panel for users in disabled group...</b>", parse_mode="HTML")
+
         # Load config for panel data
         config = await read_config()
         panel_config = config.get("panel", {})
         disabled_group_id = config.get("disabled_group_id", None)
-        
+
         if disabled_group_id is None:
             await query.edit_message_text(
-                text="⚠️ <b>No Disabled Group Configured</b>\n\n"
-                     "Please configure a disabled group in Settings first.",
+                text="⚠️ <b>No Disabled Group Configured</b>\n\nPlease configure a disabled group in Settings first.",
                 reply_markup=create_back_to_users_keyboard(),
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
             return
-        
+
         panel_data = PanelType(
             panel_username=panel_config.get("username", ""),
             panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", "")
+            panel_domain=panel_config.get("domain", ""),
         )
-        
+
         # Get users in disabled group
         stuck_users = await get_users_in_disabled_group(panel_data)
-        
+
         if not stuck_users:
             await query.edit_message_text(
                 text="✅ <b>No Users in Disabled Group</b>\n\n"
-                     f"Group ID: <code>{disabled_group_id}</code>\n\n"
-                     "No users are currently in the disabled group. Everything looks good!",
+                f"Group ID: <code>{disabled_group_id}</code>\n\n"
+                "No users are currently in the disabled group. Everything looks good!",
                 reply_markup=create_back_to_users_keyboard(),
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
             return
-        
+
         # Paginate the users
         per_page = 20
         total_users = len(stuck_users)
@@ -641,10 +602,10 @@ async def show_users_in_disabled_group(query, page: int = 0):
         start_idx = page * per_page
         end_idx = min(start_idx + per_page, total_users)
         page_users = stuck_users[start_idx:end_idx]
-        
+
         # Build user list text
         user_list = "\n".join([f"• <code>{u}</code>" for u in page_users])
-        
+
         text = (
             f"👥 <b>Users in Disabled Group</b>\n\n"
             f"🏷️ <b>Group ID:</b> <code>{disabled_group_id}</code>\n"
@@ -652,41 +613,36 @@ async def show_users_in_disabled_group(query, page: int = 0):
             f"📄 <b>Page:</b> {page + 1}/{total_pages}\n\n"
             f"{user_list}"
         )
-        
+
         # Build keyboard with pagination
         keyboard = []
-        
+
         # Pagination buttons
         nav_buttons = []
         if page > 0:
-            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"disabled_group_page:{page-1}"))
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"disabled_group_page:{page - 1}"))
         if page < total_pages - 1:
-            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"disabled_group_page:{page+1}"))
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"disabled_group_page:{page + 1}"))
         if nav_buttons:
             keyboard.append(nav_buttons)
-        
+
         # Fix all button
-        keyboard.append([
-            InlineKeyboardButton(
-                f"🔧 Fix All {total_users} Users",
-                callback_data="fix_stuck_users"
-            )
-        ])
-        
+        keyboard.append([InlineKeyboardButton(f"🔧 Fix All {total_users} Users", callback_data="fix_stuck_users")])
+
         # Refresh and back
-        keyboard.append([
-            InlineKeyboardButton("🔄 Refresh", callback_data="view_users_in_disabled_group"),
-        ])
-        keyboard.append([
-            InlineKeyboardButton("« Back to Disabled Users", callback_data=CallbackData.SHOW_DISABLED_USERS),
-        ])
-        
+        keyboard.append(
+            [
+                InlineKeyboardButton("🔄 Refresh", callback_data="view_users_in_disabled_group"),
+            ]
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton("« Back to Disabled Users", callback_data=CallbackData.SHOW_DISABLED_USERS),
+            ]
+        )
+
         try:
-            await query.edit_message_text(
-                text=text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="HTML"
-            )
+            await query.edit_message_text(text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
         except Exception as edit_err:
             if "Message is not modified" in str(edit_err):
                 try:
@@ -695,7 +651,7 @@ async def show_users_in_disabled_group(query, page: int = 0):
                     pass
                 return
             raise edit_err
-        
+
     except Exception as e:
         if "Message is not modified" in str(e):
             try:
@@ -706,22 +662,22 @@ async def show_users_in_disabled_group(query, page: int = 0):
         await query.edit_message_text(
             text=f"❌ Error getting users in disabled group: {e}",
             reply_markup=create_back_to_users_keyboard(),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
 
 async def show_user_info(query, username: str):
     """Show detailed info for a disabled user."""
     from utils import handel_dis_users as dis_registry
-    
+
     disabled_time = await dis_registry.disabled_at_of(username)
-    
+
     if disabled_time:
         elapsed = int(time.time() - disabled_time)
         minutes = elapsed // 60
         seconds = elapsed % 60
-        disabled_at = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(disabled_time))
-        
+        disabled_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(disabled_time))
+
         info_text = (
             f"ℹ️ <b>User Info: {username}</b>\n\n"
             f"🔴 <b>Status:</b> Disabled\n"
@@ -729,16 +685,12 @@ async def show_user_info(query, username: str):
             f"⏱️ <b>Elapsed:</b> {minutes}m {seconds}s\n\n"
             f"<i>Click Enable to re-activate this user.</i>"
         )
-        
+
         keyboard = [
             [InlineKeyboardButton(f"✅ Enable {username}", callback_data=f"enable_user:{username}")],
             [InlineKeyboardButton("« Back to Disabled Users", callback_data=CallbackData.SHOW_DISABLED_USERS)],
         ]
-        await query.edit_message_text(
-            text=info_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="HTML"
-        )
+        await query.edit_message_text(text=info_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
     else:
         await query.answer(f"User {username} is no longer disabled!")
         await show_disabled_users_menu(query)
@@ -753,45 +705,45 @@ async def cleanup_deleted_users_handler(query):
     """Clean up users from limiter config that no longer exist in the panel."""
     from utils.panel_api import cleanup_deleted_users
     from utils.types import PanelType
-    
+
     try:
         await query.edit_message_text(
             text="⏳ <b>Cleaning up deleted users...</b>\n\n"
-                 "Fetching all users from panel and checking limiter config...",
-            parse_mode="HTML"
+            "Fetching all users from panel and checking limiter config...",
+            parse_mode="HTML",
         )
-        
+
         # Load config for panel data
         config = await read_config()
         panel_config = config.get("panel", {})
         panel_data = PanelType(
             panel_username=panel_config.get("username", ""),
             panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", "")
+            panel_domain=panel_config.get("domain", ""),
         )
-        
+
         # Perform cleanup
         result = await cleanup_deleted_users(panel_data)
-        
+
         # Build result message
         total_removed = (
-            len(result.get("special_limits_removed", [])) +
-            len(result.get("except_users_removed", [])) +
-            len(result.get("disabled_users_removed", [])) +
-            len(result.get("user_groups_backup_removed", []))
+            len(result.get("special_limits_removed", []))
+            + len(result.get("except_users_removed", []))
+            + len(result.get("disabled_users_removed", []))
+            + len(result.get("user_groups_backup_removed", []))
         )
-        
+
         if total_removed == 0:
             await query.edit_message_text(
                 text="✅ <b>Cleanup Complete!</b>\n\n"
-                     "No deleted users found in limiter config.\n"
-                     "Everything is clean! 🎉",
+                "No deleted users found in limiter config.\n"
+                "Everything is clean! 🎉",
                 reply_markup=create_back_to_users_keyboard(),
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
         else:
             message_parts = ["🧹 <b>Cleanup Complete!</b>\n"]
-            
+
             special_limits = result.get("special_limits_removed", [])
             if special_limits:
                 message_parts.append(
@@ -800,7 +752,7 @@ async def cleanup_deleted_users_handler(query):
                 )
                 if len(special_limits) > 10:
                     message_parts.append(f" and {len(special_limits) - 10} more...")
-            
+
             except_users = result.get("except_users_removed", [])
             if except_users:
                 message_parts.append(
@@ -809,7 +761,7 @@ async def cleanup_deleted_users_handler(query):
                 )
                 if len(except_users) > 10:
                     message_parts.append(f" and {len(except_users) - 10} more...")
-            
+
             disabled_users = result.get("disabled_users_removed", [])
             if disabled_users:
                 message_parts.append(
@@ -818,7 +770,7 @@ async def cleanup_deleted_users_handler(query):
                 )
                 if len(disabled_users) > 10:
                     message_parts.append(f" and {len(disabled_users) - 10} more...")
-            
+
             group_users = result.get("user_groups_backup_removed", [])
             if group_users:
                 message_parts.append(
@@ -827,20 +779,18 @@ async def cleanup_deleted_users_handler(query):
                 )
                 if len(group_users) > 10:
                     message_parts.append(f" and {len(group_users) - 10} more...")
-            
+
             message_parts.append(f"\n\n<b>Total removed:</b> {total_removed} user entries")
-            
+
             await query.edit_message_text(
-                text="".join(message_parts),
-                reply_markup=create_back_to_users_keyboard(),
-                parse_mode="HTML"
+                text="".join(message_parts), reply_markup=create_back_to_users_keyboard(), parse_mode="HTML"
             )
-        
+
     except Exception as e:
         await query.edit_message_text(
             text=f"❌ <b>Error during cleanup:</b>\n\n{e}",
             reply_markup=create_back_to_users_keyboard(),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
 
@@ -854,14 +804,14 @@ async def handle_users_menu_callback(query, _context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(
         text="👥 <b>Users Menu</b>\n\nManage users and view disabled accounts:",
         reply_markup=create_users_menu_keyboard(),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
 async def handle_show_except_users_callback(query, _context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     """Handle callback for showing except users list (whitelist) with pagination."""
     whitelist_users = await get_except_users_list()
-    
+
     if whitelist_users:
         total = len(whitelist_users)
         text = f"✅ <b>Whitelist (Except Users)</b> ({total} user{'s' if total != 1 else ''})\n\n"
@@ -870,12 +820,8 @@ async def handle_show_except_users_callback(query, _context: ContextTypes.DEFAUL
     else:
         text = "✅ <b>Whitelist (Except Users)</b>\n\nNo users in the whitelist."
         keyboard = create_back_to_users_keyboard()
-    
-    await query.edit_message_text(
-        text=text,
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
+
+    await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
 
 
 async def handle_whitelist_page_callback(query, _context: ContextTypes.DEFAULT_TYPE, page: int):
@@ -885,37 +831,37 @@ async def handle_whitelist_page_callback(query, _context: ContextTypes.DEFAULT_T
 
 async def handle_whitelist_info_callback(query, _context: ContextTypes.DEFAULT_TYPE, username: str):
     """Handle callback for showing whitelist user info."""
-    keyboard = InlineKeyboardMarkup([
+    keyboard = InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("🗑️ Delete from Whitelist", callback_data=f"delete_whitelist:{username}")
-        ],
-        [InlineKeyboardButton("« Back to List", callback_data=CallbackData.SHOW_EXCEPT_USERS)]
-    ])
-    
+            [InlineKeyboardButton("🗑️ Delete from Whitelist", callback_data=f"delete_whitelist:{username}")],
+            [InlineKeyboardButton("« Back to List", callback_data=CallbackData.SHOW_EXCEPT_USERS)],
+        ]
+    )
+
     await query.edit_message_text(
         text=f"👤 <b>User:</b> <code>{username}</code>\n\n"
-             f"✅ <b>Status:</b> Whitelisted\n\n"
-             f"This user is exempt from IP limits and will never be disabled by the limiter.",
+        f"✅ <b>Status:</b> Whitelisted\n\n"
+        f"This user is exempt from IP limits and will never be disabled by the limiter.",
         reply_markup=keyboard,
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
 async def handle_delete_whitelist_callback(query, _context: ContextTypes.DEFAULT_TYPE, username: str):
     """Handle callback for deleting a user from whitelist."""
     result = await remove_except_user_from_config(username)
-    
+
     if result:
         text = f"✅ User <b>{username}</b> removed from whitelist!\n\nThis user will now be subject to IP limits."
     else:
         text = f"❌ User <b>{username}</b> not found in whitelist."
-    
+
     await query.edit_message_text(
         text=text,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("« Back to List", callback_data=CallbackData.SHOW_EXCEPT_USERS)]
-        ]),
-        parse_mode="HTML"
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Back to List", callback_data=CallbackData.SHOW_EXCEPT_USERS)]]
+        ),
+        parse_mode="HTML",
     )
 
 
@@ -924,13 +870,13 @@ async def handle_add_except_user_callback(query, context: ContextTypes.DEFAULT_T
     context.user_data["waiting_for"] = "except_user"
     await query.edit_message_text(
         text="➕ <b>Add User to Whitelist</b>\n\n"
-             "Send the username to add to the whitelist:\n\n"
-             "<i>Example: <code>john_doe</code></i>\n\n"
-             "<i>Or click Back to cancel.</i>",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("« Back to Whitelist", callback_data=CallbackData.SHOW_EXCEPT_USERS)]
-        ]),
-        parse_mode="HTML"
+        "Send the username to add to the whitelist:\n\n"
+        "<i>Example: <code>john_doe</code></i>\n\n"
+        "<i>Or click Back to cancel.</i>",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Back to Whitelist", callback_data=CallbackData.SHOW_EXCEPT_USERS)]]
+        ),
+        parse_mode="HTML",
     )
 
 
@@ -939,13 +885,13 @@ async def handle_remove_except_user_callback(query, context: ContextTypes.DEFAUL
     context.user_data["waiting_for"] = "remove_except_user"
     await query.edit_message_text(
         text="➖ <b>Remove User from Whitelist</b>\n\n"
-             "Send the username to remove from the whitelist:\n\n"
-             "<i>Example: <code>john_doe</code></i>\n\n"
-             "<i>Or click Back to cancel.</i>",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("« Back to Whitelist", callback_data=CallbackData.SHOW_EXCEPT_USERS)]
-        ]),
-        parse_mode="HTML"
+        "Send the username to remove from the whitelist:\n\n"
+        "<i>Example: <code>john_doe</code></i>\n\n"
+        "<i>Or click Back to cancel.</i>",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Back to Whitelist", callback_data=CallbackData.SHOW_EXCEPT_USERS)]]
+        ),
+        parse_mode="HTML",
     )
 
 
@@ -993,8 +939,7 @@ async def handle_except_user_input(update: Update, context: ContextTypes.DEFAULT
     await add_except_user(text)
     context.user_data["waiting_for"] = None
     await update.message.reply_html(
-        text=f"✅ Except user <b>{text}</b> added successfully!",
-        reply_markup=create_back_to_users_keyboard()
+        text=f"✅ Except user <b>{text}</b> added successfully!", reply_markup=create_back_to_users_keyboard()
     )
 
 
@@ -1006,16 +951,14 @@ async def handle_remove_except_user_input(update: Update, context: ContextTypes.
     text = update.message.text.strip()
     result = await remove_except_user_from_config(text)
     context.user_data["waiting_for"] = None
-    
+
     if result:
         await update.message.reply_html(
-            text=f"✅ Except user <b>{text}</b> removed successfully!",
-            reply_markup=create_back_to_users_keyboard()
+            text=f"✅ Except user <b>{text}</b> removed successfully!", reply_markup=create_back_to_users_keyboard()
         )
     else:
         await update.message.reply_html(
-            text=f"❌ Except user <b>{text}</b> not found!",
-            reply_markup=create_back_to_users_keyboard()
+            text=f"❌ Except user <b>{text}</b> not found!", reply_markup=create_back_to_users_keyboard()
         )
 
 
@@ -1028,7 +971,7 @@ def create_filtered_users_keyboard(users_list: list, page: int = 0, per_page: in
     """
     Create a keyboard with filtered users as buttons.
     These are users that are monitored but have no special limit or whitelist.
-    
+
     Args:
         users_list: List of User objects
         page: Current page number (0-indexed)
@@ -1037,12 +980,12 @@ def create_filtered_users_keyboard(users_list: list, page: int = 0, per_page: in
     keyboard = []
     total_users = len(users_list)
     total_pages = max(1, (total_users + per_page - 1) // per_page)
-    
+
     # Get current page users
     start_idx = page * per_page
     end_idx = min(start_idx + per_page, total_users)
     page_users = users_list[start_idx:end_idx]
-    
+
     # Add user buttons
     for user in page_users:
         # Show status indicator
@@ -1052,36 +995,37 @@ def create_filtered_users_keyboard(users_list: list, page: int = 0, per_page: in
             status = "🟢"
         else:
             status = "⚪"
-        
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{status} {user.username}",
-                callback_data=f"filtered_info:{user.username}"
-            )
-        ])
-    
+
+        keyboard.append(
+            [InlineKeyboardButton(f"{status} {user.username}", callback_data=f"filtered_info:{user.username}")]
+        )
+
     # Pagination buttons
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"filtered_page:{page-1}"))
-    
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"filtered_page:{page - 1}"))
+
     # Page indicator
-    nav_buttons.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="noop"))
-    
+    nav_buttons.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+
     if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"filtered_page:{page+1}"))
-    
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"filtered_page:{page + 1}"))
+
     if nav_buttons:
         keyboard.append(nav_buttons)
-    
+
     # Refresh and back buttons
-    keyboard.append([
-        InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.FILTERED_USERS_MENU),
-    ])
-    keyboard.append([
-        InlineKeyboardButton("« Back to Users", callback_data=CallbackData.BACK_USERS),
-    ])
-    
+    keyboard.append(
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.FILTERED_USERS_MENU),
+        ]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton("« Back to Users", callback_data=CallbackData.BACK_USERS),
+        ]
+    )
+
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -1089,11 +1033,11 @@ async def handle_filtered_users_menu(query, _context: ContextTypes.DEFAULT_TYPE,
     """Display the filtered users menu - users with no whitelist or special limit."""
     from db.database import get_db
     from db.crud.users import UserCRUD
-    
+
     try:
         async with get_db() as db:
             users = await UserCRUD.get_filtered_users(db)
-        
+
         if not users:
             text = (
                 "👤 <b>Filtered Users</b>\n\n"
@@ -1106,7 +1050,7 @@ async def handle_filtered_users_menu(query, _context: ContextTypes.DEFAULT_TYPE,
             # Count active/disabled
             active_count = sum(1 for u in users if not u.is_disabled_by_limiter)
             disabled_count = sum(1 for u in users if u.is_disabled_by_limiter)
-            
+
             text = (
                 f"👤 <b>Filtered Users</b>\n\n"
                 f"📊 Total: <b>{len(users)}</b> users\n"
@@ -1116,15 +1060,11 @@ async def handle_filtered_users_menu(query, _context: ContextTypes.DEFAULT_TYPE,
                 f"(no whitelist or special limit).</i>"
             )
             keyboard = create_filtered_users_keyboard(users, page=page)
-        
-        await query.edit_message_text(
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
+
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
     except Exception as e:
         await query.edit_message_text(
             text=f"❌ Error loading filtered users: {e}",
             reply_markup=create_back_to_users_keyboard(),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
