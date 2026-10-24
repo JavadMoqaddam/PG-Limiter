@@ -20,6 +20,7 @@ from utils.device_count import (
     count_devices_from_ips,
     group_ips_by_subnet,
 )
+from utils.log_observations import LOG_OBSERVATIONS
 from utils.warning_system import warning_system  # global shared instance
 from utils.isp_detector import ISPDetector
 from utils.ip_history_tracker import ip_history_tracker
@@ -34,6 +35,9 @@ from utils.shared_state import (
     node_silence_window,
     nodes_seen_within,
     pop_active_users_snapshot,
+    pop_api_users_snapshot,
+    api_evidence_is_current,
+    refresh_api_user,
     tracked_node_count,
 )
 
@@ -167,6 +171,7 @@ async def resolve_effective_limit(
         if user_gids is None:
             try:
                 from utils.user_sync import USER_METADATA_CACHE
+
                 if username in USER_METADATA_CACHE:
                     user_gids = USER_METADATA_CACHE[username].get("group_ids")
             except Exception:
@@ -174,6 +179,7 @@ async def resolve_effective_limit(
 
         if user_gids:
             from utils.user_sync import get_max_group_limit
+
             max_glim = get_max_group_limit(user_gids, cfg_group_limits)
             if max_glim is not None:
                 resolved = _usable_limit(max_glim, username, "group limit")
@@ -267,7 +273,7 @@ async def get_group_limits_batch(
             async with get_db() as db:
                 chunk_size = 900
                 for i in range(0, len(missing_usernames), chunk_size):
-                    chunk = missing_usernames[i:i + chunk_size]
+                    chunk = missing_usernames[i : i + chunk_size]
                     stmt = select(User.username, User.group_ids).where(User.username.in_(chunk))
                     result = await db.execute(stmt)
 
@@ -286,9 +292,7 @@ async def get_group_limits_batch(
         except Exception as e:
             logger.error(f"Batch fetch group_ids failed: {e}")
             if strict:
-                raise MetadataUnavailable(
-                    "group limits could not be read from the local database"
-                ) from e
+                raise MetadataUnavailable("group limits could not be read from the local database") from e
 
     # 3. Process limits (and fallback to API only if user is completely missing from local DB)
     for username in usernames:
@@ -303,6 +307,7 @@ async def get_group_limits_batch(
                 # `except Exception` below turned it into `gids = []`, and the panel
                 # fallback advertised here has in fact never run once.
                 from utils.panel_api import get_user_details
+
                 user_info = await get_user_details(panel_data, username)
                 if user_info and isinstance(user_info, dict):
                     gids = user_info.get("group_ids", [])
@@ -327,6 +332,7 @@ async def get_group_limits_batch(
         # Calculate the max limit if user is in multiple groups
         if gids:
             from utils.user_sync import get_max_group_limit
+
             max_glim = get_max_group_limit(gids, group_limits)
             if max_glim is not None:
                 result_limits[username] = max_glim
@@ -373,7 +379,7 @@ async def get_active_users_metadata_batch(
         async with get_db() as db:
             chunk_size = 900
             for i in range(0, len(missing_usernames), chunk_size):
-                chunk = missing_usernames[i:i + chunk_size]
+                chunk = missing_usernames[i : i + chunk_size]
                 stmt = select(
                     User.username,
                     User.group_ids,
@@ -381,7 +387,7 @@ async def get_active_users_metadata_batch(
                     User.is_excepted,
                     User.special_limit,
                     User.is_monitored,
-                    User.effective_ip_limit
+                    User.effective_ip_limit,
                 ).where(User.username.in_(chunk))
                 result = await db.execute(stmt)
                 for row in result:
@@ -398,9 +404,7 @@ async def get_active_users_metadata_batch(
     except Exception as e:
         logger.error(f"Batch fetch active users metadata failed: {e}")
         if strict:
-            raise MetadataUnavailable(
-                "user metadata could not be read from the local database"
-            ) from e
+            raise MetadataUnavailable("user metadata could not be read from the local database") from e
     return metadata
 
 
@@ -429,15 +433,14 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     # Read special limits from database instead of config
     from db.database import get_db
     from db.crud import UserCRUD
+
     async with get_db() as db:
         special_limit = await UserCRUD.get_all_special_limits(db)
 
     # Get panel data for filter checks
     panel_config = config_data.get("panel", {})
     panel_data = PanelType(
-        panel_config.get("username", ""),
-        panel_config.get("password", ""),
-        panel_config.get("domain", "")
+        panel_config.get("username", ""), panel_config.get("password", ""), panel_config.get("domain", "")
     )
 
     # Initialize or update ISP detector with token from config
@@ -584,7 +587,7 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
             user=UserType(name=email, ip=actual_ips_for_counting),
             formatted_ips=enhanced_formatted_ips,
             is_being_monitored=is_monitored,
-            warning_time_remaining=time_remaining
+            warning_time_remaining=time_remaining,
         )
 
     total_ips = len(all_actual_ips)
@@ -611,7 +614,9 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
         user_isp_info = {ip: isp_info_batch.get(ip, {}) for ip in user_info.user.ip if ip in isp_info_batch}
 
         ip_details, device_count = count_devices_and_details(
-            user_info, original_user, show_enhanced_details,
+            user_info,
+            original_user,
+            show_enhanced_details,
             device_config=device_config,
             user_trust_score=user_trust_score,
             isp_info=user_isp_info,
@@ -633,11 +638,7 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
     )
 
     # Sort users by device count (descending)
-    sorted_users = sorted(
-        enhanced_users_info.items(),
-        key=lambda x: all_user_device_counts.get(x[0], 0),
-        reverse=True
-    )
+    sorted_users = sorted(enhanced_users_info.items(), key=lambda x: all_user_device_counts.get(x[0], 0), reverse=True)
 
     # ---- NEW: Get Group Limits in ONE Query (Batching) ----
     active_usernames_for_batch = [email for email in active_users_snapshot.keys() if email and email.strip()]
@@ -665,8 +666,10 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
             special_limit=special_limit,
             group_limits=batched_group_limits,
         )
-        has_special_limit = (email in special_limit)
-        has_group_limit = (not has_special_limit_before) and bool(batched_group_limits and email in batched_group_limits)
+        has_special_limit = email in special_limit
+        has_group_limit = (not has_special_limit_before) and bool(
+            batched_group_limits and email in batched_group_limits
+        )
 
         # Skip users who are not exceeding their limit
         # A user violates when device_count > user_limit
@@ -695,11 +698,7 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
         else:
             limit_str = f"📊 {user_limit}"
             # Add to list of users needing limit setting
-            users_needing_limit.append({
-                "email": email,
-                "device_count": device_count,
-                "ip_count": ip_count
-            })
+            users_needing_limit.append({"email": email, "device_count": device_count, "ip_count": ip_count})
 
         user_header = f"👤 <b>{email}</b>{status_text}\n   📱 {device_count} 🌐 {ip_count} {limit_str}"
 
@@ -740,10 +739,7 @@ async def check_ip_used(config_data: dict | None = None, active_users_snapshot: 
 
 
 async def dispatch_chunked_warnings(
-    new_warnings: list[dict],
-    check_interval: float,
-    total_monitored: int,
-    max_warnings: int = 3
+    new_warnings: list[dict], check_interval: float, total_monitored: int, max_warnings: int = 3
 ) -> None:
     """
     Dispatch new warnings aggregated into chunks of 10 to avoid rate limits and message drops.
@@ -855,11 +851,7 @@ def _sample_is_trustworthy(all_users_actual_ips: dict, check_interval: int) -> b
         stale_window = node_silence_window(check_interval)
         live_nodes = nodes_seen_within(stale_window)
         if live_nodes < tracked_nodes:
-            silent_nodes = sorted(
-                node_id
-                for node_id, age in get_node_event_ages().items()
-                if age > stale_window
-            )
+            silent_nodes = sorted(node_id for node_id, age in get_node_event_ages().items() if age > stale_window)
             logger.error(
                 f"⛔ {len(silent_nodes)} of {tracked_nodes} log streams produced nothing in "
                 f"the last {int(stale_window)}s (node ids {silent_nodes}) while "
@@ -879,7 +871,21 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
 
     if config_data is None:
         config_data = await read_config()
-    active_users_snapshot = await pop_active_users_snapshot()
+    api_mode = config_data.get("ip_source") == "api"
+    active_users_snapshot = await pop_api_users_snapshot() if api_mode else await pop_active_users_snapshot(config_data)
+    if active_users_snapshot is None:
+        return
+    api_evidence = getattr(active_users_snapshot, "api_evidence", None)
+    log_evidence = getattr(active_users_snapshot, "log_evidence", None)
+    if not api_mode and not LOG_OBSERVATIONS.is_current(log_evidence):
+        reason = log_evidence.unavailable_reason if log_evidence else "missing Logs evidence"
+        logger.warning(f"Logs enforcement waiting: {reason}")
+        return
+
+    def cycle_is_current():
+        return api_evidence_is_current(api_evidence) if api_evidence else LOG_OBSERVATIONS.is_current(log_evidence)
+
+    protected_users = set(api_evidence.unknown_users) if api_evidence else set()
     all_users_log = await check_ip_used(config_data=config_data, active_users_snapshot=active_users_snapshot)
 
     # Use new config format
@@ -892,6 +898,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # Read special limits from database instead of config
     from db.database import get_db
     from db.crud import UserCRUD
+
     async with get_db() as db:
         special_limit = await UserCRUD.get_all_special_limits(db)
 
@@ -942,12 +949,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # cycle re-evaluates everyone from scratch.
     active_usernames = list(all_users_actual_ips.keys())
     try:
-        batched_group_limits = await get_group_limits_batch(
-            active_usernames, config_data, panel_data, strict=True
-        )
-        users_metadata_usage = await get_active_users_metadata_batch(
-            active_usernames, strict=True
-        )
+        batched_group_limits = await get_group_limits_batch(active_usernames, config_data, panel_data, strict=True)
+        users_metadata_usage = await get_active_users_metadata_batch(active_usernames, strict=True)
     except MetadataUnavailable as error:
         logger.error(
             f"⛔ Enforcement skipped this cycle: {error}. Nobody is warned, banned "
@@ -964,6 +967,22 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         await merge_active_users_snapshot(active_users_snapshot)
         raise
 
+    if not cycle_is_current():
+        return
+    if api_evidence:
+        if not api_evidence_is_current(api_evidence):
+            logger.info("🛰️ Discarding API evidence after a source/settings change")
+            return
+        # Preparation can await the database, ISP service and reporting. Count
+        # original timestamps at evaluation, never the time we received the IP.
+        for username, user in active_users_snapshot.items():
+            if not refresh_api_user(user, api_evidence.freshness_seconds):
+                protected_users.add(username)
+        all_users_actual_ips = {
+            name: set(user.ip) for name, user in active_users_snapshot.items() if name not in protected_users
+        }
+        all_users_data = {name: user for name, user in active_users_snapshot.items() if name not in protected_users}
+
     # ------------------------------------------------------------------
     # Single source of truth for the device count of this cycle.
     # Warning, ban and clearing decisions MUST all use the same number,
@@ -972,6 +991,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # ------------------------------------------------------------------
     device_config = DeviceCountingConfig.from_config(config_data)
     all_users_device_counts: dict[str, int] = {}
+    cycle_trust_scores = {name: warning.trust_score for name, warning in warning_system.warnings.items()}
     for _u_name, _u_ips in all_users_actual_ips.items():
         _u_data = all_users_data.get(_u_name)
         _w_curr = warning_system.warnings.get(_u_name)
@@ -987,6 +1007,31 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
             # exactly the measure that caused the earlier wave of false bans.
             fallback_count=count_devices_from_ips(_u_ips, device_config, _u_isp),
         )
+
+    def refresh_user_evidence(username: str) -> bool:
+        # Later users may wait behind warning persistence or a panel punishment.
+        # This is a local age/configuration check, with no network refetch.
+        if not cycle_is_current() or username in protected_users:
+            return False
+        if log_evidence:
+            return True
+        user = active_users_snapshot.get(username)
+        if user is None:
+            return True
+        if not refresh_api_user(user, api_evidence.freshness_seconds):
+            protected_users.add(username)
+            return False
+        ips = set(user.ip)
+        all_users_actual_ips[username] = ips
+        isp = {ip: isp_info_batch.get(ip, {}) for ip in ips if ip in isp_info_batch}
+        all_users_device_counts[username] = count_devices(
+            user,
+            device_config,
+            trust_score=cycle_trust_scores.get(username, 0.0),
+            isp_info=isp,
+            fallback_count=count_devices_from_ips(ips, device_config, isp),
+        )
+        return True
 
     total_devices_cycle = sum(all_users_device_counts.values())
     total_ips_cycle = sum(len(v) for v in all_users_actual_ips.values())
@@ -1005,15 +1050,19 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # ~200 lines below, after check_persistent_violations had already deleted every
     # expired record - so the guard meant to stop a partial view from wiping counters
     # ran too late to protect the records that path touches.
-    counters_are_trustworthy = _sample_is_trustworthy(all_users_actual_ips, check_interval)
+    counters_are_trustworthy = cycle_is_current()
 
     # Check for users who still violate limits after warning period.
     # Pass the actual IPs, group limits and the cycle's unified device counts, plus
     # the three facts this path was missing: whether the sample can be trusted, who
     # is whitelisted, and whose limit is actually known this cycle.
     from utils.user_sync import USER_METADATA_CACHE as _metadata_cache
+
     disabled_users, warned_users = await warning_system.check_persistent_violations(
-        panel_data, all_users_actual_ips, config_data, batched_group_limits,
+        panel_data,
+        all_users_actual_ips,
+        config_data,
+        batched_group_limits,
         device_counts=all_users_device_counts,
         sample_is_trustworthy=counters_are_trustworthy,
         except_users=except_users,
@@ -1025,6 +1074,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         # synced user, so an offline user is resolvable and gets judged normally - with
         # no IPs their device count is 0, so the record is dropped without a ban.
         known_users=set(users_metadata_usage) | set(_metadata_cache),
+        protected_users=protected_users,
+        refresh_user_evidence=refresh_user_evidence,
     )
 
     # Combine disabled and warned users to skip them in the loop
@@ -1049,6 +1100,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     cycle_new_warnings = []
 
     for user_name, unique_ips in all_users_actual_ips.items():
+        if not cycle_is_current():
+            return
         # Inverted from `if not except and not processed:` to an early continue so
         # that the `try` below sits at the indentation the old `if` had. The body is
         # unchanged and un-reindented on purpose: a single exception in here used to
@@ -1093,6 +1146,11 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                 group_limits=batched_group_limits,
             )
 
+            if api_evidence or log_evidence:
+                if not refresh_user_evidence(user_name):
+                    continue
+                unique_ips = all_users_actual_ips[user_name]
+
             # Get user data and ISP info for this user
             user_data = all_users_data.get(user_name)
             user_isp_info = {ip: isp_info_batch.get(ip, {}) for ip in unique_ips if ip in isp_info_batch}
@@ -1108,9 +1166,14 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                 was_monitored = user_name in warning_system.warnings
 
                 result = await warning_system.add_warning(
-                    user_name, effective_device_count, unique_ips, user_limit_number,
-                    user_data=user_data, isp_info=user_isp_info, panel_data=panel_data,
-                    send_telegram_notification=False
+                    user_name,
+                    effective_device_count,
+                    unique_ips,
+                    user_limit_number,
+                    user_data=user_data,
+                    isp_info=user_isp_info,
+                    panel_data=panel_data,
+                    send_telegram_notification=False,
                 )
 
                 if was_monitored:
@@ -1119,7 +1182,13 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         f"({len(unique_ips)} IPs, limit={user_limit_number}) (result={result})"
                     )
 
+                if not cycle_is_current():
+                    return
                 if result == "violation_limit_reached":
+                    if (api_evidence or log_evidence) and (
+                        not refresh_user_evidence(user_name) or all_users_device_counts[user_name] <= user_limit_number
+                    ):
+                        continue
                     from utils.warning_system import (
                         safe_disable_user_with_punishment,
                         safe_send_disable_notification,
@@ -1145,8 +1214,12 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
 
                     ban_action = str(punishment_result.get("action") or "")
                     if ban_action == "revoked":
-                        revoke_note = "✅ Sub revoked" if punishment_result.get("revoke_success", False) else "⚠️ Revoke failed"
-                        uuid_note = "✅ UUID reset" if punishment_result.get("uuid_reset_success", False) else "⚠️ UUID failed"
+                        revoke_note = (
+                            "✅ Sub revoked" if punishment_result.get("revoke_success", False) else "⚠️ Revoke failed"
+                        )
+                        uuid_note = (
+                            "✅ UUID reset" if punishment_result.get("uuid_reset_success", False) else "⚠️ UUID failed"
+                        )
                         msg = (
                             f"🔄 <b>SUBSCRIPTION REVOKED + DISABLED</b> - {time_str}\n\n"
                             f"User: <code>{user_name}</code>\n"
@@ -1165,6 +1238,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                         # exactly what a failure returns. The operator was told a user
                         # had been banned forever while nothing had happened at all.
                         from html import escape as _esc
+
                         reason = _esc(str(punishment_result.get("message") or ban_action))
                         msg = (
                             f"❗️ <b>BAN FAILED</b> - {time_str}\n\n"
@@ -1221,23 +1295,27 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     trust_level = w_obj.get_trust_level() if w_obj else "🟡 MEDIUM"
                     behavior = w_obj.get_behavior_summary() if w_obj else ""
                     default_consecutive = 2 if result == "updated" else 1
-                    consecutive = getattr(w_obj, "consecutive_violations", default_consecutive) if w_obj else default_consecutive
+                    consecutive = (
+                        getattr(w_obj, "consecutive_violations", default_consecutive) if w_obj else default_consecutive
+                    )
                     # The record's own threshold, not the live setting: lowering
                     # max_warning_count does not apply to a streak already in progress,
                     # so "Scan 2 of 3" has to quote the rule this user is judged by.
                     item_max_warnings = (
                         warning_system.effective_max_warnings(w_obj) if w_obj else int(max_warning_count)
                     )
-                    cycle_new_warnings.append({
-                        "username": user_name,
-                        "ip_count": effective_device_count,
-                        "limit": user_limit_number,
-                        "trust_score": trust_score,
-                        "trust_level": trust_level,
-                        "behavior": behavior,
-                        "consecutive_violations": consecutive,
-                        "max_warnings": item_max_warnings,
-                    })
+                    cycle_new_warnings.append(
+                        {
+                            "username": user_name,
+                            "ip_count": effective_device_count,
+                            "limit": user_limit_number,
+                            "trust_score": trust_score,
+                            "trust_level": trust_level,
+                            "behavior": behavior,
+                            "consecutive_violations": consecutive,
+                            "max_warnings": item_max_warnings,
+                        }
+                    )
                     if result == "new":
                         logger.warning(
                             f"User {user_name} has {effective_device_count} devices "
@@ -1278,7 +1356,11 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     for monitored_user in list(warning_system.warnings.keys()):
         if not counters_are_trustworthy:
             break
-        if monitored_user in failed_users:
+        if not cycle_is_current():
+            return
+        if api_evidence and not refresh_user_evidence(monitored_user):
+            continue
+        if monitored_user in protected_users or monitored_user in failed_users:
             # Their evaluation raised an exception this cycle, so nothing about
             # them is known well enough to justify clearing their record.
             continue
@@ -1303,6 +1385,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
             # Use the same unified device count the warning path used, so a
             # warning issued this cycle cannot be cleared in the same cycle.
             user_device_count = all_users_device_counts.get(monitored_user, len(user_current_ips))
+            if not cycle_is_current():
+                return
             if user_device_count <= u_lim:
                 await warning_system.clear_user_trust_data(monitored_user)
                 logger.info(
@@ -1337,16 +1421,25 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         )
 
     # Dispatch chunked warning reports in batches of 10
-    check_interval = float(config_data.get("check_interval") or config_data.get("monitoring", {}).get("check_interval", 60)) if config_data else 60.0
+    check_interval = (
+        float(config_data.get("check_interval") or config_data.get("monitoring", {}).get("check_interval", 60))
+        if config_data
+        else 60.0
+    )
     total_monitored = len(warning_system.get_monitoring_users())
     if cycle_new_warnings:
-        await dispatch_chunked_warnings(cycle_new_warnings, check_interval, total_monitored, max_warnings=int(max_warning_count))
+        await dispatch_chunked_warnings(
+            cycle_new_warnings, check_interval, total_monitored, max_warnings=int(max_warning_count)
+        )
 
     # Clean up expired warnings. Gated on the same trustworthiness verdict as
     # check_persistent_violations: unconditional cleanup deleted exactly the records
     # that function had just preserved.
+    if not cycle_is_current():
+        return
     await warning_system.cleanup_expired_warnings(
-        sample_is_trustworthy=counters_are_trustworthy
+        sample_is_trustworthy=counters_are_trustworthy,
+        **({"protected_users": protected_users} if api_evidence else {}),
     )
 
     all_users_log.clear()
@@ -1356,7 +1449,7 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
     """run check_ip_used() function and then run check_users_usage()"""
     while True:
         cycle_start = time.monotonic()
-        config_data = await read_config()
+        config_data = await read_config(refresh=True)
 
         # In API mode the connected IPs are collected right here, immediately
         # before enforcement, instead of being streamed in continuously by the
@@ -1378,9 +1471,7 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
             from utils.ip_source_api import collect_active_users_from_api
 
             try:
-                run_enforcement = await collect_active_users_from_api(
-                    panel_data, config_data
-                )
+                run_enforcement = await collect_active_users_from_api(panel_data, config_data)
             except Exception as error:  # pylint: disable=broad-except
                 logger.error(f"🛰️ API IP collection failed: {error}")
                 run_enforcement = False
@@ -1404,8 +1495,7 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
                 )
 
         check_interval = int(
-            config_data.get("check_interval")
-            or config_data.get("monitoring", {}).get("check_interval", 60)
+            config_data.get("check_interval") or config_data.get("monitoring", {}).get("check_interval", 60)
         )
 
         # Sleep relative to the START of the cycle so that the real period stays

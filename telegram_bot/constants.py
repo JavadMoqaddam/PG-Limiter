@@ -18,6 +18,7 @@ class ConversationState(IntEnum):
     so their states, callback data and writer functions were deleted. Those three
     settings come from the environment file (and the CLI / API), not from the bot.
     """
+
     GET_DOMAIN = 0
     GET_PORT = 1
     GET_USERNAME = 2
@@ -65,10 +66,10 @@ SET_GROUP_LIMIT = ConversationState.SET_GROUP_LIMIT
 
 class CallbackData:
     """Callback data constants for inline keyboards."""
-    
+
     # Main menu
     MAIN_MENU = "main_menu"
-    
+
     # Settings menu
     SETTINGS_MENU = "settings_menu"
     LIMITS_MENU = "limits_menu"
@@ -76,12 +77,12 @@ class CallbackData:
     MONITORING_MENU = "monitoring_menu"
     REPORTS_MENU = "reports_menu"
     ADMIN_MENU = "admin_menu"
-    
+
     # Special limit options
     SPECIAL_LIMIT_1 = "special_limit_1"
     SPECIAL_LIMIT_2 = "special_limit_2"
     SPECIAL_LIMIT_CUSTOM = "special_limit_custom"
-    
+
     # General limit options
     GENERAL_LIMIT_2 = "general_limit_2"
     GENERAL_LIMIT_3 = "general_limit_3"
@@ -97,23 +98,23 @@ class CallbackData:
     ENHANCED_MENU = "enhanced_menu"
     ENHANCED_ON = "enhanced_on"
     ENHANCED_OFF = "enhanced_off"
-    
+
     # Single IP users toggle
     SINGLE_IP_ON = "single_ip_on"
     SINGLE_IP_OFF = "single_ip_off"
-    
+
     # Monitoring actions
     MONITORING_STATUS = "monitoring_status"
     MONITORING_DETAILS = "monitoring_details"
     MONITORING_CLEAR = "monitoring_clear"
-    
+
     # Reports
     REPORT_CONNECTION = "report_connection"
     REPORT_NODE_USAGE = "report_node_usage"
     REPORT_MULTI_DEVICE = "report_multi_device"
     REPORT_IP_12H = "report_ip_12h"
     REPORT_IP_48H = "report_ip_48h"
-    
+
     # User management
     SHOW_EXCEPT_USERS = "show_except_users"
     SET_EXCEPT_USER = "set_except_user"
@@ -126,20 +127,20 @@ class CallbackData:
     SPECIAL_LIMITS_MENU = "special_limits_menu"
     FILTERED_USERS_MENU = "filtered_users_menu"
     BACK_USERS = "back_users"
-    
+
     # Admin management
     ADD_ADMIN = "add_admin"
     LIST_ADMINS = "list_admins"
     REMOVE_ADMIN = "remove_admin"
-    
+
     # Backup/Restore
     BACKUP = "backup"
     RESTORE = "restore"
-    
+
     # Config
     CREATE_CONFIG = "create_config"
     SET_IPINFO = "set_ipinfo"
-    
+
     # Disable method settings
     DISABLE_METHOD_MENU = "disable_method_menu"
     DISABLE_BY_STATUS = "disable_by_status"
@@ -148,7 +149,7 @@ class CallbackData:
     FALLBACK_GROUP_MENU = "fallback_group_menu"
     SELECT_FALLBACK_GROUP = "select_fallback_group"
     CLEAR_FALLBACK_GROUP = "clear_fallback_group"
-    
+
     # Punishment system
     PUNISHMENT_MENU = "punishment_menu"
     PUNISHMENT_TOGGLE = "punishment_toggle"
@@ -171,20 +172,20 @@ class CallbackData:
     PUNISHMENT_STEP_REVOKE = "punishment_step_revoke"
     PUNISHMENT_STEPS_RESET = "punishment_steps_reset"
     PUNISHMENT_BACK = "punishment_back"
-    
+
     # Group filter
     GROUP_FILTER_MENU = "group_filter_menu"
     GROUP_FILTER_TOGGLE = "group_filter_toggle"
     GROUP_FILTER_MODE_INCLUDE = "group_filter_mode_include"
     GROUP_FILTER_MODE_EXCLUDE = "group_filter_mode_exclude"
     GROUP_LIMIT_SET = "group_limit_set"
-    
+
     # Admin filter
     ADMIN_FILTER_MENU = "admin_filter_menu"
     ADMIN_FILTER_TOGGLE = "admin_filter_toggle"
     ADMIN_FILTER_MODE_INCLUDE = "admin_filter_mode_include"
     ADMIN_FILTER_MODE_EXCLUDE = "admin_filter_mode_exclude"
-    
+
     # CDN mode settings
     CDN_MODE_MENU = "cdn_mode_menu"
     CDN_MODE_ADD = "cdn_mode_add"
@@ -194,21 +195,21 @@ class CallbackData:
     CDN_PROVIDER_MENU = "cdn_provider_menu"
     CDN_PROVIDER_CLOUDFLARE = "cdn_provider_cloudflare"
     CDN_USE_XFF_TOGGLE = "cdn_use_xff_toggle"
-    
+
     # Subnet IP Grouping (relaxed mode)
     SUBNET_IP_GROUPING_MENU = "subnet_ip_grouping_menu"
     SUBNET_IP_GROUPING_TOGGLE = "subnet_ip_grouping_toggle"
     SUBNET_IP_GROUPING_MODE_TOGGLE = "subnet_ip_grouping_mode_toggle"
-    
+
     # High Trust IP Grouping (for trusted users, same node+inbound = 1 device)
     HIGH_TRUST_IP_GROUPING_MENU = "high_trust_ip_grouping_menu"
     HIGH_TRUST_IP_GROUPING_TOGGLE = "high_trust_ip_grouping_toggle"
-    
+
     # Trust data reset
     TRUST_RESET_MENU = "trust_reset_menu"
     TRUST_RESET_ALL = "trust_reset_all"
     TRUST_RESET_USER = "trust_reset_user"
-    
+
     # Node settings
     NODE_SETTINGS_MENU = "node_settings_menu"
     NODE_SETTINGS_REFRESH = "node_settings_refresh"
@@ -216,7 +217,7 @@ class CallbackData:
     NODE_DISABLED_MENU = "node_disabled_menu"
     NODE_CDN_CLEAR = "node_cdn_clear"
     NODE_DISABLED_CLEAR = "node_disabled_clear"
-    
+
     # User sync settings
     USER_SYNC_MENU = "user_sync_menu"
     USER_SYNC_1 = "user_sync_1"
@@ -226,7 +227,7 @@ class CallbackData:
     USER_SYNC_NOW = "user_sync_now"
     USER_SYNC_PENDING = "user_sync_pending"  # Review pending deletions
     USER_SYNC_FORCE_DELETE = "user_sync_force_delete"  # Force delete pending users
-    
+
     # Topics settings
     TOPICS_MENU = "topics_menu"
     TOPICS_TOGGLE = "topics_toggle"
@@ -235,7 +236,7 @@ class CallbackData:
     TOPICS_SET_GROUP = "topics_set_group"
     TOPICS_CHECK_PERMISSIONS = "topics_check_permissions"
     TOPICS_CLEAR_CACHE = "topics_clear_cache"
-    
+
     # Cleanup
     CLEANUP_DELETED_USERS = "cleanup_deleted_users"
 
@@ -244,13 +245,14 @@ class CallbackData:
     IP_SOURCE_SET_LOGS = "ip_source_set_logs"
     IP_SOURCE_SET_API = "ip_source_set_api"
     IP_SOURCE_SET_CONCURRENCY = "ip_source_set_concurrency"
+    IP_SOURCE_SET_FRESHNESS = "ip_source_set_freshness"
     IP_SOURCE_STATS = "ip_source_stats"
 
     # Device counting mode (node-aware devices vs node-agnostic IPs)
     DEVICE_COUNT_MENU = "device_count_menu"
     DEVICE_COUNT_SET_DEVICE = "device_count_set_device"
     DEVICE_COUNT_SET_IP = "device_count_set_ip"
-    
+
     # Auto-backup settings
     AUTO_BACKUP_MENU = "auto_backup_menu"
     AUTO_BACKUP_TOGGLE = "auto_backup_toggle"
@@ -259,7 +261,7 @@ class CallbackData:
     AUTO_BACKUP_INTERVAL_6H = "auto_backup_interval_6h"
     AUTO_BACKUP_INTERVAL_12H = "auto_backup_interval_12h"
     AUTO_BACKUP_NOW = "auto_backup_now"
-    
+
     # Back buttons
     BACK_MAIN = "back_main"
     BACK_SETTINGS = "back_settings"

@@ -33,14 +33,11 @@ OUTCOME_ERROR = "error"
 # Panel-side fixed window used by the `online=true` filter (app/db/crud/user.py)
 PANEL_ONLINE_WINDOW_SECONDS = 120
 
-# Per-IP values at or above this are Unix timestamps (last seen), below it they
-# are treated as legacy connection counts and are never filtered for staleness.
+# Values below this cannot be contemporary Xray timestamps. Their age is unknown.
 STALE_EPOCH_FLOOR = 1_000_000_000
 
 
-async def resolve_panel_token(
-    panel_data: PanelType, force_refresh: bool = False
-) -> Optional[str]:
+async def resolve_panel_token(panel_data: PanelType, force_refresh: bool = False) -> Optional[str]:
     """
     Resolve a bearer token once per collection cycle.
 
@@ -89,11 +86,9 @@ async def fetch_online_candidates(
         group_ids: Restrict to users belonging to any of these group IDs.
         admin_usernames: Restrict to users owned by these admins.
         status: Panel status filter, ``None`` to disable.
-        online_window: Freshness window in seconds. ``0`` disables the online
-            filter entirely (every matching user is returned). Windows within
-            the panel's own 2-minute window use the cheap ``online=true``
-            flag; wider windows use an explicit ``online_after`` timestamp so
-            that freshness tracks the configured check interval.
+        online_window: Retained for callers that probe all users with ``0``.
+            Any positive value selects the panel's ``online=true`` filter;
+            the limiter always selects this filter independently of its interval.
         page_size: Users per page.
         max_concurrent: Max concurrent page requests.
 
@@ -105,14 +100,6 @@ async def fetch_online_candidates(
     """
     from utils.panel_api.users import fetch_all_users_raw
 
-    use_online_flag = False
-    online_after = None
-    if online_window > 0:
-        if online_window <= PANEL_ONLINE_WINDOW_SECONDS - 10:
-            use_online_flag = True
-        else:
-            online_after = build_online_after(online_window)
-
     try:
         return await fetch_all_users_raw(
             panel_data,
@@ -121,56 +108,41 @@ async def fetch_online_candidates(
             group=group_ids or None,
             limit=page_size,
             max_concurrent=max_concurrent,
-            online=use_online_flag,
-            online_after=online_after,
+            online=online_window > 0,
+            online_after=None,
+            strict=True,
         )
     except Exception as error:
         online_ips_logger.error(f"Failed to fetch online candidates: {error}")
         return None
 
 
-def _parse_ip_payload(payload: dict) -> dict[int, dict[str, int]]:
-    """
-    Normalise a ``UserIPListAll`` body into ``{node_id: {ip: value}}``.
+def _parse_ip_payload(payload: dict) -> dict[int, dict[str, int] | None]:
+    """Preserve timestamps, empty nodes and unavailable nodes without coercion.
 
-    The per-IP value is the panel's **last-seen Unix timestamp** for that IP on
-    that node (verified against a live panel: e.g. ``1788078039`` = 2026-08-30
-    08:20 UTC). Older panel builds documented it as a connection count, and a value
-    this function cannot parse is coerced to ``1``, so callers must treat anything
-    below ``STALE_EPOCH_FLOOR`` as an unknown age rather than as a fresh connection -
-    the panel never expires an entry, so counting one would resurrect the
-    changed-network-looks-like-several-devices failure.
-
-    Nodes the panel could not reach come back as ``null`` and are skipped, as
-    are nodes that reported no IPs at all.
+    A malformed body is unknown evidence. In particular, booleans and legacy
+    connection counts must never be promoted to a current observation.
     """
     nodes = payload.get("nodes") if isinstance(payload, dict) else None
     if not isinstance(nodes, dict):
-        return {}
-
-    parsed: dict[int, dict[str, int]] = {}
+        raise ValueError("Online-IP response has no node map")
+    parsed = {}
     for node_key, node_value in nodes.items():
-        if not isinstance(node_value, dict):
-            continue
-        raw_ips = node_value.get("ips")
-        if not isinstance(raw_ips, dict) or not raw_ips:
-            continue
         try:
             node_id = int(node_key)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as error:
+            raise ValueError("Invalid node ID") from error
+        if node_value is None:
+            parsed[node_id] = None
             continue
-
-        ip_values: dict[str, int] = {}
-        for ip, value in raw_ips.items():
-            ip_str = str(ip).strip()
-            if not ip_str:
-                continue
-            try:
-                ip_values[ip_str] = max(1, int(value))
-            except (ValueError, TypeError):
-                ip_values[ip_str] = 1
-        if ip_values:
-            parsed[node_id] = ip_values
+        if not isinstance(node_value, dict) or not isinstance(node_value.get("ips"), dict):
+            raise ValueError("Invalid node IP map")
+        ip_values = {}
+        for ip, value in node_value["ips"].items():
+            if not isinstance(ip, str) or not ip.strip() or type(value) is not int:
+                raise ValueError("Invalid IP timestamp")
+            ip_values[ip.strip()] = value
+        parsed[node_id] = ip_values
     return parsed
 
 
@@ -179,7 +151,7 @@ async def fetch_user_online_ips(
     user_id: int,
     token: str,
     timeout: float = 8.0,
-) -> tuple[Optional[dict[int, dict[str, int]]], str]:
+) -> tuple[Optional[dict[int, dict[str, int] | None]], str]:
     """
     Fetch the online IPs of one user across every healthy node.
 
@@ -190,8 +162,8 @@ async def fetch_user_online_ips(
 
     Returns:
         ``(payload, outcome)`` where ``payload`` is
-        ``{node_id: {ip: last_seen_epoch}}`` on success and ``None``
-        otherwise, and ``outcome`` is one of the ``OUTCOME_*`` constants.
+        ``{node_id: {ip: last_seen_epoch} | None}`` on success and ``None``
+        otherwise. A null node is unavailable evidence, not an empty map, and ``outcome`` is one of the ``OUTCOME_*`` constants.
     """
     from utils.panel_api.request_helper import panel_request
 
@@ -209,13 +181,18 @@ async def fetch_user_online_ips(
             try:
                 return _parse_ip_payload(response.json()), OUTCOME_OK
             except Exception as parse_error:
-                online_ips_logger.debug(
-                    f"Unparseable online-IP body for user {user_id}: {parse_error}"
-                )
+                online_ips_logger.debug(f"Unparseable online-IP body for user {user_id}: {parse_error}")
                 return None, OUTCOME_ERROR
         if response.status_code == 404:
-            # User was deleted from the panel between the candidate query and now
-            return None, OUTCOME_NOT_FOUND
+            # Only the panel's explicit missing-user response proves absence.
+            # A missing route or proxy 404 leaves connection evidence unknown.
+            try:
+                body = response.json()
+            except (ValueError, AttributeError):
+                return None, OUTCOME_ERROR
+            if isinstance(body, dict) and body.get("detail") == "User not found":
+                return None, OUTCOME_NOT_FOUND
+            return None, OUTCOME_ERROR
         if response.status_code == 401:
             return None, OUTCOME_UNAUTHORIZED
         if response.status_code == 403:
@@ -229,9 +206,7 @@ async def fetch_user_online_ips(
     return None, OUTCOME_ERROR
 
 
-async def check_online_stats_permission(
-    panel_data: PanelType, user_id: int, timeout: float = 10.0
-) -> tuple[bool, str]:
+async def check_online_stats_permission(panel_data: PanelType, user_id: int, timeout: float = 10.0) -> tuple[bool, str]:
     """
     Pre-flight the online-stats endpoint against a single user.
 
@@ -251,8 +226,7 @@ async def check_online_stats_permission(
         return True, "Online-stats endpoint reachable."
     if outcome == OUTCOME_FORBIDDEN:
         return False, (
-            "Panel account lacks the <code>nodes:stats</code> permission "
-            "required by /api/node/online_stats."
+            "Panel account lacks the <code>nodes:stats</code> permission required by /api/node/online_stats."
         )
     if outcome == OUTCOME_UNAUTHORIZED:
         return False, "Panel rejected the token (401)."

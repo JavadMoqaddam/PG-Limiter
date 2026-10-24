@@ -22,17 +22,23 @@ async def fake_get_db():
 
 async def test_unknown_active_users_are_queued_once_without_default_enforcement(
     monkeypatch,
+    completed_logs_evidence,
 ):
     """The enforcement cycle queues unknown users but never judges them on defaults."""
-    users = {
-        "alice": UserType(name="alice", ip=["192.0.2.1"]),
-        "bob": UserType(name="bob", ip=["192.0.2.2"]),
-    }
+    from utils.shared_state import ActiveUsersSnapshot
+
+    users = ActiveUsersSnapshot(
+        {
+            "alice": UserType(name="alice", ip=["192.0.2.1"]),
+            "bob": UserType(name="bob", ip=["192.0.2.2"]),
+        }
+    )
+    users.log_evidence = completed_logs_evidence()
     queued: list[str] = []
     resolved: list[str] = []
     warned: list[str] = []
 
-    async def fake_pop_snapshot():
+    async def fake_pop_snapshot(_config):
         return users
 
     async def fake_check_ip_used(*, config_data, active_users_snapshot):
@@ -83,25 +89,15 @@ async def test_unknown_active_users_are_queued_once_without_default_enforcement(
     monkeypatch.setattr(check_usage, "get_active_users_metadata_batch", fake_metadata)
     monkeypatch.setattr(check_usage.ip_history_tracker, "record_many", fake_record_many)
     monkeypatch.setattr(check_usage, "count_devices", lambda *_args, **_kwargs: 1)
-    monkeypatch.setattr(
-        check_usage, "count_devices_from_ips", lambda *_args, **_kwargs: 1
-    )
+    monkeypatch.setattr(check_usage, "count_devices_from_ips", lambda *_args, **_kwargs: 1)
     monkeypatch.setattr(check_usage, "_sample_is_trustworthy", lambda *_args: True)
-    monkeypatch.setattr(
-        check_usage.warning_system, "check_persistent_violations", fake_persistent
-    )
+    monkeypatch.setattr(check_usage.warning_system, "check_persistent_violations", fake_persistent)
     monkeypatch.setattr(check_usage.warning_system, "add_warning", fail_warning)
-    monkeypatch.setattr(
-        check_usage.warning_system, "cleanup_expired_warnings", fake_cleanup
-    )
-    monkeypatch.setattr(
-        check_usage.warning_system, "get_monitoring_users", lambda: set()
-    )
+    monkeypatch.setattr(check_usage.warning_system, "cleanup_expired_warnings", fake_cleanup)
+    monkeypatch.setattr(check_usage.warning_system, "get_monitoring_users", lambda: set())
     monkeypatch.setattr(check_usage.warning_system, "warnings", {})
     monkeypatch.setattr(user_sync, "queue_unknown_user_fetch", fake_queue)
-    monkeypatch.setattr(
-        check_usage, "resolve_effective_limit", fail_resolve
-    )
+    monkeypatch.setattr(check_usage, "resolve_effective_limit", fail_resolve)
 
     await check_usage.check_users_usage(
         PanelType("admin", "secret", "panel.example"),

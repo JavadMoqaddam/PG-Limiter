@@ -43,9 +43,9 @@ def sample_config():
                 {"type": "warning", "duration": 0},
                 {"type": "disable", "duration": 15},
                 {"type": "disable", "duration": 60},
-                {"type": "disable", "duration": 0}
-            ]
-        }
+                {"type": "disable", "duration": 0},
+            ],
+        },
     }
 
 
@@ -55,7 +55,7 @@ def sample_users():
     return [
         {"name": "user1", "ip": ["1.1.1.1", "2.2.2.2"]},
         {"name": "user2", "ip": ["3.3.3.3"]},
-        {"name": "user3", "ip": ["4.4.4.4", "5.5.5.5", "6.6.6.6"]}
+        {"name": "user3", "ip": ["4.4.4.4", "5.5.5.5", "6.6.6.6"]},
     ]
 
 
@@ -65,7 +65,7 @@ def sample_log_lines():
     return [
         "2023/07/07 03:09:00 151.232.190.86:57288 accepted tcp:gateway.instagram.com:443 [REALITY TCP 4 -> IPv4] email: 22.User_22",
         "2023/07/07 03:08:59 [2a01:5ec0:5011:9962:d8ed:c723:c32:ac2a]:62316 accepted tcp:2.56.98.255:8000 [GRPC 6 >> DIRECT] email: 6.TEST_user",
-        "2023/07/07 03:09:18 [2a01:5ec0:5013:4ca8:1:0:d554:7f0e]:45572 accepted udp:1.1.1.1:53 [REALITY TCP 6 >> DIRECT] email: 2.another_user"
+        "2023/07/07 03:09:18 [2a01:5ec0:5013:4ca8:1:0:d554:7f0e]:45572 accepted udp:1.1.1.1:53 [REALITY TCP 6 >> DIRECT] email: 2.another_user",
     ]
 
 
@@ -73,17 +73,15 @@ def sample_log_lines():
 def mock_panel_type():
     """Provide a mock PanelType for tests"""
     from utils.types import PanelType
-    return PanelType(
-        panel_username="test_admin",
-        panel_password="test_password",
-        panel_domain="test.panel.com"
-    )
+
+    return PanelType(panel_username="test_admin", panel_password="test_password", panel_domain="test.panel.com")
 
 
 @pytest.fixture
 def mock_user_type():
     """Provide a mock UserType for tests"""
     from utils.types import UserType
+
     return UserType(name="test_user", ip=["1.1.1.1", "2.2.2.2"])
 
 
@@ -109,37 +107,43 @@ def mock_telegram_bot():
 def mock_httpx_client():
     """Provide a mock httpx client"""
     client = MagicMock()
-    client.get = AsyncMock(return_value=MagicMock(
-        status_code=200,
-        json=MagicMock(return_value={"country": "US", "isp": "Test ISP"})
-    ))
-    client.post = AsyncMock(return_value=MagicMock(
-        status_code=200,
-        json=MagicMock(return_value={"access_token": "test_token"})
-    ))
+    client.get = AsyncMock(
+        return_value=MagicMock(status_code=200, json=MagicMock(return_value={"country": "US", "isp": "Test ISP"}))
+    )
+    client.post = AsyncMock(
+        return_value=MagicMock(status_code=200, json=MagicMock(return_value={"access_token": "test_token"}))
+    )
     return client
 
 
 @pytest.fixture(autouse=True)
-def reset_globals():
+def reset_globals(monkeypatch):
     """Reset global state before each test"""
     # Import and reset globals that might persist between tests
     try:
         import utils.handel_dis_users as dis_mod
+
         # The registry itself lives in SQLite; the only process state left is the
         # one-shot flag for importing the retired JSON file.
         dis_mod._migrated = False
     except ImportError:
         pass
-    
+
     try:
         from utils.check_usage import ACTIVE_USERS
+
         ACTIVE_USERS.clear()
+        from utils.shared_state import begin_api_collection
+
+        begin_api_collection()
     except ImportError:
         pass
-    
+
+    from utils.log_observations import LOG_OBSERVATIONS, LogObservations
+
+    monkeypatch.setattr(LOG_OBSERVATIONS, "__dict__", LogObservations().__dict__)
     yield  # Run test
-    
+
     # Cleanup after test if needed
 
 
@@ -163,9 +167,27 @@ def pytest_collection_modifyitems(config, items):
 
 def pytest_addoption(parser):
     """Add custom command line options"""
-    parser.addoption(
-        "--run-integration",
-        action="store_true",
-        default=False,
-        help="run integration tests"
-    )
+    parser.addoption("--run-integration", action="store_true", default=False, help="run integration tests")
+
+
+@pytest.fixture
+def completed_logs_evidence():
+    """Build current completed evidence for tests focused on policy, not collection."""
+    import time
+    from utils.log_observations import LOG_OBSERVATIONS
+    from utils.shared_state import note_node_event
+    from utils.types import NodeType
+
+    def build(config=None):
+        config = config or {"check_interval": 60}
+        LOG_OBSERVATIONS.configure(config)
+        # Policy fixtures supply a known monitored interval and a known fleet.
+        LOG_OBSERVATIONS.floor = time.time() - float(config.get("check_interval", 60)) - 1
+        LOG_OBSERVATIONS.zones["1"] = LOG_OBSERVATIONS._zone("UTC")
+        LOG_OBSERVATIONS.register_fleet([NodeType(1, "node", "192.0.2.1", "connected")])
+        note_node_event(1)
+        LOG_OBSERVATIONS.fleet_floor = LOG_OBSERVATIONS.floor
+        LOG_OBSERVATIONS.transport_floor = LOG_OBSERVATIONS.floor
+        return LOG_OBSERVATIONS.evidence()
+
+    return build
