@@ -140,34 +140,48 @@ async def _find_preflight_user_id(panel_data, config_data) -> tuple[int, str]:
     """
     Pick one real user id to probe the online-stats endpoint with.
 
-    Online users are queried first because that response is tiny; only if
-    nobody is currently online does it fall back to the wider query.
+    Each query requests at most one user. Only a confirmed empty online
+    list falls back to the wider active-user query.
 
     Returns:
         ``(user_id, error)`` — ``user_id`` is ``0`` when no probe target could
         be resolved, in which case ``error`` explains why.
     """
     from utils.ip_source_api import resolve_monitored_group_ids
-    from utils.panel_api.online_ips import fetch_online_candidates
+    from utils.panel_api.request_helper import panel_get
 
     group_ids = resolve_monitored_group_ids(config_data)
-    for window in (110, 0):
-        candidates = await fetch_online_candidates(
-            panel_data,
-            group_ids=group_ids,
-            status="active",
-            online_window=window,
-            page_size=100 if window else 500,
-        )
-        if candidates is None:
-            return 0, "Could not query the panel user list."
-        for raw in candidates:
-            try:
-                user_id = int(raw.get("id"))
-            except (ValueError, TypeError):
-                continue
-            if user_id > 0:
-                return user_id, ""
+    query_error = (0, "Could not query the panel user list.")
+    for online in (True, False):
+        params = {"offset": 0, "limit": 1, "status": "active"}
+        if group_ids:
+            params["group"] = group_ids
+        if online:
+            params["online"] = "true"
+        try:
+            response = await panel_get(panel_data, "/api/users", params=params, timeout=60.0, max_retries=3)
+            if response is None or response.status_code != 200:
+                return query_error
+            data = response.json()
+        except Exception:
+            return query_error
+        if not isinstance(data, dict) or not isinstance(data.get("users"), list):
+            return query_error
+        total = data.get("total")
+        if type(total) is not int or total < 0 or len(data["users"]) != min(1, total):
+            return query_error
+        if not data["users"]:
+            continue
+        raw = data["users"][0]
+        if (
+            not isinstance(raw, dict)
+            or type(raw.get("id")) is not int
+            or raw["id"] <= 0
+            or not isinstance(raw.get("username"), str)
+            or not raw["username"].strip()
+        ):
+            return query_error
+        return raw["id"], ""
     return 0, "No active user was found to probe the endpoint with."
 
 

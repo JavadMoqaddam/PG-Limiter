@@ -107,9 +107,17 @@ async def fetch_all_users_raw(
     def validate_page(body, offset, expected_total=None):
         if not isinstance(body, dict) or not isinstance(body.get("users"), list):
             raise ValueError("Invalid /api/users page")
+        if "total" not in body:
+            raise ValueError(f"Missing /api/users total at offset {offset}")
         total = body.get("total")
-        if type(total) is not int or total < 0 or (expected_total is not None and total != expected_total):
-            raise ValueError("Missing or changing /api/users total")
+        if type(total) is not int:
+            raise ValueError(f"Invalid /api/users total at offset {offset}: type={type(total).__name__}")
+        if total < 0:
+            raise ValueError(f"Negative /api/users total at offset {offset}")
+        if expected_total is not None and total != expected_total:
+            raise ValueError(
+                f"Changed /api/users total at offset {offset}: expected={expected_total}, received={total}"
+            )
         rows = body["users"]
         if len(rows) != min(limit, max(0, total - offset)):
             raise ValueError("Incomplete /api/users page")
@@ -150,40 +158,61 @@ async def fetch_all_users_raw(
     users_logger.info(f"📥 Fetching {len(offsets)} remaining pages in parallel (max {max_concurrent} concurrent)...")
 
     semaphore = asyncio.Semaphore(max_concurrent)
+    pagination_failed = False
 
     async def fetch_page_task(offset: int) -> list[dict]:
+        nonlocal pagination_failed
         async with semaphore:
-            page_params = dict(params)
-            page_params["offset"] = offset
-            page_resp = await panel_get(
-                panel_data,
-                "/api/users",
-                params=page_params,
-                timeout=60.0,
-                max_retries=3,
-            )
-            if page_resp is None:
-                users_logger.warning(f"Failed to fetch page at offset {offset}")
-                if strict:
-                    raise ValueError(f"Unavailable /api/users page at {offset}")
+            # Set before releasing the semaphore on any fatal page failure.
+            # Queued tasks may acquire it before gather delivers that exception.
+            if strict and pagination_failed:
                 return []
             try:
-                page_data = page_resp.json()
+                page_params = dict(params)
+                page_params["offset"] = offset
+                page_resp = await panel_get(
+                    panel_data,
+                    "/api/users",
+                    params=page_params,
+                    timeout=60.0,
+                    max_retries=3,
+                )
+                if page_resp is None:
+                    users_logger.warning(f"Failed to fetch page at offset {offset}")
+                    if strict:
+                        raise ValueError(f"Unavailable /api/users page at {offset}")
+                    return []
+                try:
+                    page_data = page_resp.json()
+                    if strict:
+                        return validate_page(page_data, offset, total_users)[0]
+                    if isinstance(page_data, dict) and "users" in page_data:
+                        return page_data["users"]
+                    elif isinstance(page_data, list):
+                        return page_data
+                    return []
+                except Exception as parse_err:
+                    users_logger.warning(f"Error parsing page at offset {offset}: {parse_err}")
+                    if strict:
+                        raise ValueError(f"Invalid /api/users page at {offset}") from parse_err
+                    return []
+            except BaseException:
                 if strict:
-                    return validate_page(page_data, offset, total_users)[0]
-                if isinstance(page_data, dict) and "users" in page_data:
-                    return page_data["users"]
-                elif isinstance(page_data, list):
-                    return page_data
-                return []
-            except Exception as parse_err:
-                users_logger.warning(f"Error parsing page at offset {offset}: {parse_err}")
-                if strict:
-                    raise ValueError(f"Invalid /api/users page at {offset}") from parse_err
-                return []
+                    pagination_failed = True
+                raise
 
-    tasks = [fetch_page_task(off) for off in offsets]
-    pages = await asyncio.gather(*tasks, return_exceptions=True)
+    tasks = [asyncio.create_task(fetch_page_task(off)) for off in offsets]
+    try:
+        pages = await asyncio.gather(*tasks, return_exceptions=not strict)
+    except BaseException as error:
+        # A strict snapshot cannot recover after one failed page. Stop sibling
+        # requests and settle their cleanup before returning failure/cancellation.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if strict and isinstance(error, Exception):
+            raise ValueError("Incomplete /api/users pagination") from error
+        raise
 
     all_users = list(first_page_users)
     for i, page in enumerate(pages):

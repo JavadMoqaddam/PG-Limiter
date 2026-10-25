@@ -57,20 +57,22 @@ async def get_nodes(
     if not force_refresh and _nodes_cache["nodes"] is not None:
         current_time = time.time()
         # Check if cache is still valid, for the same panel, and for the same scope
-        if (_nodes_cache["expires_at"] > current_time and
-                _nodes_cache["panel_domain"] == panel_data.panel_domain and
-                _nodes_cache["enabled_only"] == enabled_only):
+        if (
+            _nodes_cache["expires_at"] > current_time
+            and _nodes_cache["panel_domain"] == panel_data.panel_domain
+            and _nodes_cache["enabled_only"] == enabled_only
+        ):
             time_left = int(_nodes_cache["expires_at"] - current_time)
             nodes_logger.debug(f"🖥️ Using in-memory cached nodes list (expires in {time_left // 60} minutes)")
             return _nodes_cache["nodes"]
-    
+
     nodes_logger.info(f"🖥️ Fetching nodes from panel (force_refresh={force_refresh})...")
-    
+
     # Build endpoint with optional enabled filter
     endpoint = "/api/nodes?enabled=true" if enabled_only else "/api/nodes"
-    
-    response = await panel_get(panel_data, endpoint, force_refresh=force_refresh)
-    
+
+    response = await panel_get(panel_data, endpoint)
+
     if response is None:
         message = (
             "Failed to get nodes after all retries. Make sure the panel is running "
@@ -79,13 +81,13 @@ async def get_nodes(
         await safe_send_logs_panel(message)
         nodes_logger.error(message)
         raise ValueError(message)
-    
+
     try:
         user_inform = response.json()
     except Exception as json_error:
         nodes_logger.error(f"Failed to parse JSON: {json_error}")
         raise ValueError(f"Failed to parse nodes response: {json_error}")
-    
+
     # Handle both list and dict responses
     nodes_list = None
     if isinstance(user_inform, list):
@@ -107,12 +109,12 @@ async def get_nodes(
         message = f"Nodes response is neither list nor dict: {type(user_inform)}"
         nodes_logger.error(message)
         raise ValueError(message)
-    
+
     if not nodes_list or not isinstance(nodes_list, list):
         message = "Failed to extract nodes list from response"
         nodes_logger.error(message)
         raise ValueError(message)
-    
+
     all_nodes = []
     for node in nodes_list:
         all_nodes.append(
@@ -124,15 +126,15 @@ async def get_nodes(
                 message=node.get("message", ""),
             )
         )
-    
+
     # Cache the nodes list for 1 hour (3600 seconds)
     _nodes_cache["nodes"] = all_nodes
     _nodes_cache["expires_at"] = time.time() + 3600
     _nodes_cache["panel_domain"] = panel_data.panel_domain
     _nodes_cache["enabled_only"] = enabled_only
-    
+
     nodes_logger.info(f"🖥️ Fetched {len(all_nodes)} nodes (cached for 1 hour)")
     for node in all_nodes:
         nodes_logger.debug(f"  └─ {node.node_name} (id={node.node_id}, status={node.status})")
-    
+
     return all_nodes
