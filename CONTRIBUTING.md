@@ -32,6 +32,8 @@ python3 limiter.py
 python3 -m pytest tests/ --ignore=tests/core_test.py --ignore=tests/test_minimal.py
 ```
 
+For a Docker trial before merging, follow [Testing a reviewed PR with Docker](docs/PR_TESTING.md).
+
 Dependabot checks Python dependencies each weekday at 09:00 Asia/Tehran and GitHub
 Actions and Docker images weekly on Monday at 09:00. It opens grouped minor/patch update
 PRs; major updates stay separate for review. Python test tools retain their
