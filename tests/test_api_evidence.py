@@ -385,6 +385,108 @@ async def test_partial_cycle_reports_completeness_separately_from_enforcement(ap
     assert get_last_cycle_stats().get("collection_outcome") == "success"
 
 
+@pytest.mark.parametrize(
+    ("body", "reason_key", "missing_ids"),
+    [
+        ({"nodes": {}}, "missing_node_users", (1,)),
+        ({"nodes": {"1": None}}, "null_node_users", ()),
+        ({"nodes": {"1": {"ips": {"5.6.7.8": 1}}}}, "unknown_age_users", ()),
+        ("future", "future_timestamp_users", ()),
+    ],
+)
+async def test_successful_api_responses_explain_unusable_evidence(
+    api_cycle, monkeypatch, caplog, body, reason_key, missing_ids
+):
+    from utils.ip_source_api import get_last_cycle_stats
+
+    assert await api_cycle.run()
+    warnings = dict(api_cycle.warning.warnings)
+    before = {name: record.consecutive_violations for name, record in warnings.items()}
+    monkeypatch.setattr(time, "time", lambda: api_cycle.now + 60)
+    if body == "future":
+        body = {"nodes": {"1": {"ips": {"5.6.7.8": api_cycle.now + 120}}}}
+    for name in api_cycle.bodies:
+        api_cycle.bodies[name] = body
+    caplog.clear()
+
+    assert await api_cycle.run() is False
+    stats = get_last_cycle_stats()
+    assert stats["coverage"] == 1.0
+    assert stats["fetched_ok"] == 2
+    assert stats["unknown_users"] == 2
+    assert stats[reason_key] == 2
+    assert stats["missing_node_ids"] == missing_ids
+    assert api_cycle.warning.warnings == warnings
+    assert {name: record.consecutive_violations for name, record in warnings.items()} == before
+    diagnostics = [
+        record.getMessage() for record in caplog.records if "API user evidence unavailable:" in record.getMessage()
+    ]
+    assert len(diagnostics) == 1
+    assert all(value not in diagnostics[0] for value in ("alice", "bob", "5.6.7.8", "9.9.9.9", "panel.local"))
+
+
+async def test_api_evidence_diagnostics_count_users_and_reset_after_recovery(api_cycle, monkeypatch):
+    import utils.panel_api.nodes as nodes
+    from utils.ip_source_api import get_last_cycle_stats
+    from utils.types import NodeType
+
+    monkeypatch.setattr(
+        nodes,
+        "get_nodes",
+        AsyncMock(return_value=[NodeType(n, "node", f"192.0.2.{n}", "connected") for n in (1, 2, 3)]),
+    )
+    api_cycle.bodies["alice"] = {"nodes": {"1": None}}
+    api_cycle.bodies["bob"] = {
+        "nodes": {
+            "1": {"ips": {"5.6.7.8": 1, "9.9.9.9": 2}},
+            "2": {"ips": {"5.6.7.8": api_cycle.now + 120}},
+            "3": {"ips": {}},
+        }
+    }
+    assert await api_cycle.run() is False
+    stats = get_last_cycle_stats()
+    assert stats["unknown_users"] == 2
+    assert stats["missing_node_users"] == 1
+    assert stats["null_node_users"] == 1
+    assert stats["unknown_age_users"] == 1
+    assert stats["future_timestamp_users"] == 1
+    assert stats["unknown_age_ips"] == 2
+    assert stats["missing_node_ids"] == (2, 3)
+
+    for name in api_cycle.bodies:
+        api_cycle.bodies[name] = {"nodes": {str(n): {"ips": {}} for n in (1, 2, 3)}}
+    assert await api_cycle.run() is True
+    stats = get_last_cycle_stats()
+    assert stats["unknown_users"] == 0
+    assert stats["missing_node_users"] == 0
+    assert stats["null_node_users"] == 0
+    assert stats["unknown_age_users"] == 0
+    assert stats["future_timestamp_users"] == 0
+    assert stats["missing_node_ids"] == ()
+
+
+async def test_superseded_api_evidence_does_not_publish_unusable_payload_diagnostics(api_cycle, monkeypatch, caplog):
+    import utils.ip_source_api as api
+    from utils.read_config import save_config_value
+
+    for name in api_cycle.bodies:
+        api_cycle.bodies[name] = {"nodes": {}}
+    original = api._validate_ips
+
+    async def change_settings(ips, config):
+        result = await original(ips, config)
+        await save_config_value("api_ip_freshness", "10")
+        return result
+
+    monkeypatch.setattr(api, "_validate_ips", change_settings)
+    assert await api_cycle.run() is False
+    stats = api.get_last_cycle_stats()
+    assert stats["collection_outcome"] == "superseded"
+    assert stats["missing_node_users"] == 0
+    assert stats["missing_node_ids"] == ()
+    assert not any("API user evidence unavailable:" in record.getMessage() for record in caplog.records)
+
+
 def _not_found_response(body):
     if body == "bare":
         return SimpleNamespace(status_code=404)

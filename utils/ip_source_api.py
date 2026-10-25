@@ -67,6 +67,12 @@ LAST_CYCLE_STATS: dict = {
     # value on any cycle that returns before the build.
     "future_ips": 0,
     "unknown_age_ips": 0,
+    # Reasons can overlap; each counter counts affected users, not IPs or nodes.
+    "missing_node_users": 0,
+    "null_node_users": 0,
+    "unknown_age_users": 0,
+    "future_timestamp_users": 0,
+    "missing_node_ids": (),
     "skipped_reason": "",
     # Separate remote collection health from the bool returned to enforcement:
     # complete users may still be judged during a partial collection.
@@ -428,6 +434,13 @@ async def _build_users_from_payloads(
     raw_ips = set()
     pairs_by_user = {}
     unknown = set()
+    unknown_by_reason = {
+        "missing_node_users": set(),
+        "null_node_users": set(),
+        "unknown_age_users": set(),
+        "future_timestamp_users": set(),
+    }
+    missing_node_ids = set()
     nodes_seen = set()
     stats = {
         "geo_lookups": 0,
@@ -450,23 +463,29 @@ async def _build_users_from_payloads(
             }
             if expected_node_ids is None:
                 unknown.add(username)
+                unknown_by_reason["missing_node_users"].add(username)
         if expected_node_ids and not expected_node_ids.issubset(node_map):
             unknown.add(username)
+            unknown_by_reason["missing_node_users"].add(username)
+            missing_node_ids.update(node_id for node_id in expected_node_ids - node_map.keys() if type(node_id) is int)
         pairs = []
         for node_id, ip_values in node_map.items():
             if node_id in disabled_nodes:
                 continue
             if ip_values is None:
                 unknown.add(username)
+                unknown_by_reason["null_node_users"].add(username)
                 continue
             nodes_seen.add(node_id)
             for ip, stamp in ip_values.items():
                 if type(stamp) is not int or stamp < STALE_EPOCH_FLOOR:
                     unknown.add(username)
+                    unknown_by_reason["unknown_age_users"].add(username)
                     stats["unknown_age_ips"] += 1
                     continue
                 if stamp > now:
                     unknown.add(username)
+                    unknown_by_reason["future_timestamp_users"].add(username)
                     stats["future_ips"] += 1
                     continue
                 pairs.append((node_id, ip, stamp))
@@ -483,6 +502,7 @@ async def _build_users_from_payloads(
             age = evaluated_at - stamp
             if age < 0:
                 unknown.add(username)
+                unknown_by_reason["future_timestamp_users"].add(username)
                 stats["future_ips"] += 1
             elif age >= freshness:
                 stats["stale_ips"] += 1
@@ -522,6 +542,8 @@ async def _build_users_from_payloads(
     stats.update(
         nodes_seen=len(nodes_seen), total_ips=sum(len(u.ip) for u in users.values()), users_with_ips=len(users)
     )
+    stats.update({reason: len(names) for reason, names in unknown_by_reason.items()})
+    stats["missing_node_ids"] = tuple(sorted(missing_node_ids))
     return users, stats
 
 
@@ -539,6 +561,7 @@ def _reset_cycle_stats() -> None:
     """Zero the per-cycle counters before a new collection run."""
     for key in LAST_CYCLE_STATS:
         LAST_CYCLE_STATS[key] = "" if key == "skipped_reason" else 0
+    LAST_CYCLE_STATS["missing_node_ids"] = ()
     LAST_CYCLE_STATS["ran_at"] = time.time()
     LAST_CYCLE_STATS["collection_outcome"] = "failure"
 
@@ -862,6 +885,17 @@ async def _collect_api_cycle(
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
         return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
     LAST_CYCLE_STATS["unknown_users"] = len(unknown_users)
+    LAST_CYCLE_STATS.update(build_stats)
+    if new_users.unknown_users:
+        api_ip_logger.warning(
+            "🛰️ API user evidence unavailable: %s missing-node, %s null-node, %s undatable, "
+            "%s future-dated users; missing node IDs: %s",
+            build_stats["missing_node_users"],
+            build_stats["null_node_users"],
+            build_stats["unknown_age_users"],
+            build_stats["future_timestamp_users"],
+            build_stats["missing_node_ids"],
+        )
     if unknown_users == set(raw_by_name):
         LAST_CYCLE_STATS["collection_outcome"] = "partial"
         LAST_CYCLE_STATS.update(build_stats)

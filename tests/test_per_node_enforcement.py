@@ -38,6 +38,8 @@ async def node_cycle(enforcement_cycle, completed_logs_evidence):
         LOG_OBSERVATIONS.zones[str(node_id)] = LOG_OBSERVATIONS._zone("UTC")
         note_node_event(node_id)
     LOG_OBSERVATIONS.fleet_floor = LOG_OBSERVATIONS.floor
+    for node_id in LOG_OBSERVATIONS.required_nodes:
+        LOG_OBSERVATIONS.node_states[node_id].floor = LOG_OBSERVATIONS.floor
     LOG_OBSERVATIONS.transport_floor = LOG_OBSERVATIONS.floor
     return system, get_db, messages, config
 

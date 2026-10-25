@@ -207,14 +207,15 @@ async def test_inbound_counting_fetches_isp_only_after_two_inbounds_cause_disabl
         assert "alice" not in case["system"].warnings
         assert case["requests"] == []
 
-        observe(["Vless TCP", "Vless WS"])
         for _ in range(2):
             case["now"][0] += 60
+            observe(["Vless TCP", "Vless WS"])
             await run_cycle(case)
         assert case["system"].warnings["alice"].consecutive_violations == 2
         assert case["requests"] == []
 
         case["now"][0] += 60
+        observe(["Vless TCP", "Vless WS"])
         await run_cycle(case)
         assert case["outcomes"] == ["alice"]
         assert len(case["requests"]) == 2

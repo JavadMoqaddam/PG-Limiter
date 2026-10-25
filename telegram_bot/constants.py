@@ -227,8 +227,8 @@ class CallbackData:
     USER_SYNC_10 = "user_sync_10"
     USER_SYNC_15 = "user_sync_15"
     USER_SYNC_NOW = "user_sync_now"
-    USER_SYNC_PENDING = "user_sync_pending"  # Review pending deletions
-    USER_SYNC_FORCE_DELETE = "user_sync_force_delete"  # Force delete pending users
+    USER_SYNC_PENDING = "user_sync_pending"  # Legacy button redirects to sync settings
+    USER_SYNC_FORCE_DELETE = "user_sync_force_delete"  # Legacy button redirects to sync settings
 
     # Topics settings
     TOPICS_MENU = "topics_menu"
