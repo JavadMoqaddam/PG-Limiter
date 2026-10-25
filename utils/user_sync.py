@@ -5,7 +5,9 @@ Periodically syncs users from the panel to local database for efficient filterin
 
 import asyncio
 from datetime import datetime, timezone
+from html import escape
 from typing import Optional
+from urllib.parse import quote
 
 from utils.logs import get_logger
 from utils.types import PanelType
@@ -271,17 +273,33 @@ async def get_all_users_with_details(panel_data: PanelType, status: str | None =
     """
     from utils.panel_api.users import fetch_all_users_raw
 
+    # Membership deletion requires a complete, consistent response. A failed
+    # page must never look like users removed from the panel. Username supplies
+    # deterministic ordering on the full /api/users endpoint.
+    return await fetch_all_users_raw(panel_data, status=status, sort="username", strict=True)
+
+
+async def _panel_confirms_user_absent(panel_data: PanelType, username: str) -> bool:
+    """Require the panel's explicit missing-user response, preserving unknowns."""
+    from utils.panel_api.request_helper import panel_get
+
     try:
-        return await fetch_all_users_raw(panel_data, status=status)
-    except Exception as e:
-        sync_logger.error(f"❌ Failed to fetch users with details: {e}")
-        return []
+        response = await panel_get(panel_data, f"/api/user/{quote(username, safe='')}", timeout=15.0, max_retries=1)
+        if response is None or response.status_code != 404:
+            return False
+        body = response.json()
+        return isinstance(body, dict) and body.get("detail") == "User not found"
+    except Exception:
+        # Neither dependency exception text nor panel bodies belong in sync logs.
+        return False
 
 
 async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
     """
     Sync all users from panel to local database.
-    Also detects users deleted from panel and removes them from limiter.
+    Mirror the validated panel list, confirming current absence before deletion.
+    Commit bounded batches so settings and enforcement writers can keep running.
+    Failed fetches/parses never change membership; failed writes never prune it.
 
     Args:
         panel_data: Panel connection data
@@ -305,120 +323,112 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
             sync_logger.info("🔄 Starting user sync from panel to database...")
             start_time = datetime.now(timezone.utc)
 
+            # Snapshot local rows before any network wait, then close the read
+            # transaction. Later edits and inserts belong to concurrent writers.
+            from db.database import get_db
+            from db.crud.users import UserCRUD
+            from db.models import User
+            from sqlalchemy import select, text
+
+            batch_size = 500
+            columns = tuple(User.__table__.columns.keys())
+            async with get_db() as db:
+                result = await db.execute(select(User))
+                deletion_snapshots = {
+                    user.username: tuple(getattr(user, column) for column in columns) for user in result.scalars()
+                }
+
             # Fetch ALL users from panel (all statuses) to avoid losing disabled users
             users = await get_all_users_with_details(panel_data, status=None)
 
-            if not users:
-                sync_logger.warning("⚠️ No users fetched from panel - skipping sync entirely")
-                return (0, 0, 0)
-
             sync_logger.info(f"📥 Processing {len(users)} users...")
 
-            # Build set of usernames from panel
-            panel_usernames = {u.get("username") for u in users if u.get("username")}
-
-            if not panel_usernames:
-                sync_logger.warning("⚠️ No valid usernames in panel response - skipping sync")
-                return (0, 0, 0)
-
-            # Import database modules here to avoid circular imports
-            sync_logger.info("📂 Importing database modules...")
-            from db.database import get_db
-            from db.crud.users import UserCRUD
+            # Parse the entire validated snapshot before making any writes.
+            users_to_upsert = []
+            for user_data in users:
+                try:
+                    parsed = _parse_panel_user_dict(user_data)
+                    if parsed is None:
+                        raise ValueError("Invalid panel user")
+                    users_to_upsert.append(parsed)
+                except Exception:
+                    errors += 1
+            if errors:
+                sync_logger.error(f"❌ User sync skipped: {errors} invalid panel records")
+                return (0, errors, 0)
+            panel_usernames = {user["username"] for user in users_to_upsert}
+            deletion_snapshots = {
+                name: snapshot for name, snapshot in deletion_snapshots.items() if name not in panel_usernames
+            }
 
             sync_logger.info("📂 Opening database connection for sync...")
 
-            from utils.read_config import read_config
-
-            config = await read_config()
-
             async with get_db() as db:
                 sync_logger.info("✅ Database connection opened")
-                # Get existing usernames in local DB
+                for offset in range(0, len(users_to_upsert), batch_size):
+                    count = await UserCRUD.bulk_upsert_users(db, users_to_upsert[offset : offset + batch_size])
+                    await db.commit()
+                    synced += count
+                    # Give other ready writers an opportunity between batches.
+                    await asyncio.sleep(0)
+
+            # Offset pagination can span same-count membership changes. Validate
+            # each proposed deletion against the current user-detail endpoint,
+            # with no database transaction retained during these network waits.
+            async with get_db() as db:
                 local_usernames = await UserCRUD.get_all_usernames(db)
-                sync_logger.info(f"📊 Found {len(local_usernames)} existing users in local DB")
+            potentially_deleted = sorted(local_usernames - panel_usernames)
+            confirmation_slots = asyncio.Semaphore(10)
 
-                # Sync users from panel using native Bulk Upsert
-                users_to_upsert = []
-                for user_data in users:
-                    try:
-                        parsed = _parse_panel_user_dict(user_data)
-                        if parsed:
-                            users_to_upsert.append(parsed)
-                    except Exception as e:
-                        sync_logger.error(f"Error parsing user {user_data.get('username', '?')}: {e}")
-                        errors += 1
+            async def confirm_absence(username):
+                async with confirmation_slots:
+                    return await _panel_confirms_user_absent(panel_data, username)
 
-                # Execute Native SQLite Bulk Upsert
-                synced = await UserCRUD.bulk_upsert_users(db, users_to_upsert)
-                await db.commit()
-                sync_logger.info(f"✅ Native Bulk Upsert committed: {synced} synced in single transaction")
+            for offset in range(0, len(potentially_deleted), batch_size):
+                batch = potentially_deleted[offset : offset + batch_size]
+                # A newly inserted local row belongs to a later writer. Leave it
+                # for a subsequent sync even if this run's panel view is older.
+                existing = [name for name in batch if name in deletion_snapshots]
+                errors += len(batch) - len(existing)
+                confirmed = await asyncio.gather(*(confirm_absence(name) for name in existing))
+                errors += sum(not absent for absent in confirmed)
+                absent_names = [name for name, absent in zip(existing, confirmed) if absent]
+                if not absent_names:
+                    continue
 
-                # Refresh in-memory RAM metadata cache
-                await refresh_user_metadata_cache(db)
-
-                # SAFETY CHECKS before deleting users
-                # Only delete if sync was mostly successful (less than 10% errors)
-                # and we received a reasonable number of users from panel
-                potentially_deleted = list(local_usernames - panel_usernames)
-                error_rate = errors / max(len(users), 1)
-
-                if potentially_deleted:
-                    # Check if auto-deletion is enabled in config
-                    auto_delete_enabled = config.get("user_sync", {}).get("auto_delete_users", False)
-
-                    if not auto_delete_enabled:
-                        sync_logger.info(
-                            f"ℹ️ Auto-deletion disabled. {len(potentially_deleted)} users not in panel but kept in local DB. "
-                            f"Enable 'auto_delete_users' in config or use Telegram bot to review."
-                        )
-                        # Log the users that would have been deleted
-                        if len(potentially_deleted) <= 20:
-                            sync_logger.info(f"Users not in panel: {', '.join(potentially_deleted)}")
+                async with get_db() as db:
+                    # Serialize the comparison and delete with other writers.
+                    # Full rows include policy, recovery state and panel refresh
+                    # times, all of which must survive a concurrent update.
+                    if db.bind.dialect.name == "sqlite":
+                        await db.execute(text("BEGIN IMMEDIATE"))
+                    result = await db.execute(select(User).where(User.username.in_(absent_names)).with_for_update())
+                    unchanged = []
+                    for user in result.scalars():
+                        if tuple(getattr(user, column) for column in columns) == deletion_snapshots[user.username]:
+                            unchanged.append(user.username)
                         else:
-                            sync_logger.info(f"Users not in panel (first 20): {', '.join(potentially_deleted[:20])}...")
+                            errors += 1
+                    count = await UserCRUD.delete_many(db, unchanged)
+                    await db.commit()
+                deleted += count
+                deleted_usernames.extend(unchanged)
+                await asyncio.sleep(0)
 
-                    # Safety check 1: Don't delete if there were too many sync errors
-                    elif error_rate > 0.1:  # More than 10% errors
-                        sync_logger.warning(
-                            f"⚠️ Skipping deletion: too many sync errors ({errors}/{len(users)} = {error_rate:.1%})"
-                        )
-                    # Safety check 2: Don't delete if panel returned significantly fewer users
-                    # This could indicate a pagination or API issue
-                    elif len(local_usernames) > 0 and len(panel_usernames) < len(local_usernames) * 0.5:
-                        sync_logger.warning(
-                            f"⚠️ Skipping deletion: panel returned too few users "
-                            f"({len(panel_usernames)} vs {len(local_usernames)} local). "
-                            f"This may indicate an API issue."
-                        )
-                    # Safety check 3: Don't delete more than 10% of users in one sync (stricter)
-                    elif len(potentially_deleted) > len(local_usernames) * 0.1:
-                        sync_logger.warning(
-                            f"⚠️ Skipping deletion: too many users to delete "
-                            f"({len(potentially_deleted)}/{len(local_usernames)} = "
-                            f"{len(potentially_deleted) / len(local_usernames):.1%}). "
-                            f"Manual review recommended via Telegram bot."
-                        )
-                    # Safety check 4: Don't delete more than 50 users at once
-                    elif len(potentially_deleted) > 50:
-                        sync_logger.warning(
-                            f"⚠️ Skipping deletion: {len(potentially_deleted)} users is too many to delete at once. "
-                            f"Manual review recommended via Telegram bot."
-                        )
-                    else:
-                        # All safety checks passed - proceed with deletion
-                        sync_logger.info(f"🗑️ Deleting {len(potentially_deleted)} users removed from panel")
-                        deleted_usernames = potentially_deleted
-                        deleted = await UserCRUD.delete_many(db, deleted_usernames)
-
-                await db.commit()
+            # Publish the cache after committed membership cleanup.
+            await refresh_user_metadata_cache()
 
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-            _last_sync_time = datetime.now(timezone.utc)
-
-            sync_logger.info(
-                f"✅ User sync completed: {synced} synced, {deleted} deleted, {errors} errors in {elapsed:.1f}s"
-            )
+            if errors:
+                sync_logger.warning(
+                    f"⚠️ User sync incomplete: {synced} synced, {deleted} deleted, "
+                    f"{errors} unconfirmed or changed users in {elapsed:.1f}s"
+                )
+            else:
+                _last_sync_time = datetime.now(timezone.utc)
+                sync_logger.info(
+                    f"✅ User sync completed: {synced} synced, {deleted} deleted, 0 errors in {elapsed:.1f}s"
+                )
 
             # Send Telegram notification for deleted users
             if deleted_usernames:
@@ -427,6 +437,7 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
         except Exception as e:
             import traceback
 
+            errors += 1
             sync_logger.error(f"❌ User sync failed: {type(e).__name__}: {e}")
             sync_logger.error(f"Traceback: {traceback.format_exc()}")
 
@@ -439,9 +450,9 @@ async def _notify_deleted_users(usernames: list[str]) -> None:
         from telegram_bot.send_message import send_logs
 
         if len(usernames) <= 10:
-            user_list = "\n".join(f"• <code>{u}</code>" for u in usernames)
+            user_list = "\n".join(f"• <code>{escape(u)}</code>" for u in usernames)
         else:
-            user_list = "\n".join(f"• <code>{u}</code>" for u in usernames[:10])
+            user_list = "\n".join(f"• <code>{escape(u)}</code>" for u in usernames[:10])
             user_list += f"\n... and {len(usernames) - 10} more"
 
         message = (
@@ -649,107 +660,3 @@ async def run_user_sync_loop(panel_data: PanelType):
         except Exception as e:
             sync_logger.error(f"Error in user sync loop: {e}")
             await asyncio.sleep(60)  # Wait before retry
-
-
-async def get_pending_deletions(panel_data: PanelType) -> dict:
-    """
-    Get the list of users that would be deleted during sync.
-    This allows manual review before force-deleting.
-
-    Args:
-        panel_data: Panel connection data
-
-    Returns:
-        Dictionary with pending deletions info:
-        {
-            "pending_deletions": ["user1", "user2", ...],
-            "local_count": 100,
-            "panel_count": 80,
-            "deletion_percentage": 20.0,
-            "safe_to_delete": True/False,
-            "reason": "reason if not safe"
-        }
-    """
-    from db.database import get_db
-    from db.crud import UserCRUD
-
-    result = {
-        "pending_deletions": [],
-        "local_count": 0,
-        "panel_count": 0,
-        "deletion_percentage": 0.0,
-        "safe_to_delete": True,
-        "reason": "",
-    }
-
-    try:
-        # Get ALL users from panel (not just active) for proper deletion comparison
-        users = await get_all_users_with_details(panel_data, status=None)
-        panel_usernames = {u.get("username") for u in users if u.get("username")}
-        result["panel_count"] = len(panel_usernames)
-
-        # Get local users
-        async with get_db() as db:
-            local_users = await UserCRUD.get_all(db)
-            local_usernames = {u.username for u in local_users}
-            result["local_count"] = len(local_usernames)
-
-        # Find users to delete
-        pending = list(local_usernames - panel_usernames)
-        result["pending_deletions"] = sorted(pending)
-
-        if local_usernames:
-            result["deletion_percentage"] = (len(pending) / len(local_usernames)) * 100
-
-        # Check safety
-        if len(pending) > len(local_usernames) * 0.2:
-            result["safe_to_delete"] = False
-            result["reason"] = f"Would delete more than 20% of users ({result['deletion_percentage']:.1f}%)"
-        elif len(panel_usernames) < len(local_usernames) * 0.5:
-            result["safe_to_delete"] = False
-            result["reason"] = (
-                f"Panel returned significantly fewer users ({len(panel_usernames)} vs {len(local_usernames)})"
-            )
-
-    except Exception as e:
-        sync_logger.error(f"Error getting pending deletions: {e}")
-        result["reason"] = f"Error: {e}"
-        result["safe_to_delete"] = False
-
-    return result
-
-
-async def force_delete_users(usernames: list[str]) -> tuple[int, list[str]]:
-    """
-    Force delete specific users from local database.
-    Use after manual review of pending deletions.
-
-    Args:
-        usernames: List of usernames to delete
-
-    Returns:
-        Tuple of (deleted_count, errors)
-    """
-    from db.database import get_db
-    from db.crud import UserCRUD
-
-    deleted = 0
-    errors = []
-
-    async with get_db() as db:
-        for username in usernames:
-            try:
-                result = await UserCRUD.delete(db, username)
-                if result:
-                    deleted += 1
-                else:
-                    errors.append(f"{username}: not found")
-            except Exception as e:
-                errors.append(f"{username}: {e}")
-
-        await db.commit()
-
-    if deleted:
-        await _notify_deleted_users(usernames[:deleted])
-
-    return deleted, errors

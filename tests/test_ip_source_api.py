@@ -497,6 +497,11 @@ class TestBuildUsersFromPayloads:
             "stale_ips": 0,
             "future_ips": 0,
             "unknown_age_ips": 0,
+            "missing_node_users": 0,
+            "null_node_users": 0,
+            "unknown_age_users": 0,
+            "future_timestamp_users": 0,
+            "missing_node_ids": (),
         }
 
     @pytest.mark.asyncio

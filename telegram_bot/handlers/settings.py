@@ -11,7 +11,7 @@ unchanged.
     settings_panel.py         panel domain / username / password
     settings_display.py       country filter, ipinfo token, report detail
     settings_groups.py        disabled group, fallback group
-    settings_sync.py          user sync interval, pending deletions
+    settings_sync.py          automatic panel mirror and sync interval
     settings_subnet.py        subnet grouping, high trust grouping
     settings_trust.py         trust data reset
     settings_cdn.py           CDN inbounds

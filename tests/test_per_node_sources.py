@@ -69,11 +69,16 @@ async def test_malformed_connection_key_cannot_supply_a_missing_expected_node(ap
     assert "alice" not in users
 
 
-async def test_logs_snapshot_captures_known_connected_monitored_nodes(completed_logs_evidence):
-    completed_logs_evidence({"check_interval": 60, "disabled_nodes": [9]})
+async def test_logs_snapshot_captures_known_connected_monitored_nodes(completed_logs_evidence, monkeypatch):
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    completed_logs_evidence({"check_interval": 60, "disabled_nodes": [9], "log_timezone": "UTC"})
     LOG_OBSERVATIONS.register_fleet(
         [NodeType(0, "core", "192.0.2.1", "connected"), NodeType(9, "excluded", "192.0.2.9", "connected")]
     )
+    note_node_event(0)
+    assert LOG_OBSERVATIONS.evidence().eligible_node_ids == frozenset()
+    clock[0] += 60
     note_node_event(0)
     snapshot = await get_active_users_snapshot()
     assert snapshot.log_evidence.eligible_node_ids == frozenset({0})
@@ -99,7 +104,9 @@ def test_raw_fleet_alias_cannot_become_integer_node_authority(completed_logs_evi
     assert LOG_OBSERVATIONS.evidence().eligible_node_ids is None
 
 
-def test_raw_alias_fault_retires_prior_node_evidence_after_fleet_recovery(completed_logs_evidence):
+def test_raw_alias_fault_retires_prior_node_evidence_after_fleet_recovery(completed_logs_evidence, monkeypatch):
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
     original = completed_logs_evidence()
     assert LOG_OBSERVATIONS.is_current(original)
     valid = NodeType(1, "valid", "192.0.2.1", "connected")
@@ -107,14 +114,24 @@ def test_raw_alias_fault_retires_prior_node_evidence_after_fleet_recovery(comple
     assert LOG_OBSERVATIONS.evidence().eligible_node_ids is None
     assert not LOG_OBSERVATIONS.is_current(original)
     LOG_OBSERVATIONS.register_fleet([valid])
+    assert LOG_OBSERVATIONS.evidence().eligible_node_ids == frozenset()
+    clock[0] += 60
+    note_node_event(1)
     assert LOG_OBSERVATIONS.evidence().eligible_node_ids == frozenset({1})
     assert not LOG_OBSERVATIONS.is_current(original)
 
 
 @pytest.mark.parametrize("last_status, eligible", [("connected", frozenset({0})), ("disabled", frozenset())])
-def test_repeated_valid_zero_id_retains_last_entry_fleet_semantics(completed_logs_evidence, last_status, eligible):
-    completed_logs_evidence()
+def test_repeated_valid_zero_id_retains_last_entry_fleet_semantics(
+    completed_logs_evidence, last_status, eligible, monkeypatch
+):
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    completed_logs_evidence({"log_timezone": "UTC"})
     LOG_OBSERVATIONS.register_fleet(
         [NodeType(0, "first", "192.0.2.1", "connected"), NodeType(0, "last", "192.0.2.2", last_status)]
     )
+    note_node_event(0)
+    clock[0] += 60
+    note_node_event(0)
     assert LOG_OBSERVATIONS.evidence().eligible_node_ids == eligible

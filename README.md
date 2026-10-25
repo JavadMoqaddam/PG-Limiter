@@ -205,7 +205,7 @@ Users with established, stable connection histories receive trust score incremen
 When running proxy frontends or Cloudflare CDN layers, PG-Limiter extracts the real client IP from `X-Forwarded-For` / `CF-Connecting-IP` headers rather than the CDN edge IP.
 
 ### 5. Fast Parallel User Sync
-Synchronizes 20,000+ users from PasarGuard API using parallel pagination batches (up to 10 concurrent requests) and writes them to SQLite in a single transaction via native `INSERT ... ON CONFLICT DO UPDATE`, caching metadata and limits in RAM for $O(1)$ 0ms lookups.
+Synchronizes all users and statuses from PasarGuard API using validated parallel pagination (up to 10 concurrent requests). Native `INSERT ... ON CONFLICT DO UPDATE` commits 500-user batches so configuration and enforcement writers can run between batches. Cleanup confirms each absent user's current detail response before deletion and preserves local rows changed during synchronization. Failed or incomplete list responses never trigger cleanup; uncertain deletion checks retain those users and report an incomplete sync. Existing users retain their local limits, whitelist and punishment state. The factual metadata cache refreshes after committed writes for fast policy evaluation.
 
 ### 6. IP Source: Node Logs (SSE) or Panel API
 The connected IPs of each user can come from either of two sources, switchable at runtime from **Settings → 🛰️ IP Source (Logs / API)** with no restart:
@@ -245,6 +245,8 @@ In Per Inbound mode, ten IPs on one inbound count as **1**, while one IP on thre
 Per Inbound uses accepted log traffic collected between checks, so it measures observed activity during that window. It requires **Node Logs (SSE)**: switch the IP source to logs before selecting it, and choose Per Device, Per IP or Per Node before switching to the panel API. If an incompatible API + Per Inbound combination is persisted externally, collection and enforcement pause while existing samples and warning counters are preserved.
 
 Per Node works with **Logs and API**. Several IPs or inbounds on one eligible node count as **1**; the same IP on two eligible nodes counts as **2**, including CDN traffic. CDN, subnet and High Trust grouping do not change this count. Nodes disabled in the limiter or panel, unknown IDs and malformed IDs contribute nothing. An integer ID of zero is valid when it belongs to the authoritative node fleet. Bare IPs cannot establish a node count. Accepted connections still obey country, policy and source freshness checks; missing fleet readiness or unknown user evidence preserves warnings and pauses the affected enforcement instead of clearing them as zero usage.
+
+With Logs, Per Node and Per Inbound can continue on independently ready nodes if their observations alone prove a violation. Missing-node data never clears an absent or below-limit user's warning. Recovered nodes require a complete check interval before rejoining counts. General reports included-node health and coverage transitions; Status & Reports preserves the actual ready/required coverage of completed scans. See [Logs readiness](docs/LOG_SOURCE.md).
 
 All counting modes use the dynamic database setting `device_count_mode` (`device`, `ip`, `inbound` or `node`); changing it requires no restart or schema migration.
 

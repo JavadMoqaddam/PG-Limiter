@@ -163,6 +163,15 @@ def _base_lines(facts: ReportFacts, now: float) -> list[str]:
                 f"Users counted: {_count(scan.users_counted)}",
             ]
         )
+        required = getattr(scan, "required_node_ids", None)
+        eligible = getattr(scan, "eligible_node_ids", None)
+        if scan.source == "logs" and required is not None and eligible is not None:
+            complete = bool(getattr(scan, "coverage_complete", False))
+            lines.append(f"Node coverage: {'complete' if complete else 'partial'} ({len(eligible)}/{len(required)})")
+            missing = sorted(node_id for node_id in required - eligible if type(node_id) is int)
+            if missing:
+                display = ", ".join(str(node_id) for node_id in missing[:12])
+                lines.append(f"Missing node IDs: {display}" + (" …" if len(missing) > 12 else ""))
         if facts.config_revision != getattr(scan, "config_revision", None):
             lines.append("Settings changed since this scan.")
     return lines

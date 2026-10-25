@@ -143,6 +143,7 @@ async def test_rejected_ip_with_invalid_time_does_not_poison_live_evidence(logs,
     monkeypatch.setattr(parser, "is_ip_accepted", AsyncMock(return_value=False))
     await parse_logs(record("bad time"), 1, "node", logs.config)
     assert not LOG_OBSERVATIONS.evidence().unavailable_reason
+    assert LOG_OBSERVATIONS.uncertainty_diagnostics()["reason_counts"] == {}
 
 
 @pytest.mark.parametrize("zones", [{"1": "UTC"}, {"1": "UTC", "2": "bad/zone"}])
@@ -194,6 +195,135 @@ async def test_capacity_eviction_blocks_until_forgotten_record_expires(logs):
     assert not LOG_OBSERVATIONS.evidence().unavailable_reason
     await parse_logs(record(), 1, "node", config)
     assert len(LOG_OBSERVATIONS.seen[1]) == 1
+
+
+@pytest.mark.parametrize(
+    "stamp, reason",
+    [
+        ("private malformed timestamp", "invalid_timestamp"),
+        ("2026/13/23 10:00:20.123456", "invalid_timestamp"),
+        ("2026/10/23 10:01:01.000001", "future_timestamp"),
+    ],
+)
+async def test_uncertainty_diagnostics_distinguish_timestamp_faults_without_raw_records(logs, caplog, stamp, reason):
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    await parse_logs(record(stamp, user="private-user"), 1, "private-node", logs.config)
+    diagnostics = LOG_OBSERVATIONS.uncertainty_diagnostics()
+    assert diagnostics["reason_counts"] == {reason: 1}
+    assert diagnostics["nodes"] == [{"node_id": 1, "reason_counts": {reason: 1}, "cache_entries": 0}]
+    assert diagnostics["remaining_seconds"] == pytest.approx(60)
+    assert not any("Logs uncertainty diagnostics:" in entry.getMessage() for entry in caplog.records)
+    assert LOG_OBSERVATIONS.unavailable_reason() == "timestamp or replay uncertainty in the current interval"
+    messages = [entry.getMessage() for entry in caplog.records if "Logs uncertainty diagnostics:" in entry.getMessage()]
+    assert len(messages) == 1
+    assert reason in messages[0]
+    assert all(secret not in messages[0] for secret in (stamp, "private-user", "private-node", "5.6.7.8"))
+
+
+async def test_live_eviction_diagnostics_keep_original_expiry(logs):
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    config = dict(logs.config, log_replay_cache_size=1)
+    logs.clock[0] = EPOCH
+    await parse_logs("", 1, "node", config)
+    logs.clock[0] = EPOCH + 60
+    ready_fleet(1)
+    await parse_logs(record(), 1, "node", config)
+    await parse_logs(record("2026/10/23 10:00:40.000000"), 1, "node", config)
+    diagnostics = LOG_OBSERVATIONS.uncertainty_diagnostics()
+    assert diagnostics["reason_counts"] == {"live_cache_eviction": 1}
+    assert diagnostics["nodes"] == [{"node_id": 1, "reason_counts": {"live_cache_eviction": 1}, "cache_entries": 1}]
+    assert diagnostics["cache_capacity"] == 1
+    assert diagnostics["remaining_seconds"] == pytest.approx(20.123456)
+    logs.clock[0] = EPOCH + 80.123456
+    assert not LOG_OBSERVATIONS.unavailable_reason()
+
+
+async def test_cache_capacity_reduction_diagnostics_identify_affected_node(logs):
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    await parse_logs(record(), 1, "node", logs.config)
+    await parse_logs(record(port=54321), 1, "node", logs.config)
+    await pop_active_users_snapshot(dict(logs.config, log_replay_cache_size=1))
+    diagnostics = LOG_OBSERVATIONS.uncertainty_diagnostics()
+    assert diagnostics["reason_counts"] == {"cache_capacity_reduction": 1}
+    assert diagnostics["nodes"] == [
+        {"node_id": 1, "reason_counts": {"cache_capacity_reduction": 1}, "cache_entries": 1}
+    ]
+
+
+async def test_known_replay_and_old_history_do_not_create_uncertainty_diagnostics(logs, caplog):
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    await parse_logs(record(), 1, "node", logs.config)
+    await pop_active_users_snapshot()
+    before = LOG_OBSERVATIONS.fault_version
+    await parse_logs(record(), 1, "node", logs.config)
+    await parse_logs(record("2026/10/23 09:59:59.999999"), 1, "node", logs.config)
+    assert LOG_OBSERVATIONS.fault_version == before
+    assert LOG_OBSERVATIONS.uncertainty_diagnostics()["reason_counts"] == {}
+    assert not LOG_OBSERVATIONS.unavailable_reason()
+    assert not any("Logs uncertainty diagnostics:" in entry.getMessage() for entry in caplog.records)
+
+
+async def test_frequent_timestamp_faults_aggregate_under_global_log_throttle(logs, monkeypatch, caplog):
+    import json
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    monkeypatch.setattr(time, "monotonic", lambda: logs.clock[0] - EPOCH)
+    ready_fleet(1, 2)
+    for index in range(100):
+        await parse_logs(record("bad timestamp"), (index % 2) + 1, "node", logs.config)
+        assert "uncertainty" in LOG_OBSERVATIONS.unavailable_reason()
+    messages = [entry.getMessage() for entry in caplog.records if "Logs uncertainty diagnostics:" in entry.getMessage()]
+    assert len(messages) == 1
+    assert LOG_OBSERVATIONS.uncertainty_diagnostics()["reason_counts"] == {"invalid_timestamp": 100}
+    logs.clock[0] += 59
+    assert "uncertainty" in LOG_OBSERVATIONS.unavailable_reason()
+    assert len([entry for entry in caplog.records if "Logs uncertainty diagnostics:" in entry.getMessage()]) == 1
+    logs.clock[0] += 1
+    assert "uncertainty" not in LOG_OBSERVATIONS.unavailable_reason()
+    await parse_logs(record("bad timestamp"), 1, "node", logs.config)
+    assert "uncertainty" in LOG_OBSERVATIONS.unavailable_reason()
+    messages = [entry.getMessage() for entry in caplog.records if "Logs uncertainty diagnostics:" in entry.getMessage()]
+    assert len(messages) == 2
+    diagnostics = json.loads(messages[-1].split("Logs uncertainty diagnostics: ", 1)[1])
+    assert diagnostics["reason_counts"] == {"invalid_timestamp": 1}
+
+
+@pytest.mark.parametrize("retirement", ["excluded", "revision"])
+async def test_excluded_or_superseded_timestamp_faults_do_not_create_diagnostics(logs, monkeypatch, retirement):
+    import utils.parse_logs as parser
+    from utils.log_observations import LOG_OBSERVATIONS
+    from utils.read_config import invalidate_config_cache
+
+    config = logs.config
+    if retirement == "excluded":
+        config = dict(config, disabled_nodes=[1])
+    else:
+
+        async def retire_during_admission(_ip, _config):
+            await invalidate_config_cache()
+            return True
+
+        monkeypatch.setattr(parser, "is_ip_accepted", retire_during_admission)
+    await parse_logs(record("bad timestamp"), 1, "node", config)
+    assert LOG_OBSERVATIONS.uncertainty_diagnostics()["reason_counts"] == {}
+
+
+def test_uncertainty_diagnostics_bound_node_details_and_whitelist_reasons():
+    from utils.log_observations import LogObservations
+
+    observations = LogObservations()
+    for node_id in range(1000):
+        observations.mark_uncertain(node_id=node_id, reason="future_timestamp")
+    observations.mark_uncertain(node_id="private-node", reason="private raw timestamp")
+    diagnostics = observations.uncertainty_diagnostics()
+    assert len(diagnostics["nodes"]) <= 129
+    assert diagnostics["reason_counts"] == {"future_timestamp": 1000, "unknown": 1}
+    assert all(type(node["node_id"]) is int or node["node_id"] is None for node in diagnostics["nodes"])
+    assert "private" not in str(diagnostics)
 
 
 async def test_preparation_delay_retains_original_event_time(logs, monkeypatch):

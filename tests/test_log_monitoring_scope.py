@@ -205,7 +205,8 @@ async def test_panel_exclusion_removes_pending_connections_before_counting(logs,
     batch = await pop_active_users_snapshot(logs.config)
     assert batch["alice"].ip == ["5.6.7.8"]
     assert count_devices(batch["alice"], DeviceCountingConfig()) == 1
-    assert batch.log_evidence.unavailable_reason
+    assert batch.log_evidence.coverage_complete
+    assert LOG_OBSERVATIONS.is_current(batch.log_evidence)
 
 
 @pytest.mark.parametrize("status, disabled", [("connected", [1]), ("disabled", []), ("limited", [])])

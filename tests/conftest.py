@@ -222,6 +222,8 @@ def completed_logs_evidence(operational_topics):
         note_node_event(1)
         LOG_OBSERVATIONS.fleet_floor = LOG_OBSERVATIONS.floor
         LOG_OBSERVATIONS.transport_floor = LOG_OBSERVATIONS.floor
+        for node_id in LOG_OBSERVATIONS.required_nodes or ():
+            LOG_OBSERVATIONS.node_states[node_id].floor = LOG_OBSERVATIONS.floor
         return LOG_OBSERVATIONS.evidence()
 
     return build

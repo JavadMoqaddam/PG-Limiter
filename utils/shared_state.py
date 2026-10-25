@@ -155,22 +155,24 @@ def note_node_event(node_id: int | None, when: float | None = None) -> None:
     if previous is None or now - previous > node_silence_window(LOG_OBSERVATIONS.interval) or now < previous:
         # Detect the gap on receipt too: no enforcement/status poll need have
         # observed the stale heartbeat before it was replaced by this one.
-        LOG_OBSERVATIONS.note_transport_gap(now)
+        LOG_OBSERVATIONS.note_transport_gap(now, node_id=node_id)
     NODE_LAST_EVENT[node_id] = now
 
 
 def forget_node_event(node_id: int | None) -> None:
     """Drop a node's heartbeat when its task is cancelled or the node disappears."""
-    if node_id is None:
+    if type(node_id) is not int:
         return
     if NODE_LAST_EVENT.pop(node_id, None) is not None and LOG_OBSERVATIONS.monitors(node_id):
-        LOG_OBSERVATIONS.note_transport_gap(time.time())
+        LOG_OBSERVATIONS.note_transport_gap(time.time(), node_id=node_id)
 
 
 def clear_node_events() -> None:
     """Forget every heartbeat, for the periodic full rebuild of the node tasks."""
-    if any(LOG_OBSERVATIONS.monitors(node_id) for node_id in NODE_LAST_EVENT):
-        LOG_OBSERVATIONS.note_transport_gap(time.time())
+    now = time.time()
+    for node_id in NODE_LAST_EVENT:
+        if LOG_OBSERVATIONS.monitors(node_id):
+            LOG_OBSERVATIONS.note_transport_gap(now, node_id=node_id)
     NODE_LAST_EVENT.clear()
 
 
@@ -299,12 +301,16 @@ async def merge_active_users_snapshot(batch: dict[str, UserType]) -> int:
 
 
 def retain_log_interval(users: dict[str, UserType], start: float, end: float) -> None:
-    """Retain original-time observations only from the current monitoring scope."""
+    """Retain original-time observations from a snapshot's frozen ready scope."""
+    evidence = getattr(users, "log_evidence", None)
+    eligible = evidence.eligible_node_ids if evidence is not None else None
     for name, user in list(users.items()):
         connections = [
             c
             for c in user.device_info.connections
-            if start < c.last_seen <= end and LOG_OBSERVATIONS.monitors(c.node_id)
+            if start < c.last_seen <= end
+            and LOG_OBSERVATIONS.monitors(c.node_id)
+            and (evidence is None or (type(c.node_id) is int and eligible is not None and c.node_id in eligible))
         ]
         user.device_info.connections = connections
         user.ip = sorted({c.ip for c in connections})

@@ -828,6 +828,12 @@ class EnhancedWarningSystem:
                         f"⚠️ User {username}: {device_count} devices / {len(current_ips)} IPs (limit: {user_limit_number}, violations: {warning.consecutive_violations}/{required_violations}), trust={trust_score:.0f}"
                     )
 
+                    if device_count > user_limit_number and warning.consecutive_violations < required_violations:
+                        # The main scan must advance this record through add_warning,
+                        # whose current scan-gap rule decides whether the streak
+                        # continues or resets after settings changes or downtime.
+                        continue
+
                     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                     if device_count > user_limit_number and warning.consecutive_violations >= required_violations:

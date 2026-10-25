@@ -343,10 +343,12 @@ async def check_ip_used(
         active_users_snapshot, "log_evidence", None
     )
     eligible_node_ids = getattr(evidence, "eligible_node_ids", None)
-    if config_data.get("device_count_mode") == COUNT_MODE_NODE:
-        if eligible_node_ids is None:
+    if config_data.get("device_count_mode") in (COUNT_MODE_NODE, COUNT_MODE_INBOUND):
+        if config_data.get("device_count_mode") == COUNT_MODE_NODE and eligible_node_ids is None:
             return {}
         if config_data.get("ip_source") == "api":
+            if config_data.get("device_count_mode") == COUNT_MODE_INBOUND:
+                return {}
             if not getattr(active_users_snapshot, "api_evidence", None) or not api_evidence_is_current(evidence):
                 return {}
             # Keep unknown observations in the enforcement-owned mapping so its
@@ -356,7 +358,7 @@ async def check_ip_used(
                 if username in evidence.unknown_users or not refresh_api_user(user, evidence.freshness_seconds):
                     del active_users_snapshot[username]
         else:
-            if not LOG_OBSERVATIONS.is_current(evidence):
+            if not LOG_OBSERVATIONS.is_current(evidence, allow_partial=True):
                 return {}
             retain_log_interval(active_users_snapshot, evidence.interval_start, evidence.interval_end)
     device_config = DeviceCountingConfig.from_config(config_data, eligible_node_ids=eligible_node_ids)
@@ -706,6 +708,8 @@ def _sample_is_trustworthy(all_users_actual_ips: dict, check_interval: int) -> b
 async def check_users_usage(panel_data: PanelType, config_data: dict | None = None):
     """
     Check device usage and monitor consecutive violations before applying punishment.
+
+    Return the initial Logs wait reason when source evidence blocks the scan.
     """
     global isp_detector
 
@@ -731,20 +735,25 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         return
     api_evidence = getattr(active_users_snapshot, "api_evidence", None)
     log_evidence = getattr(active_users_snapshot, "log_evidence", None)
+    allow_partial_logs = config_data.get("device_count_mode") in (COUNT_MODE_NODE, COUNT_MODE_INBOUND)
     eligible_node_ids = getattr(api_evidence or log_evidence, "eligible_node_ids", None)
     if config_data.get("device_count_mode") == COUNT_MODE_NODE and eligible_node_ids is None:
         logger.warning("Per Node enforcement waiting: missing authoritative node evidence")
         return
-    if not api_mode and not LOG_OBSERVATIONS.is_current(log_evidence):
+    if not api_mode and not LOG_OBSERVATIONS.is_current(log_evidence, allow_partial=allow_partial_logs):
         reason = log_evidence.unavailable_reason if log_evidence else "missing Logs evidence"
         logger.warning(f"Logs enforcement waiting: {reason}")
-        return
+        return reason
 
     def cycle_is_current():
         return (
             policy_monitoring_is_current()
             and monitoring_is_current(admission)
-            and (api_evidence_is_current(api_evidence) if api_evidence else LOG_OBSERVATIONS.is_current(log_evidence))
+            and (
+                api_evidence_is_current(api_evidence)
+                if api_evidence
+                else LOG_OBSERVATIONS.is_current(log_evidence, allow_partial=allow_partial_logs)
+            )
         )
 
     protected_users = set(api_evidence.unknown_users) if api_evidence else set()
@@ -850,6 +859,13 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         if not cycle_is_current() or username in protected_users:
             return False
         if log_evidence:
+            if not log_evidence.coverage_complete:
+                policy = user_policies.get(username)
+                if policy is None or not policy.eligible or all_users_device_counts.get(username, 0) <= policy.limit:
+                    # A policy await can raise the limit after a positive decision.
+                    # The reduced view then proves neither normalization nor absence.
+                    protected_users.add(username)
+                    return False
             return True
         user = active_users_snapshot.get(username)
         if user is None:
@@ -903,6 +919,22 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         f"'{device_config.count_mode}': {total_devices_cycle} devices from "
         f"{total_ips_cycle} per-user IPs (summed per user, not de-duplicated)"
     )
+
+    if log_evidence and not log_evidence.coverage_complete:
+        # Healthy Node/Inbound observations are a lower bound: they can prove
+        # a violation, but cannot prove normalization or absence on missing nodes.
+        # Include retained warning names, not just users observed this cycle.
+        protected_users.update(
+            name
+            for name, policy in user_policies.items()
+            if policy.eligible and all_users_device_counts.get(name, 0) <= policy.limit
+        )
+        logger.info(
+            "Logs enforcement has partial coverage: %s/%s included nodes ready; %s user records protected",
+            len(log_evidence.eligible_node_ids),
+            len(log_evidence.required_node_ids),
+            len(protected_users),
+        )
 
     # Judge the sample BEFORE the second ban path runs. This used to be computed
     # ~200 lines below, after check_persistent_violations had already deleted every
@@ -1313,6 +1345,10 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
             protected_users_count=len(protected_users),
             metadata_unknown_users_count=len(unknown_metadata_users),
             failed_users_count=len(failed_users),
+            coverage_complete=log_evidence.coverage_complete if log_evidence else True,
+            required_node_ids=log_evidence.required_node_ids if log_evidence else None,
+            eligible_node_ids=log_evidence.eligible_node_ids if log_evidence else None,
+            device_count_mode=device_config.count_mode,
         )
 
     all_users_log.clear()
@@ -1328,6 +1364,8 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
         source = str(config_data.get("ip_source") or "logs")
         skip_reason = ""
         failure_reason = ""
+        completed_receipt = None
+        enforcement_wait_reason = ""
 
         # In API mode the connected IPs are collected right here, immediately
         # before enforcement, instead of being streamed in continuously by the
@@ -1382,9 +1420,12 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
             # check_interval * max_warnings.
             try:
                 previous_receipt = get_last_completed_scan()
-                await check_users_usage(panel_data, config_data=config_data)
-                if get_last_completed_scan() is previous_receipt:
+                enforcement_wait_reason = await check_users_usage(panel_data, config_data=config_data)
+                receipt = get_last_completed_scan()
+                if receipt is None or receipt is previous_receipt:
                     skip_reason = "Scan did not complete: source evidence or policy unavailable"
+                else:
+                    completed_receipt = receipt
             except Exception as error:  # pylint: disable=broad-except
                 logger.error(
                     f"❌ Enforcement cycle failed and was abandoned: {error}. "
@@ -1409,6 +1450,53 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
         # equal to check_interval. Otherwise collection time (which can be
         # minutes in API mode) is added on top of the interval and the monitoring
         # window expires before the required consecutive scans can complete.
+        elapsed = time.monotonic() - cycle_start
+        # General health delivery cannot abort enforcement or shorten its cadence.
+        # Successful scan facts come from the immutable receipt, never a newer
+        # live node snapshot. Failure details stay in local logs.
+        try:
+            from utils.node_health_notifications import report_cycle, report_node_health
+
+            outcome = "failed" if failure_reason else "skipped" if skip_reason else "completed"
+            receipt = completed_receipt if outcome == "completed" else None
+            reason = (
+                "Enforcement cycle failed"
+                if failure_reason
+                else "Current source evidence or policy unavailable"
+                if skip_reason
+                else ""
+            )
+            # A later live warmup must not hide an unrelated skipped scan.
+            if (
+                outcome == "skipped"
+                and source == "logs"
+                and LOG_OBSERVATIONS.source == "logs"
+                and enforcement_wait_reason == "collecting a complete check interval"
+                and monitoring_is_current(admission)
+                and get_config_revision() == config_revision
+            ):
+                reason = enforcement_wait_reason
+            await report_cycle(
+                receipt.admission if receipt else admission,
+                receipt.source if receipt else source,
+                outcome,
+                device_count_mode=receipt.device_count_mode
+                if receipt
+                else config_data.get("device_count_mode", "device"),
+                coverage_complete=receipt.coverage_complete if receipt else source != "logs",
+                required_node_ids=receipt.required_node_ids if receipt else None,
+                eligible_node_ids=receipt.eligible_node_ids if receipt else None,
+                users_counted=receipt.users_counted if receipt else 0,
+                protected_users_count=receipt.protected_users_count if receipt else 0,
+                duration_seconds=elapsed,
+                reason=reason,
+                config_revision=receipt.config_revision if receipt else config_revision,
+            )
+            if source == "logs" and monitoring_is_current(admission) and get_config_revision() == config_revision:
+                await report_node_health(admission)
+        except Exception:
+            logger.warning("Node health reporting failed; the enforcement cycle result is preserved")
+
         elapsed = time.monotonic() - cycle_start
         if elapsed > check_interval:
             logger.warning(

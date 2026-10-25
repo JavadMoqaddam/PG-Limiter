@@ -1044,25 +1044,25 @@ cmd_edit() {
 
 cmd_shell() {
     check_running_as_root
+    detect_compose
     
     if ! is_running; then
         colorized_echo red "PG-Limiter is not running"
         exit 1
     fi
     
-    detect_compose
     $COMPOSE -f "$COMPOSE_FILE" exec pg-limiter /bin/bash
 }
 
 cmd_cli() {
     check_running_as_root
+    detect_compose
     
     if ! is_running; then
         colorized_echo red "PG-Limiter is not running"
         exit 1
     fi
     
-    detect_compose
     shift
     $COMPOSE -f "$COMPOSE_FILE" exec pg-limiter python cli_main.py "$@"
 }

@@ -35,6 +35,10 @@ class CompletedScan:
     protected_users_count: int
     metadata_unknown_users_count: int
     failed_users_count: int
+    coverage_complete: bool = True
+    required_node_ids: frozenset[int] | None = None
+    eligible_node_ids: frozenset[int] | None = None
+    device_count_mode: str = "device"
 
 
 @dataclass(frozen=True)
@@ -199,6 +203,10 @@ def record_completed_scan(
     protected_users_count: int = 0,
     metadata_unknown_users_count: int = 0,
     failed_users_count: int = 0,
+    coverage_complete: bool = True,
+    required_node_ids: frozenset[int] | None = None,
+    eligible_node_ids: frozenset[int] | None = None,
+    device_count_mode: str = "device",
 ) -> None:
     """Publish a real completed scan receipt; rejected scans leave history intact."""
     global _last_completed_scan
@@ -214,6 +222,10 @@ def record_completed_scan(
             protected_users_count,
             metadata_unknown_users_count,
             failed_users_count,
+            coverage_complete,
+            frozenset(required_node_ids) if required_node_ids is not None else None,
+            frozenset(eligible_node_ids) if eligible_node_ids is not None else None,
+            device_count_mode,
         )
         record_cycle_outcome(admission, source, "completed")
 
