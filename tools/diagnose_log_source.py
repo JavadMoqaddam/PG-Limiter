@@ -31,7 +31,15 @@ IPV4 = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
 EMAIL = re.compile(r"email:\s*([A-Za-z0-9._%+-]+)")
 INVALID_EMAILS = {"API]", "Found", "(normal)", "timeout", "EOF", "address", "INFO", "request"}
 STATUSES = {"connected", "connecting", "disconnected", "error", "disabled", "limited"}
-CONFIG_KEYS = ("general_limit", "check_interval", "max_warning_count", "country_code", "disabled_nodes")
+CONFIG_KEYS = (
+    "general_limit",
+    "check_interval",
+    "max_warning_count",
+    "country_code",
+    "disabled_nodes",
+    "api_ip_freshness",
+    "ip_source",
+)
 MAX_LINE_BYTES = 65536
 MAX_JSON_BYTES = 2 * 1024 * 1024
 
@@ -73,6 +81,7 @@ class Settings:
     capacity: int
     verify_ssl: bool = False
     timezone_mapping_valid: bool = True
+    freshness_seconds: int = 60
 
     def summary(self):
         return {
@@ -80,6 +89,7 @@ class Settings:
             "probe_format_version": 2,
             "general_limit": self.general_limit,
             "check_interval_seconds": self.check_interval,
+            "freshness_seconds": self.freshness_seconds,
             "max_warning_count": self.max_warning_count,
             "country_filter_enabled": self.country_filter_enabled,
             "log_timezone": zone_summary(self.default_timezone),
@@ -96,6 +106,12 @@ def as_int(value, fallback):
         return int(value)
     except (ValueError, TypeError, OverflowError):
         return fallback
+
+
+def positive_seconds(value, fallback):
+    """Match exact positive Last seen values without importing application code."""
+    text = str(value).strip()
+    return int(text) if text.isascii() and text.isdecimal() and int(text) > 0 else fallback
 
 
 def load_settings(environ=None):
@@ -122,6 +138,12 @@ def load_settings(environ=None):
     general_db = as_int(db.get("general_limit"), general)
     general = general_db if general_db >= 1 else general
     interval = as_int(db.get("check_interval"), as_int(env.get("CHECK_INTERVAL"), 60))
+    freshness = positive_seconds(env.get("API_IP_FRESHNESS"), 60)
+    stored_freshness = db.get("api_ip_freshness")
+    legacy_auto = str(stored_freshness).strip().lower() in {"0", "auto"} or (
+        stored_freshness is None and "ip_source" in db and not env.get("API_IP_FRESHNESS")
+    )
+    freshness = max(60, interval) if legacy_auto else positive_seconds(stored_freshness, freshness)
     warnings = as_int(db.get("max_warning_count"), as_int(env.get("MAX_WARNING_COUNT"), 3))
     capacity = as_int(env.get("LOG_REPLAY_CACHE_SIZE"), 0) if "LOG_REPLAY_CACHE_SIZE" in env else 10000
     if interval <= 0 or capacity <= 0:
@@ -159,6 +181,7 @@ def load_settings(environ=None):
         capacity,
         str(env.get("PANEL_VERIFY_SSL", "false")).lower() in {"true", "1", "yes"},
         valid_mapping,
+        freshness,
     )
 
 
@@ -243,7 +266,7 @@ class NodeStats:
         if delta > 0:
             self.reasons["future_timestamp"] += 1
             return
-        if received_at - event >= self.settings.check_interval:
+        if received_at - event >= self.settings.freshness_seconds:
             self.counts["stale_records"] += 1
             return
         if event < self.started_at:
@@ -252,7 +275,7 @@ class NodeStats:
         if digest in self.seen:
             self.counts["duplicate_records"] += 1
             return
-        cutoff = received_at - self.settings.check_interval
+        cutoff = received_at - self.settings.freshness_seconds
         while self.seen and next(iter(self.seen.values())) <= cutoff:
             self.seen.popitem(last=False)
         if len(self.seen) >= self.probe_capacity:
@@ -318,6 +341,7 @@ class NodeStats:
             "live_distinct_records_per_second": round(rate, 3),
             "event_time_span_seconds": round(self.last_event - self.first_event, 6) if count else 0,
             "projected_interval_records_at_sample_rate": round(rate * self.settings.check_interval, 1),
+            "projected_freshness_records_at_sample_rate": round(rate * self.settings.freshness_seconds, 1),
             "sample_cache_entries": len(self.seen),
             "sample_cache_scope": "recent_at_receipt_including_pre_probe_history",
             "sample_cache_at_capacity": len(self.seen) >= self.probe_capacity,

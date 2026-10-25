@@ -5,6 +5,7 @@ Decouples state ownership to eliminate circular dependencies between check_usage
 
 import asyncio
 import copy
+import math
 import time
 from dataclasses import dataclass
 
@@ -83,6 +84,51 @@ def refresh_api_user(user: UserType, freshness_seconds: int) -> bool:
     user.device_info.unique_nodes = {connection.node_id for connection in connections}
     user.device_info.inbound_protocols = {connection.inbound_protocol for connection in connections}
     user.device_info.is_multi_device = len(user.ip) > 1
+    return True
+
+
+def refresh_log_user(user: UserType, evidence: LogSampleEvidence | None) -> bool:
+    """Recount original-time observations using a current, frozen Logs scope.
+
+    Valid expired observations are known empty evidence. A retired witness or
+    an invalid/future source timestamp cannot authorize a warning or clearing.
+    """
+    if not LOG_OBSERVATIONS.is_current(evidence, allow_partial=True):
+        return False
+    evaluated_at = time.time()
+    if evaluated_at < evidence.interval_end:
+        return False
+    eligible = evidence.eligible_node_ids or frozenset()
+    versions = dict(evidence.node_versions)
+    connections = [
+        connection
+        for connection in user.device_info.connections
+        if type(connection.node_id) is int
+        and connection.node_id in eligible
+        and LOG_OBSERVATIONS.monitors(connection.node_id)
+        and LOG_OBSERVATIONS.node_epoch(connection.node_id) == versions.get(connection.node_id)
+    ]
+    if any(
+        not isinstance(connection.last_seen, (int, float))
+        or not math.isfinite(connection.last_seen)
+        or connection.last_seen > evaluated_at
+        for connection in connections
+    ):
+        return False
+    connections = [
+        connection
+        for connection in connections
+        if connection.last_seen <= evidence.interval_end
+        and 0 <= evaluated_at - connection.last_seen < evidence.freshness_seconds
+    ]
+    user.device_info.connections = connections
+    user.ip = sorted({connection.ip for connection in connections})
+    user.device_info.unique_ips = set(user.ip)
+    user.device_info.unique_nodes = {connection.node_id for connection in connections}
+    user.device_info.inbound_protocols = {connection.inbound_protocol for connection in connections}
+    user.device_info.is_multi_device = (
+        len(user.ip) > 2 or len(user.device_info.unique_nodes) > 1 or len(user.device_info.inbound_protocols) > 1
+    )
     return True
 
 
@@ -235,16 +281,19 @@ async def get_active_users_snapshot() -> dict[str, UserType]:
             if not api_evidence_is_current(_api_snapshot.api_evidence):
                 return ActiveUsersSnapshot()
             return _clone_user_map(_api_snapshot)
+        now = time.time()
+        _validate_live_log_times(now)
         snapshot = _clone_user_map(ACTIVE_USERS)
-        snapshot.log_evidence = LOG_OBSERVATIONS.evidence()
+        snapshot.log_evidence = LOG_OBSERVATIONS.evidence(end=now)
+        retain_log_interval(snapshot, snapshot.log_evidence.interval_start, snapshot.log_evidence.interval_end)
         return snapshot
 
 
 async def pop_active_users_snapshot(config_data: dict | None = None) -> ActiveUsersSnapshot:
     """
-    Atomically take an isolated point-in-time snapshot of ACTIVE_USERS and clear the collection.
-    Guarantees that new connections arriving during cycle analysis are preserved for the next cycle
-    and never orphaned or dropped by a delayed clear.
+    Atomically take an isolated snapshot while retaining fresh Logs observations.
+    Original source times bound the rolling store, including when Last seen is
+    longer than the scan interval. Concurrent ingestion never aliases the snapshot.
     """
     global _api_snapshot
     from utils.read_config import get_config_revision
@@ -258,21 +307,24 @@ async def pop_active_users_snapshot(config_data: dict | None = None) -> ActiveUs
             return ActiveUsersSnapshot()
         if config_data is not None and LOG_OBSERVATIONS.configure(config_data):
             ACTIVE_USERS.clear()
+        now = time.time()
+        _validate_live_log_times(now)
+        evidence = LOG_OBSERVATIONS.evidence(end=now)
+        # Prune the live store without the snapshot's ready-node filter. Records
+        # from monitored nodes still warming up must remain available to later scans.
+        retain_log_interval(ACTIVE_USERS, max(LOG_OBSERVATIONS.floor, evidence.interval_start), evidence.interval_end)
         snapshot = _clone_user_map(ACTIVE_USERS)
-        snapshot.log_evidence = LOG_OBSERVATIONS.evidence()
+        snapshot.log_evidence = evidence
         retain_log_interval(snapshot, snapshot.log_evidence.interval_start, snapshot.log_evidence.interval_end)
-        ACTIVE_USERS.clear()
         return snapshot
 
 
 async def merge_active_users_snapshot(batch: dict[str, UserType]) -> int:
     """Requeue a consumed batch when the cycle failed before it could be evaluated.
 
-    A ``pop_active_users_snapshot()`` clears ACTIVE_USERS, so a failure later in the
-    cycle would lose the batch: the next cycle would see those still-connected users as
-    absent and clear their warnings. This restores each user from the batch, but merges
-    by connection identity - a newer event that arrived during the cycle is kept, never
-    overwritten by the stale sample.
+    Rolling Logs observations normally remain in ACTIVE_USERS. Preserve the
+    restoration contract for callers holding an unevaluated batch, without
+    overwriting newer observations or crossing source generations.
 
     Returns the number of users actually restored (those without a newer observation).
     """
@@ -288,7 +340,9 @@ async def merge_active_users_snapshot(batch: dict[str, UserType]) -> int:
             getattr(batch, "log_evidence", None)
         ):
             return 0
-        retain_log_interval(batch, max(LOG_OBSERVATIONS.floor, time.time() - LOG_OBSERVATIONS.interval), time.time())
+        retain_log_interval(
+            batch, max(LOG_OBSERVATIONS.floor, time.time() - LOG_OBSERVATIONS.freshness_seconds), time.time()
+        )
         for email, user in batch.items():
             if not email or not user:
                 continue
@@ -300,6 +354,14 @@ async def merge_active_users_snapshot(batch: dict[str, UserType]) -> int:
     return restored
 
 
+def _validate_live_log_times(now: float) -> None:
+    """Retire invalid monitored-node evidence before snapshot pruning removes it."""
+    for user in ACTIVE_USERS.values():
+        for connection in user.device_info.connections:
+            if LOG_OBSERVATIONS.monitors(connection.node_id):
+                LOG_OBSERVATIONS.validate_source_time(connection.node_id, connection.last_seen, now=now)
+
+
 def retain_log_interval(users: dict[str, UserType], start: float, end: float) -> None:
     """Retain original-time observations from a snapshot's frozen ready scope."""
     evidence = getattr(users, "log_evidence", None)
@@ -308,7 +370,9 @@ def retain_log_interval(users: dict[str, UserType], start: float, end: float) ->
         connections = [
             c
             for c in user.device_info.connections
-            if start < c.last_seen <= end
+            if type(c.last_seen) in (int, float)
+            and math.isfinite(c.last_seen)
+            and start < c.last_seen <= end
             and LOG_OBSERVATIONS.monitors(c.node_id)
             and (evidence is None or (type(c.node_id) is int and eligible is not None and c.node_id in eligible))
         ]

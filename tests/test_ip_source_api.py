@@ -225,6 +225,103 @@ def _patch_collector(
     return notifications
 
 
+async def test_all_unknown_cycle_records_elapsed_collection_time(monkeypatch, panel, api_config):
+    """An incomplete sample must report its real collection cost, not a default zero."""
+    import utils.ip_source_api as api
+
+    _patch_collector(
+        monkeypatch,
+        candidates=[{"id": 1, "username": "sample", "status": "active"}],
+        payloads={"sample": {1: {}}},
+        node_name_map={1: "first", 2: "second"},
+    )
+    clock = iter([1000.0, 1000.0, 1242.0])
+    monkeypatch.setattr(api.time, "perf_counter", lambda: next(clock))
+
+    assert await api.collect_active_users_from_api(panel, api_config) is False
+    stats = api.get_last_cycle_stats()
+    assert stats["skipped_reason"] == "all user evidence unknown"
+    assert stats["duration_ms"] == 242_000
+
+
+async def test_missing_node_fallback_reports_transport_and_user_evidence_separately(monkeypatch, panel, api_config):
+    """Complete global node coverage must not hide per-user missing maps in fallback."""
+    from unittest.mock import AsyncMock
+
+    import utils.ip_source_api as api
+    import utils.read_config as config
+
+    notifications = _patch_collector(
+        monkeypatch,
+        candidates=[
+            {"id": 1, "username": "private-first", "status": "active"},
+            {"id": 2, "username": "private-second", "status": "active"},
+        ],
+        payloads={"private-first": {1: {}, 2: {}}, "private-second": {1: {}, 3: {}}},
+        node_name_map={1: "first", 2: "second", 3: "third"},
+    )
+    api_config["api_ip_auto_fallback"] = True
+    monkeypatch.setattr(config, "save_config_value", AsyncMock(return_value=True))
+
+    assert await api.collect_active_users_from_api(panel, api_config) is False
+    assert await api.collect_active_users_from_api(panel, api_config) is False
+    message = next(text for text in notifications if "IP Source reverted to Logs" in text)
+    assert "2 consecutive API collections were incomplete" in message
+    assert "HTTP lookups: <code>2</code> OK / <code>0</code> failed" in message
+    assert "Users missing required node evidence: <code>2</code>" in message
+    assert "Nodes reporting across responses: <code>3/3</code>" in message
+    assert "Nodes absent across all responses: <code>0</code>" in message
+    assert "private-first" not in message and "private-second" not in message
+    assert api.get_last_cycle_stats()["consecutive_unsuccessful_cycles"] == 2
+
+
+async def test_fallback_records_that_a_partial_sample_was_not_enforced(monkeypatch, panel, api_config):
+    """Fallback discards even a partially usable sample before enforcement."""
+    from unittest.mock import AsyncMock
+
+    import utils.ip_source_api as api
+    import utils.read_config as config
+
+    _patch_collector(
+        monkeypatch,
+        candidates=[
+            {"id": 1, "username": "known", "status": "active"},
+            {"id": 2, "username": "unknown", "status": "active"},
+        ],
+        payloads={"known": {1: {}, 2: {}}, "unknown": {1: {}}},
+        node_name_map={1: "first", 2: "second"},
+    )
+    api_config["api_ip_auto_fallback"] = True
+    monkeypatch.setattr(config, "save_config_value", AsyncMock(return_value=True))
+
+    assert await api.collect_active_users_from_api(panel, api_config) is True
+    assert await api.collect_active_users_from_api(panel, api_config) is False
+    assert api.get_last_cycle_stats()["fallback_applied"] is True
+
+
+async def test_permission_denied_fallback_reports_forbidden_lookups(monkeypatch, panel, api_config):
+    """403 responses must remain visible when they are separate from failed lookups."""
+    from unittest.mock import AsyncMock
+
+    import utils.ip_source_api as api
+    import utils.read_config as config
+
+    notifications = _patch_collector(
+        monkeypatch,
+        candidates=[{"id": 1, "username": "sample", "status": "active"}],
+        counters={"ok": 0, "failed": 0, "not_found": 0, "forbidden": 1, "unauthorized": 0},
+        node_name_map={1: "first"},
+    )
+    api_config["api_ip_auto_fallback"] = True
+    monkeypatch.setattr(config, "save_config_value", AsyncMock(return_value=True))
+
+    assert await api.collect_active_users_from_api(panel, api_config) is False
+    assert await api.collect_active_users_from_api(panel, api_config) is False
+    message = next(text for text in notifications if "IP Source reverted to Logs" in text)
+    assert "HTTP lookups: <code>0</code> OK / <code>0</code> failed" in message
+    assert "Forbidden lookups (403): <code>1</code>" in message
+
+
 class TestResolveMonitoredGroupIds:
     """
     Group narrowing decides how small the candidate query stays.

@@ -1,6 +1,7 @@
 """A failed included node cannot contaminate independent completed Logs evidence."""
 
 import asyncio
+import copy
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -89,7 +90,9 @@ async def test_recovery_cannot_enter_an_old_partial_snapshot(fleet):
     assert batch.log_evidence.eligible_node_ids == frozenset({1, 2})
     # Even a mapping receiving a recovered-node record retains its captured scope.
     await parse_logs(record("2026/10/23 10:01:40.000000"), 28, "recovered", fleet.config)
-    batch["bob"] = ACTIVE_USERS["alice"]
+    recovered_user = copy.deepcopy(ACTIVE_USERS["alice"])
+    recovered_user.device_info.connections = [c for c in recovered_user.device_info.connections if c.node_id == 28]
+    batch["bob"] = recovered_user
     retain_log_interval(batch, EPOCH, EPOCH + 120)
     assert "bob" not in batch
 

@@ -231,7 +231,8 @@ async def test_unknown_logs_evidence_preserves_history_without_warning_ban_clear
     await parse_logs("", 1, "node", api_cycle.config)
     LOG_OBSERVATIONS.register_fleet([NodeType(1, "node", "192.0.2.1", "connected")])
     note_node_event(1)
-    clock[0] += 60
+    # Shared Last seen is 90s in this fixture, longer than its 60s cadence.
+    clock[0] += 90
     assert LOG_OBSERVATIONS.is_current(LOG_OBSERVATIONS.evidence())
     LOG_OBSERVATIONS.register_fleet(None)
     mutation_names = ("add_warning", "check_persistent_violations", "clear_user_trust_data", "cleanup_expired_warnings")

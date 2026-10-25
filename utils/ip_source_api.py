@@ -23,6 +23,7 @@ import asyncio
 import copy
 import time
 from dataclasses import dataclass, replace
+from html import escape
 from typing import Optional
 
 from utils.logs import get_logger
@@ -58,6 +59,7 @@ LAST_CYCLE_STATS: dict = {
     # cycle where every user call returned 200 reads 1.0 even if two thirds of the
     # nodes contributed no IPs at all, which under-counts devices silently.
     "nodes_expected": 0,
+    "node_evidence_evaluated": False,
     "node_coverage": 0.0,
     "duration_ms": 0,
     "geo_lookups": 0,
@@ -78,6 +80,8 @@ LAST_CYCLE_STATS: dict = {
     # complete users may still be judged during a partial collection.
     "collection_outcome": "failure",  # success, partial, failure, superseded
     "unknown_users": 0,
+    "consecutive_unsuccessful_cycles": 0,
+    "fallback_applied": False,
 }
 
 # Unsuccessful collection cycles, scoped to the configuration that produced them.
@@ -101,6 +105,31 @@ COVERAGE_SKIP_ALERT_THRESHOLD = 3
 def get_last_cycle_stats() -> dict:
     """Return a copy of the most recent collection cycle statistics."""
     return dict(LAST_CYCLE_STATS)
+
+
+def format_api_evidence_summary(stats: dict) -> str:
+    """Describe aggregate lookup and evidence results without identifying users."""
+
+    def count(key: str) -> int:
+        value = stats.get(key, 0)
+        return value if type(value) is int and value >= 0 else 0
+
+    seen, expected = count("nodes_seen"), count("nodes_expected")
+    if expected and stats.get("node_evidence_evaluated"):
+        reporting = f"<code>{seen}/{expected}</code> ({seen / expected:.1%})"
+        absent = f"<code>{max(0, expected - seen)}</code>"
+    else:
+        reporting = f"unknown (expected <code>{expected}</code>)" if expected else "unknown (expected fleet unknown)"
+        absent = "unknown"
+    return (
+        f"HTTP lookups: <code>{count('fetched_ok')}</code> OK / <code>{count('fetched_failed')}</code> failed\n"
+        f"Forbidden lookups (403): <code>{count('forbidden')}</code>\n"
+        f"Users with incomplete evidence: <code>{count('unknown_users')}</code>\n"
+        f"Users missing required node evidence: <code>{count('missing_node_users')}</code>\n"
+        f"Nodes reporting across responses: {reporting}\n"
+        f"Nodes absent across all responses: {absent}\n"
+        f"Stale source observations dropped: <code>{count('stale_ips')}</code>"
+    )
 
 
 async def _notify(message: str) -> None:
@@ -476,7 +505,8 @@ async def _build_users_from_payloads(
                 unknown.add(username)
                 unknown_by_reason["null_node_users"].add(username)
                 continue
-            nodes_seen.add(node_id)
+            if expected_node_ids is None or node_id in expected_node_ids:
+                nodes_seen.add(node_id)
             for ip, stamp in ip_values.items():
                 if type(stamp) is not int or stamp < STALE_EPOCH_FLOOR:
                     unknown.add(username)
@@ -561,6 +591,7 @@ def _reset_cycle_stats() -> None:
     """Zero the per-cycle counters before a new collection run."""
     for key in LAST_CYCLE_STATS:
         LAST_CYCLE_STATS[key] = "" if key == "skipped_reason" else 0
+    LAST_CYCLE_STATS.update(node_evidence_evaluated=False, fallback_applied=False)
     LAST_CYCLE_STATS["missing_node_ids"] = ()
     LAST_CYCLE_STATS["ran_at"] = time.time()
     LAST_CYCLE_STATS["collection_outcome"] = "failure"
@@ -602,9 +633,11 @@ async def _account_collection_cycle(config_data: dict, result: _CollectionResult
         _failure_revision = revision
     if result.outcome == "success":
         _consecutive_dead_cycles = 0
+        LAST_CYCLE_STATS["consecutive_unsuccessful_cycles"] = 0
         return result.enforcement_ready
 
     _consecutive_dead_cycles += 1
+    LAST_CYCLE_STATS["consecutive_unsuccessful_cycles"] = _consecutive_dead_cycles
     api_ip_logger.warning(
         f"🛰️ API IP collection incomplete ({result.reason}) — unsuccessful cycle "
         f"{_consecutive_dead_cycles}/{DEAD_CYCLE_FALLBACK_THRESHOLD}"
@@ -625,12 +658,16 @@ async def _account_collection_cycle(config_data: dict, result: _CollectionResult
     if saved is None:
         return False
 
+    LAST_CYCLE_STATS["fallback_applied"] = True
     api_ip_logger.error("🛰️ Reverted IP source to log mode after repeated failures")
     await _notify(
         "🛰️ <b>IP Source reverted to Logs</b>\n\n"
-        f"API collection was unsuccessful for {DEAD_CYCLE_FALLBACK_THRESHOLD} "
-        f"consecutive cycles (<code>{result.reason}</code>).\n"
-        "Log streaming has been restored automatically."
+        f"{LAST_CYCLE_STATS['consecutive_unsuccessful_cycles']} consecutive API collections were incomplete.\n"
+        f"Latest reason: <code>{escape(result.reason)}</code>.\n\n"
+        f"{format_api_evidence_summary(LAST_CYCLE_STATS)}\n\n"
+        "HTTP success does not confirm complete node evidence for each user.\n"
+        "The latest API enforcement cycle was skipped; warning counters and history were preserved.\n"
+        "Logs were selected automatically. Fresh Logs evidence is required before enforcement resumes."
     )
     return False
 
@@ -710,7 +747,11 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
             config_data.get("_revision", get_config_revision()),
             _resolve_freshness_window(config_data),
         )
-        result = await _collect_api_cycle(panel_data, config_data, source_config, evidence)
+        started = time.perf_counter()
+        try:
+            result = await _collect_api_cycle(panel_data, config_data, source_config, evidence)
+        finally:
+            LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         if not monitoring_is_current(admission):
             await synchronize_monitoring()
             return False
@@ -752,6 +793,7 @@ async def _collect_api_cycle(
     except ValueError:
         LAST_CYCLE_STATS["skipped_reason"] = "node availability unknown"
         return _CollectionResult("failure", False, "node availability unknown", evidence)
+    LAST_CYCLE_STATS["nodes_expected"] = len(expected_node_ids)
     evidence = replace(evidence, eligible_node_ids=frozenset(expected_node_ids))
 
     if not monitoring_is_current(admission):
@@ -813,6 +855,8 @@ async def _collect_api_cycle(
     # counts as covered; 403/timeouts/5xx leave the user's state unknown.
     answered = counters["ok"] + counters["not_found"]
     coverage = answered / len(targets) if targets else 1.0
+    answered_users = set(payloads) | getattr(payloads, "not_found_users", set())
+    transport_unknown_users = {name for name, _, _ in targets} - answered_users
 
     LAST_CYCLE_STATS.update(
         {
@@ -821,6 +865,7 @@ async def _collect_api_cycle(
             "not_found": counters["not_found"],
             "forbidden": counters["forbidden"],
             "coverage": round(coverage, 4),
+            "unknown_users": len(transport_unknown_users),
         }
     )
 
@@ -865,6 +910,7 @@ async def _collect_api_cycle(
         fetch_times=fetch_times,
         expected_node_ids=expected_node_ids,
     )
+    LAST_CYCLE_STATS["node_evidence_evaluated"] = True
 
     # Node coverage counts a healthy empty map as a response too. Individual
     # users with missing nodes are protected separately; this aggregate is for
@@ -879,7 +925,6 @@ async def _collect_api_cycle(
     LAST_CYCLE_STATS["nodes_expected"] = nodes_expected
     LAST_CYCLE_STATS["node_coverage"] = round(node_coverage, 4)
 
-    answered_users = set(payloads) | getattr(payloads, "not_found_users", set())
     unknown_users = (set(raw_by_name) - answered_users) | set(new_users.unknown_users)
     if not api_evidence_is_current(evidence) or source_config != config_data or not monitoring_is_current(admission):
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")

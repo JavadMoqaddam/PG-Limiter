@@ -100,6 +100,66 @@ def test_missing_database_is_not_created(tmp_path):
     assert not path.exists()
 
 
+def test_probe_reads_shared_last_seen_independently_of_scan_interval(tmp_path):
+    probe = load_probe()
+    path = tmp_path / "limiter.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)")
+        for key, value in {"check_interval": "300", "api_ip_freshness": "20"}.items():
+            connection.execute("INSERT INTO config VALUES (?, ?)", (key, json.dumps(value)))
+    original = path.read_bytes()
+    result = probe.load_settings(
+        {
+            "DATABASE_URL": f"sqlite+aiosqlite:///{path}",
+            "PANEL_DOMAIN": "PRIVATE_PANEL",
+            "API_IP_FRESHNESS": "40",
+        }
+    )
+    stats = probe.NodeStats(1, "connected", result, EPOCH)
+    stats.zone = probe.source_zone("UTC")
+    stats.observe(access_record("2026/10/25 09:59:41"), EPOCH)
+    stats.observe(access_record("2026/10/25 09:59:40"), EPOCH)
+    report = stats.summary(2)
+    assert report["recent_distinct_records"] == 1
+    assert report["stale_records"] == 1
+    assert result.summary()["freshness_seconds"] == 20
+    assert result.summary()["check_interval_seconds"] == 300
+    assert path.read_bytes() == original
+
+
+def test_probe_replay_and_capacity_estimate_use_last_seen_window():
+    probe = load_probe()
+    config = settings(probe, check_interval=300, freshness_seconds=20)
+    stats = probe.NodeStats(1, "connected", config, EPOCH)
+    stats.observe(access_record("2026/10/25 10:00:01"), EPOCH + 2)
+    stats.observe(access_record("2026/10/25 10:00:22"), EPOCH + 23)
+    report = stats.summary(4)
+    assert report["live_distinct_records"] == 2
+    assert report["projected_freshness_records_at_sample_rate"] == 10
+    assert report["projected_interval_records_at_sample_rate"] == 150
+    assert report["sample_cache_entries"] == 1
+
+
+@pytest.mark.parametrize("stored,expected", [(None, 40), ("0", 300), ("auto", 300), ("20.5", 40), (True, 40)])
+def test_probe_uses_environment_fallback_and_read_only_legacy_auto(tmp_path, stored, expected):
+    probe = load_probe()
+    path = tmp_path / "limiter.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)")
+        for key, value in {"check_interval": "300", "api_ip_freshness": stored}.items():
+            connection.execute("INSERT INTO config VALUES (?, ?)", (key, json.dumps(value)))
+    original = path.read_bytes()
+    result = probe.load_settings(
+        {
+            "DATABASE_URL": f"sqlite+aiosqlite:///{path}",
+            "PANEL_DOMAIN": "PRIVATE_PANEL",
+            "API_IP_FRESHNESS": "40",
+        }
+    )
+    assert result.summary()["freshness_seconds"] == expected
+    assert path.read_bytes() == original
+
+
 @pytest.mark.parametrize("general", ["0", "-2", "bad"])
 def test_invalid_environment_general_limit_uses_the_application_default(tmp_path, general):
     probe = load_probe()
@@ -190,7 +250,7 @@ def test_replay_cache_is_bounded_and_projection_does_not_claim_daemon_occupancy(
 def test_history_age_and_distinct_records_are_measured_without_a_post_start_timestamp(monkeypatch):
     probe = load_probe()
     monkeypatch.setattr(probe.time, "time", lambda: EPOCH + 8)
-    stats = probe.NodeStats(1, "connected", settings(probe, check_interval=300), EPOCH)
+    stats = probe.NodeStats(1, "connected", settings(probe, check_interval=300, freshness_seconds=300), EPOCH)
     history = access_record("2026/10/25 09:58:00")
     stats.observe(history, EPOCH + 1)
     stats.observe(history, EPOCH + 2)

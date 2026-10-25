@@ -48,9 +48,15 @@ async def notice_cycle(tmp_path, monkeypatch, completed_logs_evidence, settings_
     config = await read_config()
 
     def snapshot(config):
-        from utils.shared_state import ActiveUsersSnapshot
+        from utils.shared_state import _clone_user_map
 
-        batch = ActiveUsersSnapshot(users.copy())
+        batch = _clone_user_map(users)
+        for user in batch.values():
+            if not user.device_info.connections:
+                # IP-only fixtures model newly observed traffic in each scan.
+                # Preserve explicit inbound observations and isolate fixture data
+                # from the enforcement path's local freshness pruning.
+                user.device_info.connections = [ConnectionInfo(ip, 1, "node", "Vless", now[0]) for ip in user.ip]
         batch.log_evidence = completed_logs_evidence(config)
         return batch
 

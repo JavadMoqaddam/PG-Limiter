@@ -134,6 +134,8 @@ def _parse_ip_payload(payload: dict) -> dict[int, dict[str, int] | None]:
             node_id = int(node_key)
         except (ValueError, TypeError) as error:
             raise ValueError("Invalid node ID") from error
+        if node_id in parsed:
+            raise ValueError("Duplicate normalized node ID")
         if node_value is None:
             parsed[node_id] = None
             continue
@@ -143,7 +145,10 @@ def _parse_ip_payload(payload: dict) -> dict[int, dict[str, int] | None]:
         for ip, value in node_value["ips"].items():
             if not isinstance(ip, str) or not ip.strip() or type(value) is not int:
                 raise ValueError("Invalid IP timestamp")
-            ip_values[ip.strip()] = value
+            normalized_ip = ip.strip()
+            if normalized_ip in ip_values:
+                raise ValueError("Duplicate normalized IP")
+            ip_values[normalized_ip] = value
         parsed[node_id] = ip_values
     return parsed
 

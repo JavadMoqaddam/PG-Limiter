@@ -213,22 +213,27 @@ The connected IPs of each user can come from either of two sources, switchable a
 | | 📜 **Node Logs (SSE)** — default | 🛰️ **Panel API** |
 |---|---|---|
 | Transport | One persistent SSE stream per node | `GET /api/node/online_stats/{id}/ip`, once per online user per cycle |
-| Timing | Original Xray printed timestamps within a completed `CHECK_INTERVAL` | Original Xray IP timestamps checked against the editable Last seen threshold |
+| Timing | Original Xray printed timestamps checked against shared Last seen at evaluation | Original Xray IP timestamps checked against the same Last seen threshold |
 | Inbound detail | Real inbound name per connection | Single sentinel inbound (`API`) |
-| Requires | Reachable SSE, explicit Xray process timezones and a ready fleet/complete interval | Panel account with `nodes:stats` and complete evidence from relevant enabled nodes |
+| Requires | Reachable SSE, explicit Xray process timezones and independently ready nodes after conservative warm-up | Panel account with `nodes:stats` and complete evidence from relevant enabled nodes |
 
 Both modes publish source-specific snapshots through the shared `ACTIVE_USERS` structure. Existing device counting, subnet/CDN/high-trust grouping, trust scoring and punishment continue to apply, with configurable `CHECK_INTERVAL` and `MAX_WARNING_COUNT`. API observations carry no real inbound names; inbound-only monitoring requires Logs.
 
+**Last seen applies to both sources.** The Telegram setting uses the existing `api_ip_freshness` database row and `API_IP_FRESHNESS` ENV default; no separate Logs setting is required. `CHECK_INTERVAL` controls scan cadence and warning timing. An observation qualifies only while `0 <= evaluation time - original source timestamp < Last seen`, including after slow preparation. Source-opening timestamps do not establish continuous bytes or an idle open connection. SSE heartbeats and replay delivery do not make old observations fresh.
+
+When Last seen exceeds the cadence, Logs keeps eligible observations across successive scans without renewing their timestamps. Source/settings changes and recovered nodes require conservative warm-up of `max(CHECK_INTERVAL, Last seen)`.
+
 **How API mode keeps a cycle safe:**
+
 * **Candidate narrowing.** `GET /api/users` uses `status=active` and `online=true`, independently of `CHECK_INTERVAL`. Include group IDs are sent together; empty Include selects nobody. Exclusions, administrator filters and exceptions still apply. Group Limits set limits and never replace the Group Filter.
-* **Exact Last seen threshold.** Edit a positive whole number of seconds T in **Settings → IP Source → Last seen**. An IP qualifies only when `0 <= evaluation time - original Xray timestamp < T`, including after asynchronous preparation. Receipt time never makes an observation fresh, and no 30-second buffer is added. Xray updates this timestamp when a tracked connection opens, so a long-lived connection can have an old timestamp. API and Logs counts can differ.
+* **Exact Last seen threshold.** Edit a positive whole number of seconds T in **Settings → IP Source → Last seen**. Both API and Logs use that value exactly, with no 30-second buffer. A long-lived connection can have an old timestamp; this is recent source evidence, not a byte-traffic meter. API and Logs counts can differ.
 * **Unknown evidence protection.** Failed requests, malformed bodies, invalid timestamps and missing expected node responses protect affected users from warnings, punishment and false clearing. Incomplete candidate/node lists or a relevant enabled node in `error`/`connecting` skip the whole cycle, including an empty candidate list, preserving existing warnings. Explicitly operator-disabled nodes are excluded. The configurable coverage gates (user coverage defaults to **80%**) can skip collection; a high answer rate never makes missing evidence known. Healthy empty maps, valid expired observations and confirmed deleted users can clear warnings.
-* **Auto-fallback.** With automatic fallback enabled, exactly two consecutive unsuccessful completed API collection cycles persist the source as Logs and attempt one Telegram alert. A complete successful cycle, including a genuinely empty one, resets the streak. Logs then waits for its timezone/readiness requirements and a completed interval.
+* **Auto-fallback.** With automatic fallback enabled, exactly two consecutive unsuccessful completed API collection cycles persist the source as Logs and attempt one Telegram alert. A complete successful cycle, including a genuinely empty one, resets the streak. Logs then waits for its timezone/readiness requirements and conservative warm-up.
 * **Per-inbound CDN grouping is inactive** in API mode because the panel reports no inbound names — use **CDN Nodes** (per-node) instead of CDN Inbounds.
 
-Switching to API mode runs a pre-flight probe against a real online user first, and refuses to switch if the endpoint is not reachable. **Settings → 🛰️ IP Source → 📊 Last API Cycle** shows the last cycle's candidate narrowing, coverage, 403/404 counts and duration.
+Switching to API mode runs a pre-flight probe against a real online user first, and refuses to switch if the endpoint is not reachable. **Settings → 🛰️ IP Source → 📊 Last API Cycle** separates successful requests, users missing required node evidence, expected nodes reporting across responses, globally absent nodes and elapsed time. HTTP 200 alone does not prove a complete per-user node map. Missing-node IDs across users are a union, not a list missing from every user; aggregate node coverage is a separate measure. If collection stops before node-map evaluation, reporting and absence remain unknown. After switching to Logs, the API report is historical.
 
-Logs preserves Xray's original printed process-local time and rejects retained replay records across reconnects. Configure `LOG_NODE_TIMEZONES` and/or an explicit `LOG_TIMEZONE` for the Xray process/container; host or panel timezone alone does not establish it. Unknown zones, fleet or transport readiness preserve warnings while enforcement waits. A source/settings change or transport recovery requires a full ordinary `CHECK_INTERVAL` before Logs resumes. See [Panel API IP source](docs/API_IP_SOURCE.md) and [Node Logs source and readiness](docs/LOG_SOURCE.md) for configuration, recovery and protocol limits.
+Logs preserves Xray's original printed process-local time and rejects retained replay records across reconnects. Configure `LOG_NODE_TIMEZONES` and/or an explicit `LOG_TIMEZONE` for the Xray process/container; host or panel timezone alone does not establish it. Unknown zones, fleet or transport readiness preserve warnings while enforcement waits. A source/settings change or transport recovery requires `max(CHECK_INTERVAL, Last seen)` of warm-up before Logs resumes. See [Panel API IP source](docs/API_IP_SOURCE.md) and [Node Logs source and readiness](docs/LOG_SOURCE.md) for configuration, recovery and protocol limits.
 
 ### 7. Device Counting Modes
 Choose the enforcement measure at runtime from **Settings → 🧮 Device Counting**:
@@ -236,17 +241,19 @@ Choose the enforcement measure at runtime from **Settings → 🧮 Device Counti
 | Mode | What counts as one device |
 |---|---|
 | **Per Device (by inbound)** — default | One client IP (or grouped subnet) on one inbound |
-| **Per IP** | One client IP (or grouped subnet), regardless of inbound |
-| **Per Inbound** | One distinct inbound tag observed during the current check window, regardless of IPs |
+| **Per IP** | One accepted source IP (or configured grouping), regardless of inbound or node |
+| **Per Inbound** | One distinct inbound tag with eligible recent source evidence, regardless of IPs |
 | **Per Node** | One known connected monitored node with accepted active user connections |
 
 In Per Inbound mode, ten IPs on one inbound count as **1**, while one IP on three inbounds counts as **3**. The same inbound tag across several nodes counts once. Tags are trimmed and case-sensitive; disabled nodes, blank tags and the reserved `Unknown` placeholder contribute nothing. Without inbound information, the count is **0** and never falls back to the number of IPs. CDN, subnet and High Trust grouping do not change this count.
 
-Per Inbound uses accepted log traffic collected between checks, so it measures observed activity during that window. It requires **Node Logs (SSE)**: switch the IP source to logs before selecting it, and choose Per Device, Per IP or Per Node before switching to the panel API. If an incompatible API + Per Inbound combination is persisted externally, collection and enforcement pause while existing samples and warning counters are preserved.
+In Per IP mode, the same accepted IP on two fresh valid nodes counts as **1**; two accepted IPs count as **2** unless configured subnet or CDN grouping combines them. High Trust inbound grouping does not merge Per IP addresses. Registered panel-node addresses are filtered. Other relay addresses can appear in the source IPs shown by the UI, so Per IP does not establish the number of physical client devices.
+
+Per Inbound uses accepted log events still within Last seen when evaluated. These recent openings do not prove ongoing bytes. It requires **Node Logs (SSE)**: switch the IP source to logs before selecting it, and choose Per Device, Per IP or Per Node before switching to the panel API. If an incompatible API + Per Inbound combination is persisted externally, collection and enforcement pause while existing samples and warning counters are preserved.
 
 Per Node works with **Logs and API**. Several IPs or inbounds on one eligible node count as **1**; the same IP on two eligible nodes counts as **2**, including CDN traffic. CDN, subnet and High Trust grouping do not change this count. Nodes disabled in the limiter or panel, unknown IDs and malformed IDs contribute nothing. An integer ID of zero is valid when it belongs to the authoritative node fleet. Bare IPs cannot establish a node count. Accepted connections still obey country, policy and source freshness checks; missing fleet readiness or unknown user evidence preserves warnings and pauses the affected enforcement instead of clearing them as zero usage.
 
-With Logs, Per Node and Per Inbound can continue on independently ready nodes if their observations alone prove a violation. Missing-node data never clears an absent or below-limit user's warning. Recovered nodes require a complete check interval before rejoining counts. General reports included-node health and coverage transitions; Status & Reports preserves the actual ready/required coverage of completed scans. See [Logs readiness](docs/LOG_SOURCE.md).
+With Logs, Per Node and Per Inbound can continue on independently ready nodes if their observations alone prove a violation. Missing-node data never clears an absent or below-limit user's warning. Recovered nodes require `max(CHECK_INTERVAL, Last seen)` of warm-up before rejoining counts. General reports included-node health and coverage transitions; Status & Reports preserves the actual ready/required coverage of completed scans. See [Logs readiness](docs/LOG_SOURCE.md).
 
 All counting modes use the dynamic database setting `device_count_mode` (`device`, `ip`, `inbound` or `node`); changing it requires no restart or schema migration.
 
@@ -402,7 +409,7 @@ When Subnet Grouping is enabled, multiple connections originating from the same 
 
 <details>
 <summary><b>When should I switch the IP source to the panel API?</b></summary>
-Use API mode when node logs are unavailable or too noisy to stream reliably. It queries <code>online_stats</code> once per online user per cycle, so with a <code>CHECK_INTERVAL</code> of 180–300 seconds the panel load stays negligible. It needs a panel account with the <code>nodes:stats</code> permission; the bot pre-flights that before switching, and reverts to logs automatically if the endpoint stops answering.
+Use API mode when node logs are unavailable or too noisy to stream reliably. It queries <code>online_stats</code> once per online user per cycle; panel load depends on candidate count, node RPC latency and concurrency. It needs a panel account with the <code>nodes:stats</code> permission. With automatic fallback enabled, two unsuccessful collection cycles switch to Logs, including cycles whose HTTP requests succeed but whose per-user node evidence is incomplete.
 </details>
 
 <details>

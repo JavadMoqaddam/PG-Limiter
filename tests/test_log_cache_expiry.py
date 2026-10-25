@@ -14,7 +14,7 @@ def replay_cache(monkeypatch):
     clock = [800.0]
     monkeypatch.setattr(observations.time, "time", lambda: clock[0])
     state = observations.LogObservations()
-    config = {"log_timezone": "UTC", "check_interval": 300, "log_replay_cache_size": 10000}
+    config = {"log_timezone": "UTC", "check_interval": 300, "api_ip_freshness": 300, "log_replay_cache_size": 10000}
     state.configure(config)
     clock[0] = 1000.0
     return SimpleNamespace(state=state, clock=clock, config=config)

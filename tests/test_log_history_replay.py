@@ -25,7 +25,12 @@ async def logs(monkeypatch, operational_topics):
     clock = [EPOCH]
     monkeypatch.setattr(time, "time", lambda: clock[0])
     monkeypatch.setattr(parser, "is_ip_accepted", AsyncMock(return_value=True))
-    config = {"ip_source": "logs", "check_interval": 60, "log_node_timezones": {"1": "UTC", "2": "Europe/Istanbul"}}
+    config = {
+        "ip_source": "logs",
+        "check_interval": 60,
+        "api_ip_freshness": 60,
+        "log_node_timezones": {"1": "UTC", "2": "Europe/Istanbul"},
+    }
     # Start observing a complete ordinary interval before the first enforcement.
     await parse_logs("", 1, "node", config)
     ready_fleet(1)
@@ -42,7 +47,9 @@ async def test_replay_after_snapshot_is_not_new_activity(logs):
     await parse_logs(record(), 1, "node", logs.config)
     assert "alice" in await pop_active_users_snapshot()
     await parse_logs(record(), 1, "node", logs.config)
-    assert ACTIVE_USERS == {}
+    connection = ACTIVE_USERS["alice"].device_info.connections[0]
+    assert connection.connection_count == 1
+    assert connection.last_seen == EPOCH + 20.123456
     await parse_logs(record("2026/10/23 10:00:40.654321"), 1, "node", logs.config)
     assert ACTIVE_USERS["alice"].device_info.connections[0].last_seen == EPOCH + 40.654321
 
@@ -353,7 +360,7 @@ async def test_source_switch_during_parser_preparation_cannot_write_api_map(logs
     assert set(ACTIVE_USERS) == {"api-only"}
 
 
-async def test_fixed_completed_interval_survives_slow_enforcement_preparation(api_cycle, logs, monkeypatch):
+async def test_original_observations_expire_during_slow_enforcement_preparation(api_cycle, logs, monkeypatch):
     import utils.check_usage as usage
 
     api_cycle.config.update(logs.config)
@@ -361,16 +368,17 @@ async def test_fixed_completed_interval_survives_slow_enforcement_preparation(ap
     await parse_logs(record(), 1, "node", api_cycle.config)
     await parse_logs(record(ip="9.9.9.9"), 1, "node", api_cycle.config)
 
-    prepare = usage.get_active_users_metadata_batch
+    prepare = usage.read_config_snapshot
 
     async def slow_metadata(*args, **kwargs):
-        metadata = await prepare(*args, **kwargs)
+        snapshot = await prepare(*args, **kwargs)
         logs.clock[0] = EPOCH + 125
-        return metadata
+        ready_fleet(1)
+        return snapshot
 
-    monkeypatch.setattr(usage, "get_active_users_metadata_batch", slow_metadata)
+    monkeypatch.setattr(usage, "read_config_snapshot", slow_metadata)
     await usage.check_users_usage(api_cycle.panel, api_cycle.config)
-    assert api_cycle.warning.warnings["alice"].consecutive_violations == 1
+    assert api_cycle.warning.warnings == {}
 
 
 async def test_valid_empty_completed_interval_clears_warning(api_cycle, logs):

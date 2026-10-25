@@ -4,6 +4,7 @@ import hashlib
 import heapq
 import json
 import logging
+import math
 import re
 import time
 from collections import OrderedDict
@@ -11,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from utils.read_config import DEFAULT_API_IP_FRESHNESS, normalize_api_ip_freshness
 
 _TIMESTAMP = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?\s")
 _TIMESTAMP_FAILURE_REASONS = {
@@ -49,7 +52,7 @@ def _printed_second_timestamp(zone: ZoneInfo, printed_second: str) -> int:
 
 @dataclass(frozen=True)
 class LogSampleEvidence:
-    """A completed ordinary interval, never moved forward during preparation."""
+    """A completed source-time window, never moved forward during preparation."""
 
     generation: int
     config_revision: int
@@ -61,6 +64,7 @@ class LogSampleEvidence:
     required_node_ids: frozenset[int] | None = None
     node_versions: tuple[tuple[int, int], ...] = ()
     coverage_complete: bool = False
+    freshness_seconds: int = DEFAULT_API_IP_FRESHNESS
 
 
 @dataclass
@@ -80,6 +84,7 @@ class LogObservations:
         self.signature = None
         self.floor = time.time()
         self.interval = 60.0
+        self.freshness_seconds = DEFAULT_API_IP_FRESHNESS
         self.capacity = 10000
         self.source = "logs"
         self.zones: dict[str, ZoneInfo | None] = {}
@@ -127,6 +132,7 @@ class LogObservations:
             config.get("log_timezone"),
             config.get("log_replay_cache_size", 10000),
             tuple(sorted(set(config.get("disabled_nodes", []) or []))),
+            normalize_api_ip_freshness(config.get("api_ip_freshness")),
         )
         if signature == self.signature:
             return False
@@ -134,6 +140,7 @@ class LogObservations:
         self.signature = signature
         self.source = signature[0]
         self.disabled_nodes = frozenset(signature[5])
+        self.freshness_seconds = signature[6]
         self._refresh_required_nodes()
         self.config_error = ""
         try:
@@ -158,8 +165,10 @@ class LogObservations:
             self._expire_replay_cache(node_id, now)
             while len(cache) > self.capacity:
                 _, evicted_at = cache.popitem(last=False)
-                if evicted_at + self.interval > now:
-                    self.mark_uncertain(evicted_at + self.interval, node_id=node_id, reason="cache_capacity_reduction")
+                if evicted_at + self.freshness_seconds > now:
+                    self.mark_uncertain(
+                        evicted_at + self.freshness_seconds, node_id=node_id, reason="cache_capacity_reduction"
+                    )
             self._compact_replay_cache(node_id)
         return True
 
@@ -272,8 +281,8 @@ class LogObservations:
         now = time.time()
         if now >= self.uncertain_until:
             self._uncertainty_counts.clear()
-        self.uncertain_until = max(self.uncertain_until, until if until is not None else now + self.interval)
-        deadline = until if until is not None else now + self.interval
+        deadline = until if until is not None else now + self.freshness_seconds
+        self.uncertain_until = max(self.uncertain_until, deadline)
         if type(node_id) is int and self.required_nodes is not None and node_id in self.required_nodes:
             # A fault retires captured witnesses, but does not move healthy floors.
             state = self.node_states.get(node_id)
@@ -325,6 +334,7 @@ class LogObservations:
             "remaining_seconds": max(0.0, self.uncertain_until - time.time()),
             "uncertain_until": self.uncertain_until,
             "interval_seconds": self.interval,
+            "freshness_seconds": self.freshness_seconds,
             "cache_capacity": self.capacity,
         }
 
@@ -355,7 +365,7 @@ class LogObservations:
         """Reclaim expired source times even when admission order differs."""
         cache = self.seen[node_id]
         expiry = self._seen_expiry[node_id]
-        cutoff = now - self.interval
+        cutoff = now - self.freshness_seconds
         while expiry and expiry[0][0] <= cutoff:
             observed_at, fingerprint = heapq.heappop(expiry)
             # Live overflow can leave an index entry for an evicted identity.
@@ -371,10 +381,28 @@ class LogObservations:
             heapq.heapify(expiry)
             self._seen_expiry[node_id] = expiry
 
+    def validate_source_time(self, node_id: int, observed_at: float, *, now: float | None = None) -> bool:
+        """Preserve uncertainty before an unusable original time can be discarded."""
+        evaluated_at = time.time() if now is None else now
+        reason = ""
+        if type(observed_at) not in (int, float) or not math.isfinite(observed_at):
+            reason = "invalid_timestamp"
+        elif observed_at > evaluated_at:
+            reason = "future_timestamp"
+        if reason:
+            # A discarded future observation can qualify until its original
+            # expiry; a backwards clock step must not shorten that deadline.
+            expiry_base = observed_at if reason == "future_timestamp" else evaluated_at
+            self.mark_uncertain(expiry_base + self.freshness_seconds, node_id=node_id, reason=reason)
+            return False
+        return True
+
     def admit(self, node_id: int, line: str, observed_at: float) -> bool:
         """Commit identity after preparation, atomically with the user-map mutation."""
         now = time.time()
-        if observed_at < self.floor or not 0 <= now - observed_at < self.interval:
+        if not self.validate_source_time(node_id, observed_at, now=now):
+            return False
+        if observed_at < self.floor or not 0 <= now - observed_at < self.freshness_seconds:
             return False
         cache = self.seen.setdefault(node_id, OrderedDict())
         self._seen_expiry.setdefault(node_id, [])
@@ -387,8 +415,8 @@ class LogObservations:
         heapq.heappush(self._seen_expiry[node_id], (observed_at, fingerprint))
         while len(cache) > self.capacity:
             _, evicted_at = cache.popitem(last=False)
-            if evicted_at + self.interval > now:
-                self.mark_uncertain(evicted_at + self.interval, node_id=node_id, reason="live_cache_eviction")
+            if evicted_at + self.freshness_seconds > now:
+                self.mark_uncertain(evicted_at + self.freshness_seconds, node_id=node_id, reason="live_cache_eviction")
         self._compact_replay_cache(node_id)
         return True
 
@@ -405,7 +433,7 @@ class LogObservations:
         if now < self._global_uncertain_until:
             self._report_uncertainty()
             return "timestamp or replay uncertainty in the current interval"
-        if now - self.interval < max(self.floor, self.fleet_floor, self.transport_floor):
+        if now - max(self.interval, self.freshness_seconds) < max(self.floor, self.fleet_floor, self.transport_floor):
             return "collecting a complete check interval"
         return ""
 
@@ -425,7 +453,7 @@ class LogObservations:
         state = self.node_states.get(node_id)
         if state is not None and now < state.uncertain_until:
             return "timestamp or replay uncertainty in the current interval"
-        if state is None or now - self.interval < state.floor:
+        if state is None or now - max(self.interval, self.freshness_seconds) < state.floor:
             return "collecting a complete check interval"
         return ""
 
@@ -449,10 +477,10 @@ class LogObservations:
             return "collecting a complete check interval"
         return ""
 
-    def evidence(self) -> LogSampleEvidence:
+    def evidence(self, *, end: float | None = None) -> LogSampleEvidence:
         from utils.read_config import get_config_revision
 
-        now = time.time()
+        now = time.time() if end is None else end
         required = frozenset(self.required_nodes) if self.required_nodes is not None else None
         global_reason = self._global_unavailable_reason(now)
         eligible = (
@@ -463,7 +491,7 @@ class LogObservations:
         return LogSampleEvidence(
             self.generation,
             get_config_revision(),
-            now - self.interval,
+            now - self.freshness_seconds,
             now,
             self.fault_version,
             self.unavailable_reason(end=now),
@@ -471,6 +499,7 @@ class LogObservations:
             required,
             tuple((node_id, self.node_states[node_id].epoch) for node_id in sorted(eligible or ())),
             required is not None and eligible == required and not global_reason,
+            self.freshness_seconds,
         )
 
     def is_current(self, evidence: LogSampleEvidence | None, *, allow_partial: bool = False) -> bool:

@@ -45,7 +45,11 @@ def create_ip_source_keyboard(current_source: str, concurrency: int, freshness: 
                 f"⚡ API Concurrency: {concurrency}", callback_data=CallbackData.IP_SOURCE_SET_CONCURRENCY
             )
         ],
-        [InlineKeyboardButton(f"🕒 Last seen: {freshness}s", callback_data=CallbackData.IP_SOURCE_SET_FRESHNESS)],
+        [
+            InlineKeyboardButton(
+                f"🕒 Last seen (API + Logs): {freshness}s", callback_data=CallbackData.IP_SOURCE_SET_FRESHNESS
+            )
+        ],
         [InlineKeyboardButton("📊 Last API Cycle", callback_data=CallbackData.IP_SOURCE_STATS)],
         [InlineKeyboardButton("« Back to Settings", callback_data=CallbackData.SETTINGS_MENU)],
     ]
@@ -82,11 +86,16 @@ def _build_ip_source_text(config_data: dict) -> str:
         f"<b>Logs evidence:</b> {logs_readiness}\n"
         "Set <code>LOG_NODE_TIMEZONES</code> (or explicit <code>LOG_TIMEZONE</code>) for Xray containers. "
         "Missing zones, incomplete fleet or replay uncertainty preserve warning history. "
-        "A source/settings change requires one complete check interval.\n\n"
+        "After source/settings changes or transport gaps, Logs needs a complete observation warm-up "
+        "of <code>max(Check interval, Last seen)</code>.\n\n"
+        "<b>Shared source timestamp age:</b>\n"
+        f"• Last seen: <code>{freshness}s</code> for API and Logs\n"
+        "• Uses the original source event timestamp at evaluation\n"
+        "• Independent of <code>CHECK_INTERVAL</code>\n"
+        "• Measures recent connection events, not ongoing byte traffic\n\n"
         "<b>API mode settings:</b>\n"
         f"• Check interval: <code>{interval}s</code>\n"
         "• Candidates: active users with <code>online=true</code> and Group Filter\n"
-        f"• Last seen: <code>{freshness}s</code> (independent of check interval)\n"
         f"• Min coverage: <code>{coverage:.0%}</code>\n"
         f"• Auto-fallback to logs: {auto_fallback}\n\n"
         "<b>API observations:</b>\n"
@@ -309,9 +318,10 @@ async def handle_ip_source_freshness_callback(query, context: ContextTypes.DEFAU
         text=(
             "🕒 <b>Last seen</b>\n\n"
             f"Current: <code>{current}s</code>\n\n"
-            "Count an IP only while its Xray timestamp is younger than this value. "
-            "Xray updates the timestamp when a tracked connection opens, so a "
-            "long-lived connection may have an old timestamp.\n\n"
+            "Applies to API and Logs: count source events only while their original "
+            "timestamp is younger than this value. It is independent of <code>CHECK_INTERVAL</code>. "
+            "These observations describe recent connection events, not ongoing byte traffic. "
+            "A long-lived transmitting connection may have an older event timestamp.\n\n"
             "Send a positive whole number of seconds, or /cancel."
         ),
         reply_markup=InlineKeyboardMarkup(
@@ -345,14 +355,14 @@ async def ip_source_freshness_handler(update: Update, context: ContextTypes.DEFA
         context.user_data["waiting_for"] = "ip_source_freshness"
         return await update.message.reply_html("❌ Could not save Last seen. Try again or /cancel.")
     await update.message.reply_html(
-        f"✅ Last seen set to <code>{value}s</code>.",
+        f"✅ Last seen for API and Logs set to <code>{value}s</code>.",
         reply_markup=create_ip_source_keyboard(source, concurrency, value),
     )
 
 
 async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_TYPE):
     """Show the statistics of the most recent API collection cycle."""
-    from utils.ip_source_api import get_last_cycle_stats
+    from utils.ip_source_api import format_api_evidence_summary, get_last_cycle_stats
 
     config_data = await read_config()
     stats = get_last_cycle_stats()
@@ -384,31 +394,32 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
     age = max(0, int(time.time() - ran_at))
     age_label = f"{age}s ago" if age < 120 else f"{age // 60}m ago"
     skipped = stats.get("skipped_reason") or ""
-    verdict = f"⚠️ Cycle skipped — {skipped}" if skipped else "✅ Sample available for enforcement"
-    if not skipped and stats.get("collection_outcome") == "partial":
+    outcome = stats.get("collection_outcome")
+    fallback = stats.get("fallback_applied", False)
+    if skipped:
+        verdict = f"⚠️ Cycle skipped — {escape(str(skipped))}"
+    elif fallback:
+        verdict = "⚠️ Cycle skipped — IP source reverted to Logs"
+    elif outcome in {"success", "partial"}:
+        verdict = "✅ Sample available for enforcement"
+    else:
+        verdict = "⚠️ Collection unavailable or still in progress; no usable sample recorded"
+    if not skipped and not fallback and outcome == "partial":
         verdict += f" ({stats.get('unknown_users', 0)} users protected: incomplete evidence)"
 
-    # Nodes seen was rendered without its denominator, which is the number that matters:
-    # a per-user coverage of 100% says nothing about a fleet where two thirds of the
-    # nodes went quiet. The guard is required - node_coverage is set to 1.0 with
-    # nodes_expected 0 when the node list could not be read, and "1/0 (100%)" is a lie.
-    nodes_seen = stats.get("nodes_seen", 0)
-    nodes_expected = int(stats.get("nodes_expected") or 0)
-    nodes_label = (
-        f"{nodes_seen}/{nodes_expected} ({float(stats.get('node_coverage') or 0):.0%})"
-        if nodes_expected
-        else f"{nodes_seen}"
-    )
     dropped = [f"{stats.get('stale_ips', 0)} stale"]
     if stats.get("unknown_age_ips"):
         dropped.append(f"{stats['unknown_age_ips']} undatable")
     if stats.get("future_ips"):
         dropped.append(f"{stats['future_ips']} future-dated")
+    historical = "Historical API collection; current source is Logs.\n" if config_data.get("ip_source") != "api" else ""
 
     text = (
         "📊 <b>Last API Cycle</b>\n\n"
+        f"{historical}"
         f"<b>Ran:</b> {age_label} in <code>{stats.get('duration_ms', 0)}ms</code>\n"
         f"{verdict}\n\n"
+        f"Consecutive incomplete API collections: <code>{stats.get('consecutive_unsuccessful_cycles', 0)}</code>\n\n"
         "<b>Candidate narrowing:</b>\n"
         f"• From panel: <code>{stats.get('candidates', 0)}</code>\n"
         f"• After local filters: <code>{stats.get('prefiltered', 0)}</code>\n\n"
@@ -418,11 +429,13 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
         f"• Not found (404): <code>{stats.get('not_found', 0)}</code>\n"
         f"• Forbidden (403): <code>{stats.get('forbidden', 0)}</code>\n"
         f"• Coverage: <code>{float(stats.get('coverage') or 0):.1%}</code>\n\n"
+        "<b>Evidence:</b>\n"
+        f"{format_api_evidence_summary(stats)}\n"
+        "HTTP success does not confirm complete node evidence for each user.\n\n"
         "<b>Result:</b>\n"
         f"• Users with IPs: <code>{stats.get('users_with_ips', 0)}</code>\n"
         f"• Accepted IPs: <code>{stats.get('total_ips', 0)}</code>\n"
         f"• IPs dropped: <code>{', '.join(dropped)}</code>\n"
-        f"• Nodes reporting: <code>{nodes_label}</code>\n"
         f"• Geo lookups: <code>{stats.get('geo_lookups', 0)}</code>"
     )
 

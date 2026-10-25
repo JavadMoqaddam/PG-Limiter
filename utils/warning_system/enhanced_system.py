@@ -847,12 +847,17 @@ class EnhancedWarningSystem:
                                     and not warning.is_monitoring_active()
                                     and warning.consecutive_violations >= self.effective_max_warnings(warning)
                                     and (refresh_user_evidence is None or refresh_user_evidence(username))
+                                    and (device_counts or {}).get(username, len(all_users_actual_ips.get(username, ())))
+                                    > user_limit_number
                                 )
 
                             async def revalidate_punishment():
+                                nonlocal user_limit_number
                                 policy = await current_policy(username)
-                                count = (device_counts or {}).get(username, len(all_users_actual_ips.get(username, ())))
-                                return policy is not None and punishment_is_current() and count > policy.limit
+                                if policy is None:
+                                    return False
+                                user_limit_number = policy.limit
+                                return punishment_is_current()
 
                             with enforcement_guard(revalidate_punishment, punishment_is_current):
                                 punishment_result = await safe_disable_user_with_punishment(
