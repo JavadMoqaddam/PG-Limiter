@@ -109,16 +109,16 @@ async def test_api_read_and_write_failures_return_503(settings_db, monkeypatch):
 
 
 async def test_api_config_masks_copied_credentials_and_projects_timing(settings_db, monkeypatch):
-    monkeypatch.setenv("PANEL_PASSWORD", "private-panel-password")
+    monkeypatch.setenv("PANEL_API_KEY", "private-panel-key")
     monkeypatch.setenv("API_PASSWORD", "private-api-password")
     await api_server.set_check_interval(interval=180, username="admin")
     data = (await api_server.get_config(username="admin"))["data"]
     assert data["timing"]["check_interval"] == 180
-    assert data["panel"]["password"] == "***"
+    assert data["panel"]["api_key"] == "***"
     assert data["api"]["password"] == "***"
     assert "config_degraded" not in data
     assert "_runtime_config_revision" not in data
-    assert (await config.read_config())["panel"]["password"] == "private-panel-password"
+    assert (await config.read_config())["panel"]["api_key"] == "private-panel-key"
 
 
 async def test_api_failed_write_does_not_advance_revision(settings_db, monkeypatch):

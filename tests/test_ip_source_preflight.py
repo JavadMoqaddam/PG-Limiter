@@ -9,7 +9,7 @@ import pytest
 from telegram_bot.handlers import settings_ip_source as settings
 from test_inbound_mode_settings import LocalQuery, settings_store  # noqa: F401
 from utils import read_config as config_module
-from utils.panel_api import auth, request_helper
+from utils.panel_api import request_helper
 from utils.types import PanelType
 
 
@@ -21,9 +21,9 @@ async def panel_http(monkeypatch):
 
     def respond(request):
         calls.append(request)
-        if request.url.path == "/api/admin/token":
-            return httpx.Response(200, json={"access_token": "test-token", "token_type": "bearer"})
-        assert request.headers["Authorization"] == "Bearer test-token"
+        assert request.url.path != "/api/admin/token"
+        assert request.headers["X-Api-Key"] == "test-panel-key"
+        assert "Authorization" not in request.headers
         reply = routes[request.url.path]
         if callable(reply):
             reply = reply(request)
@@ -39,14 +39,9 @@ async def panel_http(monkeypatch):
         monkeypatch.setattr(request_helper, "get_panel_client", get_client)
         monkeypatch.setattr(request_helper, "circuit_breaker", request_helper.PanelCircuitBreaker())
         monkeypatch.setattr(request_helper, "_panel_health", dict(request_helper._panel_health))
-        monkeypatch.setattr(auth, "_token_cache", {"token": None, "expires_at": 0, "panel_domain": None})
-        monkeypatch.setattr(auth, "_auth_token_lock", asyncio.Lock())
         monkeypatch.setenv("PANEL_DOMAIN", "https://panel.test")
-        monkeypatch.setenv("PANEL_USERNAME", "test-admin")
-        monkeypatch.setenv("PANEL_PASSWORD", "test-password")
-        yield SimpleNamespace(
-            panel=PanelType("test-admin", "test-password", "https://panel.test"), calls=calls, routes=routes
-        )
+        monkeypatch.setenv("PANEL_API_KEY", "test-panel-key")
+        yield SimpleNamespace(panel=PanelType("https://panel.test", "test-panel-key"), calls=calls, routes=routes)
 
 
 async def test_preflight_fetches_only_one_user_from_a_large_online_list(panel_http):
@@ -228,11 +223,6 @@ async def test_no_probe_target_preserves_logs_without_endpoint_request(node_logs
 
 
 async def test_open_circuit_breaker_preserves_logs_without_http(node_logs_config, panel_http, monkeypatch):
-    monkeypatch.setattr(
-        auth,
-        "_token_cache",
-        {"token": "test-token", "expires_at": float("inf"), "panel_domain": "https://panel.test"},
-    )
     breaker = request_helper.circuit_breaker
     breaker.state = breaker.STATE_OPEN
 
@@ -242,7 +232,7 @@ async def test_open_circuit_breaker_preserves_logs_without_http(node_logs_config
     assert panel_http.calls == []
 
 
-async def test_list_401_refresh_still_allows_a_verified_source_switch(node_logs_config, panel_http):
+async def test_list_401_preserves_source_without_login_fallback(node_logs_config, panel_http):
     attempts = []
 
     def users(request):
@@ -256,9 +246,9 @@ async def test_list_401_refresh_still_allows_a_verified_source_switch(node_logs_
 
     await settings.handle_ip_source_set_api_callback(LocalQuery(), SimpleNamespace(user_data={}))
 
-    assert (await config_module.read_config())["ip_source"] == "api"
-    assert len([request for request in panel_http.calls if request.url.path == "/api/admin/token"]) == 2
-    assert len(attempts) == 2
+    assert (await config_module.read_config())["ip_source"] == "logs"
+    assert not [request for request in panel_http.calls if request.url.path == "/api/admin/token"]
+    assert len(attempts) == 1
 
 
 @pytest.mark.parametrize("path", ["/api/users", "/api/node/online_stats/7/ip"])

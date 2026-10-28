@@ -121,7 +121,9 @@ async def test_confirmed_disable_is_owned_before_registry_cancellation(fact_data
     monkeypatch.setattr(users.dis_users, "disable", cancelled_registry)
     with pytest.raises(asyncio.CancelledError):
         async with journal.action("alice", 2, on_disabled=lambda: system.mark_unrecorded("alice", 2, 15)):
-            await users.disable_user(PanelType("u", "p", "d"), UserType(name="alice", ip=[]))
+            await users.disable_user(
+                PanelType(panel_domain="d", panel_api_key="pg_key_test"), UserType(name="alice", ip=[])
+            )
     assert await journal.ready_before(100.0)
     from db.crud.punishment_facts import PunishmentFactsCRUD
 
@@ -170,7 +172,9 @@ async def test_selected_step_captures_actual_flags(fact_database, tmp_path, monk
     monkeypatch.setattr(users, "disable_user", AsyncMock())
     monkeypatch.setattr(users, "revoke_user_subscription", AsyncMock(return_value=True))
     monkeypatch.setattr(users, "reset_user_uuid", AsyncMock(return_value=False))
-    await users.disable_user_with_punishment(PanelType("u", "p", "d"), UserType("alice", []))
+    await users.disable_user_with_punishment(
+        PanelType(panel_domain="d", panel_api_key="pg_key_test"), UserType("alice", [])
+    )
     await system.clear_all_history()
     async with fact_database() as db:
         rows = (await db.scalars(select(PunishmentFact))).all()
@@ -193,7 +197,7 @@ async def test_disappearing_user_is_not_a_plain_ban(fact_database, tmp_path, mon
     monkeypatch.setattr(users, "check_user_exists", AsyncMock(return_value=False))
     monkeypatch.setattr(users, "safe_send_logs_panel", AsyncMock())
     async with journal.action("gone", None):
-        await users.disable_user(PanelType("u", "p", "d"), UserType("gone", []))
+        await users.disable_user(PanelType(panel_domain="d", panel_api_key="pg_key_test"), UserType("gone", []))
         facts.current_action().mark_disabled()
     async with fact_database() as db:
         assert await PunishmentFactsCRUD.aggregate(db, 0, 9999999999) == ({}, 0)

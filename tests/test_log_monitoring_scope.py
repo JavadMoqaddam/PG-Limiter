@@ -30,7 +30,6 @@ async def streams(api_cycle, logs, monkeypatch):
     monkeypatch.setattr(collector, "_pending_status_update_task", None)
     monkeypatch.setattr(collector, "send_logs", AsyncMock(return_value=77))
     monkeypatch.setattr(collector, "edit_message", AsyncMock(return_value=True))
-    monkeypatch.setattr(collector, "get_token", AsyncMock(return_value=SimpleNamespace(panel_token="test")))
     opened = []
     started = {i: asyncio.Event() for i in (1, 9)}
     closed = {i: asyncio.Event() for i in (1, 9)}

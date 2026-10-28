@@ -106,10 +106,7 @@ async def handle_user_sync_now_callback(query, _context: ContextTypes.DEFAULT_TY
         from utils.types import PanelType
 
         config_data = await read_config()
-        panel_config = config_data.get("panel", {})
-        panel_data = PanelType(
-            panel_config.get("username", ""), panel_config.get("password", ""), panel_config.get("domain", "")
-        )
+        panel_data = PanelType.from_config(config_data)
 
         last_sync_before = await get_last_sync_time()
         synced, errors, deleted = await sync_users_to_database(panel_data)

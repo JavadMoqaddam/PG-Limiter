@@ -69,8 +69,7 @@ def zone_summary(value):
 @dataclass
 class Settings:
     panel_base: str = field(repr=False)
-    username: str = field(repr=False)
-    password: str = field(repr=False)
+    panel_api_key: str = field(repr=False)
     general_limit: int
     check_interval: int
     max_warning_count: int
@@ -169,8 +168,7 @@ def load_settings(environ=None):
         raise ProbeError("configuration_panel_invalid")
     return Settings(
         domain,
-        env.get("PANEL_USERNAME", "admin"),
-        env.get("PANEL_PASSWORD", ""),
+        env.get("PANEL_API_KEY", ""),
         general,
         interval,
         warnings,
@@ -424,7 +422,7 @@ def print_json(value):
 async def diagnose(
     settings, client, *, duration=8, concurrency=4, total_timeout=180, request_timeout=8, nodes=None, emit=print_json
 ):
-    """Authenticate once, list the full fleet, and observe each relevant node once."""
+    """List the fleet and observe relevant nodes using only the configured API key."""
     emit(settings.summary())
     emit(
         {
@@ -439,17 +437,10 @@ async def diagnose(
     stats_list = []
     try:
         async with asyncio.timeout(total_timeout):
-            auth = await request_json(
-                client,
-                "POST",
-                settings.panel_base + "/api/admin/token",
-                "auth",
-                request_timeout,
-                data={"username": settings.username, "password": settings.password},
-            )
-            if not isinstance(auth, dict) or not isinstance(auth.get("access_token"), str) or not auth["access_token"]:
-                raise ProbeError("auth_payload_invalid")
-            headers = {"Authorization": "Bearer " + auth["access_token"], "Accept": "text/event-stream"}
+            key = settings.panel_api_key.strip()
+            if not key or not key.isascii() or any(ord(char) < 33 or ord(char) == 127 for char in key):
+                raise ProbeError("configuration_panel_api_key_invalid")
+            headers = {"X-Api-Key": key, "Accept": "text/event-stream"}
             fleet = await request_json(
                 client, "GET", settings.panel_base + "/api/nodes", "nodes", request_timeout, headers=headers
             )

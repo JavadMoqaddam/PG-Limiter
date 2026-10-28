@@ -27,7 +27,7 @@ async def get_groups(panel_data: PanelType, force_refresh: bool = False) -> list
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
         force_refresh (bool): If True, bypass cache and fetch fresh groups.
 
     Returns:
@@ -37,28 +37,30 @@ async def get_groups(panel_data: PanelType, force_refresh: bool = False) -> list
         ValueError: If the function fails to get groups from the API.
     """
     current_time = time.time()
-    if (not force_refresh and 
-        _groups_cache["groups"] is not None and 
-        _groups_cache["panel_domain"] == panel_data.panel_domain and
-        current_time < _groups_cache["expires_at"]):
+    if (
+        not force_refresh
+        and _groups_cache["groups"] is not None
+        and _groups_cache["panel_domain"] == panel_data.panel_domain
+        and current_time < _groups_cache["expires_at"]
+    ):
         groups_logger.debug("👥 Using cached groups list")
         return _groups_cache["groups"]
 
     groups_logger.debug(f"👥 Fetching groups from panel (force_refresh={force_refresh})...")
-    
-    response = await panel_get(panel_data, "/api/groups", force_refresh=force_refresh)
-    
+
+    response = await panel_get(panel_data, "/api/groups")
+
     if response is None:
         message = "Failed to get groups after all retries"
         groups_logger.error(message)
         raise ValueError(message)
-    
+
     try:
         data = response.json()
     except Exception as json_error:
-        groups_logger.error(f"Failed to parse JSON: {json_error}")
-        raise ValueError(f"Failed to parse groups response: {json_error}")
-    
+        groups_logger.error(f"Failed to parse groups response: {type(json_error).__name__}")
+        raise ValueError("Failed to parse groups response") from None
+
     # Handle response structure
     groups = None
     if isinstance(data, dict) and "groups" in data:
@@ -69,7 +71,7 @@ async def get_groups(panel_data: PanelType, force_refresh: bool = False) -> list
         message = f"Unexpected groups response format: {type(data)}"
         groups_logger.error(message)
         raise ValueError(message)
-    
+
     # Cache result for 10 minutes (600s)
     _groups_cache["groups"] = groups
     _groups_cache["expires_at"] = current_time + 600.0

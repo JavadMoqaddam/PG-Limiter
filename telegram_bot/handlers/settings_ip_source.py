@@ -25,12 +25,7 @@ def _build_panel_data(config_data: dict):
     """Build a PanelType from the stored panel configuration."""
     from utils.types import PanelType
 
-    panel_config = config_data.get("panel", {})
-    return PanelType(
-        panel_config.get("username", ""),
-        panel_config.get("password", ""),
-        panel_config.get("domain", ""),
-    )
+    return PanelType.from_config(config_data)
 
 
 def create_ip_source_keyboard(current_source: str, concurrency: int, freshness: int = 60):
@@ -218,8 +213,8 @@ async def handle_ip_source_set_api_callback(query, context: ContextTypes.DEFAULT
 
     from utils.panel_api.online_ips import check_online_stats_permission
 
-    panel_data = _build_panel_data(config_data)
     try:
+        panel_data = _build_panel_data(config_data)
         user_id, probe_error = await _find_preflight_user_id(panel_data, config_data)
         if not user_id:
             ok, reason = False, probe_error

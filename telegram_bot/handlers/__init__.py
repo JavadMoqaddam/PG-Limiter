@@ -51,9 +51,6 @@ from telegram_bot.handlers.users import (
 
 from telegram_bot.handlers.settings import (
     set_panel_domain,
-    get_domain,
-    get_username,
-    get_password,
     set_ipinfo_token,
     ipinfo_token_handler,
     handle_disable_by_group_callback,
@@ -181,9 +178,6 @@ __all__ = [
     "handle_delete_whitelist_callback",
     # Settings handlers
     "set_panel_domain",
-    "get_domain",
-    "get_username",
-    "get_password",
     "set_ipinfo_token",
     "ipinfo_token_handler",
     "handle_disable_by_group_callback",

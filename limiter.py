@@ -201,8 +201,9 @@ async def main():
                 # while the limiter sat in this retry loop.
                 await send_logs(
                     "Please configure the required settings:\n"
-                    "/create_config - Panel credentials\n"
+                    "/create_config - Panel environment setup instructions\n"
                     "/set_general_limit_number - Default IP limit\n\n"
+                    "Set <code>PANEL_DOMAIN</code> and <code>PANEL_API_KEY</code> in the environment file.\n"
                     "The check interval and the re-enable timeout are set in the "
                     "environment file, not from the bot:\n"
                     "<code>CHECK_INTERVAL</code> - seconds between scans (180-300)\n"
@@ -212,11 +213,7 @@ async def main():
                 await asyncio.sleep(60)
 
         # Initialize panel connection
-        panel_data = PanelType(
-            config_file["panel"]["username"],
-            config_file["panel"]["password"],
-            config_file["panel"]["domain"],
-        )
+        panel_data = PanelType.from_config(config_file)
         main_logger.info(f"✓ Panel configured: {config_file['panel']['domain']}")
 
         # Preserve disabled users across restarts (enable_dis_user background loop handles expired bans)

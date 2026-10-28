@@ -36,7 +36,9 @@ def panel_snapshot(monkeypatch):
         assert "status" not in params
         offset, limit = params["offset"], params["limit"]
         response = type(
-            "Response", (), {"json": lambda self: {"users": rows[offset : offset + limit], "total": len(rows)}}
+            "Response",
+            (),
+            {"status_code": 200, "json": lambda self: {"users": rows[offset : offset + limit], "total": len(rows)}},
         )
         return response()
 
@@ -61,7 +63,11 @@ async def test_complete_snapshot_removes_all_absent_users_and_preserves_local_po
         db.add_all(User(username=f"removed_{index}") for index in range(100))
         db.add(User(username="disabled", panel_id=2, special_limit=9, is_excepted=True, is_disabled_by_limiter=True))
 
-    assert await sync.sync_users_to_database(PanelType("admin", "password", "panel.test")) == (5, 0, 100)
+    assert await sync.sync_users_to_database(PanelType(panel_domain="panel.test", panel_api_key="pg_key_test")) == (
+        5,
+        0,
+        100,
+    )
     async with database.get_db() as db:
         assert await UserCRUD.get_all_usernames(db) == {"active", "disabled", "limited", "expired", "on_hold"}
         row = await UserCRUD.get_by_username(db, "disabled")
@@ -73,7 +79,11 @@ async def test_complete_snapshot_removes_all_absent_users_and_preserves_local_po
 async def test_validated_empty_panel_clears_local_membership(settings_db, panel_snapshot):
     async with database.get_db() as db:
         db.add(User(username="removed"))
-    assert await sync.sync_users_to_database(PanelType("admin", "password", "panel.test")) == (0, 0, 1)
+    assert await sync.sync_users_to_database(PanelType(panel_domain="panel.test", panel_api_key="pg_key_test")) == (
+        0,
+        0,
+        1,
+    )
     async with database.get_db() as db:
         assert await UserCRUD.get_all_usernames(db) == set()
     assert sync.USER_METADATA_CACHE == {}
@@ -101,10 +111,12 @@ async def test_invalid_snapshot_never_changes_local_users(settings_db, panel_sna
         data = {"users": page, "total": total}
         if failure == "missing_total":
             data.pop("total")
-        return type("Response", (), {"json": lambda self: data})()
+        return type("Response", (), {"status_code": 200, "json": lambda self: data})()
 
     monkeypatch.setattr(request_helper, "panel_get", panel_get)
-    synced, errors, deleted = await sync.sync_users_to_database(PanelType("admin", "password", "panel.test"))
+    synced, errors, deleted = await sync.sync_users_to_database(
+        PanelType(panel_domain="panel.test", panel_api_key="pg_key_test")
+    )
     assert (synced, deleted) == (0, 0)
     assert errors > 0
     async with database.get_db() as db:
@@ -137,7 +149,9 @@ async def test_settings_writer_can_commit_between_user_batches(settings_db, pane
         return await original_execute(db, statement, *args, **kwargs)
 
     monkeypatch.setattr(AsyncSession, "execute", pause_second_insert)
-    task = asyncio.create_task(sync.sync_users_to_database(PanelType("admin", "password", "panel.test")))
+    task = asyncio.create_task(
+        sync.sync_users_to_database(PanelType(panel_domain="panel.test", panel_api_key="pg_key_test"))
+    )
     try:
         await asyncio.wait_for(second_insert.wait(), 5)
         async with database.get_db() as db:
@@ -167,7 +181,9 @@ async def test_cleanup_preserves_users_added_between_batches(settings_db, panel_
         return await original_execute(db, statement, *args, **kwargs)
 
     monkeypatch.setattr(AsyncSession, "execute", pause_second_insert)
-    task = asyncio.create_task(sync.sync_users_to_database(PanelType("admin", "password", "panel.test")))
+    task = asyncio.create_task(
+        sync.sync_users_to_database(PanelType(panel_domain="panel.test", panel_api_key="pg_key_test"))
+    )
     try:
         await asyncio.wait_for(second_insert.wait(), 5)
         async with database.get_db() as db:
@@ -212,7 +228,11 @@ async def test_same_count_panel_membership_churn_preserves_still_present_local_p
         return SimpleNamespace(status_code=200, json=lambda: original[1000])
 
     monkeypatch.setattr(request_helper, "panel_get", panel_get)
-    assert await sync.sync_users_to_database(PanelType("admin", "password", "panel.test")) == (1002, 1, 0)
+    assert await sync.sync_users_to_database(PanelType(panel_domain="panel.test", panel_api_key="pg_key_test")) == (
+        1002,
+        1,
+        0,
+    )
     async with database.get_db() as db:
         user = await UserCRUD.get_by_username(db, "user_1000")
         assert (user.special_limit, user.is_excepted, user.is_disabled_by_limiter) == (9, True, True)
@@ -254,7 +274,11 @@ async def test_unconfirmed_user_absence_preserves_local_policy(
         return SimpleNamespace(status_code=404, json=invalid_json)
 
     monkeypatch.setattr(request_helper, "panel_get", panel_get)
-    assert await sync.sync_users_to_database(PanelType("admin", "password", "panel.test")) == (0, 1, 0)
+    assert await sync.sync_users_to_database(PanelType(panel_domain="panel.test", panel_api_key="pg_key_test")) == (
+        0,
+        1,
+        0,
+    )
     async with database.get_db() as db:
         user = await UserCRUD.get_by_username(db, "kept")
         assert (user.special_limit, user.is_excepted) == (9, True)
@@ -276,7 +300,11 @@ async def test_incomplete_cleanup_notifies_only_confirmed_committed_deletions(se
         return await original_get(_panel, path, **kwargs)
 
     monkeypatch.setattr(request_helper, "panel_get", panel_get)
-    assert await sync.sync_users_to_database(PanelType("admin", "password", "panel.test")) == (0, 1, 1)
+    assert await sync.sync_users_to_database(PanelType(panel_domain="panel.test", panel_api_key="pg_key_test")) == (
+        0,
+        1,
+        1,
+    )
     async with database.get_db() as db:
         assert await UserCRUD.get_all_usernames(db) == {"kept"}
         assert (await UserCRUD.get_by_username(db, "kept")).special_limit == 9
@@ -298,7 +326,11 @@ async def test_cleanup_preserves_local_edit_committed_during_full_panel_fetch(se
         return await original_get(_panel, path, **kwargs)
 
     monkeypatch.setattr(request_helper, "panel_get", panel_get)
-    assert await sync.sync_users_to_database(PanelType("admin", "password", "panel.test")) == (0, 1, 0)
+    assert await sync.sync_users_to_database(PanelType(panel_domain="panel.test", panel_api_key="pg_key_test")) == (
+        0,
+        1,
+        0,
+    )
     async with database.get_db() as db:
         assert (await UserCRUD.get_by_username(db, "kept")).special_limit == 9
     assert sync._last_sync_time is None
@@ -331,7 +363,11 @@ async def test_cleanup_confirmation_releases_database_and_preserves_concurrent_l
         return SimpleNamespace(status_code=404, json=lambda: {"detail": "User not found"})
 
     monkeypatch.setattr(request_helper, "panel_get", panel_get)
-    assert await sync.sync_users_to_database(PanelType("admin", "password", "panel.test")) == (0, 1, 0)
+    assert await sync.sync_users_to_database(PanelType(panel_domain="panel.test", panel_api_key="pg_key_test")) == (
+        0,
+        1,
+        0,
+    )
     async with database.get_db() as db:
         user = await UserCRUD.get_by_username(db, "kept")
         if edit_kind == "policy":
@@ -361,7 +397,11 @@ async def test_failed_later_batch_keeps_committed_count_and_skips_pruning(settin
         return await original_execute(db, statement, *args, **kwargs)
 
     monkeypatch.setattr(AsyncSession, "execute", fail_second_insert)
-    assert await sync.sync_users_to_database(PanelType("admin", "password", "panel.test")) == (500, 1, 0)
+    assert await sync.sync_users_to_database(PanelType(panel_domain="panel.test", panel_api_key="pg_key_test")) == (
+        500,
+        1,
+        0,
+    )
     async with database.get_db() as db:
         names = await UserCRUD.get_all_usernames(db)
     assert len(names) == 501 and "kept" in names and "user_500" not in names

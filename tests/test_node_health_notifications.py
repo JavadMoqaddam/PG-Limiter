@@ -409,7 +409,7 @@ async def test_panel_poll_reports_included_failure_even_without_an_active_task(a
     monkeypatch.setattr(streams, "get_nodes", AsyncMock(return_value=actual_nodes.nodes))
     monkeypatch.setattr(streams, "wait_for_monitoring_change", finish)
     with pytest.raises(asyncio.CancelledError):
-        await streams.handle_cancel(PanelType("test", "test", "panel.invalid"), [])
+        await streams.handle_cancel(PanelType(panel_domain="panel.invalid", panel_api_key="pg_key_test"), [])
     assert len(health.messages) == 1
     assert "28" in health.messages[0][0] and "panel connection unavailable" in health.messages[0][0]
 
@@ -447,5 +447,7 @@ async def test_scheduled_stream_rebuild_does_not_report_a_failed_monitoring_inci
     monkeypatch.setattr(streams, "create_node_task", AsyncMock())
     monkeypatch.setattr(streams, "send_logs", AsyncMock())
     with pytest.raises(asyncio.CancelledError):
-        await streams.handle_cancel_all([], PanelType("test", "test", "panel.invalid"), SimpleNamespace())
+        await streams.handle_cancel_all(
+            [], PanelType(panel_domain="panel.invalid", panel_api_key="pg_key_test"), SimpleNamespace()
+        )
     assert health.messages == []

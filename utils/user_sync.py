@@ -529,12 +529,7 @@ async def fetch_and_sync_single_user(username: str, panel_data: Optional[PanelTy
             from utils.read_config import read_config
 
             config = await read_config()
-            panel_config = config.get("panel", {})
-            panel_data = PanelType(
-                panel_username=panel_config.get("username", ""),
-                panel_password=panel_config.get("password", ""),
-                panel_domain=panel_config.get("domain", ""),
-            )
+            panel_data = PanelType.from_config(config)
 
         # Validate panel_data has required fields
         if not panel_data.panel_domain:

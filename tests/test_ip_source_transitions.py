@@ -61,7 +61,6 @@ async def source_runtime(monkeypatch, tmp_path, operational_topics):
         api=api, config=config, state=state, mode="failure", node_status=None, notifications=[], requests=0
     )
     monkeypatch.setattr(requests, "is_panel_available", lambda: runtime.mode != "unavailable")
-    monkeypatch.setattr(online, "resolve_panel_token", AsyncMock(return_value="test-token"))
 
     async def get_nodes(_panel):
         if runtime.mode == "node_failure":
@@ -76,10 +75,10 @@ async def source_runtime(monkeypatch, tmp_path, operational_topics):
         if runtime.mode == "candidate_failure":
             return None
         users = [] if runtime.mode == "no_candidates" else [{"id": i, "username": f"u{i}"} for i in range(1, 5)]
-        return SimpleNamespace(json=lambda: {"users": users, "total": len(users)})
+        return SimpleNamespace(status_code=200, json=lambda: {"users": users, "total": len(users)})
 
-    async def panel_request(_panel, method, path, token, **kwargs):
-        assert method == "GET" and token == "test-token"
+    async def panel_request(_panel, method, path, **kwargs):
+        assert method == "GET"
         runtime.requests += 1
         user_id = int(path.split("/")[-2])
         if runtime.mode == "cancelled":
@@ -114,7 +113,7 @@ async def source_runtime(monkeypatch, tmp_path, operational_topics):
     async def collect(mode):
         runtime.mode = mode
         return await api.collect_active_users_from_api(
-            PanelType("admin", "password", "panel.local"), await config.read_config()
+            PanelType(panel_domain="panel.local", panel_api_key="pg_key_test"), await config.read_config()
         )
 
     runtime.collect = collect
@@ -239,7 +238,12 @@ async def test_degraded_configuration_is_neutral(source_runtime):
     cfg = await r.config.read_config()
     cfg["config_degraded"] = True
     previous_requests = r.requests
-    assert await r.api.collect_active_users_from_api(PanelType("a", "p", "panel.local"), cfg) is False
+    assert (
+        await r.api.collect_active_users_from_api(
+            PanelType(panel_domain="panel.local", panel_api_key="pg_key_test"), cfg
+        )
+        is False
+    )
     assert r.requests == previous_requests
     assert (await r.config.read_config())["ip_source"] == "api"
     await r.collect("failure")

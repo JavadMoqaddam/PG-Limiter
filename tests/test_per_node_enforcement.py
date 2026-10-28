@@ -21,7 +21,7 @@ from utils.shared_state import (
 )
 from utils.types import ConnectionInfo, NodeType, PanelType, UserType
 
-PANEL = PanelType("admin", "secret", "panel.local")
+PANEL = PanelType(panel_domain="panel.local", panel_api_key="pg_key_test")
 
 
 @pytest.fixture

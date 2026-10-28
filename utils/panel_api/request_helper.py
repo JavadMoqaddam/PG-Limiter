@@ -4,7 +4,7 @@ Panel API Request Helper with Fallback and Retry
 This module provides a unified way to make panel API requests with:
 - Automatic retry with exponential backoff
 - Fallback between HTTPS and HTTP
-- Token refresh on 401 errors
+- API-key authentication without login or authentication retries
 - Proper error logging
 """
 
@@ -20,7 +20,7 @@ import httpx
 
 from utils.logs import log_api_request, get_logger
 from utils.types import PanelType
-from utils.panel_api.auth import get_token, invalidate_token_cache
+from utils.panel_api.auth import get_panel_headers
 from utils.enforcement_guard import EnforcementProtected, start_enforcement_effect, validate_enforcement
 
 # Module logger
@@ -150,7 +150,7 @@ def _get_scheme_order(domain: str = "") -> list[str]:
     ``host:port`` form used in .env.example) means HTTPS only. There used to be a
     trailing ``["https", "http"]`` fallback, but the test above it made it
     unreachable - and reaching it would have been worse than the bug, since it would
-    retry the admin login over plaintext HTTP after an HTTPS failure.
+    send credentials over plaintext HTTP after an HTTPS failure.
     """
     if domain.startswith("http://"):
         return ["http"]
@@ -208,7 +208,7 @@ async def check_panel_availability(panel_data: PanelType, timeout: float = 5.0) 
     for scheme in _get_scheme_order(panel_data.panel_domain):
         url = f"{scheme}://{bare_domain}/api/"
         try:
-            response = await client.get(url, timeout=timeout)
+            response = await client.get(url, headers=get_panel_headers(panel_data), timeout=timeout)
             # Any response (even 401/404) means panel is up
             if response.status_code < 500:
                 _record_connection_success()
@@ -267,7 +267,6 @@ async def panel_request(
     panel_data: PanelType,
     method: Literal["GET", "POST", "PUT", "DELETE"],
     endpoint: str,
-    token: str,
     params: Optional[dict] = None,
     json_data: Optional[dict] = None,
     form_data: Optional[dict] = None,
@@ -282,7 +281,6 @@ async def panel_request(
         panel_data: Panel connection data
         method: HTTP method
         endpoint: API endpoint (e.g., "/api/users")
-        token: Bearer token for authorization
         params: Query parameters for GET/POST/etc. requests
         json_data: JSON body for POST/PUT requests
         form_data: Form data for POST requests
@@ -300,7 +298,7 @@ async def panel_request(
         request_logger.warning(f"⚡ Circuit Breaker OPEN: Panel API unavailable, failing fast for {endpoint}")
         return None, "Circuit Breaker OPEN: Panel API unavailable"
 
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_panel_headers(panel_data)
     last_error = None
 
     for attempt in range(max_retries):
@@ -318,7 +316,7 @@ async def panel_request(
             try:
                 client = await get_panel_client()
                 if method != "GET":
-                    # Authentication/client acquisition may suspend after the
+                    # Client acquisition may suspend after the
                     # journal and provenance checks. Refresh facts once more,
                     # then own the first mutation with no intervening await.
                     await validate_enforcement()
@@ -359,10 +357,10 @@ async def panel_request(
                     _record_success(scheme)
                     return response, None
 
-                # Auth error - caller should refresh token
-                if response.status_code == 401:
+                # A rejected API key cannot be refreshed. Do not retry or change schemes.
+                if response.status_code in (401, 403):
                     _record_failure(scheme)
-                    return response, "Unauthorized - token may be expired"
+                    return response, f"Panel API key rejected: HTTP {response.status_code}"
 
                 # Not found
                 if response.status_code == 404:
@@ -400,16 +398,16 @@ async def panel_request(
                 _record_connection_failure()
                 # Server/network failure - trip Circuit Breaker
                 circuit_breaker.record_result(is_server_failure=True)
-                last_error = f"Network/Server error on {url}: {type(e).__name__}: {str(e)[:50]}"
+                last_error = f"Network/Server error on {url}: {type(e).__name__}"
                 request_logger.warning(last_error)
                 continue
 
             except Exception as e:
                 elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request(method, url, None, elapsed, str(e)[:50])
+                log_api_request(method, url, None, elapsed, type(e).__name__)
                 _record_failure(scheme)
                 circuit_breaker.record_result(is_server_failure=True)
-                last_error = f"Error on {url}: {type(e).__name__}: {str(e)[:50]}"
+                last_error = f"Error on {url}: {type(e).__name__}"
                 request_logger.error(last_error)
                 continue
 
@@ -424,55 +422,25 @@ async def panel_request(
     return None, last_error or "All attempts failed"
 
 
-async def _get_token_for_request(panel_data: PanelType, force_refresh: bool = False) -> Optional[str]:
-    """Get a valid token for making requests."""
-    try:
-        token_result = await get_token(panel_data, force_refresh=force_refresh)
-        if isinstance(token_result, ValueError):
-            request_logger.error(f"Failed to get token: {token_result}")
-            return None
-        return token_result.panel_token
-    except Exception as e:
-        request_logger.error(f"Token acquisition error: {e}")
-        return None
-
-
 async def _execute_panel_request(
     panel_data: PanelType,
     method: Literal["GET", "POST", "PUT", "DELETE"],
     endpoint: str,
-    force_refresh: bool = False,
     json_data: Optional[dict] = None,
     form_data: Optional[dict] = None,
     params: Optional[dict] = None,
     **kwargs,
 ) -> Optional[httpx.Response]:
-    """Internal helper executing panel requests with automatic token handling and 401 retry."""
-    token = await _get_token_for_request(panel_data, force_refresh)
-    if not token:
-        return None
-
-    response, error = await panel_request(
-        panel_data, method, endpoint, token, params=params, json_data=json_data, form_data=form_data, **kwargs
+    """Execute a request using the configured API key with no auth retry."""
+    response, _ = await panel_request(
+        panel_data, method, endpoint, params=params, json_data=json_data, form_data=form_data, **kwargs
     )
-
-    # On 401, retry once with fresh token
-    if response and response.status_code == 401 and not force_refresh:
-        await invalidate_token_cache()
-        token = await _get_token_for_request(panel_data, force_refresh=True)
-        if token:
-            response, error = await panel_request(
-                panel_data, method, endpoint, token, params=params, json_data=json_data, form_data=form_data, **kwargs
-            )
-
     return response
 
 
-async def panel_get(
-    panel_data: PanelType, endpoint: str, force_refresh: bool = False, **kwargs
-) -> Optional[httpx.Response]:
-    """Convenience wrapper for GET requests with automatic token handling."""
-    return await _execute_panel_request(panel_data, "GET", endpoint, force_refresh=force_refresh, **kwargs)
+async def panel_get(panel_data: PanelType, endpoint: str, **kwargs) -> Optional[httpx.Response]:
+    """Send a GET request using the configured API key."""
+    return await _execute_panel_request(panel_data, "GET", endpoint, **kwargs)
 
 
 async def panel_post(
@@ -480,29 +448,24 @@ async def panel_post(
     endpoint: str,
     json_data: Optional[dict] = None,
     form_data: Optional[dict] = None,
-    force_refresh: bool = False,
     **kwargs,
 ) -> Optional[httpx.Response]:
-    """Convenience wrapper for POST requests with automatic token handling."""
+    """Send a POST request using the configured API key."""
     return await _execute_panel_request(
-        panel_data, "POST", endpoint, force_refresh=force_refresh, json_data=json_data, form_data=form_data, **kwargs
+        panel_data, "POST", endpoint, json_data=json_data, form_data=form_data, **kwargs
     )
 
 
 async def panel_put(
-    panel_data: PanelType, endpoint: str, json_data: Optional[dict] = None, force_refresh: bool = False, **kwargs
+    panel_data: PanelType, endpoint: str, json_data: Optional[dict] = None, **kwargs
 ) -> Optional[httpx.Response]:
-    """Convenience wrapper for PUT requests with automatic token handling."""
-    return await _execute_panel_request(
-        panel_data, "PUT", endpoint, force_refresh=force_refresh, json_data=json_data, **kwargs
-    )
+    """Send a PUT request using the configured API key."""
+    return await _execute_panel_request(panel_data, "PUT", endpoint, json_data=json_data, **kwargs)
 
 
-async def panel_delete(
-    panel_data: PanelType, endpoint: str, force_refresh: bool = False, **kwargs
-) -> Optional[httpx.Response]:
-    """Convenience wrapper for DELETE requests with automatic token handling."""
-    return await _execute_panel_request(panel_data, "DELETE", endpoint, force_refresh=force_refresh, **kwargs)
+async def panel_delete(panel_data: PanelType, endpoint: str, **kwargs) -> Optional[httpx.Response]:
+    """Send a DELETE request using the configured API key."""
+    return await _execute_panel_request(panel_data, "DELETE", endpoint, **kwargs)
 
 
 def get_panel_health() -> dict:

@@ -57,7 +57,6 @@ async def api_cycle(tmp_path, monkeypatch, operational_topics):
     # Only external I/O is replaced; collection, metadata, counting and warnings run.
     monkeypatch.setattr(usage, "send_logs", AsyncMock())
     monkeypatch.setattr(usage, "send_user_message", AsyncMock())
-    monkeypatch.setattr(auth, "get_token", AsyncMock(return_value=SimpleNamespace(panel_token="test")))
     monkeypatch.setattr(nodes, "get_nodes", AsyncMock(return_value=[NodeType(1, "node", "192.0.2.1", "connected")]))
     monkeypatch.setattr(requests, "is_panel_available", lambda: True)
     monkeypatch.setattr(api, "_notify", AsyncMock())
@@ -70,10 +69,11 @@ async def api_cycle(tmp_path, monkeypatch, operational_topics):
     async def get(_panel, path, **kwargs):
         assert path == "/api/users"
         return SimpleNamespace(
-            json=lambda: {"users": [{"id": i, "username": n} for i, n in enumerate(bodies, 1)], "total": len(bodies)}
+            status_code=200,
+            json=lambda: {"users": [{"id": i, "username": n} for i, n in enumerate(bodies, 1)], "total": len(bodies)},
         )
 
-    async def request(_panel, _method, path, _token, **kwargs):
+    async def request(_panel, _method, path, **kwargs):
         name = list(bodies)[int(path.split("/")[-2]) - 1]
         body = bodies[name]
         if body is None:
@@ -93,7 +93,7 @@ async def api_cycle(tmp_path, monkeypatch, operational_topics):
         "country_code": "",
         "except_users": [],
     }
-    panel = PanelType("admin", "test", "panel.local")
+    panel = PanelType(panel_domain="panel.local", panel_api_key="pg_key_test")
 
     async def run():
         ready = await api.collect_active_users_from_api(panel, config)
@@ -509,10 +509,10 @@ async def test_unconfirmed_404_preserves_warning_while_known_user_advances(api_c
     monkeypatch.setattr(time, "time", lambda: api_cycle.now + 60)
     original = requests.panel_request
 
-    async def request(panel, method, path, token, **kwargs):
+    async def request(panel, method, path, **kwargs):
         if path == "/api/node/online_stats/1/ip":
             return _not_found_response(body), None
-        return await original(panel, method, path, token, **kwargs)
+        return await original(panel, method, path, **kwargs)
 
     monkeypatch.setattr(requests, "panel_request", request)
     assert await api_cycle.run()

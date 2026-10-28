@@ -28,7 +28,7 @@ except ImportError as exc:
     raise ImportError("Module 'httpx' is not installed. Use: 'pip install httpx'") from exc
 from telegram_bot.send_message import send_logs, edit_message
 from utils.logs import logger  # pylint: disable=ungrouped-imports
-from utils.panel_api import get_nodes, get_token
+from utils.panel_api import get_nodes, get_panel_headers
 from utils.parse_logs import clear_node_active_connections, parse_logs, set_current_node_info
 from utils.shared_state import (
     clear_node_events,
@@ -332,8 +332,6 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
         node (NodeType): The specific node to connect to.
         admission: Original owner's Topics admission, when scheduled by a node poll.
 
-    Raises:
-        ValueError: If there is an issue with getting the panel token.
     """
     from utils.panel_api.request_helper import wait_for_panel, is_panel_available
     from utils.read_config import get_config_revision
@@ -396,21 +394,6 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
         if not monitoring_is_current(admission):
             return
 
-        # get_token raises on failure. This call sat outside the try below, so a panel
-        # that refused to authenticate killed this node's task - and with it, being a
-        # TaskGroup child, the whole process. Retry in place instead: the loop already
-        # handles panel unavailability a few lines up.
-        try:
-            get_panel_token = await get_token(panel_data)
-        except Exception as token_error:  # pylint: disable=broad-except
-            logger.error(f"Could not obtain a panel token for node {node.node_id}: {token_error}. Retrying in 30s.")
-            await _update_node_status(node.node_id, node.node_name, "❌ Authentication Error", admission)
-            await asyncio.sleep(30)
-            continue
-        token = get_panel_token.panel_token
-        if not monitoring_is_current(admission):
-            return
-
         # Determine the scheme based on the domain
         scheme = "http" if panel_data.panel_domain.startswith("http://") else "https"
         base_url = panel_data.panel_domain.replace("https://", "").replace("http://", "")
@@ -418,7 +401,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
         try:
             url = f"{scheme}://{base_url}/api/node/{node.node_id}/logs"
             headers = {
-                "Authorization": f"Bearer {token}",
+                **get_panel_headers(panel_data),
                 "Accept": "text/event-stream",
                 "Cache-Control": "no-cache",
             }
@@ -519,9 +502,14 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
                                 await parse_logs(log_data, node.node_id, node.node_name)
 
         except httpx.HTTPStatusError as error:
+            status = error.response.status_code
+            if status in (401, 403):
+                await _update_node_status(node.node_id, node.node_name, "❌ Authentication Error", admission)
+                logger.error(f"Panel API key rejected for node {node.node_id}: HTTP {status}")
+                return
             consecutive_failures += 1
             await _update_node_status(node.node_id, node.node_name, "❌ HTTP Error", admission)
-            logger.error(f"HTTP error connecting to node {node.node_id}: {error}")
+            logger.error(f"HTTP error connecting to node {node.node_id}: HTTP {status}")
             retry_delay = min(60, 5 * (2 ** min(consecutive_failures - 1, 4)))
             await asyncio.sleep(retry_delay)
             await _update_node_status(node.node_id, node.node_name, "⏳ Reconnecting...", admission)
@@ -530,7 +518,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
         except httpx.ConnectError as error:
             consecutive_failures += 1
             await _update_node_status(node.node_id, node.node_name, "❌ Connection Error", admission)
-            logger.error(f"Connection error for node {node.node_id}: {error}")
+            logger.error(f"Connection error for node {node.node_id}: {type(error).__name__}")
             # Shorter sleep if panel might be restarting
             retry_delay = (
                 min(30, 3 * (2 ** min(consecutive_failures - 1, 3)))
@@ -544,7 +532,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
         except Exception as error:  # pylint: disable=broad-except
             consecutive_failures += 1
             await _update_node_status(node.node_id, node.node_name, "❌ Failed", admission)
-            logger.error(f"Failed to connect to node {node.node_id}: {error}")
+            logger.error(f"Failed to connect to node {node.node_id}: {type(error).__name__}")
             retry_delay = min(60, 5 * (2 ** min(consecutive_failures - 1, 4)))
             await asyncio.sleep(retry_delay)
             await _update_node_status(node.node_id, node.node_name, "⏳ Reconnecting...", admission)

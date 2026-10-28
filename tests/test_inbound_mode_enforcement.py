@@ -41,7 +41,7 @@ async def test_direct_incompatible_enforcement_keeps_sample_and_warning(monkeypa
 
     monkeypatch.setattr(usage, "check_ip_used", stop_before_reporting)
     await usage.check_users_usage(
-        PanelType("admin", "secret", "panel.local"),
+        PanelType(panel_domain="panel.local", panel_api_key="pg_key_test"),
         config_data={"ip_source": "api", "device_count_mode": "inbound"},
     )
     assert ACTIVE_USERS["alice"] is user
@@ -74,7 +74,7 @@ async def test_daemon_incompatible_mode_keeps_sample_without_collection(monkeypa
     monkeypatch.setattr("utils.ip_source_api.collect_active_users_from_api", replace_snapshot)
     monkeypatch.setattr(usage.asyncio, "sleep", stop_after_cycle)
     with pytest.raises(asyncio.CancelledError):
-        await usage.run_check_users_usage(PanelType("admin", "secret", "panel.local"))
+        await usage.run_check_users_usage(PanelType(panel_domain="panel.local", panel_api_key="pg_key_test"))
     assert ACTIVE_USERS["alice"] is user
     assert usage.warning_system.warnings["alice"] is warning
     assert warning.consecutive_violations == 2
@@ -158,7 +158,7 @@ async def test_many_ips_on_one_inbound_stay_within_limit(enforcement_cycle, prio
         system.warnings["alice"] = existing_warning()
     ACTIVE_USERS["alice"] = observed_user([("5.6.7.8", "Vless"), ("9.9.9.9", "Vless"), ("4.4.4.4", "Vless")])
     await usage.check_users_usage(
-        PanelType("admin", "secret", "panel.local"),
+        PanelType(panel_domain="panel.local", panel_api_key="pg_key_test"),
         config_data={"device_count_mode": "inbound", "limits": {"general": 1}, "check_interval": 60},
     )
     assert "alice" not in system.warnings
@@ -168,7 +168,7 @@ async def test_one_ip_on_two_inbounds_creates_and_retains_warning(enforcement_cy
     system, _get_db, _messages = enforcement_cycle
     ACTIVE_USERS["alice"] = observed_user([("5.6.7.8", "Vless TCP"), ("5.6.7.8", "Vless WS")])
     await usage.check_users_usage(
-        PanelType("admin", "secret", "panel.local"),
+        PanelType(panel_domain="panel.local", panel_api_key="pg_key_test"),
         config_data={"device_count_mode": "inbound", "limits": {"general": 1}, "check_interval": 60},
     )
     warning = system.warnings["alice"]
@@ -185,7 +185,7 @@ async def test_persistent_violation_bans_using_inbounds_instead_of_ip_count(enfo
     system.warnings["alice"] = warning
     ACTIVE_USERS["alice"] = observed_user([("5.6.7.8", "Vless TCP"), ("5.6.7.8", "Vless WS")])
     await usage.check_users_usage(
-        PanelType("admin", "secret", "panel.local"),
+        PanelType(panel_domain="panel.local", panel_api_key="pg_key_test"),
         config_data={"device_count_mode": "inbound", "limits": {"general": 1}, "check_interval": 60},
     )
     async with get_db() as session:

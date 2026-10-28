@@ -80,7 +80,7 @@
 ## 📋 Requirements
 
 - **Docker** and **Docker Compose** (installed automatically by the installer)
-- **PasarGuard Panel** (latest version with SSE logs enabled, or an account with `nodes:stats` for API mode)
+- **PasarGuard Panel** with API-key authentication; grant the key `nodes.logs` for SSE logs or `nodes.stats` for API mode, plus the permissions in the [panel API-key guide](docs/PANEL_API_KEY.md)
 - **Telegram Bot Token** (from [@BotFather](https://t.me/BotFather))
 
 ---
@@ -108,7 +108,7 @@ sudo bash /tmp/pg-limiter.sh install
 The installer will:
 1. Check and install Docker & Docker Compose if missing.
 2. Setup directories at `/etc/opt/pg-limiter/` and `/var/lib/pg-limiter/`.
-3. Interactively prompt for panel credentials and Telegram bot tokens.
+3. Interactively prompt for the panel domain, panel API key and Telegram bot token.
 4. Pull the multi-arch Docker image for the release the installer belongs to (`ghcr.io/javadmoqaddam/pg-limiter:<version>`).
 5. Install the global `pg-limiter` command line tool and start the stack.
 
@@ -215,7 +215,7 @@ The connected IPs of each user can come from either of two sources, switchable a
 | Transport | One persistent SSE stream per node | `GET /api/node/online_stats/{id}/ip`, once per online user per cycle |
 | Timing | Original Xray printed timestamps checked against shared Last seen at evaluation | Original Xray IP timestamps checked against the same Last seen threshold |
 | Inbound detail | Real inbound name per connection | Single sentinel inbound (`API`) |
-| Requires | Reachable SSE, explicit Xray process timezones and independently ready nodes after conservative warm-up | Panel account with `nodes:stats` and complete evidence from relevant enabled nodes |
+| Requires | API key with `nodes.logs`, reachable SSE, explicit Xray process timezones and independently ready nodes after conservative warm-up | API key with `nodes.stats` and complete evidence from relevant enabled nodes |
 
 Both modes publish source-specific snapshots through the shared `ACTIVE_USERS` structure. Existing device counting, subnet/CDN/high-trust grouping, trust scoring and punishment continue to apply, with configurable `CHECK_INTERVAL` and `MAX_WARNING_COUNT`. API observations carry no real inbound names; inbound-only monitoring requires Logs.
 
@@ -277,8 +277,7 @@ existing warning until they can be assessed within the monitoring scope again.
 ```bash
 # Panel Settings (Required)
 PANEL_DOMAIN=panel.example.com:8443
-PANEL_USERNAME=admin
-PANEL_PASSWORD=your_secure_password
+PANEL_API_KEY=your_panel_api_key
 
 # Telegram Bot (Required)
 BOT_TOKEN=123456789:ABC-YOUR-BOT-TOKEN
@@ -293,6 +292,16 @@ COUNTRY_CODE=IR
 # Daily Report calendar timezone (00:00; unset defaults to UTC)
 TZ=UTC
 ```
+
+The panel API key is the sole panel credential for builds containing this change.
+REST requests, SSE log streams and startup probes send it in `X-Api-Key`.
+Panel username/password login is unsupported. Changing `PANEL_DOMAIN` or
+`PANEL_API_KEY` requires restarting the process or recreating its container.
+See the [panel API-key guide](docs/PANEL_API_KEY.md) for permission scopes,
+upgrading an existing `.env` and TLS settings. The released `v1.7.0` installer
+and image linked above predate this change; deploy a build containing it before
+migrating your credentials. The optional management API keeps its separate
+`API_USERNAME` and `API_PASSWORD` authentication.
 
 ---
 
@@ -409,7 +418,7 @@ When Subnet Grouping is enabled, multiple connections originating from the same 
 
 <details>
 <summary><b>When should I switch the IP source to the panel API?</b></summary>
-Use API mode when node logs are unavailable or too noisy to stream reliably. It queries <code>online_stats</code> once per online user per cycle; panel load depends on candidate count, node RPC latency and concurrency. It needs a panel account with the <code>nodes:stats</code> permission. With automatic fallback enabled, two unsuccessful collection cycles switch to Logs, including cycles whose HTTP requests succeed but whose per-user node evidence is incomplete.
+Use API mode when node logs are unavailable or too noisy to stream reliably. It queries <code>online_stats</code> once per online user per cycle; panel load depends on candidate count, node RPC latency and concurrency. It needs a panel API key with the <code>nodes.stats</code> permission. With automatic fallback enabled, two unsuccessful collection cycles switch to Logs, including cycles whose HTTP requests succeed but whose per-user node evidence is incomplete. Grant <code>nodes.logs</code> too when using automatic fallback.
 </details>
 
 <details>

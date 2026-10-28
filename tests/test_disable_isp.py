@@ -134,7 +134,7 @@ async def notice_cycle(tmp_path, monkeypatch, completed_logs_evidence, settings_
 
 
 async def run_cycle(case):
-    await usage.check_users_usage(PanelType("admin", "secret", "panel.example"), case["config"])
+    await usage.check_users_usage(PanelType(panel_domain="panel.example", panel_api_key="pg_key_test"), case["config"])
 
 
 @pytest.mark.parametrize("action", ["disabled", "revoked", "warning", "error"])

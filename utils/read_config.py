@@ -203,8 +203,7 @@ def load_env_config() -> Dict[str, Any]:
         # Panel settings (from ENV only)
         "panel": {
             "domain": _get_env("PANEL_DOMAIN", ""),
-            "username": _get_env("PANEL_USERNAME", "admin"),
-            "password": _get_env("PANEL_PASSWORD", ""),
+            "api_key": _get_env("PANEL_API_KEY", ""),
         },
         # Telegram settings (from ENV only)
         "telegram": {
@@ -718,8 +717,9 @@ async def _merge_loaded_config(env_config, db_data, check_required_elements=Fals
     if check_required_elements:
         if not config["panel"]["domain"]:
             raise ValueError("PANEL_DOMAIN is not set in environment")
-        if not config["panel"]["password"]:
-            raise ValueError("PANEL_PASSWORD is not set in environment")
+        from utils.types import PanelType
+
+        PanelType.from_config(config)
         if not config["telegram"]["bot_token"]:
             raise ValueError("BOT_TOKEN is not set in environment")
         if not config["telegram"]["admins"]:
@@ -899,8 +899,7 @@ def get_config_value(config: dict, key: str, default: Any = None) -> Any:
     """
     key_map = {
         "PANEL_DOMAIN": lambda c: c.get("panel", {}).get("domain"),
-        "PANEL_USERNAME": lambda c: c.get("panel", {}).get("username"),
-        "PANEL_PASSWORD": lambda c: c.get("panel", {}).get("password"),
+        "PANEL_API_KEY": lambda c: c.get("panel", {}).get("api_key"),
         "BOT_TOKEN": lambda c: c.get("telegram", {}).get("bot_token"),
         "ADMINS": lambda c: c.get("telegram", {}).get("admins"),
         "GENERAL_LIMIT": lambda c: c.get("limits", {}).get("general"),

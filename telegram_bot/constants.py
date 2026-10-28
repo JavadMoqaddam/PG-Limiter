@@ -19,10 +19,7 @@ class ConversationState(IntEnum):
     settings come from the environment file (and the CLI / API), not from the bot.
     """
 
-    GET_DOMAIN = 0
     GET_PORT = 1
-    GET_USERNAME = 2
-    GET_PASSWORD = 3
     GET_CONFIRMATION = 4
     GET_CHAT_ID = 5
     GET_SPECIAL_LIMIT = 6
@@ -42,10 +39,7 @@ class ConversationState(IntEnum):
 
 
 # Re-export as module-level names for backward compatibility
-GET_DOMAIN = ConversationState.GET_DOMAIN
 GET_PORT = ConversationState.GET_PORT
-GET_USERNAME = ConversationState.GET_USERNAME
-GET_PASSWORD = ConversationState.GET_PASSWORD
 GET_CONFIRMATION = ConversationState.GET_CONFIRMATION
 GET_CHAT_ID = ConversationState.GET_CHAT_ID
 GET_SPECIAL_LIMIT = ConversationState.GET_SPECIAL_LIMIT
@@ -287,7 +281,7 @@ HELP_TEXT = """
 
 <b>🔧 Configuration:</b>
 /start - Show main menu
-/create_config - Setup panel info
+/create_config - Panel environment setup instructions
 
 <b>🎯 Limits:</b>
 /set_special_limit - Set user-specific limit

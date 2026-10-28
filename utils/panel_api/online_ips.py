@@ -37,26 +37,6 @@ PANEL_ONLINE_WINDOW_SECONDS = 120
 STALE_EPOCH_FLOOR = 1_000_000_000
 
 
-async def resolve_panel_token(panel_data: PanelType, force_refresh: bool = False) -> Optional[str]:
-    """
-    Resolve a bearer token once per collection cycle.
-
-    The fan-out reuses a single token instead of asking the auth layer per
-    request, which would turn one cycle into thousands of cache lookups.
-    """
-    from utils.panel_api.auth import get_token
-
-    try:
-        token_result = await get_token(panel_data, force_refresh=force_refresh)
-    except Exception as error:
-        online_ips_logger.error(f"Token acquisition failed: {error}")
-        return None
-    if isinstance(token_result, ValueError):
-        online_ips_logger.error(f"Token acquisition failed: {token_result}")
-        return None
-    return token_result.panel_token
-
-
 def build_online_after(window_seconds: int) -> str:
     """Build an ISO-8601 UTC timestamp for ``now - window_seconds``."""
     moment = datetime.now(timezone.utc) - timedelta(seconds=max(1, int(window_seconds)))
@@ -156,7 +136,6 @@ def _parse_ip_payload(payload: dict) -> dict[int, dict[str, int] | None]:
 async def fetch_user_online_ips(
     panel_data: PanelType,
     user_id: int,
-    token: str,
     timeout: float = 8.0,
 ) -> tuple[Optional[dict[int, dict[str, int] | None]], str]:
     """
@@ -174,11 +153,10 @@ async def fetch_user_online_ips(
     """
     from utils.panel_api.request_helper import panel_request
 
-    response, error = await panel_request(
+    response, _ = await panel_request(
         panel_data,
         "GET",
         f"/api/node/online_stats/{user_id}/ip",
-        token,
         timeout=timeout,
         max_retries=1,
     )
@@ -188,7 +166,7 @@ async def fetch_user_online_ips(
             try:
                 return _parse_ip_payload(response.json()), OUTCOME_OK
             except Exception as parse_error:
-                online_ips_logger.debug(f"Unparseable online-IP body for user {user_id}: {parse_error}")
+                online_ips_logger.debug(f"Unparseable online-IP body for user {user_id}: {type(parse_error).__name__}")
                 return None, OUTCOME_ERROR
         if response.status_code == 404:
             # Only the panel's explicit missing-user response proves absence.
@@ -206,10 +184,6 @@ async def fetch_user_online_ips(
             return None, OUTCOME_FORBIDDEN
         return None, OUTCOME_ERROR
 
-    # panel_request() collapses non-401/404 error responses into an error
-    # string, so 403 has to be recovered from there.
-    if error and "HTTP 403" in error:
-        return None, OUTCOME_FORBIDDEN
     return None, OUTCOME_ERROR
 
 
@@ -224,17 +198,13 @@ async def check_online_stats_permission(panel_data: PanelType, user_id: int, tim
     Returns:
         ``(ok, human_readable_reason)``.
     """
-    token = await resolve_panel_token(panel_data)
-    if not token:
-        return False, "Could not obtain a panel token."
-
-    _, outcome = await fetch_user_online_ips(panel_data, user_id, token, timeout=timeout)
+    _, outcome = await fetch_user_online_ips(panel_data, user_id, timeout=timeout)
     if outcome in (OUTCOME_OK, OUTCOME_NOT_FOUND):
         return True, "Online-stats endpoint reachable."
     if outcome == OUTCOME_FORBIDDEN:
         return False, (
-            "Panel account lacks the <code>nodes:stats</code> permission required by /api/node/online_stats."
+            "Panel API key lacks the <code>nodes:stats</code> permission required by /api/node/online_stats."
         )
     if outcome == OUTCOME_UNAUTHORIZED:
-        return False, "Panel rejected the token (401)."
+        return False, "Panel rejected the API key (401)."
     return False, "Online-stats endpoint did not respond successfully."

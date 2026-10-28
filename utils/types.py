@@ -9,20 +9,27 @@ from typing import Dict, List, Optional
 
 @dataclass(slots=True)
 class PanelType:
-    """
-    A class used to represent the credentials for a panel.
+    """Panel connection settings with an API key excluded from representations."""
 
-    Attributes:
-        panel_username (str): The username for the panel.
-        panel_password (str): The password for the panel.
-        panel_domain (str): The domain for the panel.
-        panel_token (Optional[str]): The token for the panel. None if no token is provided.
-    """
-
-    panel_username: str
-    panel_password: str
     panel_domain: str
-    panel_token: str | None = None
+    panel_api_key: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        """Normalize settings and reject keys that cannot safely become headers."""
+        if not isinstance(self.panel_domain, str) or not self.panel_domain.strip():
+            raise ValueError("PANEL_DOMAIN must be configured")
+        self.panel_domain = self.panel_domain.strip()
+        if not isinstance(self.panel_api_key, str) or not self.panel_api_key.strip():
+            raise ValueError("PANEL_API_KEY must be configured")
+        self.panel_api_key = self.panel_api_key.strip()
+        if any(not 33 <= ord(character) <= 126 for character in self.panel_api_key):
+            raise ValueError("PANEL_API_KEY must contain only visible ASCII characters")
+
+    @classmethod
+    def from_config(cls, config: dict) -> "PanelType":
+        """Build connection settings from the canonical full configuration."""
+        panel = config.get("panel", {})
+        return cls(panel_domain=panel.get("domain"), panel_api_key=panel.get("api_key"))
 
 
 @dataclass(slots=True)
@@ -62,7 +69,7 @@ class UserStatus(Enum):
 class ConnectionInfo:
     """
     Represents connection information for a specific IP address.
-    
+
     Attributes:
         ip (str): The IP address
         node_id (int): The node ID where this IP was seen
@@ -71,6 +78,7 @@ class ConnectionInfo:
         last_seen (float): Timestamp of last activity
         connection_count (int): Number of connections seen
     """
+
     ip: str
     node_id: int
     node_name: str
@@ -83,7 +91,7 @@ class ConnectionInfo:
 class DeviceInfo:
     """
     Represents device information based on IP and connection patterns.
-    
+
     Attributes:
         connections (List[ConnectionInfo]): List of connection information
         is_multi_device (bool): Whether this user appears to use multiple devices
@@ -91,6 +99,7 @@ class DeviceInfo:
         unique_nodes (set): Set of unique node IDs
         inbound_protocols (set): Set of inbound protocols used
     """
+
     connections: List[ConnectionInfo] = field(default_factory=list)
     is_multi_device: bool = False
     unique_ips: set = field(default_factory=set)

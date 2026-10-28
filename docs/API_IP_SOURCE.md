@@ -1,7 +1,11 @@
 # Panel API IP source
 
-Select **Settings → IP Source → Panel API** in Telegram. The panel account must
-have `nodes:stats` permission. Collection queries active users with `online=true`
+Select **Settings → IP Source → Panel API** in Telegram. Configure `PANEL_API_KEY`
+with `nodes.stats`, `nodes.read` and `users.read` permissions, covering the users
+you intend to monitor. Requests send `X-Api-Key`; username/password panel login
+is unsupported. Grant `nodes.logs` as well if using automatic fallback to Logs.
+See [Panel API-key authentication](PANEL_API_KEY.md) for setup, scopes and the
+permissions needed to enforce limits. Collection queries active users with `online=true`
 and the configured **Group Filter**. All Include group IDs are sent together;
 an empty Include filter selects nobody. Group Limits set limits, not the query
 scope. Exclusions, administrator filters and exceptions still apply.
@@ -137,6 +141,11 @@ When automatic fallback is disabled, API remains selected and the existing
 coverage diagnostics continue to report skipped enforcement.
 
 ## Configuration and upgrades
+
+Builds containing API-key authentication require `PANEL_API_KEY` instead of
+`PANEL_USERNAME`/`PANEL_PASSWORD`; changing the process environment requires a
+restart or container recreation. This credential change preserves the
+coverage, missing-node and timestamp checks described above.
 
 `API_IP_FRESHNESS=60` supplies the default for new installations. Set any positive
 whole number of seconds. The stored `api_ip_freshness` database setting takes

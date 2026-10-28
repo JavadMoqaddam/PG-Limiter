@@ -43,7 +43,7 @@ async def get_nodes(
 
     Args:
         panel_data (PanelType): A PanelType object containing
-            the username, password, and domain for the panel API.
+            the API key and domain for the panel API.
         force_refresh (bool): If True, bypass cache and fetch fresh nodes.
         enabled_only (bool): If True (default), only fetch enabled nodes.
 
@@ -74,19 +74,21 @@ async def get_nodes(
     response = await panel_get(panel_data, endpoint)
 
     if response is None:
-        message = (
-            "Failed to get nodes after all retries. Make sure the panel is running "
-            "and the username and password are correct."
-        )
+        message = "Failed to get nodes after all retries. Check panel availability and API-key permissions."
         await safe_send_logs_panel(message)
+        nodes_logger.error(message)
+        raise ValueError(message)
+
+    if response.status_code in (401, 403):
+        message = f"Panel API key rejected while fetching nodes: HTTP {response.status_code}"
         nodes_logger.error(message)
         raise ValueError(message)
 
     try:
         user_inform = response.json()
     except Exception as json_error:
-        nodes_logger.error(f"Failed to parse JSON: {json_error}")
-        raise ValueError(f"Failed to parse nodes response: {json_error}")
+        nodes_logger.error(f"Failed to parse nodes response: {type(json_error).__name__}")
+        raise ValueError("Failed to parse nodes response") from None
 
     # Handle both list and dict responses
     nodes_list = None
@@ -98,11 +100,11 @@ async def get_nodes(
         elif "data" in user_inform:
             nodes_list = user_inform["data"]
         else:
-            nodes_logger.warning(f"Unexpected nodes dict structure. Keys: {list(user_inform.keys())}")
+            nodes_logger.warning("Unexpected nodes dict structure")
             if "id" in user_inform and "name" in user_inform:
                 nodes_list = [user_inform]
             else:
-                message = f"Cannot parse nodes from dict: {user_inform}"
+                message = "Cannot parse nodes from response dict"
                 nodes_logger.error(message)
                 raise ValueError(message)
     else:

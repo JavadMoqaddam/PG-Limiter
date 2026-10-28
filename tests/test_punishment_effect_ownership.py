@@ -3,8 +3,10 @@
 import asyncio
 import copy
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from sqlalchemy import select
 
@@ -24,14 +26,14 @@ def real_transports(real_node_punishment, monkeypatch, client):
     monkeypatch.setattr(users, "reset_user_uuid", disable.real_reset)
     monkeypatch.setattr(users, "disable_user_by_status", disable.real_status)
     monkeypatch.setattr(requests, "get_panel_client", AsyncMock(return_value=client))
-    monkeypatch.setattr(requests, "_get_token_for_request", AsyncMock(return_value="token"))
+    monkeypatch.setattr(requests, "asyncio", SimpleNamespace(sleep=AsyncMock()))
     monkeypatch.setattr(requests, "circuit_breaker", requests.PanelCircuitBreaker())
     return requests
 
 
 @pytest.mark.parametrize("source", ["logs", "api"])
 @pytest.mark.parametrize("expired", [False, True])
-@pytest.mark.parametrize("refusal", ["token", "circuit", "adapter_false"])
+@pytest.mark.parametrize("refusal", ["client", "circuit", "adapter_false"])
 async def test_revoke_without_any_started_effect_preserves_paused_warning(
     real_node_punishment, operational_topics, monkeypatch, source, expired, refusal
 ):
@@ -56,15 +58,29 @@ async def test_revoke_without_any_started_effect_preserves_paused_warning(
         if calls == 1:
             entered.set()
             await release.wait()
-            return None if refusal == "token" else (False if refusal == "adapter_false" else "token")
-        return "token"
+            if refusal == "adapter_false":
+                return False
+        if calls <= 3:
+            raise httpx.ConnectError("Panel client unavailable before sending a request")
+        return client
 
     if refusal == "adapter_false":
         monkeypatch.setattr(users, "revoke_user_subscription", preparation)
+    elif refusal == "client":
+        monkeypatch.setattr(requests, "get_panel_client", preparation)
     else:
-        monkeypatch.setattr(requests, "_get_token_for_request", preparation)
-        if refusal == "circuit":
-            monkeypatch.setattr(requests.circuit_breaker, "allow_request", MagicMock(side_effect=[False, True, True]))
+        monkeypatch.setattr(requests.circuit_breaker, "allow_request", MagicMock(side_effect=[False, True, True]))
+        original_request = requests.panel_request
+
+        async def refused_request(*args, **kwargs):
+            # The real circuit refuses the first request before any HTTP effect;
+            # suspend its acknowledgement while monitoring is paused.
+            result = await original_request(*args, **kwargs)
+            entered.set()
+            await release.wait()
+            return result
+
+        monkeypatch.setattr(requests, "panel_request", refused_request)
     outcomes = []
 
     async def capture_punishment(panel, user):
@@ -141,7 +157,7 @@ async def test_started_or_confirmed_revoke_retains_remaining_effects_after_pause
     if first_effect == "adapter_success":
         monkeypatch.setattr(users, "revoke_user_subscription", first_mutation)
     elif first_effect == "uuid_adapter_success":
-        monkeypatch.setattr(requests, "_get_token_for_request", AsyncMock(side_effect=[None, "token"]))
+        monkeypatch.setattr(requests.circuit_breaker, "allow_request", MagicMock(side_effect=[False, True]))
         monkeypatch.setattr(users, "reset_user_uuid", first_mutation)
     caller = asyncio.create_task(usage.check_users_usage(PANEL, config_data=config))
     try:
@@ -171,7 +187,7 @@ async def test_started_or_confirmed_revoke_retains_remaining_effects_after_pause
 
 @pytest.mark.parametrize("source", ["logs", "api"])
 @pytest.mark.parametrize("expired", [False, True])
-@pytest.mark.parametrize("refusal", ["token", "circuit"])
+@pytest.mark.parametrize("refusal", ["client", "circuit"])
 async def test_unstarted_failed_revoke_allows_current_later_punishment(
     real_node_punishment, monkeypatch, source, expired, refusal
 ):
@@ -183,8 +199,12 @@ async def test_unstarted_failed_revoke_allows_current_later_punishment(
     await prepare_overflow(real_node_punishment, source, expired)
     client = MagicMock(post=AsyncMock(), put=AsyncMock(return_value=MagicMock(status_code=200)))
     requests = real_transports(real_node_punishment, monkeypatch, client)
-    if refusal == "token":
-        monkeypatch.setattr(requests, "_get_token_for_request", AsyncMock(side_effect=[None, "token", "token"]))
+    if refusal == "client":
+        monkeypatch.setattr(
+            requests,
+            "get_panel_client",
+            AsyncMock(side_effect=[httpx.ConnectError("Client unavailable")] * 3 + [client, client]),
+        )
     else:
         monkeypatch.setattr(requests.circuit_breaker, "allow_request", MagicMock(side_effect=[False, True, True]))
     await usage.check_users_usage(PANEL, config_data=config)
@@ -199,7 +219,7 @@ async def test_unstarted_failed_revoke_allows_current_later_punishment(
         assert len(list(await db.scalars(select(ViolationHistory)))) == 1
 
 
-async def test_direct_management_no_token_revoke_keeps_existing_fallback(
+async def test_direct_management_unavailable_client_revoke_keeps_existing_fallback(
     real_node_punishment, operational_topics, monkeypatch
 ):
     import utils.panel_api.users as users
@@ -209,7 +229,11 @@ async def test_direct_management_no_token_revoke_keeps_existing_fallback(
     _system, get_db, _messages, _config, _journal, _disable, _time = real_node_punishment
     client = MagicMock(post=AsyncMock(), put=AsyncMock(return_value=MagicMock(status_code=200)))
     requests = real_transports(real_node_punishment, monkeypatch, client)
-    monkeypatch.setattr(requests, "_get_token_for_request", AsyncMock(side_effect=[None, "token", "token"]))
+    monkeypatch.setattr(
+        requests,
+        "get_panel_client",
+        AsyncMock(side_effect=[httpx.ConnectError("Client unavailable")] * 3 + [client, client]),
+    )
     await operational_topics.set_enabled(False)
     async with get_db() as db:
         await UserCRUD.create_or_update(db, "alice", group_ids=[99])

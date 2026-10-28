@@ -427,13 +427,15 @@ async def test_reconnect_preserves_pending_observation_and_ignores_history(logs,
             return Response()
 
     monkeypatch.setattr(streams.httpx, "AsyncClient", Client)
-    monkeypatch.setattr(streams, "get_token", AsyncMock(return_value=SimpleNamespace(panel_token="test")))
     monkeypatch.setattr(streams, "_ip_source_is_api", AsyncMock(return_value=False))
     monkeypatch.setattr(streams, "_update_node_status", AsyncMock())
     monkeypatch.setattr("utils.read_config.read_config", AsyncMock(return_value=logs.config))
     monkeypatch.setattr("utils.parse_logs.get_cached_parser_config", AsyncMock(return_value=logs.config))
     with pytest.raises(asyncio.CancelledError):
-        await streams.get_nodes_logs(PanelType("a", "b", "panel.local"), NodeType(1, "node", "192.0.2.1", "connected"))
+        await streams.get_nodes_logs(
+            PanelType(panel_domain="panel.local", panel_api_key="pg_key_test"),
+            NodeType(1, "node", "192.0.2.1", "connected"),
+        )
     assert ACTIVE_USERS["alice"].device_info.connections[0].connection_count == 1
     assert ACTIVE_USERS["alice"].device_info.connections[0].last_seen == EPOCH + 20.123456
 
@@ -753,7 +755,6 @@ async def test_real_reconnect_heartbeat_cannot_clear_warning_before_full_interva
             return Response()
 
     monkeypatch.setattr(streams.httpx, "AsyncClient", Client)
-    monkeypatch.setattr(streams, "get_token", AsyncMock(return_value=SimpleNamespace(panel_token="test")))
     monkeypatch.setattr(streams, "_ip_source_is_api", AsyncMock(return_value=False))
     monkeypatch.setattr(streams, "_update_node_status", AsyncMock())
     monkeypatch.setattr("utils.read_config.read_config", AsyncMock(return_value=api_cycle.config))

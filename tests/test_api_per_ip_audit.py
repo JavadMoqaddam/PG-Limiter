@@ -39,7 +39,7 @@ async def per_ip_cycle(api_cycle, monkeypatch):
 
     async def nodes_get(_panel, path):
         assert path == "/api/nodes?enabled=true"
-        return SimpleNamespace(json=lambda: {"nodes": cycle.fleet})
+        return SimpleNamespace(status_code=200, json=lambda: {"nodes": cycle.fleet})
 
     monkeypatch.setattr(nodes, "panel_get", nodes_get)
     async with database.get_db() as db:

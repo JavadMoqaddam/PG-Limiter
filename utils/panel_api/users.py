@@ -10,10 +10,14 @@ from utils import handel_dis_users as dis_users
 from utils.logs import logger, log_api_request, log_user_action, get_logger
 from utils.read_config import read_config
 from utils.types import PanelType, UserType
-from utils.panel_api.auth import get_token, invalidate_token_cache, safe_send_logs_panel
+from utils.panel_api.auth import safe_send_logs_panel
 
 # Module logger
 users_logger = get_logger("panel_api.users")
+
+
+class _PanelAuthenticationError(ValueError):
+    """Reject a user snapshot when the panel refuses its API key."""
 
 
 async def fetch_all_users_raw(
@@ -98,11 +102,14 @@ async def fetch_all_users_raw(
         users_logger.error(message)
         raise ValueError(message)
 
+    if response.status_code in (401, 403):
+        raise _PanelAuthenticationError(f"Panel API key rejected while fetching users: HTTP {response.status_code}")
+
     try:
         data = response.json()
     except Exception as e:
-        users_logger.error(f"Failed to parse JSON response from /api/users: {e}")
-        raise ValueError(f"Invalid JSON from /api/users: {e}") from e
+        users_logger.error(f"Failed to parse JSON response from /api/users: {type(e).__name__}")
+        raise ValueError("Invalid JSON from /api/users") from None
 
     def validate_page(body, offset, expected_total=None):
         if not isinstance(body, dict) or not isinstance(body.get("users"), list):
@@ -182,20 +189,30 @@ async def fetch_all_users_raw(
                     if strict:
                         raise ValueError(f"Unavailable /api/users page at {offset}")
                     return []
+                if page_resp.status_code in (401, 403):
+                    raise _PanelAuthenticationError(
+                        f"Panel API key rejected while fetching users: HTTP {page_resp.status_code}"
+                    )
                 try:
                     page_data = page_resp.json()
-                    if strict:
-                        return validate_page(page_data, offset, total_users)[0]
-                    if isinstance(page_data, dict) and "users" in page_data:
-                        return page_data["users"]
-                    elif isinstance(page_data, list):
-                        return page_data
-                    return []
                 except Exception as parse_err:
-                    users_logger.warning(f"Error parsing page at offset {offset}: {parse_err}")
+                    users_logger.warning(f"Error parsing page at offset {offset}: {type(parse_err).__name__}")
                     if strict:
-                        raise ValueError(f"Invalid /api/users page at {offset}") from parse_err
+                        raise ValueError(f"Invalid /api/users page at {offset}") from None
                     return []
+                if strict:
+                    try:
+                        return validate_page(page_data, offset, total_users)[0]
+                    except ValueError as validation_error:
+                        # Our validator reports only fixed reasons, offsets and
+                        # numeric totals, never the payload or decoder text.
+                        users_logger.warning(f"Invalid page at offset {offset}: {validation_error}")
+                        raise
+                if isinstance(page_data, dict) and "users" in page_data:
+                    return page_data["users"]
+                elif isinstance(page_data, list):
+                    return page_data
+                return []
             except BaseException:
                 if strict:
                     pagination_failed = True
@@ -216,10 +233,12 @@ async def fetch_all_users_raw(
 
     all_users = list(first_page_users)
     for i, page in enumerate(pages):
+        if isinstance(page, _PanelAuthenticationError):
+            raise page
         if isinstance(page, Exception):
-            users_logger.error(f"Exception fetching page {i + 1}: {page}")
+            users_logger.error(f"Exception fetching page {i + 1}: {type(page).__name__}")
             if strict:
-                raise ValueError("Incomplete /api/users pagination") from page
+                raise ValueError("Incomplete /api/users pagination") from None
             continue
         if isinstance(page, list):
             all_users.extend(page)
@@ -304,7 +323,7 @@ async def check_user_exists(panel_data: PanelType, username: str) -> bool:
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
         username (str): The username to check.
 
     Returns:
@@ -358,8 +377,8 @@ async def get_user_details(panel_data: PanelType, username: str) -> dict | None 
                 users_logger.debug(f"👤 Got details for {username}: groups={user_data.get('group_ids', [])}")
                 return user_data
             except Exception as json_error:
-                users_logger.error(f"Failed to parse JSON for {username}: {json_error}")
-                raise ValueError(f"Failed to parse JSON for {username}: {json_error}") from json_error
+                users_logger.error(f"Failed to parse JSON for {username}: {type(json_error).__name__}")
+                raise ValueError(f"Failed to parse JSON for {username}") from None
         elif response.status_code == 404:
             users_logger.warning(f"User {username} not found")
             return None
@@ -405,7 +424,7 @@ async def update_user_groups(panel_data: PanelType, username: str, group_ids: li
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
         username (str): The username to update.
         group_ids (list[int]): The list of group IDs to set for the user.
 
@@ -446,7 +465,7 @@ async def enable_all_user(panel_data: PanelType) -> None | ValueError:
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
 
     Returns:
         None
@@ -666,7 +685,7 @@ async def enable_selected_users(panel_data: PanelType, inactive_users: set[str])
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
         inactive_users (set[str]): A list of user str that are currently inactive.
 
     Returns:
@@ -882,7 +901,7 @@ async def _disable_user(
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
         username (user): The username of the user to disable.
         duration_seconds (int): Optional custom disable duration in seconds.
         permanent (bool): If True, user will never be auto-enabled (manual only).
@@ -959,7 +978,7 @@ async def disable_user_with_punishment(panel_data: PanelType, username: UserType
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
         username (UserType): The username of the user to disable.
 
     Returns:
@@ -1333,7 +1352,7 @@ async def cleanup_deleted_users(panel_data: PanelType) -> dict:
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
 
     Returns:
         dict: Empty result as function is disabled.

@@ -30,8 +30,7 @@ def show_config():
     panel = config.get("panel", {})
     info("📡 Panel Configuration:")
     print(f"  Domain:   {panel.get('domain', 'Not set')}")
-    print(f"  Username: {panel.get('username', 'Not set')}")
-    print(f"  Password: {'*' * len(panel.get('password', '')) or 'Not set'}")
+    print(f"  API key: {'Set' if panel.get('api_key') else 'Not set'}")
     print()
 
     # Limits
@@ -130,17 +129,7 @@ def cleanup_deleted_users():
     async def run_cleanup():
         # Load config for panel data
         config = await read_settings()
-        panel_config = config.get("panel", {})
-
-        if not panel_config.get("domain"):
-            error("Panel not configured. Run the Telegram bot to set up panel config first.")
-            return
-
-        panel_data = PanelType(
-            panel_username=panel_config.get("username", ""),
-            panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", ""),
-        )
+        panel_data = PanelType.from_config(config)
 
         info("🔍 Fetching users from panel...")
         result = await do_cleanup(panel_data)

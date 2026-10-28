@@ -38,7 +38,7 @@ async def test_candidate_http_query_uses_online_flag(monkeypatch, panel, api_con
     async def get(_panel, path, **kwargs):
         assert path == "/api/users"
         seen.append(kwargs["params"])
-        return SimpleNamespace(json=lambda: {"users": [], "total": 0})
+        return SimpleNamespace(status_code=200, json=lambda: {"users": [], "total": 0})
 
     async def nodes(*args):
         return {1: "node"}, set(), {1}
@@ -59,7 +59,7 @@ async def test_partial_candidate_pages_are_unknown(monkeypatch, panel, bad_page)
 
     async def get(_panel, _path, **kwargs):
         data = {"users": [{"id": 1, "username": "alice"}], "total": 2} if kwargs["params"]["offset"] == 0 else bad_page
-        return None if data is None else SimpleNamespace(json=lambda: data)
+        return None if data is None else SimpleNamespace(status_code=200, json=lambda: data)
 
     monkeypatch.setattr(requests, "panel_get", get)
     assert await fetch_online_candidates(panel, page_size=1) is None
@@ -72,7 +72,9 @@ async def test_duplicate_candidates_on_first_page_are_unknown(monkeypatch, panel
     from utils.panel_api.online_ips import fetch_online_candidates
 
     body = {"users": [{"id": 1, "username": "alice"}, {"id": 1, "username": "alice"}], "total": 2}
-    monkeypatch.setattr(requests, "panel_get", AsyncMock(return_value=SimpleNamespace(json=lambda: body)))
+    monkeypatch.setattr(
+        requests, "panel_get", AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: body))
+    )
     assert await fetch_online_candidates(panel) is None
 
 
@@ -114,7 +116,7 @@ def panel():
     """Panel credentials; every network call is patched out."""
     from utils.types import PanelType
 
-    return PanelType("admin", "pass", "panel.local")
+    return PanelType(panel_domain="panel.local", panel_api_key="pg_key_test")
 
 
 @pytest.fixture

@@ -356,7 +356,6 @@ async def _fetch_all_online_ips(
         OUTCOME_OK,
         OUTCOME_UNAUTHORIZED,
         fetch_user_online_ips,
-        resolve_panel_token,
     )
 
     counters = {"ok": 0, "failed": 0, "not_found": 0, "forbidden": 0, "unauthorized": 0}
@@ -366,27 +365,21 @@ async def _fetch_all_online_ips(
     if not targets or not monitoring_is_current(admission):
         return payloads, counters, fetch_times
 
-    token = await resolve_panel_token(panel_data)
-    if not token or not monitoring_is_current(admission):
-        counters["failed"] = len(targets)
-        return payloads, counters, fetch_times
-
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
-    async def _one(username: str, user_id: int, active_token: str):
+    async def _one(username: str, user_id: int):
         async with semaphore:
             if not monitoring_is_current(admission):
                 return None
-            payload, outcome = await fetch_user_online_ips(panel_data, user_id, active_token, timeout=timeout)
+            payload, outcome = await fetch_user_online_ips(panel_data, user_id, timeout=timeout)
             if not monitoring_is_current(admission):
                 return None
             return username, user_id, payload, outcome, time.time()
 
-    async def _run(batch: list[tuple[str, int]], active_token: str) -> list[tuple[str, int]]:
-        """Execute one pass; return the subset that needs a token refresh."""
-        needs_retry: list[tuple[str, int]] = []
+    async def _run(batch: list[tuple[str, int]]) -> None:
+        """Execute one pass and preserve the outcome of rejected API keys."""
         results = await asyncio.gather(
-            *[_one(name, uid, active_token) for name, uid in batch],
+            *[_one(name, uid) for name, uid in batch],
             return_exceptions=True,
         )
         for item in results:
@@ -407,26 +400,13 @@ async def _fetch_all_online_ips(
             elif outcome == OUTCOME_FORBIDDEN:
                 counters["forbidden"] += 1
             elif outcome == OUTCOME_UNAUTHORIZED:
-                needs_retry.append((username, user_id))
+                counters["unauthorized"] += 1
+                counters["failed"] += 1
             else:
                 counters["failed"] += 1
-        return needs_retry
 
     batch = [(name, uid) for name, uid, _ in targets]
-    retry_batch = await _run(batch, token)
-
-    # A token can expire mid-cycle; refresh once and replay only the 401s so a
-    # whole cycle is not lost to an expiry.
-    if retry_batch and monitoring_is_current(admission):
-        api_ip_logger.info(f"🔑 Refreshing token and replaying {len(retry_batch)} unauthorized lookups")
-        fresh_token = await resolve_panel_token(panel_data, force_refresh=True)
-        if fresh_token:
-            still_failing = await _run(retry_batch, fresh_token)
-            counters["unauthorized"] += len(still_failing)
-            counters["failed"] += len(still_failing)
-        else:
-            counters["unauthorized"] += len(retry_batch)
-            counters["failed"] += len(retry_batch)
+    await _run(batch)
 
     return payloads, counters, fetch_times
 

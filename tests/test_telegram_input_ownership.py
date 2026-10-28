@@ -14,7 +14,6 @@ from telegram.request import BaseRequest
 import telegram_bot.handlers.admin as admin_handlers
 import telegram_bot.handlers.limits as limit_handlers
 import telegram_bot.handlers.settings_display as display_handlers
-import telegram_bot.handlers.settings_panel as panel_handlers
 import telegram_bot.handlers.settings_ip_source as ip_source_handlers
 import telegram_bot.handlers.users as user_handlers
 import telegram_bot.main as tgmain
@@ -109,9 +108,6 @@ async def dispatcher(monkeypatch):
         config["ipinfo_token"] = value
         return True
 
-    async def save_panel(domain, password, username):
-        config["panel"] = {"domain": domain, "username": username, "password": password}
-
     async def add_admin(value):
         admins.add(int(value))
         return True
@@ -134,7 +130,6 @@ async def dispatcher(monkeypatch):
     monkeypatch.setattr(admin_handlers, "remove_admin_from_config", remove_admin)
     monkeypatch.setattr(limit_handlers, "save_general_limit", save_general_limit)
     monkeypatch.setattr(display_handlers, "save_ipinfo_token", save_token)
-    monkeypatch.setattr(panel_handlers, "add_base_information", save_panel)
     monkeypatch.setattr(ip_source_handlers, "read_config", configured_settings)
     monkeypatch.setattr(ip_source_handlers, "save_config_value", save_setting)
     app.add_error_handler(collect_error)
@@ -427,26 +422,44 @@ async def test_native_entry_rejects_retired_prompt_and_accepts_delivered_prompt(
         assert getattr(dispatcher, target) == expected
 
 
-async def test_each_panel_step_rejects_earlier_prompt_and_accepts_current_reply(dispatcher, monkeypatch):
+async def test_create_config_guides_env_setup_and_ends_input_without_collecting_credentials(dispatcher, monkeypatch):
     monkeypatch.setattr("utils.read_config.load_env_config", lambda: {})
+    await dispatcher.click("custom_limit:alice", prompt=50)
     await dispatcher.text("/create_config")
-    domain_prompt = dispatcher.sent_ids[-1]
-    await dispatcher.text("wrong.example", reply_to=50)
-    assert dispatcher.sent_ids[-1] == domain_prompt
-    await dispatcher.text("panel.example", reply_to=domain_prompt)
-    username_prompt = dispatcher.sent_ids[-1]
-    await dispatcher.text("wrong-user", reply_to=domain_prompt)
-    assert dispatcher.sent_ids[-1] == username_prompt
-    await dispatcher.text("operator", reply_to=username_prompt)
-    password_prompt = dispatcher.sent_ids[-1]
-    await dispatcher.text("wrong-password", reply_to=username_prompt)
+
+    guidance = dispatcher.messages[-1]
+    assert "PANEL_DOMAIN" in guidance
+    assert "PANEL_API_KEY" in guidance
+    assert "pg-limiter config" in guidance
+    assert "Send" not in guidance
+    assert "input_owner" not in dispatcher.app.user_data[7]
+    assert "waiting_for" not in dispatcher.app.user_data[7]
+
+    await dispatcher.text("private-panel-key", reply_to=dispatcher.sent_ids[-1])
+    await dispatcher.text("3", reply_to=50)
     assert "panel" not in dispatcher.config
-    await dispatcher.text("test-password", reply_to=password_prompt)
-    assert dispatcher.config["panel"] == {
-        "domain": "panel.example",
-        "username": "operator",
-        "password": "test-password",
-    }
+    assert dispatcher.limits == {}
+    assert all("private-panel-key" not in message for message in dispatcher.messages)
+
+
+async def test_create_config_preserves_admin_permission_check(dispatcher):
+    await dispatcher.text("/create_config", user=8)
+
+    assert not any("PANEL_API_KEY" in message for message in dispatcher.messages)
+    assert "panel" not in dispatcher.config
+
+
+async def test_create_config_hides_existing_key_and_escapes_domain(dispatcher, monkeypatch):
+    monkeypatch.setattr(
+        "utils.read_config.load_env_config",
+        lambda: {"panel": {"domain": "https://panel.test/<unsafe>", "api_key": "private-panel-key"}},
+    )
+
+    await dispatcher.text("/create_config")
+
+    assert "private-panel-key" not in dispatcher.messages[-1]
+    assert "&lt;unsafe&gt;" in dispatcher.messages[-1]
+    assert "input_owner" not in dispatcher.app.user_data[7]
 
 
 async def test_native_numeric_step_rejects_earlier_step_prompt(dispatcher):

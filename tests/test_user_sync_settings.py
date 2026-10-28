@@ -19,7 +19,7 @@ from test_config_revisions import settings_db  # noqa: F401
 def sync_menu_config(monkeypatch):
     panel_config = {
         "user_sync_interval": 5,
-        "panel": {"username": "admin", "password": "password", "domain": "https://panel.example"},
+        "panel": {"api_key": "pg_key_test", "domain": "https://panel.example"},
     }
     monkeypatch.setattr(settings, "read_config", AsyncMock(return_value=panel_config))
     monkeypatch.setattr(config, "read_config", AsyncMock(return_value=panel_config))

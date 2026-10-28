@@ -9,7 +9,6 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -34,8 +33,7 @@ def access_record(stamp="2026/10/25 10:00:01.123456", *, port=12345, ip="5.6.7.8
 def settings(probe, **overrides):
     values = {
         "panel_base": "https://PRIVATE_PANEL",
-        "username": "PRIVATE_ADMIN",
-        "password": "PRIVATE_PASSWORD",
+        "panel_api_key": "pg_key_PRIVATE_KEY",
         "general_limit": 2,
         "check_interval": 60,
         "max_warning_count": 3,
@@ -47,6 +45,27 @@ def settings(probe, **overrides):
     }
     values.update(overrides)
     return probe.Settings(**values)
+
+
+async def test_probe_uses_api_key_without_password_login():
+    probe = load_probe()
+    config = settings(probe)
+    config.panel_api_key = "pg_key_PRIVATE_KEY"
+    requests, emitted = [], []
+
+    def respond(request):
+        requests.append(request)
+        assert request.method == "GET"
+        assert request.headers["X-Api-Key"] == "pg_key_PRIVATE_KEY"
+        assert "Authorization" not in request.headers
+        return httpx.Response(200, json=[])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        await probe.diagnose(config, client, emit=emitted.append)
+
+    assert [(request.method, request.url.path) for request in requests] == [("GET", "/api/nodes")]
+    assert emitted[-1]["kind"] == "complete"
+    assert "pg_key_PRIVATE_KEY" not in json.dumps(emitted)
 
 
 def test_reads_only_requested_committed_settings_without_changing_database(tmp_path):
@@ -75,7 +94,7 @@ def test_reads_only_requested_committed_settings_without_changing_database(tmp_p
             "LOG_TIMEZONE": "UTC",
             "LOG_NODE_TIMEZONES": '{"1":"Europe/Istanbul","01":"UTC"}',
             "PANEL_DOMAIN": "PRIVATE_PANEL",
-            "PANEL_PASSWORD": "PRIVATE_PASSWORD",
+            "PANEL_API_KEY": "pg_key_PRIVATE_KEY",
         }
     )
 
@@ -362,12 +381,9 @@ async def test_http_probe_is_read_only_private_and_honors_node_scope(monkeypatch
 
     def respond(request):
         requests.append(request)
-        if request.url.path == "/api/admin/token":
-            assert parse_qs(request.content.decode()) == {
-                "username": ["PRIVATE_ADMIN"],
-                "password": ["PRIVATE_PASSWORD"],
-            }
-            return httpx.Response(200, json={"access_token": "PRIVATE_TOKEN"})
+        assert request.method == "GET"
+        assert request.headers["X-Api-Key"] == "pg_key_PRIVATE_KEY"
+        assert "Authorization" not in request.headers
         if request.url.path == "/api/nodes":
             return httpx.Response(
                 200,
@@ -378,14 +394,12 @@ async def test_http_probe_is_read_only_private_and_honors_node_scope(monkeypatch
                     {"id": 4, "status": unknown_status},
                 ],
             )
-        assert request.headers["Authorization"] == "Bearer PRIVATE_TOKEN"
         return httpx.Response(200, content=f"data: {access_record('2026/10/25 10:00:00')}\n\n".encode())
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         await probe.diagnose(settings(probe, disabled_nodes=frozenset({2})), client, emit=emitted.append)
 
     assert [(request.method, request.url.path) for request in requests] == [
-        ("POST", "/api/admin/token"),
         ("GET", "/api/nodes"),
         ("GET", "/api/node/1/logs"),
         ("GET", "/api/node/4/logs"),
@@ -399,6 +413,7 @@ async def test_http_probe_is_read_only_private_and_honors_node_scope(monkeypatch
         "PRIVATE_ADMIN",
         "PRIVATE_PASSWORD",
         "PRIVATE_TOKEN",
+        "pg_key_PRIVATE_KEY",
         "PRIVATE_PANEL",
         "PRIVATE_NODE",
         "PRIVATE_USER",
@@ -415,8 +430,6 @@ async def test_silent_stream_is_closed_at_the_sampling_deadline():
     stream = IdleStream()
 
     def respond(request):
-        if request.url.path.endswith("/token"):
-            return httpx.Response(200, json={"access_token": "PRIVATE_TOKEN"})
         if request.url.path == "/api/nodes":
             return httpx.Response(200, json=[{"id": 1, "status": "connected"}])
         return httpx.Response(200, stream=stream)
@@ -433,8 +446,6 @@ async def test_connection_headers_obey_the_request_deadline():
     emitted = []
 
     async def respond(request):
-        if request.url.path.endswith("/token"):
-            return httpx.Response(200, json={"access_token": "PRIVATE_TOKEN"})
         if request.url.path == "/api/nodes":
             return httpx.Response(200, json=[{"id": 1, "status": "connected"}])
         await asyncio.Event().wait()
@@ -461,8 +472,6 @@ async def test_completed_streams_release_replay_memory_after_reporting(monkeypat
     monkeypatch.setattr(probe, "NodeStats", tracked_stats)
 
     def respond(request):
-        if request.url.path.endswith("/token"):
-            return httpx.Response(200, json={"access_token": "PRIVATE_TOKEN"})
         if request.url.path == "/api/nodes":
             return httpx.Response(200, json=[{"id": 1, "status": "connected"}])
         return httpx.Response(200, content=f"data: {access_record('2026/10/25 10:00:00')}\n\n".encode())
@@ -488,8 +497,6 @@ async def test_live_rate_uses_observation_time_after_connection_headers(monkeypa
             clock[0] = 6
 
     def respond(request):
-        if request.url.path.endswith("/token"):
-            return httpx.Response(200, json={"access_token": "PRIVATE_TOKEN"})
         if request.url.path == "/api/nodes":
             return httpx.Response(200, json=[{"id": 1, "status": "connected"}])
         clock[0] = 4
@@ -516,8 +523,6 @@ async def test_oversized_stream_line_is_dropped_and_later_records_are_observed(m
             yield f"data: {access_record('2026/10/25 10:00:00')}\n\n".encode()
 
     def respond(request):
-        if request.url.path.endswith("/token"):
-            return httpx.Response(200, json={"access_token": "PRIVATE_TOKEN"})
         if request.url.path == "/api/nodes":
             return httpx.Response(200, json=[{"id": 1, "status": "connected"}])
         return httpx.Response(200, stream=PayloadStream())
@@ -565,8 +570,6 @@ async def test_concurrency_and_total_runtime_are_bounded_even_with_silent_nodes(
     streams = []
 
     def respond(request):
-        if request.url.path.endswith("/token"):
-            return httpx.Response(200, json={"access_token": "PRIVATE_TOKEN"})
         if request.url.path == "/api/nodes":
             return httpx.Response(200, json=[{"id": index, "status": "connected"} for index in range(1, 7)])
         stream = IdleStream(counters)
@@ -592,7 +595,7 @@ async def test_concurrency_and_total_runtime_are_bounded_even_with_silent_nodes(
 
 
 @pytest.mark.parametrize("failure", ["status", "exception"])
-async def test_authentication_errors_do_not_expose_exception_or_response_text(failure):
+async def test_node_list_errors_do_not_expose_exception_or_response_text(failure):
     probe = load_probe()
     emitted = []
 
@@ -604,5 +607,5 @@ async def test_authentication_errors_do_not_expose_exception_or_response_text(fa
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         await probe.diagnose(settings(probe), client, emit=emitted.append)
     assert emitted[-1]["kind"] == "error"
-    assert emitted[-1]["code"] in {"auth_http_403", "auth_network_error"}
+    assert emitted[-1]["code"] in {"nodes_http_403", "nodes_network_error"}
     assert "PRIVATE" not in json.dumps(emitted)

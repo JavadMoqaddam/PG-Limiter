@@ -12,11 +12,13 @@ from utils.types import PanelType
 
 @pytest.fixture
 def panel():
-    return PanelType("admin", "password", "panel.test")
+    return PanelType(panel_domain="panel.test", panel_api_key="pg_key_test")
 
 
 def page(offset, total=8):
-    return SimpleNamespace(json=lambda: {"users": [{"id": offset + 1, "username": f"user_{offset}"}], "total": total})
+    return SimpleNamespace(
+        status_code=200, json=lambda: {"users": [{"id": offset + 1, "username": f"user_{offset}"}], "total": total}
+    )
 
 
 @pytest.mark.parametrize("failure", ["missing", "changed_total", "network_error", "cancelled"])
@@ -147,7 +149,7 @@ async def test_total_failure_identifies_offset_and_reason_without_payload(
         body = {"users": [{"id": 2, "username": "private-user-marker"}], "total": bad_total}
         if missing:
             body.pop("total")
-        return SimpleNamespace(json=lambda: body)
+        return SimpleNamespace(status_code=200, json=lambda: body)
 
     monkeypatch.setattr(request_helper, "panel_get", get)
     with pytest.raises(ValueError):

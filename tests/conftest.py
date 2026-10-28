@@ -74,7 +74,7 @@ def mock_panel_type():
     """Provide a mock PanelType for tests"""
     from utils.types import PanelType
 
-    return PanelType(panel_username="test_admin", panel_password="test_password", panel_domain="test.panel.com")
+    return PanelType(panel_domain="test.panel.com", panel_api_key="pg_key_test")
 
 
 @pytest.fixture

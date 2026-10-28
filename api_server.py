@@ -151,17 +151,13 @@ async def get_panel_data():
     from utils.types import PanelType
 
     config = await _read_settings()
-    panel_config = config.get("panel", {})
-    if not panel_config.get("domain"):
+    try:
+        return PanelType.from_config(config)
+    except ValueError as error:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Panel not configured",
-        )
-    return PanelType(
-        panel_username=panel_config.get("username", ""),
-        panel_password=panel_config.get("password", ""),
-        panel_domain=panel_config["domain"],
-    )
+            detail=str(error),
+        ) from error
 
 
 def verify_credentials(request: Request = None, credentials: HTTPBasicCredentials = Depends(security)):
@@ -493,7 +489,7 @@ async def enable_all_disabled_users(username: str = Depends(verify_credentials))
 async def get_config(username: str = Depends(verify_credentials)):
     """Present copied canonical settings with credentials masked."""
     config = await _read_settings()
-    for section, credential in (("panel", "password"), ("telegram", "bot_token"), ("api", "password")):
+    for section, credential in (("panel", "api_key"), ("telegram", "bot_token"), ("api", "password")):
         if credential in config.get(section, {}):
             config[section][credential] = "***"
     config = {key: value for key, value in config.items() if not key.startswith("_") and key != "config_degraded"}
@@ -551,16 +547,10 @@ async def cleanup_deleted_users(username: str = Depends(verify_credentials)):
 
     try:
         config = await read_config()
-        panel_config = config.get("panel", {})
-
-        if not panel_config.get("domain"):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Panel not configured")
-
-        panel_data = PanelType(
-            panel_username=panel_config.get("username", ""),
-            panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", ""),
-        )
+        try:
+            panel_data = PanelType.from_config(config)
+        except ValueError as error:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
 
         result = await do_cleanup(panel_data)
 

@@ -361,12 +361,7 @@ async def enable_single_user(query, username: str):
 
         # Load config for panel data
         config = await read_config()
-        panel_config = config.get("panel", {})
-        panel_data = PanelType(
-            panel_username=panel_config.get("username", ""),
-            panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", ""),
-        )
+        panel_data = PanelType.from_config(config)
 
         # Enable user on panel
         result = await enable_selected_users(panel_data, {username})
@@ -434,12 +429,7 @@ async def enable_all_disabled_users(query):
 
         # Load config for panel data
         config = await read_config()
-        panel_config = config.get("panel", {})
-        panel_data = PanelType(
-            panel_username=panel_config.get("username", ""),
-            panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", ""),
-        )
+        panel_data = PanelType.from_config(config)
 
         # Enable all users on panel
         result = await enable_selected_users(panel_data, usernames)
@@ -499,12 +489,7 @@ async def fix_stuck_users_handler(query):
 
         # Load config for panel data
         config = await read_config()
-        panel_config = config.get("panel", {})
-        panel_data = PanelType(
-            panel_username=panel_config.get("username", ""),
-            panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", ""),
-        )
+        panel_data = PanelType.from_config(config)
 
         # First, show how many users are in disabled group
         stuck_usernames = await get_users_in_disabled_group(panel_data)
@@ -568,7 +553,6 @@ async def show_users_in_disabled_group(query, page: int = 0):
 
         # Load config for panel data
         config = await read_config()
-        panel_config = config.get("panel", {})
         disabled_group_id = config.get("disabled_group_id", None)
 
         if disabled_group_id is None:
@@ -579,11 +563,7 @@ async def show_users_in_disabled_group(query, page: int = 0):
             )
             return
 
-        panel_data = PanelType(
-            panel_username=panel_config.get("username", ""),
-            panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", ""),
-        )
+        panel_data = PanelType.from_config(config)
 
         # Get users in disabled group
         stuck_users = await get_users_in_disabled_group(panel_data)
@@ -718,12 +698,7 @@ async def cleanup_deleted_users_handler(query):
 
         # Load config for panel data
         config = await read_config()
-        panel_config = config.get("panel", {})
-        panel_data = PanelType(
-            panel_username=panel_config.get("username", ""),
-            panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", ""),
-        )
+        panel_data = PanelType.from_config(config)
 
         # Perform cleanup
         result = await cleanup_deleted_users(panel_data)
