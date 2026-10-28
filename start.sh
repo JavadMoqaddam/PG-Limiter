@@ -80,12 +80,12 @@ log_info "Data directories ready"
 log_step 2 "Validating environment variables..."
 MISSING_VARS=""
 [ -z "$PANEL_DOMAIN" ] && MISSING_VARS="$MISSING_VARS PANEL_DOMAIN"
-[ -z "$PANEL_PASSWORD" ] && MISSING_VARS="$MISSING_VARS PANEL_PASSWORD"
+[ -z "${PANEL_API_KEY//[[:space:]]/}" ] && MISSING_VARS="$MISSING_VARS PANEL_API_KEY"
 [ -z "$BOT_TOKEN" ] && MISSING_VARS="$MISSING_VARS BOT_TOKEN"
 [ -z "$ADMIN_IDS" ] && MISSING_VARS="$MISSING_VARS ADMIN_IDS"
 
 if [ -n "$MISSING_VARS" ]; then
-    log_error "Missing required environment variables:$MISSING_VARS"
+    log_error "Missing required environment variables:$MISSING_VARS. Configure them in .env."
     exit 1
 fi
 
@@ -391,30 +391,35 @@ logging.disable(logging.CRITICAL)
 
 async def check_panel():
     import httpx
-    domain = os.environ.get('PANEL_DOMAIN', '')
+    domain = os.environ.get('PANEL_DOMAIN', '').strip().rstrip('/')
+    api_key = os.environ.get('PANEL_API_KEY', '').strip()
+    if not api_key or any(not 33 <= ord(character) <= 126 for character in api_key):
+        print('ERROR: PANEL_API_KEY must contain only visible ASCII characters')
+        return
     # Honor the operator's PANEL_VERIFY_SSL setting rather than hardcoding an
     # insecure client. Defaults to False to preserve behavior for self-signed panels.
     verify_ssl = os.environ.get('PANEL_VERIFY_SSL', 'false').lower() in ('true', '1', 'yes')
 
-    # Try HTTPS first, then HTTP
-    for scheme in ['https', 'http']:
-        url = f'{scheme}://{domain}/api/'
-        try:
-            async with httpx.AsyncClient(verify=verify_ssl, timeout=10) as client:
-                response = await client.get(url)
-                if response.status_code in [200, 401, 403, 404]:
-                    print(f'REACHABLE: {scheme}://{domain} (status: {response.status_code})')
-                    return
-        except Exception:
-            continue
+    # Honor an explicit HTTP scheme; a scheme-less domain uses HTTPS.
+    if not domain.startswith(('https://', 'http://')):
+        domain = 'https://' + domain
+    url = domain + '/api/'
+    try:
+        async with httpx.AsyncClient(verify=verify_ssl, timeout=10) as client:
+            response = await client.get(url, headers={'X-Api-Key': api_key})
+            if response.status_code in [200, 401, 403, 404]:
+                print(f'REACHABLE: {domain} (status: {response.status_code})')
+                return
+    except Exception:
+        pass
     
     print(f'UNREACHABLE: Could not connect to {domain}')
 
 try:
     asyncio.run(check_panel())
     sys.exit(0)
-except Exception as e:
-    print(f'ERROR: {e}')
+except Exception as error:
+    print(f'ERROR: {type(error).__name__}')
     sys.exit(1)
 " 2>&1)
 PANEL_EXIT=$?
