@@ -43,6 +43,61 @@ async def test_preserves_printed_microsecond_time(logs):
     assert ACTIVE_USERS["alice"].device_info.connections[0].last_seen == EPOCH + 20.123456
 
 
+@pytest.mark.parametrize("handling_offset", [60.5, 62.0, 122.0])
+async def test_future_parse_retains_original_expiry_across_preparation(logs, monkeypatch, handling_offset):
+    """An early rejection must not lose its original expiry or become activity."""
+    import utils.parse_logs as parser
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    async def prepare(*_args):
+        logs.clock[0] = EPOCH + handling_offset
+        return True
+
+    monkeypatch.setattr(parser, "is_ip_accepted", prepare)
+    await parse_logs(record("2026/10/23 10:01:01.000001"), 1, "node", logs.config)
+    assert ACTIVE_USERS == {}
+    assert LOG_OBSERVATIONS.node_states[1].uncertain_until == pytest.approx(EPOCH + 121.000001, rel=0, abs=0.000001)
+    assert LOG_OBSERVATIONS.seen.get(1, {}) == {}
+
+
+async def test_future_fault_captures_exact_parse_and_receipt_clocks(logs, monkeypatch):
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    monkeypatch.setattr(time, "monotonic", lambda: 1234.5)
+    await parse_logs(record("2026/10/23 10:01:01.000001", user="private-user"), 1, "private-node", logs.config)
+    faults = LOG_OBSERVATIONS.uncertainty_diagnostics()["timestamp_faults"]
+    assert len(faults) == 1
+    fault = faults[0]
+    assert fault["phase"] == "timestamp_parse"
+    assert fault["node_id"] == 1
+    assert fault["timezone"] == "UTC"
+    assert fault["source_epoch"] == pytest.approx(EPOCH + 61.000001, rel=0, abs=0.000001)
+    assert fault["evaluation_wall"] == EPOCH + 60
+    assert fault["received_wall"] == EPOCH + 60
+    assert fault["evaluation_monotonic"] == 1234.5
+    assert fault["received_monotonic"] == 1234.5
+    assert fault["source_minus_evaluation_seconds"] == pytest.approx(1.000001)
+    assert all(secret not in str(faults) for secret in ("private-user", "private-node", "5.6.7.8", "accepted"))
+
+
+async def test_backward_step_diagnostics_identify_admission_comparison(logs, monkeypatch):
+    import utils.parse_logs as parser
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    async def prepare(*_args):
+        logs.clock[0] = EPOCH + 19
+        return True
+
+    monkeypatch.setattr(parser, "is_ip_accepted", prepare)
+    await parse_logs(record(), 1, "node", logs.config)
+    assert ACTIVE_USERS == {}
+    fault = LOG_OBSERVATIONS.uncertainty_diagnostics()["timestamp_faults"][0]
+    assert fault["phase"] == "admission"
+    assert fault["evaluation_wall"] == EPOCH + 19
+    assert fault["received_wall"] == EPOCH + 60
+    assert fault["source_minus_evaluation_seconds"] == pytest.approx(1.123456)
+
+
 async def test_replay_after_snapshot_is_not_new_activity(logs):
     await parse_logs(record(), 1, "node", logs.config)
     assert "alice" in await pop_active_users_snapshot()
@@ -205,27 +260,30 @@ async def test_capacity_eviction_blocks_until_forgotten_record_expires(logs):
 
 
 @pytest.mark.parametrize(
-    "stamp, reason",
+    "stamp, reason, remaining",
     [
-        ("private malformed timestamp", "invalid_timestamp"),
-        ("2026/13/23 10:00:20.123456", "invalid_timestamp"),
-        ("2026/10/23 10:01:01.000001", "future_timestamp"),
+        ("private malformed timestamp", "invalid_timestamp", 60),
+        ("2026/13/23 10:00:20.123456", "invalid_timestamp", 60),
+        ("2026/10/23 10:01:01.000001", "future_timestamp", 61.000001),
     ],
 )
-async def test_uncertainty_diagnostics_distinguish_timestamp_faults_without_raw_records(logs, caplog, stamp, reason):
+async def test_uncertainty_diagnostics_distinguish_timestamp_faults_without_raw_records(
+    logs, caplog, stamp, reason, remaining
+):
     from utils.log_observations import LOG_OBSERVATIONS
 
     await parse_logs(record(stamp, user="private-user"), 1, "private-node", logs.config)
     diagnostics = LOG_OBSERVATIONS.uncertainty_diagnostics()
     assert diagnostics["reason_counts"] == {reason: 1}
     assert diagnostics["nodes"] == [{"node_id": 1, "reason_counts": {reason: 1}, "cache_entries": 0}]
-    assert diagnostics["remaining_seconds"] == pytest.approx(60)
+    assert diagnostics["remaining_seconds"] == pytest.approx(remaining)
     assert not any("Logs uncertainty diagnostics:" in entry.getMessage() for entry in caplog.records)
     assert LOG_OBSERVATIONS.unavailable_reason() == "timestamp or replay uncertainty in the current interval"
     messages = [entry.getMessage() for entry in caplog.records if "Logs uncertainty diagnostics:" in entry.getMessage()]
     assert len(messages) == 1
     assert reason in messages[0]
-    assert all(secret not in messages[0] for secret in (stamp, "private-user", "private-node", "5.6.7.8"))
+    # A validated timestamp prefix is intentional clock evidence, never a raw record.
+    assert all(secret not in messages[0] for secret in (record(stamp), "private-user", "private-node", "5.6.7.8"))
 
 
 async def test_live_eviction_diagnostics_keep_original_expiry(logs):

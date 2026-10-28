@@ -460,6 +460,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
                         # Honour a runtime switch to API mode: the stream is
                         # abandoned so the outer loop can park the task.
                         now = time.time()
+                        received_monotonic = time.monotonic()
                         # Any line at all counts, including the keep-alives that
                         # carry no "data:" payload: this answers "is the stream
                         # alive", not "did a user connect". Counting only parsed
@@ -499,7 +500,20 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
                         if line.startswith("data: "):
                             log_data = line[6:]  # Remove "data: " prefix
                             if log_data.strip():  # Only process non-empty log data
-                                await parse_logs(log_data, node.node_id, node.node_name)
+                                await parse_logs(
+                                    log_data,
+                                    node.node_id,
+                                    node.node_name,
+                                    received_wall=now,
+                                    received_monotonic=received_monotonic,
+                                )
+                    else:
+                        # HTTP 200 followed by EOF is still a closed transport.
+                        # Use the retry path instead of immediately reopening it;
+                        # explicit breaks and retired monitoring remain intentional.
+                        if not await _ip_source_is_api():
+                            if monitoring_is_current(admission) and LOG_OBSERVATIONS.monitors(node.node_id):
+                                raise httpx.ReadError("SSE stream ended")
 
         except httpx.HTTPStatusError as error:
             status = error.response.status_code

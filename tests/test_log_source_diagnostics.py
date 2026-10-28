@@ -119,6 +119,49 @@ def test_missing_database_is_not_created(tmp_path):
     assert not path.exists()
 
 
+def test_probe_reads_native_numeric_values_from_sqlite_json_columns(tmp_path):
+    """SQLite's JSON affinity returns numeric settings as numbers, unlike TEXT fixtures."""
+    probe = load_probe()
+    path = tmp_path / "limiter.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE config (key TEXT PRIMARY KEY, value JSON)")
+        for key, value in {
+            "general_limit": 7,
+            "check_interval": 300,
+            "max_warning_count": 5,
+            "api_ip_freshness": 20,
+            "country_code": None,
+            "disabled_nodes": "2,3",
+            "ip_source": "api",
+        }.items():
+            connection.execute("INSERT INTO config VALUES (?, ?)", (key, json.dumps(value)))
+        assert connection.execute("SELECT typeof(value) FROM config WHERE key = 'check_interval'").fetchone() == (
+            "integer",
+        )
+    original = path.read_bytes()
+    modified_at = path.stat().st_mtime_ns
+
+    result = probe.load_settings(
+        {
+            "DATABASE_URL": f"sqlite+aiosqlite:///{path}",
+            "PANEL_DOMAIN": "panel.invalid",
+            "PANEL_API_KEY": "pg_synthetic",
+            "CHECK_INTERVAL": "60",
+            "API_IP_FRESHNESS": "60",
+        }
+    )
+
+    assert result.general_limit == 7
+    assert result.check_interval == 300
+    assert result.max_warning_count == 5
+    assert result.freshness_seconds == 20
+    assert not result.country_filter_enabled
+    assert result.disabled_nodes == frozenset({2, 3})
+    assert path.read_bytes() == original
+    assert path.stat().st_mtime_ns == modified_at
+    assert set(tmp_path.iterdir()) == {path}
+
+
 def test_probe_reads_shared_last_seen_independently_of_scan_interval(tmp_path):
     probe = load_probe()
     path = tmp_path / "limiter.db"

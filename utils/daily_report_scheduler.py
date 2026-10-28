@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 import os
 from typing import Callable
 
+from apscheduler.jobstores.base import JobLookupError
+
 from utils.daily_report import DailyReportService, configured_zone, next_midnight
 from utils.logs import get_logger
 
@@ -25,10 +27,15 @@ class DailyReportScheduler:
 
     def _reschedule(self) -> None:
         self.generation += 1
-        if self.midnight_job is not None:
-            self.midnight_job.schedule_removal()
-            self.midnight_job = None
+        previous_job = self.midnight_job
+        self.midnight_job = None
         self.due = None
+        if previous_job is not None:
+            try:
+                previous_job.schedule_removal()
+            except JobLookupError:
+                # APScheduler removes date jobs before invoking their callback.
+                pass
         self.zone_name = os.environ.get("TZ", "UTC")
         zone = configured_zone()
         if zone is None:
@@ -59,8 +66,13 @@ class DailyReportScheduler:
                 if self.due is not None and self.clock() >= self.due:
                     # Recover the most recent missed boundary if APScheduler
                     # dropped a misfire while the application was busy/suspended.
-                    await self.service.report_previous_day(self.clock())
-                    self._reschedule()
+                    generation = self.generation
+                    self.due = None  # Claim this boundary before yielding to the callback.
+                    try:
+                        await self.service.report_previous_day(self.clock())
+                    finally:
+                        if generation == self.generation:
+                            self._reschedule()
                 else:
                     await self.service.retry_pending(self.clock())
             except Exception as error:
@@ -71,12 +83,17 @@ class DailyReportScheduler:
         if data["generation"] != self.generation or os.environ.get("TZ", "UTC") != data["zone"]:
             return
         zone = configured_zone()
-        if zone is None or self.clock() < data["due"]:
+        if zone is None or self.clock() < data["due"] or self.due != data["due"]:
             return
+        # The accepted one-shot is already consumed. Claim its boundary so the
+        # watcher cannot independently recover the same occurrence while we await.
+        self.midnight_job = None
+        self.due = None
         try:
             await self.service.report_previous_day(self.clock())
         finally:
-            self._reschedule()
+            if data["generation"] == self.generation:
+                self._reschedule()
 
 
 async def start_daily_report_scheduler(application) -> DailyReportScheduler | None:

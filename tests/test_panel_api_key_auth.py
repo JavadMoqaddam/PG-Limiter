@@ -269,7 +269,9 @@ async def test_sse_loopback_receives_api_key_and_consumes_stream(key_sse, monkey
         writer.close()
         await writer.wait_closed()
 
-    async def parse(line, node_id, name):
+    async def parse(line, node_id, name, **receipt):
+        assert set(receipt) == {"received_wall", "received_monotonic"}
+        assert all(isinstance(value, float) for value in receipt.values())
         parsed.append((line, node_id, name))
         raise asyncio.CancelledError
 

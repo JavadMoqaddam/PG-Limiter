@@ -16,7 +16,7 @@ from utils.ip_facts import (
     is_public_ip,
 )
 from utils.read_config import read_config, get_config_revision
-from utils.log_observations import LOG_OBSERVATIONS
+from utils.log_observations import LOG_OBSERVATIONS, FutureTimestampError
 from utils.monitoring_gate import monitoring_is_current, monitoring_snapshot, synchronize_monitoring
 from utils.types import ConnectionInfo, DeviceInfo, UserType
 from utils.logs import get_logger
@@ -328,6 +328,9 @@ async def parse_logs(
     node_id: int = None,
     node_name: str = None,
     config_data: dict | None = None,
+    *,
+    received_wall: float | None = None,
+    received_monotonic: float | None = None,
 ) -> dict[str, UserType] | dict:  # pylint: disable=too-many-branches
     """
     Asynchronously parse logs to extract and validate IP addresses, emails, and inbound protocols.
@@ -343,6 +346,8 @@ async def parse_logs(
     """
     global _PARSER_OBSERVATION_CONFIG
 
+    received_wall = time.time() if received_wall is None else received_wall
+    received_monotonic = time.monotonic() if received_monotonic is None else received_monotonic
     admission = monitoring_snapshot()
     await synchronize_monitoring()
     if not monitoring_is_current(admission):
@@ -405,11 +410,17 @@ async def parse_logs(
         inbound_protocol = inbound_match.group(1).strip() if inbound_match else "Unknown"
         observed_at = None
         timestamp_fault = ""
+        future_fault = None
         try:
             observed_at = LOG_OBSERVATIONS.timestamp(line, current_node_id)
+        except FutureTimestampError as error:
+            timestamp_fault = "future_timestamp"
+            future_fault = error
         except ValueError as error:
             timestamp_fault = LOG_OBSERVATIONS.timestamp_failure_reason(error)
-        prepared_records.append((line, ip_match.group(1), raw_email, inbound_protocol, observed_at, timestamp_fault))
+        prepared_records.append(
+            (line, ip_match.group(1), raw_email, inbound_protocol, observed_at, timestamp_fault, future_fault)
+        )
 
     # Pre-resolve unknown numeric IDs once, using the matches already captured.
     if unknown_ids:
@@ -429,7 +440,7 @@ async def parse_logs(
         except Exception as e:
             parse_logger.error(f"Error batch-resolving numeric IDs: {e}")
 
-    for line, ip, raw_email, inbound_protocol, observed_at, timestamp_fault in prepared_records:
+    for line, ip, raw_email, inbound_protocol, observed_at, timestamp_fault, future_fault in prepared_records:
         if not monitoring_is_current(admission):
             return ACTIVE_USERS
 
@@ -476,9 +487,29 @@ async def parse_logs(
             ):
                 continue
             if observed_at is None:
-                LOG_OBSERVATIONS.mark_uncertain(node_id=current_node_id, reason=timestamp_fault or "invalid_timestamp")
+                until = future_fault.source_epoch + LOG_OBSERVATIONS.freshness_seconds if future_fault else None
+                LOG_OBSERVATIONS.mark_uncertain(
+                    until, node_id=current_node_id, reason=timestamp_fault or "invalid_timestamp"
+                )
+                if future_fault:
+                    LOG_OBSERVATIONS.record_timestamp_fault(
+                        current_node_id,
+                        future_fault.source_epoch,
+                        phase="timestamp_parse",
+                        evaluation_wall=future_fault.evaluation_wall,
+                        evaluation_monotonic=future_fault.evaluation_monotonic,
+                        line=line,
+                        received_wall=received_wall,
+                        received_monotonic=received_monotonic,
+                    )
                 continue
-            if not LOG_OBSERVATIONS.admit(current_node_id, line, observed_at):
+            if not LOG_OBSERVATIONS.admit(
+                current_node_id,
+                line,
+                observed_at,
+                received_wall=received_wall,
+                received_monotonic=received_monotonic,
+            ):
                 continue
             user = ACTIVE_USERS.get(email)
             if user:

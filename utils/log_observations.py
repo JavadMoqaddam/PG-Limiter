@@ -32,6 +32,16 @@ _DIAGNOSTIC_LOG_INTERVAL = 60.0
 _logger = logging.getLogger(__name__)
 
 
+class FutureTimestampError(ValueError):
+    """Retain a rejected timestamp and the actual comparison clocks."""
+
+    def __init__(self, source_epoch: float, evaluation_wall: float, evaluation_monotonic: float):
+        super().__init__("future source timestamp")
+        self.source_epoch = source_epoch
+        self.evaluation_wall = evaluation_wall
+        self.evaluation_monotonic = evaluation_monotonic
+
+
 @lru_cache(maxsize=1024)
 def _printed_second_timestamp(zone: ZoneInfo, printed_second: str) -> int:
     """Cache zone conversion only; fractions and future checks remain per record."""
@@ -105,6 +115,7 @@ class LogObservations:
         self._next_node_epoch = 0
         self._global_uncertain_until = 0.0
         self._uncertainty_counts: dict[int | None, dict[str, int]] = {}
+        self._timestamp_faults: dict[int | None, dict] = {}
         self._next_diagnostic_log = 0.0
 
     def invalidate(self):
@@ -281,6 +292,7 @@ class LogObservations:
         now = time.time()
         if now >= self.uncertain_until:
             self._uncertainty_counts.clear()
+            self._timestamp_faults.clear()
         deadline = until if until is not None else now + self.freshness_seconds
         self.uncertain_until = max(self.uncertain_until, deadline)
         if type(node_id) is int and self.required_nodes is not None and node_id in self.required_nodes:
@@ -336,6 +348,42 @@ class LogObservations:
             "interval_seconds": self.interval,
             "freshness_seconds": self.freshness_seconds,
             "cache_capacity": self.capacity,
+            "timestamp_faults": list(self._timestamp_faults.values()),
+        }
+
+    def record_timestamp_fault(
+        self,
+        node_id: int,
+        source_epoch: float,
+        *,
+        phase: str,
+        evaluation_wall: float,
+        evaluation_monotonic: float,
+        line: str | None = None,
+        received_wall: float | None = None,
+        received_monotonic: float | None = None,
+    ) -> None:
+        """Keep one clock comparison per bounded node, never a raw access record."""
+        key = node_id if type(node_id) is int else None
+        if key not in self._timestamp_faults and len(self._timestamp_faults) >= _MAX_DIAGNOSTIC_NODES:
+            # Overflow shares the existing null aggregate rather than growing memory.
+            key = None
+            if key not in self._timestamp_faults:
+                self._timestamp_faults.pop(next(iter(self._timestamp_faults)))
+        match = _TIMESTAMP.match(line) if line is not None else None
+        prefix = match[1] + ("." + match[2] if match[2] else "") if match else None
+        zone = self.zone(node_id)
+        self._timestamp_faults[key] = {
+            "node_id": node_id if key is not None else None,
+            "phase": phase,
+            "timestamp_prefix": prefix,
+            "timezone": zone.key if zone else None,
+            "source_epoch": source_epoch,
+            "received_wall": received_wall,
+            "received_monotonic": received_monotonic,
+            "evaluation_wall": evaluation_wall,
+            "evaluation_monotonic": evaluation_monotonic,
+            "source_minus_evaluation_seconds": source_epoch - evaluation_wall,
         }
 
     def _report_uncertainty(self) -> None:
@@ -357,8 +405,9 @@ class LogObservations:
         # Integer composition preserves aware datetime.timestamp rounding, also
         # for dates before 1970 and near datetime's supported year boundaries.
         observed_at = (seconds * 1_000_000 + micros) / 1_000_000
-        if observed_at > time.time():
-            raise ValueError("future source timestamp")
+        evaluated_at = time.time()
+        if observed_at > evaluated_at:
+            raise FutureTimestampError(observed_at, evaluated_at, time.monotonic())
         return observed_at
 
     def _expire_replay_cache(self, node_id: int, now: float) -> None:
@@ -381,9 +430,19 @@ class LogObservations:
             heapq.heapify(expiry)
             self._seen_expiry[node_id] = expiry
 
-    def validate_source_time(self, node_id: int, observed_at: float, *, now: float | None = None) -> bool:
+    def validate_source_time(
+        self,
+        node_id: int,
+        observed_at: float,
+        *,
+        now: float | None = None,
+        line: str | None = None,
+        received_wall: float | None = None,
+        received_monotonic: float | None = None,
+    ) -> bool:
         """Preserve uncertainty before an unusable original time can be discarded."""
         evaluated_at = time.time() if now is None else now
+        evaluated_monotonic = time.monotonic()
         reason = ""
         if type(observed_at) not in (int, float) or not math.isfinite(observed_at):
             reason = "invalid_timestamp"
@@ -394,13 +453,39 @@ class LogObservations:
             # expiry; a backwards clock step must not shorten that deadline.
             expiry_base = observed_at if reason == "future_timestamp" else evaluated_at
             self.mark_uncertain(expiry_base + self.freshness_seconds, node_id=node_id, reason=reason)
+            if reason == "future_timestamp":
+                self.record_timestamp_fault(
+                    node_id,
+                    observed_at,
+                    phase="admission" if line is not None else "snapshot",
+                    evaluation_wall=evaluated_at,
+                    evaluation_monotonic=evaluated_monotonic,
+                    line=line,
+                    received_wall=received_wall,
+                    received_monotonic=received_monotonic,
+                )
             return False
         return True
 
-    def admit(self, node_id: int, line: str, observed_at: float) -> bool:
+    def admit(
+        self,
+        node_id: int,
+        line: str,
+        observed_at: float,
+        *,
+        received_wall: float | None = None,
+        received_monotonic: float | None = None,
+    ) -> bool:
         """Commit identity after preparation, atomically with the user-map mutation."""
         now = time.time()
-        if not self.validate_source_time(node_id, observed_at, now=now):
+        if not self.validate_source_time(
+            node_id,
+            observed_at,
+            now=now,
+            line=line,
+            received_wall=received_wall,
+            received_monotonic=received_monotonic,
+        ):
             return False
         if observed_at < self.floor or not 0 <= now - observed_at < self.freshness_seconds:
             return False

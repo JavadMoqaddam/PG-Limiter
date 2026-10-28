@@ -113,10 +113,8 @@ def positive_seconds(value, fallback):
     return int(text) if text.isascii() and text.isdecimal() and int(text) > 0 else fallback
 
 
-def load_settings(environ=None):
-    """Read only the relevant ENV values and committed SQLite configuration rows."""
-    env = os.environ if environ is None else environ
-    url = env.get("DATABASE_URL", "sqlite+aiosqlite:///./data/pg_limiter.db")
+def read_stored_settings(url: str, keys: tuple[str, ...]) -> dict:
+    """Read selected committed values without changing SQLite or importing the app."""
     prefix = next((item for item in ("sqlite+aiosqlite:///", "sqlite:///") if url.startswith(item)), None)
     if prefix is None or "?" in url or url.endswith(":memory:"):
         raise ProbeError("configuration_database_unsupported")
@@ -125,12 +123,23 @@ def load_settings(environ=None):
         with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2) as connection:
             connection.execute("PRAGMA query_only=ON")
             rows = connection.execute(
-                "SELECT key, value FROM config WHERE key IN (" + ",".join("?" for _ in CONFIG_KEYS) + ")",
-                CONFIG_KEYS,
+                "SELECT key, value FROM config WHERE key IN (" + ",".join("?" for _ in keys) + ")",
+                keys,
             ).fetchall()
-        db = {key: json.loads(value) if value is not None else None for key, value in rows}
+        # The real JSON column has NUMERIC affinity: sqlite3 can return numbers
+        # directly, while strings/containers/bools remain serialized JSON text.
+        return {
+            key: value if value is None or isinstance(value, (int, float)) else json.loads(value) for key, value in rows
+        }
     except (OSError, sqlite3.Error, ValueError, TypeError):
         raise ProbeError("configuration_unavailable") from None
+
+
+def load_settings(environ=None):
+    """Read only the relevant ENV values and committed SQLite configuration rows."""
+    env = os.environ if environ is None else environ
+    url = env.get("DATABASE_URL", "sqlite+aiosqlite:///./data/pg_limiter.db")
+    db = read_stored_settings(url, CONFIG_KEYS)
     general = as_int(env.get("GENERAL_LIMIT"), 2)
     if general < 1:
         general = 2

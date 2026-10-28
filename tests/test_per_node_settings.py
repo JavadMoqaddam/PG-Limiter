@@ -55,11 +55,16 @@ async def test_failed_node_write_does_not_confirm_or_change_mode(settings_store,
 
 
 async def test_api_source_selection_remains_available_while_counting_nodes(settings_store, monkeypatch):
+    monkeypatch.setenv("PANEL_DOMAIN", "https://panel.invalid")
+    monkeypatch.setenv("PANEL_API_KEY", "synthetic-panel-key")
     assert await config_module.save_config_value("device_count_mode", "node")
     monkeypatch.setattr(source_settings, "_find_preflight_user_id", AsyncMock(return_value=(7, "")))
-    monkeypatch.setattr("utils.panel_api.online_ips.check_online_stats_permission", AsyncMock(return_value=(True, "")))
+    permission = AsyncMock(return_value=(True, ""))
+    monkeypatch.setattr("utils.panel_api.online_ips.check_online_stats_permission", permission)
     await source_settings.handle_ip_source_set_api_callback(LocalQuery(), SimpleNamespace(user_data={}))
     config = await config_module.read_config()
+    permission.assert_awaited_once()
+    assert permission.await_args.args[0].panel_api_key == "synthetic-panel-key"
     assert config["device_count_mode"] == "node"
     assert config["ip_source"] == "api"
 

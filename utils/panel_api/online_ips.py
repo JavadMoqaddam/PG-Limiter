@@ -151,7 +151,7 @@ async def fetch_user_online_ips(
         ``{node_id: {ip: last_seen_epoch} | None}`` on success and ``None``
         otherwise. A null node is unavailable evidence, not an empty map, and ``outcome`` is one of the ``OUTCOME_*`` constants.
     """
-    from utils.panel_api.request_helper import panel_request
+    from utils.panel_api.request_helper import online_stats_circuit_breaker, panel_request
 
     response, _ = await panel_request(
         panel_data,
@@ -159,6 +159,7 @@ async def fetch_user_online_ips(
         f"/api/node/online_stats/{user_id}/ip",
         timeout=timeout,
         max_retries=1,
+        breaker=online_stats_circuit_breaker,
     )
 
     if response is not None:

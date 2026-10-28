@@ -86,6 +86,9 @@ class PanelCircuitBreaker:
 
 # Shared circuit breaker instance
 circuit_breaker = PanelCircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
+# Online-stat fan-out has different upstream failure modes from user snapshots
+# and mutations. Its bursts must not suppress those independent operations.
+online_stats_circuit_breaker = PanelCircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
 
 # Shared persistent httpx.AsyncClient with connection pooling
 _panel_client: Optional[httpx.AsyncClient] = None
@@ -273,6 +276,7 @@ async def panel_request(
     timeout: float = 30.0,
     max_retries: int = 3,
     retry_delay: float = 1.0,
+    breaker: PanelCircuitBreaker | None = None,
 ) -> tuple[Optional[httpx.Response], Optional[str]]:
     """
     Make a panel API request with automatic retry and scheme fallback.
@@ -293,8 +297,9 @@ async def panel_request(
         - On success: (response, None)
         - On failure: (None, error_message)
     """
+    active_breaker = circuit_breaker if breaker is None else breaker
     # Check Circuit Breaker before making network requests
-    if not circuit_breaker.allow_request():
+    if not active_breaker.allow_request():
         request_logger.warning(f"⚡ Circuit Breaker OPEN: Panel API unavailable, failing fast for {endpoint}")
         return None, "Circuit Breaker OPEN: Panel API unavailable"
 
@@ -350,7 +355,7 @@ async def panel_request(
                 # 4xx Client Errors (400, 401, 403, 404): Panel is UP and functioning!
                 # Reset/don't trip Circuit Breaker on 4xx business responses
                 if response.status_code < 500:
-                    circuit_breaker.record_result(is_server_failure=False)
+                    active_breaker.record_result(is_server_failure=False)
 
                 # Success
                 if response.status_code in (200, 201, 204):
@@ -377,7 +382,7 @@ async def panel_request(
 
                 # 5xx Server error - count as server failure for Circuit Breaker
                 if response.status_code >= 500:
-                    circuit_breaker.record_result(is_server_failure=True)
+                    active_breaker.record_result(is_server_failure=True)
                     _record_failure(scheme)
                     last_error = f"Server error ({response.status_code}) on {url}"
                     request_logger.warning(last_error)
@@ -397,7 +402,7 @@ async def panel_request(
                 _record_failure(scheme)
                 _record_connection_failure()
                 # Server/network failure - trip Circuit Breaker
-                circuit_breaker.record_result(is_server_failure=True)
+                active_breaker.record_result(is_server_failure=True)
                 last_error = f"Network/Server error on {url}: {type(e).__name__}"
                 request_logger.warning(last_error)
                 continue
@@ -406,7 +411,7 @@ async def panel_request(
                 elapsed = (time.perf_counter() - start_time) * 1000
                 log_api_request(method, url, None, elapsed, type(e).__name__)
                 _record_failure(scheme)
-                circuit_breaker.record_result(is_server_failure=True)
+                active_breaker.record_result(is_server_failure=True)
                 last_error = f"Error on {url}: {type(e).__name__}"
                 request_logger.error(last_error)
                 continue
