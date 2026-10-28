@@ -89,6 +89,10 @@
 
 ### Quick Install with Docker (Recommended)
 
+The commands below install v1.7.0, which predates API-key-only authentication.
+To use `PANEL_API_KEY`, build and install a version containing the API-key change
+as described in the [panel API-key guide](docs/PANEL_API_KEY.md).
+
 Run the one-line installer:
 
 ```bash
@@ -105,7 +109,8 @@ curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.0/pg-
 sudo bash /tmp/pg-limiter.sh install
 ```
 
-The installer will:
+An installer containing the API-key change will:
+
 1. Check and install Docker & Docker Compose if missing.
 2. Setup directories at `/etc/opt/pg-limiter/` and `/var/lib/pg-limiter/`.
 3. Interactively prompt for the panel domain, panel API key and Telegram bot token.
@@ -351,7 +356,6 @@ Runs on port `8080` by default. Swagger documentation available at `http://local
 
 | Cache Item | TTL | Purpose |
 |------------|-----|---------|
-| **Access Tokens** | 30 min | Panel API authentication |
 | **Node List** | 1 hour | Active PasarGuard SSE nodes |
 | **Configuration** | 5 min | Dynamic runtime parameters |
 | **User Metadata** | 1 min | Pre-computed limits held in RAM |
