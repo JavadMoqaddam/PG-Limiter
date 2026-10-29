@@ -245,8 +245,7 @@ confirmation list changes, unobserved users' pending warnings are preserved.
 Observed users still need valid IP evidence and matching current group/core
 scope. The background full-user sync can refresh valid returned users but
 defers deletion of local membership when its listing changes; that incomplete
-sync does not advance the last completed-sync time. No counters or Trust
-history are reset to recover from pagination churn.
+sync does not advance the last fully successful-sync time shown in the UI. Its completed-attempt time still schedules the next full sync, so pagination churn cannot cause a bulk retry before every IP cycle. No counters or Trust history are reset.
 
 At the normal INFO log level, online-IP collection prints a starting count,
 progress at most once every ten seconds as requests finish, and a final
@@ -284,10 +283,8 @@ collection. Collection start logs include the effective timeout, concurrency and
 breaker wait budget. Aggregate counters distinguish read, connect, pool and
 write timeouts; unclassified timeouts still count toward the timeout total.
 
-Full user synchronization runs in a separate background task. Its timer starts
-after the previous sync returns, and it can run while IP collection is active.
-The shared one-second page gate serializes `/api/users` attempts (including
-candidate pages, sync pages and membership batches), not whole collection cycles
-or `/api/node/online_stats/{id}/ip` requests. The sync and IP collection locks
-each prevent duplicate instances of their own operation; they do not exclude
-one another.
+Full user synchronization, API collection and punishment IP refresh share one workload slot, so their panel work does not overlap. The one-second `/api/users` page gate also applies to candidate, sync and membership pages.
+
+Before each new API collection, the daemon checks the current `user_sync_interval` after any queue wait. If the interval has elapsed since the previous completed sync attempt, full sync runs first. An active collection finishes normally when the deadline passes. Initial startup retains a separate 30-second grace period; the background scheduler also checks the deadline while idle, including in Logs mode.
+
+Manual or periodic sync can satisfy a pending deadline without an extra bulk fetch. Completed incomplete/failed attempts start the configured interval too; cancellation leaves the retry due. Observation timestamps and per-request timeout/breaker budgets start after the workload wait. Queueing does not count as a panel outage. See the [trial guide](PR_TESTING.md) for observable ordering and validation.

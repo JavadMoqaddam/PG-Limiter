@@ -198,3 +198,13 @@ screen.log
 
 # Backup files
 backups/
+# Local investigation and operator handoffs (keep outside distributable source)
+/HANDOFF.md
+/SESSION_*.md
+/PENDING_WORK_*.md
+/RELEASE-REVIEW-*.md
+/docs/superpowers/
+/pg-limiter-logs_*.txt
+/activation-result.json
+/progress.log
+/*-runtime.log

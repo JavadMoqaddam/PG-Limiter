@@ -3,7 +3,7 @@
   <img src="https://img.shields.io/badge/License-AGPL--3.0-green" alt="License">
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white" alt="Docker">
-  <img src="https://img.shields.io/badge/Version-1.7.1-orange" alt="Version">
+  <img src="https://img.shields.io/badge/Development-1.7.1-orange" alt="Version">
 </p>
 
 <h1 align="center">🛡️ PG-Limiter</h1>
@@ -12,10 +12,12 @@
   <b>High-Performance IP Connection Limiter for <a href="https://github.com/PasarGuard/panel">PasarGuard</a> Panel</b>
   <br><br>
   Real-time SSE multi-node connection monitor, Telegram Forum Topics integration,<br>
-  Subnet grouping, High Trust scoring, in-process caching, and zero-false-positive punishment system.
+  Subnet grouping, High Trust scoring, in-process caching, and configurable enforcement with warning-history protection.
 </p>
 
 ---
+
+Development toward **1.7.1** is in progress; the latest published release is [1.7.0](https://github.com/JavadMoqaddam/PG-Limiter/releases/tag/v1.7.0). The behavior described here follows this development branch. See the [draft release notes](docs/releases/v1.7.1.md) for migration requirements.
 
 ## 📑 Table of Contents
 
@@ -29,7 +31,7 @@
   - [Subnet Grouping (/24)](#2-subnet-ip-grouping-24)
   - [High Trust Mode](#3-high-trust-mode)
   - [CDN & Cloudflare Support](#4-cdn-mode--x-forwarded-for-xff)
-  - [Fast User Sync & In-RAM Cache](#5-fast-parallel-user-sync)
+  - [Fast User Sync & In-RAM Cache](#5-batched-user-sync)
   - [IP Source: Logs or Panel API](#6-ip-source-node-logs-sse-or-panel-api)
 - [Configuration](#-configuration)
 - [CLI Interface](#-cli-interface)
@@ -50,7 +52,7 @@
 | 🔒 **IP Limiting** | Limit concurrent connections per user globally or with special per-user limits |
 | 📊 **Real-time SSE Monitoring** | SSE-based live log streaming across all connected PasarGuard nodes |
 | 🛰️ **Switchable IP Source** | Collect connected IPs from node logs (SSE) or from the panel API, switchable live from Telegram |
-| 🛡️ **3-Cycle Verification** | Monitors violations across 3 consecutive scans before penalty, eliminating false positives |
+| 🛡️ **3-Cycle Verification** | Requires the configured number of consecutive valid over-limit observations before a penalty (default: 3) |
 | 🌐 **Subnet Grouping (/24)** | Consolidates dynamic cellular carrier IPs into single `/24` subnets |
 | ⭐ **High Trust Mode** | Dynamically scores long-term stable users to prevent accidental disconnects |
 | ☁️ **CDN & XFF Support** | Extracts genuine client IPs behind Cloudflare and reverse proxies |
@@ -61,7 +63,7 @@
 | Feature | Description |
 |---------|-------------|
 | 📌 **Forum Topics** | Routes specific notifications to dedicated Supergroup Forum topics |
-| ⚡ **Priority Dispatcher** | Rate-limited message queue with guaranteed delivery and error recovery |
+| ⚡ **Priority Dispatcher** | Rate-limited message queue with retries, delivery receipts and explicit uncertain outcomes |
 | 🎛️ **Full Interactive UI** | Control settings, whitelist, special limits, nodes, and backups via inline buttons |
 | 📝 **Audit Logging** | Preserves violation and disable message history for accounting |
 | 💾 **Automated Backups** | Scheduled periodic backups sent directly to your Telegram backup topic |
@@ -69,8 +71,8 @@
 ### ⚡ Performance & Data Management
 | Feature | Description |
 |---------|-------------|
-| 🚀 **Fast Parallel Sync** | Fetches 20,000+ users across pages in parallel with native SQLite bulk upsert |
-| 🧠 **0ms In-RAM Lookups** | Zero-latency pre-computed RAM cache for instantaneous user limit evaluation |
+| 🚀 **Batched User Sync** | Mirrors panel users using paced pages and bounded SQLite write batches |
+| 🧠 **Metadata Cache** | In-memory user facts reduce repeated lookups; current settings still determine policy |
 | 🏎️ **In-Process Caching** | One bounded cache per data type, with no external cache service to run |
 | 💿 **Async SQLite Engine** | Modern WAL-mode async database with automated Alembic migrations |
 | 🐳 **Multi-Arch Docker** | Automated CI/CD builds for `linux/amd64` and `linux/arm64` |
@@ -93,17 +95,17 @@ Version 1.7.1 requires `PANEL_API_KEY`. Before upgrading from 1.7.0, prepare
 the key and permission scopes described in the
 [panel API-key guide](docs/PANEL_API_KEY.md).
 
-Run the one-line installer:
+For the published stable release, run the versioned installer. Its setup and credentials are described in the [1.7.0 documentation](https://github.com/JavadMoqaddam/PG-Limiter/tree/v1.7.0#-installation); the API-key migration above applies to the upcoming 1.7.1 upgrade:
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.1/pg-limiter.sh) install
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.0/pg-limiter.sh) install
 ```
 
 Or download and run step-by-step:
 
 ```bash
 # Download the installer
-curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.1/pg-limiter.sh -o /tmp/pg-limiter.sh
+curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.0/pg-limiter.sh -o /tmp/pg-limiter.sh
 
 # Run installation
 sudo bash /tmp/pg-limiter.sh install
@@ -194,11 +196,11 @@ restorable and remove any newer outbox before the restored database starts.
 ## 💡 Key Systems & Architecture
 
 ### 1. 3 Consecutive Scans Verification
-To prevent false-positive bans caused by temporary network glitches, VPN reconnects, or carrier handovers:
+The warning threshold is configurable. With the default threshold of 3, consecutive valid over-limit observations work as follows:
 * **Scan 1:** System flags over-limit usage and places user under monitoring (`consecutive_violations = 1`).
 * **Scan 2:** Violation persists; warning updated (`consecutive_violations = 2`).
-* **Scan 3:** Third consecutive violation confirms abuse; user is disabled/moved according to punishment rules.
-* **Auto-Purge:** If user traffic normalizes or user disconnects at any point before Scan 3, monitoring state is instantly cleared.
+* **Scan 3:** Third consecutive valid over-limit observation reaches the threshold; user is disabled/moved according to punishment rules.
+* **Valid normalization:** A valid within-limit observation can clear the violation counter. Missing or invalid evidence preserves the existing warning; disconnection alone is not proof of zero connections.
 
 ### 2. Subnet IP Grouping (/24)
 Mobile network providers (Irancell, MCI, Rightel, etc.) often assign multiple IPs from the same `/24` block during a single session. Enabling Subnet Grouping aggregates IP addresses sharing the same `/24` subnet prefix as a single connection.
@@ -209,8 +211,8 @@ Users with established, stable connection histories receive trust score incremen
 ### 4. CDN Mode & X-Forwarded-For (XFF)
 When running proxy frontends or Cloudflare CDN layers, PG-Limiter extracts the real client IP from `X-Forwarded-For` / `CF-Connecting-IP` headers rather than the CDN edge IP.
 
-### 5. Fast Parallel User Sync
-Synchronizes all users and statuses from PasarGuard API using validated parallel pagination (up to 10 concurrent requests). Native `INSERT ... ON CONFLICT DO UPDATE` commits 500-user batches so configuration and enforcement writers can run between batches. Cleanup confirms each absent user's current detail response before deletion and preserves local rows changed during synchronization. Failed or incomplete list responses never trigger cleanup; uncertain deletion checks retain those users and report an incomplete sync. Existing users retain their local limits, whitelist and punishment state. The factual metadata cache refreshes after committed writes for fast policy evaluation.
+### 5. Batched User Sync
+Synchronizes all users and statuses from PasarGuard API using validated pagination with serialized page requests. Native `INSERT ... ON CONFLICT DO UPDATE` commits 500-user batches so configuration and enforcement writers can run between batches. Cleanup confirms each absent user's current detail response before deletion and preserves local rows changed during synchronization. Failed or incomplete list responses never trigger cleanup; uncertain deletion checks retain those users and report an incomplete sync. Existing users retain their local limits, whitelist and punishment state. The factual metadata cache refreshes after committed writes for fast policy evaluation.
 
 ### 6. IP Source: Node Logs (SSE) or Panel API
 The connected IPs of each user can come from either of two sources, switchable at runtime from **Settings → 🛰️ IP Source (Logs / API)** with no restart:
@@ -232,7 +234,7 @@ When Last seen exceeds the cadence, Logs keeps eligible observations across succ
 
 * **Candidate narrowing.** `GET /api/users` uses `status=active` and `online=true`, independently of `CHECK_INTERVAL`. Include group IDs are sent together; empty Include selects nobody. Exclusions, administrator filters and exceptions still apply. Group Limits set limits and never replace the Group Filter.
 * **Exact Last seen threshold.** Edit a positive whole number of seconds T in **Settings → IP Source → Last seen**. Both API and Logs use that value exactly, with no 30-second buffer. A long-lived connection can have an old timestamp; this is recent source evidence, not a byte-traffic meter. API and Logs counts can differ.
-* **Unknown evidence protection.** Failed requests, malformed bodies, null maps and invalid timestamps protect affected users from warnings, punishment and false clearing. Successful responses are counted from the returned IPs without requiring every eligible node. Omitted maps add no connections; within-limit or empty successful responses can clear warnings. Current group/core scope and the HTTP answer-rate gate (default **80%**) still apply. An unavailable node does not veto observations from healthy nodes; absent users' warnings remain protected during fleet outages or changing pagination. Valid expired activity observations and confirmed deleted users can also clear warnings.
+* **Unknown evidence protection.** Failed requests, malformed bodies, null maps and invalid timestamps protect affected users from warnings, punishment and false clearing. Successful responses are counted from the returned IPs without requiring every eligible node. Omitted maps add no connections. An empty aggregate (`nodes={}`) is unknown; a valid explicit empty map from an eligible healthy node can establish zero. Invalid evidence affects only that user. Current group/core scope and the HTTP answer-rate gate (default **80%**) still apply. An unavailable node does not veto observations from healthy nodes; absent users' warnings remain protected during fleet outages or changing pagination. Valid expired activity observations and confirmed deleted users can also clear warnings.
 * **Auto-fallback.** With automatic fallback enabled, two consecutive unusable API collection cycles persist the source as Logs and attempt one Telegram alert. Usable partial cycles and valid empty results reset the streak; omitted node maps alone do not trigger fallback. Logs then waits for its timezone/readiness requirements and conservative warm-up.
 * **Per-inbound CDN grouping is inactive** in API mode because the panel reports no inbound names — use **CDN Nodes** (per-node) instead of CDN Inbounds.
 
@@ -335,7 +337,7 @@ python cli_main.py disabled enable-all
 
 ## 🌐 REST API
 
-An optional REST API server is available for custom dashboards and automation:
+An optional REST API server is available for custom dashboards and automation. It binds to `127.0.0.1` by default and requires a nonempty `API_PASSWORD`. Remote use needs an explicit `API_HOST`, TLS and access controls. Five failed logins from a client cause a temporary 429 cooldown before further passwords are evaluated; clients sharing a proxy address share that budget. Trust forwarding headers only from your own proxy.
 
 ```bash
 python api_server.py
@@ -412,7 +414,7 @@ PG-Limiter/
 
 <details>
 <summary><b>Does PG-Limiter ban users who disconnect during a scan?</b></summary>
-With the 3-cycle consecutive verification system, a valid within-limit observation clears the violation counter with zero penalty. In API mode, a successful response is counted as returned, including empty or omitted node maps. Failed requests and invalid observations preserve existing warnings.
+The configured number of consecutive valid violations is required before punishment. A valid within-limit observation can clear the counter. Failed requests, invalid observations and empty aggregate node maps preserve existing warnings; a disconnection alone does not establish a valid zero count.
 </details>
 
 <details>
@@ -422,12 +424,12 @@ When Subnet Grouping is enabled, multiple connections originating from the same 
 
 <details>
 <summary><b>When should I switch the IP source to the panel API?</b></summary>
-Use API mode when node logs are unavailable or too noisy to stream reliably. It queries <code>online_stats</code> once per online user per cycle; panel load depends on candidate count, node RPC latency and concurrency. It needs a panel API key with the <code>nodes.stats</code> permission. With automatic fallback enabled, two unusable collection cycles switch to Logs. Omitted node maps alone do not trigger fallback: returned IPs determine both excess usage and normalization. Grant <code>nodes.logs</code> too when using automatic fallback. See <a href="docs/API_IP_SOURCE.md">API collection behavior</a> for counting and error handling.
+Use API mode when node logs are unavailable or too noisy to stream reliably. It queries <code>online_stats</code> once per online user per cycle; panel load depends on candidate count, node RPC latency and concurrency. It needs a panel API key with the <code>nodes.stats</code> permission. With automatic fallback enabled, two unusable collection cycles switch to Logs. Usable healthy-node observations can continue counting when another node is unavailable. Unknown user evidence is skipped and preserves warnings. Grant <code>nodes.logs</code> too when using automatic fallback. See <a href="docs/API_IP_SOURCE.md">API collection behavior</a> for counting and error handling.
 </details>
 
 <details>
 <summary><b>How do I update PG-Limiter?</b></summary>
-Simply run <code>pg-limiter update</code>. It pulls the latest Docker image, applies any pending database migrations automatically, and restarts the service with zero downtime.
+Simply run <code>pg-limiter update</code>. It downloads the published release, applies pending database migrations and recreates the limiter container. Monitoring is interrupted during replacement and source warm-up; retain a backup and the previous image for recovery.
 </details>
 
 ---
@@ -436,4 +438,6 @@ Simply run <code>pg-limiter update</code>. It pulls the latest Docker image, app
 
 This project is licensed under the **AGPL-3.0 License** - see the [LICENSE](LICENSE) file for details.
 
-Based on [V2IpLimit](https://github.com/houshmand-2005/V2IpLimit) by [houshmand-2005](https://github.com/houshmand-2005), redesigned and enhanced for the PasarGuard community.
+Maintained by [JavadMoqaddam](https://github.com/JavadMoqaddam). This project originated from [MatinDehghanian/PG-Limiter](https://github.com/MatinDehghanian/PG-Limiter), which is based on [V2IpLimit](https://github.com/houshmand-2005/V2IpLimit) by [houshmand-2005](https://github.com/houshmand-2005), redesigned and enhanced for the PasarGuard community.
+
+Security reports: see [SECURITY.md](SECURITY.md). Development and release preparation: see [CONTRIBUTING.md](CONTRIBUTING.md).
