@@ -5,14 +5,11 @@ name: "Security Review (Claude Code)"
 # scanners miss, and posts findings as PR comments. It complements, rather than
 # replaces, the existing CodeQL (codeql.yml) and Bandit (ci.yml) scans.
 #
-# Scoped to pull requests targeting the default branch, matching the convention
-# in ci.yml and codeql.yml. The API key is read from a repository secret and is
-# never hardcoded - see the setup note below.
+# Optional: enable the repository variable ENABLE_CLAUDE_SECURITY_REVIEW=true
+# and configure ANTHROPIC_API_KEY. Ordinary tests and CodeQL do not need API credits.
 
 on:
   pull_request:
-    branches: [main]
-  workflow_dispatch:
 
 # Least privilege: read the code, write PR comments. Nothing else.
 permissions:
@@ -25,6 +22,7 @@ jobs:
     # Dependabot and fork PRs have no repository secrets. Their ordinary tests,
     # Bandit and CodeQL still run; the API-backed reviewer needs a trusted event.
     if: >-
+      vars.ENABLE_CLAUDE_SECURITY_REVIEW == 'true' &&
       github.actor != 'dependabot[bot]' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
@@ -37,15 +35,12 @@ jobs:
           # change against its base.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 2
+          persist-credentials: false
 
       - name: Run Claude Code Security Review
         # No release tags are published. Keep a reviewed commit; Dependabot cannot
         # update this pin until upstream publishes version tags.
         uses: anthropics/claude-code-security-review@0c6a49f1fa56a1d472575da86a94dbc1edb78eda
-        env:
-          # Route Claude API traffic through the self-hosted gateway. The
-          # underlying Claude Code process reads this from the environment.
-          ANTHROPIC_BASE_URL: "https://api.justwoker.icu"
         with:
           comment-pr: true
           claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}

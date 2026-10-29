@@ -6,7 +6,16 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
-## [1.7.1]
+## [1.7.1] - Unreleased
+
+### Security and maintenance
+
+- Default the optional API to loopback, enforce failed-auth cooldowns before checking credentials, and redact database URLs from configuration responses.
+- Escape panel group names in Telegram HTML and use console logging if writable application log paths are unavailable, without a shared `/tmp` fallback.
+- Verify panel TLS by default for REST and SSE. Existing explicit `PANEL_VERIFY_SSL=false` remains supported; private certificates need an explicitly trusted CA bundle before upgrading.
+- Restrict Docker inputs to runtime source and include license/attribution. Route image publication through the verified release workflow and require an intentional tag or manual dispatch.
+- Cover development-target PRs with CI/CodeQL. Make the paid Claude reviewer opt-in and remove the hardcoded third-party API gateway.
+- Retire internal release-review notes from the distributable tree and clarify development status, supported behavior, private security reporting and repository independence preparation.
 
 ### Fixed
 
