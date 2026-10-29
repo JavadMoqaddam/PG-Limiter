@@ -15,7 +15,7 @@ All notable changes to PG-Limiter are recorded here. Format follows
 - Verify panel TLS by default for REST and SSE. Existing explicit `PANEL_VERIFY_SSL=false` remains supported; private certificates need an explicitly trusted CA bundle before upgrading.
 - Restrict Docker inputs to runtime source and include license/attribution. Route image publication through the verified release workflow and require an intentional tag or manual dispatch.
 - Cover development-target PRs with CI/CodeQL. Make the paid Claude reviewer opt-in and remove the hardcoded third-party API gateway.
-- Retire internal release-review notes from the distributable tree and clarify development status, supported behavior, private security reporting and repository independence preparation.
+- Retire internal release-review and implementation notes from the distributable tree, remove the duplicated 1.7.0 release document, and clarify development status, supported behavior, private security reporting and repository independence preparation. Published 1.7.0 notes remain on the GitHub release and version tag.
 
 ### Fixed
 
