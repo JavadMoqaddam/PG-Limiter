@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION="1.7.0"
+VERSION="1.7.1"
 
 # Colors for output
 RED='\033[0;31m'
@@ -25,6 +25,7 @@ CRASH_LOG="/var/lib/pg-limiter/logs/crash.log"
 RESTART_COUNT=0
 MAX_RESTARTS=2
 RESTART_DELAY=5
+LIMITER_PID=""
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ERROR HANDLING AND SIGNAL TRAPS
@@ -32,10 +33,19 @@ RESTART_DELAY=5
 
 # Trap for graceful shutdown
 cleanup() {
+    # A second signal must not interrupt the child's cleanup or restart it.
+    trap '' SIGTERM SIGINT SIGHUP
     log_warn "Received shutdown signal, cleaning up..."
-    # Kill any background processes
-    jobs -p | xargs -r kill 2>/dev/null
-    log_info "PG-Limiter stopped gracefully"
+    if [ -n "$LIMITER_PID" ]; then
+        kill -TERM "$LIMITER_PID" 2>/dev/null || true
+        if wait "$LIMITER_PID"; then
+            log_info "PG-Limiter stopped gracefully"
+        else
+            log_warn "PG-Limiter stopped with child exit code $?"
+        fi
+    else
+        jobs -p | xargs -r kill 2>/dev/null
+    fi
     exit 0
 }
 
@@ -641,8 +651,14 @@ except Exception as e:
     exc_type, exc_value, exc_tb = sys.exc_info()
     write_crash_log(exc_type, exc_value, exc_tb)
     sys.exit(1)
-"
-    return $?
+" &
+    # Bash handles traps promptly while waiting for an asynchronous child;
+    # foreground Python would defer the trap until Python had already exited.
+    LIMITER_PID=$!
+    wait "$LIMITER_PID"
+    local exit_code=$?
+    LIMITER_PID=""
+    return "$exit_code"
 }
 
 # Main loop with restart logic
