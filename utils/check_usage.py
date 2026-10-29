@@ -355,7 +355,9 @@ async def check_ip_used(
             # later freshness check can protect their warning records.
             active_users_snapshot = dict(active_users_snapshot)
             for username, user in list(active_users_snapshot.items()):
-                if username in evidence.unknown_users or not refresh_api_user(user, evidence.freshness_seconds):
+                if username in evidence.unknown_users or not refresh_api_user(
+                    user, evidence.freshness_seconds, evidence=evidence
+                ):
                     del active_users_snapshot[username]
         elif not LOG_OBSERVATIONS.is_current(evidence, allow_partial=True):
             return {}
@@ -824,7 +826,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     def refresh_sample_users() -> None:
         for username, user in active_users_snapshot.items():
             trustworthy = (
-                refresh_api_user(user, api_evidence.freshness_seconds)
+                refresh_api_user(user, api_evidence.freshness_seconds, evidence=api_evidence)
                 if api_evidence
                 else refresh_log_user(user, log_evidence)
             )
@@ -879,10 +881,15 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         # This is a local age/configuration check, with no network refetch.
         if not cycle_is_current() or username in protected_users:
             return False
+        if api_evidence:
+            observed = api_evidence.observation_windows.get(username)
+            if observed is not None and not observed.clock_is_current():
+                protected_users.add(username)
+                return False
         user = active_users_snapshot.get(username)
         if user is not None:
             trustworthy = (
-                refresh_api_user(user, api_evidence.freshness_seconds)
+                refresh_api_user(user, api_evidence.freshness_seconds, evidence=api_evidence)
                 if api_evidence
                 else refresh_log_user(user, log_evidence)
             )
@@ -906,6 +913,32 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                 protected_users.add(username)
                 return False
         return True
+
+    # Ordinary scan decisions keep their own request snapshot. A panel mutation
+    # additionally needs a recent request for this user, not for the whole fleet.
+    def punishment_observation_is_current(username: str) -> bool:
+        if api_evidence is None:
+            return True
+        window = api_evidence.observation_windows.get(username)
+        return window is not None and window.is_fresh(api_evidence.freshness_seconds)
+
+    async def refresh_punishment_observation(username: str) -> bool:
+        nonlocal api_evidence
+        if not cycle_is_current() or username in protected_users:
+            return False
+        if api_evidence is None or punishment_observation_is_current(username):
+            return True
+        from dataclasses import replace
+        from utils.ip_source_api import recheck_api_user
+
+        refreshed = await recheck_api_user(panel_data, username, config_data, api_evidence)
+        if refreshed is None or not cycle_is_current():
+            protected_users.add(username)
+            return False
+        user, window = refreshed
+        api_evidence = replace(api_evidence, observation_windows={**api_evidence.observation_windows, username: window})
+        active_users_snapshot[username] = user
+        return refresh_user_evidence(username) and punishment_observation_is_current(username)
 
     async def refresh_current_policy(username: str) -> UserPolicy | None:
         """Recheck factual eligibility and evidence after every preparation await."""
@@ -976,6 +1009,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         refresh_user_evidence=refresh_user_evidence,
         user_policies=user_policies,
         refresh_user_policy=refresh_current_policy,
+        refresh_punishment_evidence=refresh_punishment_observation,
+        punishment_evidence_is_current=punishment_observation_is_current,
         enforcement_is_current=lambda: cycle_is_current() and get_config_revision() == cycle_snapshot.local_revision,
     )
 
@@ -1085,10 +1120,13 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                             and candidate_warning.consecutive_violations
                             >= warning_system.effective_max_warnings(candidate_warning)
                             and refresh_user_evidence(user_name)
+                            and punishment_observation_is_current(user_name)
                             and all_users_device_counts.get(user_name, 0) > user_policies[user_name].limit
                         )
 
                     async def revalidate_punishment():
+                        if not await refresh_punishment_observation(user_name):
+                            return False
                         policy = await refresh_current_policy(user_name)
                         return (
                             policy is not None
@@ -1096,6 +1134,9 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                             and all_users_device_counts[user_name] > policy.limit
                         )
 
+                    if not await revalidate_punishment():
+                        protected_users.add(user_name)
+                        continue
                     with enforcement_guard(revalidate_punishment, punishment_is_current):
                         punishment_result = await safe_disable_user_with_punishment(
                             panel_data, UserType(name=user_name, ip=[])

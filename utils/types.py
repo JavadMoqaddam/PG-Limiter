@@ -51,6 +51,7 @@ class NodeType:
     status: str
     message: str | None = None
     core_config_id: int | None = None
+    core_version: str | None = None
 
 
 class UserStatus(Enum):

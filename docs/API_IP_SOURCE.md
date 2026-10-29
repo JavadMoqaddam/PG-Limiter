@@ -10,28 +10,44 @@ and the configured **Group Filter**. All Include group IDs are sent together;
 an empty Include filter selects nobody. Group Limits set limits, not the query
 scope. Exclusions, administrator filters and exceptions still apply.
 
-**Last seen** sets a positive whole number of seconds, T, shared by API and
-SSE/Logs through the existing `api_ip_freshness` setting and `API_IP_FRESHNESS`
-ENV default. Edit it in the same menu; the value is saved exactly, including values below 30 seconds. Each IP
-qualifies only when its original Xray timestamp satisfies:
+**Last seen** is a positive whole number of seconds, T, stored in the existing
+`api_ip_freshness` setting (defaulted by `API_IP_FRESHNESS`). It stays independent
+of the check interval. API requests and SSE events provide different evidence:
 
-```text
-0 <= evaluation time - source timestamp < T
-```
+- For Xray cores reporting version **26.4.13 or later**, an IP in the current
+  response represents an open tracked connection. Its timestamp records the
+  last connection opening, so an old timestamp does not exclude an open
+  connection. The original timestamp is retained for diagnostics.
+- Native WireGuard returns endpoint activity history, which can outlive a
+  connection. WireGuard and older/unknown Xray versions retain timestamp-age
+  filtering: an IP must be less than T seconds old at the start of **that
+  user's actual request**. Timestamps arising during the request are allowed;
+  timestamps beyond receipt time and invalid timestamps remain unknown.
+- SSE/Logs continues filtering original event timestamps at evaluation. Log
+  receipt, heartbeats and replay do not renew an event.
 
-At T=90, an observation 89 seconds old qualifies; observations 90 or 91 seconds
-old do not. Future timestamps and invalid timestamps are unknown evidence.
-Receipt time never replaces the source timestamp. Freshness is evaluated after
-collection and asynchronous preparation, and again locally before decisions
-when processing takes time. There is no additional panel request before a ban.
+API request times are recorded after acquiring a concurrency slot. A validated
+per-user result is frozen for that one collection cycle; waiting for other
+users, IP preparation or warning persistence cannot turn it into an empty
+observation. No earlier cycle's IPs are merged into it. Reports and warning
+counts describe each user's request, not a simultaneous fleet-wide snapshot.
 
-Xray updates this timestamp when a tracked connection opens. A long-lived
-transmitting connection can therefore have an old timestamp; this setting
-does not measure continuous bytes or establish an idle open connection. SSE
-heartbeats, receipt time and replayed records do not renew source freshness.
-API observations can differ from recent Logs evidence; choose T for the behavior of your deployment. The
-panel's online-user filter and Last seen apply to different data: the former
-selects users, while the latter accepts individual IP observations.
+Before a panel punishment, the request observation must still be younger than
+T. An older observation triggers a fresh lookup for **only that user**, followed
+by current node/group/core and user-membership checks. A changed scope, failed
+or incomplete response prevents punishment and preserves the warning. A fresh
+within-limit response also prevents the pending punishment. Repeated guards
+reuse a still-fresh observation; the final effect boundary checks age again.
+Age is bounded from request start using both wall and monotonic clocks, so a
+slow response does not get a new lifetime merely by arriving late.
+
+For example, with T=20, a connection present in a supported Xray response still
+counts when the rest of collection takes five minutes. It requires a new
+observation before punishment. For WireGuard/legacy timestamps, age 19 at request
+start qualifies and age 20 expires; later batch time does not change that result.
+These observations do not establish ongoing byte traffic or physical devices.
+The panel's `online=true` two-minute window only selects candidates; it does not
+replace either source's evidence checks.
 
 `CHECK_INTERVAL` controls collection frequency and warning timing independently of T. It does not
 add a 30-second allowance or widen the candidate query. `MAX_WARNING_COUNT`,
@@ -82,7 +98,7 @@ No separate per-user permission request is added. Observed membership or node-sc
 changes retire only the affected users. Failed topology/permission requests
 cannot become empty scopes; check `groups.read` and `cores.read` permissions.
 
-A valid empty map or only valid expired timestamps can clear warnings when all
+A valid empty map (or expired activity timestamps on WireGuard/legacy cores) can clear warnings when all
 of the user's required healthy-node maps are present. During a fleet outage or
 topology change, retained warning users absent from the candidate list are
 protected as well. A complete empty candidate list can clear warnings only when
@@ -119,8 +135,8 @@ and `consecutive_unsuccessful_cycles` as separate measures. A partial collection
 can still enforce known users and resets the unsuccessful-cycle streak.
 The existing three-skip coverage alert counter is separate from the two-cycle
 fallback counter. Missing-node protection
-and stale timestamp filtering are different checks. A slow fanout can age early
-responses beyond Last seen before evaluation. Elapsed time includes collector
+and activity-timestamp filtering are different checks. Slow fanout does not expire
+earlier per-user scan results; old observations are refreshed before punishment. Elapsed time includes collector
 work even when the cycle returns all-user-unknown; a skipped cycle is not an
 instantaneous collection.
 `fallback_applied` records a committed automatic source switch. After Logs is
@@ -144,7 +160,7 @@ A later background mirror-pagination failure is a separate operation and does
 not explain that API cycle's missing-node result.
 
 A collection with usable evidence resets the failure streak. Valid empty results, all-valid
-expired timestamps and confirmed deleted users count as success. Only the
+expired activity timestamps and confirmed deleted users count as success. Only the
 panel's explicit `{"detail": "User not found"}` response confirms deletion;
 a generic route or proxy HTTP 404 remains unknown evidence. Cancellation,
 degraded local configuration and superseded settings do not count as outages.

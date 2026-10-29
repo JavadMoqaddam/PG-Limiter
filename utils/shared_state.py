@@ -7,10 +7,11 @@ import asyncio
 import copy
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from utils.types import UserType
 from utils.log_observations import LOG_OBSERVATIONS, LogSampleEvidence
+from utils.api_observations import APIObservationWindow, APIUserContext
 
 # Global state of currently active connected users
 ACTIVE_USERS: dict[str, UserType] = {}
@@ -21,7 +22,7 @@ ACTIVE_USERS_LOCK = asyncio.Lock()
 
 @dataclass(frozen=True)
 class APISampleEvidence:
-    """The settings and unknown users belonging to one completed API collection."""
+    """Settings, per-request timing and user scopes of one API collection."""
 
     generation: int
     config_revision: int
@@ -31,6 +32,9 @@ class APISampleEvidence:
     # During fleet outages, absence from the online list cannot clear a warning.
     # Successfully evaluated users (including valid empty maps) remain actionable.
     known_users: frozenset[str] | None = None
+    observation_windows: dict[str, APIObservationWindow] = field(default_factory=dict)
+    user_contexts: dict[str, APIUserContext] = field(default_factory=dict)
+    live_node_ids: frozenset[int] = frozenset()
 
 
 class ActiveUsersSnapshot(dict[str, UserType]):
@@ -72,14 +76,21 @@ def api_evidence_is_current(evidence: APISampleEvidence) -> bool:
     return evidence.generation == _api_generation and evidence.config_revision == get_config_revision()
 
 
-def refresh_api_user(user: UserType, freshness_seconds: int) -> bool:
-    """Evaluate source timestamps locally, including after asynchronous preparation."""
-    evaluated_at = time.time()
+def refresh_api_user(user: UserType, freshness_seconds: int, *, evidence: APISampleEvidence | None = None) -> bool:
+    """Recount the same request-owned observation throughout its one API cycle."""
+    window = evidence.observation_windows.get(user.name) if evidence else None
+    if evidence is not None and (window is None or not window.clock_is_current()):
+        return False
+    evaluated_at = window.started_at if window else time.time()
+    latest_at = window.received_at if window else evaluated_at
+    live_nodes = evidence.live_node_ids if evidence else frozenset()
     connections = user.device_info.connections
-    if any(connection.last_seen > evaluated_at for connection in connections):
+    if any(connection.last_seen > latest_at for connection in connections):
         return False
     connections = [
-        connection for connection in connections if 0 <= evaluated_at - connection.last_seen < freshness_seconds
+        connection
+        for connection in connections
+        if connection.node_id in live_nodes or max(0, evaluated_at - connection.last_seen) < freshness_seconds
     ]
     user.device_info.connections = connections
     user.ip = sorted({connection.ip for connection in connections})

@@ -225,8 +225,13 @@ def _patch_collector(
 
     async def fake_fetch(_panel, targets, **_kwargs):
         default = {"ok": len(targets), "failed": 0, "not_found": 0, "forbidden": 0, "unauthorized": 0}
-        resolved = dict(payloads or {})
+        from utils.api_observations import APIObservationWindow, monotonic_time
+
+        resolved = api_mod.OnlineIPResults()
+        resolved.update(payloads or {})
         now = time.time()
+        mono = monotonic_time()
+        resolved.observations = {name: APIObservationWindow(now, now, mono, mono) for name in resolved}
         return resolved, dict(counters or default), {name: now for name in resolved}
 
     async def fake_notify(message: str):

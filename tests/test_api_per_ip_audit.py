@@ -266,10 +266,8 @@ async def test_per_ip_source_freshness_twenty_seconds_is_independent_of_interval
 
 
 @pytest.mark.parametrize("phase", ["admission", "snapshot", "report", "history"])
-async def test_per_ip_observations_expiring_during_preparation_clear_only_known_complete_users(
-    per_ip_cycle, monkeypatch, phase
-):
-    """A pre-await fresh sample cannot authorize a post-await stale warning."""
+async def test_per_ip_request_observations_survive_preparation(per_ip_cycle, monkeypatch, phase):
+    """Preparation time cannot turn a complete request into an empty sample."""
     import utils.check_usage as usage
     import utils.ip_source_api as api
 
@@ -308,7 +306,10 @@ async def test_per_ip_observations_expiring_during_preparation_clear_only_known_
         monkeypatch.setattr(usage.ip_history_tracker, "record_many", delayed)
 
     assert await cycle.run()
-    assert cycle.warning.warnings == {}
+    assert {name: warning.consecutive_violations for name, warning in cycle.warning.warnings.items()} == {
+        "alice": 2,
+        "bob": 2,
+    }
 
 
 @pytest.mark.parametrize("kind", ["http_failure", "missing_node", "null_node", "invalid_timestamp", "future"])
@@ -429,7 +430,7 @@ async def test_per_ip_expiry_at_final_enforcement_boundary_preserves_incident(pe
 
     async def prepared_punishment(_panel, user):
         await validate_enforcement()
-        cycle.clock[0] += 1
+        cycle.clock[0] += 20
         try:
             start_enforcement_effect()
         except EnforcementProtected:

@@ -57,7 +57,17 @@ async def publish_user(config, user, source, *, eligible=frozenset({0, 2}), unkn
         assert await save_config_value("ip_source", "api")
         await read_config()
         config.update(ip_source="api", _revision=get_config_revision())
-        evidence = APISampleEvidence(begin_api_collection(), get_config_revision(), 60, unknown, eligible)
+        from utils.api_observations import APIObservationWindow, monotonic_time
+
+        now, mono = time.time(), monotonic_time()
+        evidence = APISampleEvidence(
+            begin_api_collection(),
+            get_config_revision(),
+            60,
+            unknown,
+            eligible,
+            observation_windows={user.name: APIObservationWindow(now, now, mono, mono)},
+        )
         assert await publish_api_snapshot({"alice": user}, evidence)
     else:
         ACTIVE_USERS["alice"] = user

@@ -39,6 +39,7 @@ from utils.monitoring_gate import monitoring_is_current, monitoring_snapshot, sy
 from utils.types import ConnectionInfo, PanelType, UserType
 from utils.device_count import COUNT_MODE_NODE
 from utils.api_node_scope import load_node_scope
+from utils.api_observations import APIObservationWindow, APIUserContext, monotonic_time
 
 api_ip_logger = get_logger("ip_source_api")
 
@@ -77,6 +78,8 @@ LAST_CYCLE_STATS: dict = {
     "future_timestamp_users": 0,
     "unknown_scope_users": 0,
     "unavailable_nodes": 0,
+    "live_connection_nodes": 0,
+    "activity_timestamp_nodes": 0,
     "missing_node_ids": (),
     "skipped_reason": "",
     # Separate remote collection health from the bool returned to enforcement:
@@ -130,6 +133,8 @@ def format_api_evidence_summary(stats: dict) -> str:
         f"Users with incomplete evidence: <code>{count('unknown_users')}</code>\n"
         f"Users with unavailable or changed node scope: <code>{count('unknown_scope_users')}</code>\n"
         f"Unavailable monitored nodes: <code>{count('unavailable_nodes')}</code>\n"
+        f"Connected nodes by IP evidence: <code>{count('live_connection_nodes')}</code> live maps / "
+        f"<code>{count('activity_timestamp_nodes')}</code> activity timestamps\n"
         f"Users missing required node evidence: <code>{count('missing_node_users')}</code>\n"
         f"Nodes reporting across responses: {reporting}\n"
         f"Nodes absent across all responses: {absent}\n"
@@ -323,6 +328,7 @@ class OnlineIPResults(dict[str, dict[int, dict[str, int] | None]]):
     def __init__(self) -> None:
         super().__init__()
         self.not_found_users: set[str] = set()
+        self.observations: dict[str, APIObservationWindow] = {}
 
 
 async def _fetch_all_online_ips(
@@ -337,8 +343,8 @@ async def _fetch_all_online_ips(
     Returns:
         ``({username: {node_id: {ip: last_seen}}}, counters, {username: fetched_at})``
 
-    ``fetched_at`` is receipt time for diagnostics. Eligibility uses the source
-    timestamp at evaluation, including after the entire fan-out completes.
+    ``fetched_at`` is receipt time for diagnostics. Each payload also owns its
+    actual request window, captured after it acquires a concurrency slot.
     """
     from utils.panel_api.online_ips import (
         OUTCOME_FORBIDDEN,
@@ -361,10 +367,12 @@ async def _fetch_all_online_ips(
         async with semaphore:
             if not monitoring_is_current(admission):
                 return None
+            started_at, started_monotonic = time.time(), monotonic_time()
             payload, outcome = await fetch_user_online_ips(panel_data, user_id, timeout=timeout)
+            observed = APIObservationWindow(started_at, time.time(), started_monotonic, monotonic_time())
             if not monitoring_is_current(admission):
                 return None
-            return username, user_id, payload, outcome, time.time()
+            return username, user_id, payload, outcome, observed
 
     async def _run(batch: list[tuple[str, int]]) -> None:
         """Execute one pass and preserve the outcome of rejected API keys."""
@@ -378,15 +386,17 @@ async def _fetch_all_online_ips(
             if not isinstance(item, tuple):
                 counters["failed"] += 1
                 continue
-            username, user_id, payload, outcome, fetched_at = item
+            username, user_id, payload, outcome, observed = item
             if outcome == OUTCOME_OK:
                 counters["ok"] += 1
                 payloads[username] = payload if payload is not None else {}
-                fetch_times[username] = fetched_at
+                fetch_times[username] = observed.received_at
+                payloads.observations[username] = observed
             elif outcome == OUTCOME_NOT_FOUND:
                 counters["not_found"] += 1
                 payloads.not_found_users.add(username)
-                fetch_times[username] = fetched_at
+                fetch_times[username] = observed.received_at
+                payloads.observations[username] = observed
             elif outcome == OUTCOME_FORBIDDEN:
                 counters["forbidden"] += 1
             elif outcome == OUTCOME_UNAUTHORIZED:
@@ -420,12 +430,14 @@ async def _build_users_from_payloads(
     fetch_times: dict[str, float] | None = None,
     expected_node_ids: set[int] | None = None,
     required_nodes_by_user: dict[str, frozenset[int] | None] | None = None,
+    observation_windows: dict[str, APIObservationWindow] | None = None,
+    live_node_ids: frozenset[int] = frozenset(),
 ) -> tuple[dict[str, UserType], dict]:
-    """Build source-timestamp observations and retain each user's uncertainty.
+    """Build per-request observations, retaining source timestamps and uncertainty.
 
-    Receipt times are retained in the transport interface for diagnostics only.
-    Xray timestamps are evaluated after asynchronous IP admission, and again
-    after enforcement preparation; an old connection never gets a new timestamp.
+    Verified live maps establish connection presence independently of opening
+    time. Other producers use source age at request start. A later batch delay
+    cannot expire either observation; missing request timing stays unknown.
     """
     from utils.panel_api.online_ips import STALE_EPOCH_FLOOR
 
@@ -454,6 +466,12 @@ async def _build_users_from_payloads(
     }
     now = time.time()
     for username, node_map in payloads.items():
+        window = observation_windows.get(username) if observation_windows is not None else None
+        if observation_windows is not None and (window is None or not window.clock_is_current()):
+            unknown.add(username)
+            unknown_by_reason["unknown_age_users"].add(username)
+            continue
+        latest_at = window.received_at if window else now
         required = expected_node_ids
         if required_nodes_by_user is not None:
             required = required_nodes_by_user.get(username)
@@ -494,7 +512,7 @@ async def _build_users_from_payloads(
                     unknown_by_reason["unknown_age_users"].add(username)
                     stats["unknown_age_ips"] += 1
                     continue
-                if stamp > now:
+                if stamp > latest_at:
                     unknown.add(username)
                     unknown_by_reason["future_timestamp_users"].add(username)
                     stats["future_ips"] += 1
@@ -508,14 +526,17 @@ async def _build_users_from_payloads(
     users = ActiveUsersSnapshot()
     users.unknown_users = frozenset(unknown)
     for username, pairs in pairs_by_user.items():
+        window = observation_windows.get(username) if observation_windows is not None else None
+        reference_at = window.started_at if window else evaluated_at
+        latest_at = window.received_at if window else evaluated_at
         usable = []
         for node_id, ip, stamp in pairs:
-            age = evaluated_at - stamp
-            if age < 0:
+            age = max(0, reference_at - stamp)
+            if stamp > latest_at:
                 unknown.add(username)
                 unknown_by_reason["future_timestamp_users"].add(username)
                 stats["future_ips"] += 1
-            elif age >= freshness:
+            elif node_id not in live_node_ids and age >= freshness:
                 stats["stale_ips"] += 1
             elif ip in accepted:
                 usable.append((node_id, ip, stamp))
@@ -566,6 +587,71 @@ def _resolve_online_window(_config_data: dict) -> int:
 def _resolve_freshness_window(config_data: dict) -> int:
     """Read exact normalized seconds; only read_config migrates legacy Auto."""
     return normalize_api_ip_freshness(config_data.get("api_ip_freshness"))
+
+
+async def recheck_api_user(
+    panel_data: PanelType, username: str, config_data: dict, evidence: APISampleEvidence
+) -> tuple[UserType, APIObservationWindow] | None:
+    """Re-observe only a pending punishment whose original request is too old.
+
+    Metadata must still describe the same user and required scope. Failure or
+    an incomplete response cannot authorize a mutation or erase the incident.
+    """
+    from utils.panel_api.users import get_user_details
+
+    context = evidence.user_contexts.get(username)
+    admission = monitoring_snapshot()
+    if context is None or not api_evidence_is_current(evidence) or not monitoring_is_current(admission):
+        return None
+    try:
+        raw_context = {"id": context.user_id, "username": username, "group_ids": list(context.group_ids)}
+        api_ip_logger.info("API IP observation expired before punishment; refreshing user %s", username)
+        payloads, _counts, _times = await _fetch_all_online_ips(
+            panel_data, [(username, context.user_id, raw_context)], 1, float(config_data.get("api_ip_timeout") or 8)
+        )
+        if username not in payloads:
+            return None
+        window = payloads.observations[username]
+        users, _stats = await _build_users_from_payloads(
+            payloads,
+            {username: raw_context},
+            {},
+            set(),
+            config_data,
+            required_nodes_by_user={username: context.required_nodes},
+            observation_windows=payloads.observations,
+            live_node_ids=context.live_nodes,
+        )
+        if username in users.unknown_users:
+            return None
+        # Confirmation follows the new IP request and async IP validation, as in
+        # the main collector. A changed scope cannot authorize the old incident.
+        names, _disabled, monitored = await _resolve_node_context(panel_data, config_data)
+        scope = await load_node_scope(panel_data, monitored)
+        raw = await get_user_details(panel_data, username)
+        if (
+            not isinstance(raw, dict)
+            or type(raw.get("id")) is not int
+            or raw.get("id") != context.user_id
+            or raw.get("username") != username
+            or raw.get("status") != "active"
+            or scope.required_nodes(raw) != context.required_nodes
+            or frozenset(raw["group_ids"]) != context.group_ids
+            or (scope.live_nodes & context.required_nodes) != context.live_nodes
+        ):
+            return None
+        if (
+            not window.is_fresh(evidence.freshness_seconds)
+            or not api_evidence_is_current(evidence)
+            or not monitoring_is_current(admission)
+        ):
+            return None
+        user = users.get(username, UserType(name=username, ip=[]))
+        for connection in user.device_info.connections:
+            connection.node_name = names.get(connection.node_id, connection.node_name)
+        return user, window
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return None
 
 
 def _reset_cycle_stats() -> None:
@@ -779,6 +865,8 @@ async def _collect_api_cycle(
         LAST_CYCLE_STATS["skipped_reason"] = "node topology unavailable"
         return _CollectionResult("failure", False, "node topology unavailable", evidence)
     LAST_CYCLE_STATS["unavailable_nodes"] = len(node_scope.monitored_nodes - node_scope.available_nodes)
+    LAST_CYCLE_STATS["live_connection_nodes"] = len(node_scope.available_nodes & node_scope.live_nodes)
+    LAST_CYCLE_STATS["activity_timestamp_nodes"] = len(node_scope.available_nodes - node_scope.live_nodes)
     LAST_CYCLE_STATS["nodes_expected"] = len(expected_node_ids)
     evidence = replace(evidence, eligible_node_ids=node_scope.available_nodes)
 
@@ -906,6 +994,8 @@ async def _collect_api_cycle(
         fetch_times=fetch_times,
         expected_node_ids=expected_node_ids,
         required_nodes_by_user=required_by_name,
+        observation_windows=payloads.observations,
+        live_node_ids=node_scope.live_nodes,
     )
     # Confirm shared topology and paged memberships after the fan-out. No
     # per-user permission requests are added, and only affected users are retired.
@@ -939,7 +1029,11 @@ async def _collect_api_cycle(
             and frozenset(raw["group_ids"]) == frozenset(current["group_ids"])
         )
         required_by_name[name] = (
-            required if same_membership and required == final_scope.required_nodes(current) else None
+            required
+            if same_membership
+            and required == final_scope.required_nodes(current)
+            and (required & node_scope.live_nodes) == (required & final_scope.live_nodes)
+            else None
         )
     evidence = replace(evidence, eligible_node_ids=node_scope.available_nodes & final_scope.available_nodes)
     LAST_CYCLE_STATS["unavailable_nodes"] = len(final_scope.monitored_nodes - final_scope.available_nodes)
@@ -996,6 +1090,18 @@ async def _collect_api_cycle(
         evidence,
         unknown_users=frozenset(unknown_users),
         known_users=None if absence_complete else frozenset(set(raw_by_name) - unknown_users),
+        observation_windows=dict(payloads.observations),
+        live_node_ids=node_scope.live_nodes,
+        user_contexts={
+            name: APIUserContext(
+                raw["id"],
+                frozenset(raw["group_ids"]),
+                required_by_name[name],
+                required_by_name[name] & node_scope.live_nodes,
+            )
+            for name, raw in raw_by_name.items()
+            if name not in unknown_users and required_by_name.get(name) is not None
+        },
     )
     if not await publish_api_snapshot(new_users, evidence):
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
@@ -1018,6 +1124,8 @@ async def _collect_api_cycle(
         f"(candidates {len(candidates)} → targets {len(targets)}, "
         f"user coverage {coverage:.1%}, node coverage {node_coverage:.1%} "
         f"({build_stats['nodes_seen']}/{nodes_expected}), "
+        f"{LAST_CYCLE_STATS['live_connection_nodes']} live-map / "
+        f"{LAST_CYCLE_STATS['activity_timestamp_nodes']} activity-timestamp nodes, "
         f"{build_stats['stale_ips']} stale IPs dropped, "
         f"{LAST_CYCLE_STATS['duration_ms']}ms)"
     )

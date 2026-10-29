@@ -127,6 +127,7 @@ async def get_nodes(
                 status=node["status"],
                 message=node.get("message", ""),
                 core_config_id=node.get("core_config_id", -1),
+                core_version=node.get("core_version") or node.get("xray_version"),
             )
         )
 

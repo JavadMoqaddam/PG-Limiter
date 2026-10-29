@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from ipaddress import ip_interface
 
 from utils.types import PanelType
+from utils.api_observations import xray_has_live_ip_map
 
 
 def _ids(value) -> frozenset[int]:
@@ -93,6 +94,7 @@ class APINodeScope:
     group_tags: dict[int, frozenset[str]]
     node_tags: dict[int, frozenset[str]]
     available_nodes: frozenset[int]
+    live_nodes: frozenset[int] = frozenset()
     _combinations: dict[frozenset[int], frozenset[int]] = field(default_factory=dict, compare=False, repr=False)
 
     @property
@@ -139,6 +141,7 @@ def build_node_scope(nodes, groups: list[dict], cores: list[dict], monitored: se
     core_tags = {}
     node_tags = {}
     available = set()
+    live = set()
     for node in nodes:
         if type(node.node_id) is not int or node.node_id in node_tags:
             raise ValueError("Malformed node topology")
@@ -156,11 +159,15 @@ def build_node_scope(nodes, groups: list[dict], cores: list[dict], monitored: se
         if cid not in core_tags:
             core_tags[cid] = _core_tags(core_rows[cid])
         node_tags[node.node_id] = core_tags[cid]
+        if (core_rows[cid].get("type") or "xray") == "xray" and xray_has_live_ip_map(
+            getattr(node, "core_version", None)
+        ):
+            live.add(node.node_id)
         if node.status == "connected":
             available.add(node.node_id)
     if set(node_tags) != monitored:
         raise ValueError("Monitored node topology is incomplete")
-    return APINodeScope(group_tags, node_tags, frozenset(available))
+    return APINodeScope(group_tags, node_tags, frozenset(available), frozenset(live))
 
 
 async def load_node_scope(panel: PanelType, monitored: set[int]) -> APINodeScope:

@@ -67,6 +67,10 @@ async def api_cycle(tmp_path, monkeypatch, operational_topics):
     }
 
     async def get(_panel, path, **kwargs):
+        if path.startswith("/api/user/"):
+            name = path.removeprefix("/api/user/")
+            body = {"id": list(bodies).index(name) + 1, "username": name, "group_ids": [1], "status": "active"}
+            return SimpleNamespace(status_code=200, json=lambda: body)
         if path == "/api/groups":
             body = {"groups": [{"id": 1, "name": "test", "inbound_tags": ["test"], "is_disabled": False}], "total": 1}
             return SimpleNamespace(status_code=200, json=lambda: body)
@@ -197,7 +201,7 @@ async def test_setting_change_during_collection_discards_batch(api_cycle, monkey
     assert api_cycle.warning.warnings == {}
 
 
-async def test_freshness_is_rechecked_after_async_preparation(api_cycle, monkeypatch):
+async def test_request_snapshot_survives_async_preparation(api_cycle, monkeypatch):
     import utils.check_usage as usage
 
     await api_cycle.run()
@@ -213,7 +217,7 @@ async def test_freshness_is_rechecked_after_async_preparation(api_cycle, monkeyp
 
     monkeypatch.setattr(usage, "read_config_snapshot", delayed_metadata)
     assert await api_cycle.run()
-    assert api_cycle.warning.warnings == {}
+    assert set(api_cycle.warning.warnings) == {"alice", "bob"}
 
 
 async def test_config_change_during_preparation_keeps_counters(api_cycle, monkeypatch):
@@ -250,7 +254,7 @@ async def test_late_log_updates_cannot_contaminate_api_enforcement(api_cycle):
     assert api_cycle.warning.warnings == {}
 
 
-async def test_slow_warning_persistence_does_not_warn_later_users_on_expired_ips(api_cycle, monkeypatch):
+async def test_slow_warning_persistence_keeps_later_users_request_snapshot(api_cycle, monkeypatch):
     import utils.warning_system.enhanced_system as warnings
 
     await api_cycle.run()
@@ -264,7 +268,7 @@ async def test_slow_warning_persistence_does_not_warn_later_users_on_expired_ips
 
     monkeypatch.setattr(warnings, "atomic_write_json", delayed_write)
     assert await api_cycle.run()
-    assert "bob" not in api_cycle.warning.warnings
+    assert api_cycle.warning.warnings["bob"].consecutive_violations == 2
 
 
 async def test_missing_node_list_skips_enforcement(api_cycle, monkeypatch):
