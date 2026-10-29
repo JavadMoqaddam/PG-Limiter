@@ -40,7 +40,7 @@ resource and action as `resource.action`.
 | Limiter operation | Required panel permission |
 | --- | --- |
 | List and refresh the node fleet | `nodes.read` |
-| Collect online IPs through the panel API | `nodes.stats` |
+| Collect online IPs through the panel API and resolve per-user node scope | `nodes.stats`, `groups.read`, `cores.read` |
 | Stream node logs through SSE, including automatic fallback | `nodes.logs` |
 | Synchronize users and check current user facts | `users.read` |
 | Disable/re-enable users or change their groups/proxy settings | `users.update` |

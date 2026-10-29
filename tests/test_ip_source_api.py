@@ -45,6 +45,12 @@ async def test_candidate_http_query_uses_online_flag(monkeypatch, panel, api_con
 
     monkeypatch.setattr(requests, "panel_get", get)
     monkeypatch.setattr(api, "_resolve_node_context", nodes)
+    from unittest.mock import AsyncMock
+    from utils.api_node_scope import APINodeScope
+
+    monkeypatch.setattr(
+        api, "load_node_scope", AsyncMock(return_value=APINodeScope({}, {1: frozenset()}, frozenset({1})))
+    )
     api_config.update(check_interval=interval, group_filter={"enabled": True, "mode": "include", "group_ids": [7, 9]})
     assert await api.collect_active_users_from_api(panel, api_config)
     assert seen == [{"offset": 0, "limit": 500, "status": "active", "group": [7, 9], "online": "true"}]
@@ -193,11 +199,15 @@ def _patch_collector(
     import utils.ip_source_api as api_mod
     import utils.panel_api.online_ips as online_ips_mod
     import utils.panel_api.request_helper as request_helper_mod
+    from utils.api_node_scope import APINodeScope
+    import copy
 
     notifications: list[str] = []
 
     async def fake_candidates(*_args, **_kwargs):
-        return candidates
+        if candidates is None:
+            return None
+        return [{"group_ids": [1], **copy.deepcopy(row)} for row in candidates]
 
     async def fake_node_context(*_args, **_kwargs):
         names = dict(node_name_map or {})
@@ -209,6 +219,9 @@ def _patch_collector(
         # some nodes have gone quiet.
         expected = set(expected_node_ids) if expected_node_ids is not None else set(names) - disabled
         return names, disabled, expected
+
+    async def fake_scope(_panel, monitored):
+        return APINodeScope({1: frozenset({"test"})}, {n: frozenset({"test"}) for n in monitored}, frozenset(monitored))
 
     async def fake_fetch(_panel, targets, **_kwargs):
         default = {"ok": len(targets), "failed": 0, "not_found": 0, "forbidden": 0, "unauthorized": 0}
@@ -222,6 +235,7 @@ def _patch_collector(
     monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", fake_candidates)
     monkeypatch.setattr(request_helper_mod, "is_panel_available", lambda: panel_available)
     monkeypatch.setattr(api_mod, "_resolve_node_context", fake_node_context)
+    monkeypatch.setattr(api_mod, "load_node_scope", fake_scope)
     monkeypatch.setattr(api_mod, "_fetch_all_online_ips", fake_fetch)
     monkeypatch.setattr(api_mod, "_notify", fake_notify)
     return notifications
@@ -277,8 +291,8 @@ async def test_missing_node_fallback_reports_transport_and_user_evidence_separat
     assert api.get_last_cycle_stats()["consecutive_unsuccessful_cycles"] == 2
 
 
-async def test_fallback_records_that_a_partial_sample_was_not_enforced(monkeypatch, panel, api_config):
-    """Fallback discards even a partially usable sample before enforcement."""
+async def test_usable_partial_samples_do_not_trigger_global_fallback(monkeypatch, panel, api_config):
+    """Unknown users must not interrupt other users' complete observations."""
     from unittest.mock import AsyncMock
 
     import utils.ip_source_api as api
@@ -297,8 +311,9 @@ async def test_fallback_records_that_a_partial_sample_was_not_enforced(monkeypat
     monkeypatch.setattr(config, "save_config_value", AsyncMock(return_value=True))
 
     assert await api.collect_active_users_from_api(panel, api_config) is True
-    assert await api.collect_active_users_from_api(panel, api_config) is False
-    assert api.get_last_cycle_stats()["fallback_applied"] is True
+    assert await api.collect_active_users_from_api(panel, api_config) is True
+    assert api.get_last_cycle_stats()["fallback_applied"] is False
+    assert api.get_last_cycle_stats()["consecutive_unsuccessful_cycles"] == 0
 
 
 async def test_permission_denied_fallback_reports_forbidden_lookups(monkeypatch, panel, api_config):
@@ -596,6 +611,7 @@ class TestBuildUsersFromPayloads:
             "stale_ips": 0,
             "future_ips": 0,
             "unknown_age_ips": 0,
+            "unknown_scope_users": 0,
             "missing_node_users": 0,
             "null_node_users": 0,
             "unknown_age_users": 0,

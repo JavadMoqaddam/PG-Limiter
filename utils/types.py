@@ -50,6 +50,7 @@ class NodeType:
     node_ip: str
     status: str
     message: str | None = None
+    core_config_id: int | None = None
 
 
 class UserStatus(Enum):

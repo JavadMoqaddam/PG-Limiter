@@ -1,7 +1,7 @@
 # Panel API IP source
 
 Select **Settings → IP Source → Panel API** in Telegram. Configure `PANEL_API_KEY`
-with `nodes.stats`, `nodes.read` and `users.read` permissions, covering the users
+with `nodes.stats`, `nodes.read`, `users.read`, `groups.read` and `cores.read` permissions, covering the users
 you intend to monitor. Requests send `X-Api-Key`; username/password panel login
 is unsupported. Grant `nodes.logs` as well if using automatic fallback to Logs.
 See [Panel API-key authentication](PANEL_API_KEY.md) for setup, scopes and the
@@ -55,20 +55,41 @@ or normalization decision is made, and existing warning counters remain.
 Node-ID aliases that normalize to the same ID, such as `1` and `01`, or IP keys
 that become identical after trimming whitespace make the whole user's payload
 malformed. They cannot overwrite conflicting evidence and clear a warning.
-Successfully observed users can still be evaluated when the configured global
-coverage gates allow the cycle. An 80% answer rate never makes the remaining
+Users with complete evidence are evaluated when the HTTP answer-rate gate allows
+the cycle. An incomplete user is skipped entirely, including when the visible
+IPs already exceed their limit. Their warning counter, Trust and history remain. An 80% answer rate never makes the remaining
 20% known.
 
-A valid empty IP map and a map containing only valid expired timestamps are
-successful observations and can clear warnings. Failure to obtain a complete
-candidate list or the node list skips enforcement. Every relevant panel-enabled
-node must be connected after excluding the limiter's explicit disabled nodes.
-An enabled `error` or `connecting` node makes the whole cycle unavailable, even
-when the online candidate list is empty: the panel omits unhealthy nodes from
-its IP response, so their absence cannot establish that users disconnected.
-This preserves warnings for users omitted from the online query as well as its
-candidates. Existing expected-connected-node checks still protect individual
-users when an otherwise healthy node response is missing.
+Required nodes are resolved for each user from their enabled PasarGuard groups,
+those groups' inbound tags, and the effective core configuration of each included
+node. Include is the limiter's global monitoring selection; it does not grant
+every user access to every included node. Multiple groups contribute the union
+of their nodes. Node names such as `pm-` and the keys returned by the IP endpoint
+are not used to infer authorization.
+
+Only connected nodes in that user's applicable scope require a response.
+An `error`/`connecting` node does not stop users being checked on healthy nodes,
+including users in the same group. This counts the healthy monitored scope;
+it does not prove that the excluded node has no live client connections.
+Missing/null data from an expected healthy node still protects that user. If
+none of a user's applicable nodes are healthy, their evidence remains unknown.
+
+Group memberships arrive with the existing online-user list. Group/core metadata
+is shared across users, and each group combination shares its node calculation.
+Nodes, groups and cores are read before collection and confirmed after IP
+preparation; the paged online-user list is read again to confirm memberships.
+No separate per-user permission request is added. Observed membership or node-scope
+changes retire only the affected users. Failed topology/permission requests
+cannot become empty scopes; check `groups.read` and `cores.read` permissions.
+
+A valid empty map or only valid expired timestamps can clear warnings when all
+of the user's required healthy-node maps are present. During a fleet outage or
+topology change, retained warning users absent from the candidate list are
+protected as well. A complete empty candidate list can clear warnings only when
+the monitored fleet/topology remains available and unchanged through the query.
+Failure to obtain the candidate list, fleet or required topology skips the cycle.
+Fleet node-coverage percentages are diagnostic; the legacy
+`api_ip_min_node_coverage` value no longer vetoes complete per-user evidence.
 
 API batches are never merged with earlier cycles or Logs, and a settings change
 invalidates an in-flight batch without resetting warnings. **Last API Cycle** shows whether the sample
@@ -78,6 +99,7 @@ was complete, partially usable, or skipped.
 
 Successful requests describe HTTP transport, not complete user evidence. **Users
 missing required node evidence** counts users whose expected node keys are absent.
+Expected nodes are the union of the per-user required sets evaluated in the batch.
 **Nodes reporting across responses** counts expected node IDs with valid maps
 present anywhere in the batch; **Nodes absent across all responses** is expected
 nodes minus that union. Unexpected node IDs cannot compensate for a missing
@@ -94,7 +116,7 @@ user has missing node evidence.
 
 The report retains unknown users, stale observations, elapsed collection time
 and `consecutive_unsuccessful_cycles` as separate measures. A partial collection
-can still enforce known users, so unsuccessful and skipped are not synonyms.
+can still enforce known users and resets the unsuccessful-cycle streak.
 The existing three-skip coverage alert counter is separate from the two-cycle
 fallback counter. Missing-node protection
 and stale timestamp filtering are different checks. A slow fanout can age early
@@ -109,10 +131,10 @@ or discarded fallback samples are not reported as available for enforcement.
 
 With `api_ip_auto_fallback` enabled (the default), two consecutive unsuccessful
 API collection cycles switch the source to Logs. Each cycle counts once,
-regardless of the number of failed user requests. Both failed and partial
-collections count, including unreachable panels, incomplete candidate or node
-queries, malformed responses and missing user evidence. Known users may still
-be evaluated on the first partial cycle when the coverage gates allow it.
+regardless of the number of failed user requests. Only cycles that cannot supply
+an enforceable sample count: unreachable panels, incomplete candidate/topology
+queries, insufficient HTTP coverage or all-user-unknown evidence. A usable partial
+cycle continues evaluating complete users and does not trigger global fallback.
 
 All requests can return HTTP 200 while missing per-user node maps make every
 user unknown. The checked panel producer can omit failed, None or user-not-found
@@ -121,7 +143,7 @@ unsuccessful collections can trigger fallback despite successful HTTP transport.
 A later background mirror-pagination failure is a separate operation and does
 not explain that API cycle's missing-node result.
 
-A complete collection resets the failure streak. Valid empty results, all-valid
+A collection with usable evidence resets the failure streak. Valid empty results, all-valid
 expired timestamps and confirmed deleted users count as success. Only the
 panel's explicit `{"detail": "User not found"}` response confirms deletion;
 a generic route or proxy HTTP 404 remains unknown evidence. Cancellation,

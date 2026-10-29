@@ -33,8 +33,8 @@ async def per_ip_cycle(api_cycle, monkeypatch):
     monkeypatch.setattr(nodes, "_nodes_cache", dict(nodes=None, expires_at=0, panel_domain=None, enabled_only=None))
     monkeypatch.setattr(nodes, "get_nodes", real_get_nodes)
     cycle.fleet = [
-        {"id": 1, "name": "direct-1", "address": "8.9.10.11", "status": "connected"},
-        {"id": 2, "name": "direct-2", "address": "8.9.10.12", "status": "connected"},
+        {"id": 1, "name": "direct-1", "address": "8.9.10.11", "status": "connected", "core_config_id": 1},
+        {"id": 2, "name": "direct-2", "address": "8.9.10.12", "status": "connected", "core_config_id": 1},
     ]
 
     async def nodes_get(_panel, path):

@@ -62,19 +62,46 @@ async def source_runtime(monkeypatch, tmp_path, operational_topics):
     )
     monkeypatch.setattr(requests, "is_panel_available", lambda: runtime.mode != "unavailable")
 
-    async def get_nodes(_panel):
+    async def get_nodes(_panel, **kwargs):
         if runtime.mode == "node_failure":
             return None
-        fleet = [SimpleNamespace(node_id=1, node_name="node", node_ip="192.0.2.1", status="connected")]
+        fleet = [
+            SimpleNamespace(node_id=1, node_name="node", node_ip="192.0.2.1", status="connected", core_config_id=1)
+        ]
         if runtime.node_status is not None:
-            fleet.append(SimpleNamespace(node_id=2, node_name="other", node_ip="192.0.2.2", status=runtime.node_status))
+            fleet.append(
+                SimpleNamespace(
+                    node_id=2, node_name="other", node_ip="192.0.2.2", status=runtime.node_status, core_config_id=1
+                )
+            )
         return fleet
 
     async def panel_get(_panel, path, **kwargs):
+        if path == "/api/groups":
+            body = {"groups": [{"id": 1, "name": "test", "inbound_tags": ["test"], "is_disabled": False}], "total": 1}
+            return SimpleNamespace(status_code=200, json=lambda: body)
+        if path == "/api/cores":
+            body = {
+                "cores": [
+                    {
+                        "id": 1,
+                        "type": "xray",
+                        "config": {"inbounds": [{"tag": "test", "protocol": "vless"}]},
+                        "exclude_inbound_tags": [],
+                        "fallbacks_inbound_tags": [],
+                    }
+                ],
+                "count": 1,
+            }
+            return SimpleNamespace(status_code=200, json=lambda: body)
         assert path == "/api/users"
         if runtime.mode == "candidate_failure":
             return None
-        users = [] if runtime.mode == "no_candidates" else [{"id": i, "username": f"u{i}"} for i in range(1, 5)]
+        users = (
+            []
+            if runtime.mode == "no_candidates"
+            else [{"id": i, "username": f"u{i}", "group_ids": [1]} for i in range(1, 5)]
+        )
         return SimpleNamespace(status_code=200, json=lambda: {"users": users, "total": len(users)})
 
     async def panel_request(_panel, method, path, **kwargs):
@@ -133,14 +160,13 @@ async def source_runtime(monkeypatch, tmp_path, operational_topics):
         "node_failure",
         "invalid_response",
         "missing_node",
-        "partial",
         "route_not_found",
     ],
 )
 async def test_second_unsuccessful_cycle_commits_logs(source_runtime, failure):
     r = source_runtime
     first = await r.collect(failure)
-    assert first is (failure == "partial")
+    assert first is False
     assert (await r.config.read_config())["ip_source"] == "api"
     assert r.notifications == []
     assert await r.collect(failure) is False
@@ -152,7 +178,7 @@ async def test_second_unsuccessful_cycle_commits_logs(source_runtime, failure):
     assert await r.state.pop_active_users_snapshot() == {}
 
 
-@pytest.mark.parametrize("success", ["success", "valid_empty", "all_expired", "no_candidates", "not_found"])
+@pytest.mark.parametrize("success", ["success", "partial", "valid_empty", "all_expired", "no_candidates", "not_found"])
 async def test_valid_success_breaks_failure_streak(source_runtime, success):
     r = source_runtime
     await r.collect("failure")
@@ -166,36 +192,34 @@ async def test_valid_success_breaks_failure_streak(source_runtime, success):
 
 @pytest.mark.parametrize("status", ["error", "connecting"])
 @pytest.mark.parametrize("sample", ["valid_empty", "success", "no_candidates"])
-async def test_two_completed_unavailable_fleet_cycles_commit_fallback(source_runtime, status, sample):
+async def test_unavailable_node_does_not_trigger_fallback_for_healthy_scope(source_runtime, status, sample):
     r = source_runtime
     r.node_status = status
-    assert await r.collect(sample) is False
-    assert r.state.ACTIVE_USERS == {}
-    assert await r.state.pop_api_users_snapshot() is None
+    for _ in range(3):
+        assert await r.collect(sample) is True
+        snapshot = await r.state.pop_api_users_snapshot()
+        assert snapshot is not None
+        assert snapshot.api_evidence.eligible_node_ids == {1}
+        assert snapshot.api_evidence.known_users == (set() if sample == "no_candidates" else {"u1", "u2", "u3", "u4"})
+        assert r.api.get_last_cycle_stats()["consecutive_unsuccessful_cycles"] == 0
     assert (await r.config.read_config())["ip_source"] == "api"
     assert r.notifications == []
-    assert await r.collect(sample) is False
-    assert (await r.config.read_config())["ip_source"] == "logs"
-    assert len(r.notifications) == 1
-    assert "reverted to Logs" in r.notifications[0]
-    assert r.state.ACTIVE_USERS == {}
-    assert await r.state.pop_api_users_snapshot() is None
 
 
 @pytest.mark.parametrize("status", ["error", "connecting"])
 @pytest.mark.parametrize("success", ["valid_empty", "no_candidates", "all_expired", "not_found"])
-async def test_healthy_fleet_success_resets_unavailable_cycle_streak(source_runtime, status, success):
+async def test_usable_scope_resets_transport_failure_streak(source_runtime, status, success):
     r = source_runtime
     r.node_status = status
-    assert await r.collect("valid_empty") is False
+    assert await r.collect("failure") is False
     r.node_status = "connected"
     assert await r.collect(success) is True
     assert r.api.get_last_cycle_stats()["collection_outcome"] == "success"
     r.node_status = status
-    assert await r.collect("valid_empty") is False
+    assert await r.collect("failure") is False
     assert (await r.config.read_config())["ip_source"] == "api"
     assert r.notifications == []
-    assert await r.collect("valid_empty") is False
+    assert await r.collect("failure") is False
     assert (await r.config.read_config())["ip_source"] == "logs"
     assert len(r.notifications) == 1
 
@@ -275,13 +299,13 @@ async def test_failed_fallback_write_retries_after_its_own_invalidation(source_r
         return await original(session, key, value, **kwargs)
 
     monkeypatch.setattr(r.config.ConfigCRUD, "set", write)
-    await r.collect("partial")
-    assert await r.collect("partial") is True
+    await r.collect("failure")
+    assert await r.collect("failure") is False
     assert attempts == 1
     assert (await r.config.read_config())["ip_source"] == "api"
-    assert set(r.state.ACTIVE_USERS) == {"u1", "u2", "u3"}
+    assert r.state.ACTIVE_USERS == {}
     assert r.notifications == []
-    assert await r.collect("partial") is False
+    assert await r.collect("failure") is False
     assert attempts == 2
     assert (await r.config.read_config())["ip_source"] == "logs"
 
@@ -299,8 +323,8 @@ async def test_notification_failure_cannot_undo_or_repeat_committed_switch(sourc
         raise RuntimeError("Telegram unavailable")
 
     monkeypatch.setattr(messages, "send_logs", fail)
-    await r.collect("partial")
-    assert await r.collect("partial") is False
+    await r.collect("failure")
+    assert await r.collect("failure") is False
     assert (await r.config.read_config())["ip_source"] == "logs"
     assert await r.collect("failure") is False
     assert len(notifications) == 1
@@ -522,8 +546,8 @@ async def test_source_changes_preserve_warning_history(source_runtime, monkeypat
     before = deepcopy(warning)
     await r.collect("success")
     if transition == "fallback":
-        await r.collect("partial")
-        await r.collect("partial")
+        await r.collect("failure")
+        await r.collect("failure")
     elif transition == "delete":
         await r.config.delete_config_value("ip_source")
     else:

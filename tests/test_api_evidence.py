@@ -67,10 +67,30 @@ async def api_cycle(tmp_path, monkeypatch, operational_topics):
     }
 
     async def get(_panel, path, **kwargs):
+        if path == "/api/groups":
+            body = {"groups": [{"id": 1, "name": "test", "inbound_tags": ["test"], "is_disabled": False}], "total": 1}
+            return SimpleNamespace(status_code=200, json=lambda: body)
+        if path == "/api/cores":
+            body = {
+                "cores": [
+                    {
+                        "id": 1,
+                        "type": "xray",
+                        "config": {"inbounds": [{"tag": "test", "protocol": "vless"}]},
+                        "exclude_inbound_tags": [],
+                        "fallbacks_inbound_tags": [],
+                    }
+                ],
+                "count": 1,
+            }
+            return SimpleNamespace(status_code=200, json=lambda: body)
         assert path == "/api/users"
         return SimpleNamespace(
             status_code=200,
-            json=lambda: {"users": [{"id": i, "username": n} for i, n in enumerate(bodies, 1)], "total": len(bodies)},
+            json=lambda: {
+                "users": [{"id": i, "username": n, "group_ids": [1]} for i, n in enumerate(bodies, 1)],
+                "total": len(bodies),
+            },
         )
 
     async def request(_panel, _method, path, **kwargs):
@@ -257,7 +277,9 @@ async def test_missing_node_list_skips_enforcement(api_cycle, monkeypatch):
 
 @pytest.mark.parametrize("status", ["error", "connecting"])
 @pytest.mark.parametrize("sample", ["empty_ips", "nonempty_ips", "no_candidates", "omitted_warning_user"])
-async def test_unavailable_enabled_node_preserves_entire_warning_cycle(api_cycle, monkeypatch, status, sample):
+async def test_unavailable_node_preserves_absent_warnings_but_allows_healthy_scope(
+    api_cycle, monkeypatch, status, sample
+):
     import utils.ip_source_api as api
     import utils.panel_api.nodes as nodes
     from utils.types import NodeType
@@ -284,12 +306,14 @@ async def test_unavailable_enabled_node_preserves_entire_warning_cycle(api_cycle
     elif sample == "omitted_warning_user":
         api_cycle.bodies.pop("alice")
 
-    ready = await api_cycle.run()
-    assert api_cycle.warning.warnings == warnings
-    assert {name: record.consecutive_violations for name, record in warnings.items()} == before
-    assert ready is False
-    assert api.get_last_cycle_stats()["collection_outcome"] == "failure"
-    assert api.get_last_cycle_stats()["skipped_reason"] == "node availability unknown"
+    assert await api_cycle.run() is True
+    if sample == "empty_ips":
+        assert api_cycle.warning.warnings == {}
+    else:
+        assert api_cycle.warning.warnings == warnings
+        expected = {name: count + int(name in api_cycle.bodies) for name, count in before.items()}
+        assert {name: record.consecutive_violations for name, record in warnings.items()} == expected
+    assert api.get_last_cycle_stats()["consecutive_unsuccessful_cycles"] == 0
 
 
 @pytest.mark.parametrize("status", ["error", "connecting"])

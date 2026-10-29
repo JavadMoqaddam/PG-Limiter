@@ -28,6 +28,9 @@ class APISampleEvidence:
     freshness_seconds: int
     unknown_users: frozenset[str] = frozenset()
     eligible_node_ids: frozenset[int] | None = None
+    # During fleet outages, absence from the online list cannot clear a warning.
+    # Successfully evaluated users (including valid empty maps) remain actionable.
+    known_users: frozenset[str] | None = None
 
 
 class ActiveUsersSnapshot(dict[str, UserType]):

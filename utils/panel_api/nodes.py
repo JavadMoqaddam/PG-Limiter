@@ -126,6 +126,7 @@ async def get_nodes(
                 node_ip=node["address"],
                 status=node["status"],
                 message=node.get("message", ""),
+                core_config_id=node.get("core_config_id", -1),
             )
         )
 

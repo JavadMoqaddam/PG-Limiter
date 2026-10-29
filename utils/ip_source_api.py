@@ -38,6 +38,7 @@ from utils.shared_state import (
 from utils.monitoring_gate import monitoring_is_current, monitoring_snapshot, synchronize_monitoring
 from utils.types import ConnectionInfo, PanelType, UserType
 from utils.device_count import COUNT_MODE_NODE
+from utils.api_node_scope import load_node_scope
 
 api_ip_logger = get_logger("ip_source_api")
 
@@ -74,6 +75,8 @@ LAST_CYCLE_STATS: dict = {
     "null_node_users": 0,
     "unknown_age_users": 0,
     "future_timestamp_users": 0,
+    "unknown_scope_users": 0,
+    "unavailable_nodes": 0,
     "missing_node_ids": (),
     "skipped_reason": "",
     # Separate remote collection health from the bool returned to enforcement:
@@ -125,6 +128,8 @@ def format_api_evidence_summary(stats: dict) -> str:
         f"HTTP lookups: <code>{count('fetched_ok')}</code> OK / <code>{count('fetched_failed')}</code> failed\n"
         f"Forbidden lookups (403): <code>{count('forbidden')}</code>\n"
         f"Users with incomplete evidence: <code>{count('unknown_users')}</code>\n"
+        f"Users with unavailable or changed node scope: <code>{count('unknown_scope_users')}</code>\n"
+        f"Unavailable monitored nodes: <code>{count('unavailable_nodes')}</code>\n"
         f"Users missing required node evidence: <code>{count('missing_node_users')}</code>\n"
         f"Nodes reporting across responses: {reporting}\n"
         f"Nodes absent across all responses: {absent}\n"
@@ -145,32 +150,20 @@ async def _notify(message: str) -> None:
 
 
 async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tuple[dict, set, set]:
-    """
-    Build the node lookup table and refresh the node-IP blocklist.
+    """Refresh the monitored fleet and seed the relay-IP blocklist.
 
-    In log mode ``create_node_task`` adds every node IP to the shared blocklist
-    so that inter-node relay traffic is never counted as a user device. API mode
-    does not go through that path, so the same seeding happens here.
-
-    Returns:
-        ``(node_name_map, disabled_node_ids, expected_node_ids)``
-
-    ``expected_node_ids`` are the connected nodes the operator has not disabled -
-    the set that ought to show up in a healthy cycle. Without it there is no way
-    to tell "users are concentrated on 16 nodes" from "33 nodes stopped
-    reporting", and the two have opposite meanings for the device counts.
-    Every relevant enabled node must be connected before even an empty candidate
-    list can establish known absence; the panel IP producer omits unhealthy nodes.
+    Return names, explicitly/panel-disabled IDs and monitored IDs. Availability
+    is resolved per user's group/core scope; one offline node cannot veto the
+    complete responses of unrelated users or healthy nodes of the same group.
     """
     from utils.ip_facts import register_node_ips
     from utils.panel_api.nodes import get_nodes
 
     node_name_map: dict[int, str] = {}
-    connected_node_ids: set = set()
+    monitored_node_ids: set[int] = set()
     disabled_nodes = set(config_data.get("disabled_nodes") or [])
-    node_mode = config_data.get("device_count_mode") == COUNT_MODE_NODE
     try:
-        nodes = await get_nodes(panel_data)
+        nodes = await get_nodes(panel_data, force_refresh=True)
     except Exception as error:
         api_ip_logger.warning(f"Could not resolve node list: {error}")
         nodes = None
@@ -178,19 +171,16 @@ async def _resolve_node_context(panel_data: PanelType, config_data: dict) -> tup
     if nodes and not isinstance(nodes, ValueError):
         register_node_ips(node.node_ip for node in nodes)
         for node in nodes:
-            if node_mode and type(node.node_id) is not int:
+            if type(node.node_id) is not int:
                 raise ValueError("Invalid node ID in the authoritative node list")
             node_name_map[node.node_id] = node.node_name
-            if node_mode and node.status in ("disabled", "limited"):
+            if node.status in ("disabled", "limited"):
                 disabled_nodes.add(node.node_id)
-            if getattr(node, "status", None) == "connected":
-                connected_node_ids.add(node.node_id)
-            elif node.node_id not in disabled_nodes:
-                raise ValueError("Enabled node availability is unknown")
+            monitored_node_ids.add(node.node_id)
 
     if nodes is None or isinstance(nodes, ValueError):
         raise ValueError("Node availability is unknown")
-    return node_name_map, disabled_nodes, connected_node_ids - disabled_nodes
+    return node_name_map, disabled_nodes, monitored_node_ids - disabled_nodes
 
 
 def resolve_monitored_group_ids(config_data: dict) -> Optional[list[int]]:
@@ -429,6 +419,7 @@ async def _build_users_from_payloads(
     config_data: dict,
     fetch_times: dict[str, float] | None = None,
     expected_node_ids: set[int] | None = None,
+    required_nodes_by_user: dict[str, frozenset[int] | None] | None = None,
 ) -> tuple[dict[str, UserType], dict]:
     """Build source-timestamp observations and retain each user's uncertainty.
 
@@ -448,6 +439,7 @@ async def _build_users_from_payloads(
         "null_node_users": set(),
         "unknown_age_users": set(),
         "future_timestamp_users": set(),
+        "unknown_scope_users": set(),
     }
     missing_node_ids = set()
     nodes_seen = set()
@@ -462,21 +454,30 @@ async def _build_users_from_payloads(
     }
     now = time.time()
     for username, node_map in payloads.items():
+        required = expected_node_ids
+        if required_nodes_by_user is not None:
+            required = required_nodes_by_user.get(username)
+            if required is None:
+                unknown.add(username)
+                unknown_by_reason["unknown_scope_users"].add(username)
+                pairs_by_user[username] = []
+                continue
+            node_map = {nid: values for nid, values in node_map.items() if type(nid) is int and nid in required}
         if config_data.get("device_count_mode") == COUNT_MODE_NODE:
             # Unknown identities cannot supply a required map, even when bools
             # or floats compare equal to an integer node ID in Python.
             node_map = {
                 node_id: values
                 for node_id, values in node_map.items()
-                if type(node_id) is int and expected_node_ids is not None and node_id in expected_node_ids
+                if type(node_id) is int and required is not None and node_id in required
             }
-            if expected_node_ids is None:
+            if required is None:
                 unknown.add(username)
                 unknown_by_reason["missing_node_users"].add(username)
-        if expected_node_ids and not expected_node_ids.issubset(node_map):
+        if required and not required.issubset(node_map):
             unknown.add(username)
             unknown_by_reason["missing_node_users"].add(username)
-            missing_node_ids.update(node_id for node_id in expected_node_ids - node_map.keys() if type(node_id) is int)
+            missing_node_ids.update(node_id for node_id in required - node_map.keys() if type(node_id) is int)
         pairs = []
         for node_id, ip_values in node_map.items():
             if node_id in disabled_nodes:
@@ -604,14 +605,14 @@ class _CollectionResult:
 
 
 async def _account_collection_cycle(config_data: dict, result: _CollectionResult) -> bool:
-    """Account once and commit fallback without overwriting newer settings."""
+    """Count only unusable cycles for fallback, preserving newer settings."""
     global _consecutive_dead_cycles, _failure_revision
 
     revision = result.evidence.config_revision
     if _failure_revision != revision:
         _consecutive_dead_cycles = 0
         _failure_revision = revision
-    if result.outcome == "success":
+    if result.outcome == "success" or result.enforcement_ready:
         _consecutive_dead_cycles = 0
         LAST_CYCLE_STATS["consecutive_unsuccessful_cycles"] = 0
         return result.enforcement_ready
@@ -770,11 +771,16 @@ async def _collect_api_cycle(
 
     try:
         node_name_map, disabled_nodes, expected_node_ids = await _resolve_node_context(panel_data, config_data)
-    except ValueError:
-        LAST_CYCLE_STATS["skipped_reason"] = "node availability unknown"
-        return _CollectionResult("failure", False, "node availability unknown", evidence)
+        node_scope = await load_node_scope(panel_data, expected_node_ids)
+    except (ValueError, AttributeError, TypeError):
+        api_ip_logger.warning(
+            "API node topology unavailable; check nodes.read, groups.read, cores.read and panel metadata"
+        )
+        LAST_CYCLE_STATS["skipped_reason"] = "node topology unavailable"
+        return _CollectionResult("failure", False, "node topology unavailable", evidence)
+    LAST_CYCLE_STATS["unavailable_nodes"] = len(node_scope.monitored_nodes - node_scope.available_nodes)
     LAST_CYCLE_STATS["nodes_expected"] = len(expected_node_ids)
-    evidence = replace(evidence, eligible_node_ids=frozenset(expected_node_ids))
+    evidence = replace(evidence, eligible_node_ids=node_scope.available_nodes)
 
     if not monitoring_is_current(admission):
         return _CollectionResult("superseded", False, "Topics monitoring paused or changed", evidence)
@@ -812,6 +818,14 @@ async def _collect_api_cycle(
 
     if not targets:
         # Valid absence still runs enforcement so normalized users can clear.
+        try:
+            _names, _disabled, final_monitored = await _resolve_node_context(panel_data, config_data)
+            final_scope = await load_node_scope(panel_data, final_monitored)
+        except (ValueError, AttributeError, TypeError):
+            LAST_CYCLE_STATS["skipped_reason"] = "node scope confirmation failed"
+            return _CollectionResult("failure", False, "node scope confirmation failed", evidence)
+        if node_scope != final_scope or final_scope.monitored_nodes != final_scope.available_nodes:
+            evidence = replace(evidence, known_users=frozenset())
         if not await publish_api_snapshot({}, evidence):
             return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
         LAST_CYCLE_STATS["collection_outcome"] = "success"
@@ -881,6 +895,8 @@ async def _collect_api_cycle(
     _forbidden_alert_sent = False
 
     raw_by_name = {name: raw for name, _, raw in targets}
+    required_by_name = {name: node_scope.required_nodes(raw) for name, raw in raw_by_name.items()}
+    expected_node_ids = set().union(*(ids for ids in required_by_name.values() if ids is not None))
     new_users, build_stats = await _build_users_from_payloads(
         payloads,
         raw_by_name,
@@ -889,12 +905,56 @@ async def _collect_api_cycle(
         config_data,
         fetch_times=fetch_times,
         expected_node_ids=expected_node_ids,
+        required_nodes_by_user=required_by_name,
     )
+    # Confirm shared topology and paged memberships after the fan-out. No
+    # per-user permission requests are added, and only affected users are retired.
+    try:
+        _names, _disabled, final_monitored = await _resolve_node_context(panel_data, config_data)
+        final_scope = await load_node_scope(panel_data, final_monitored)
+        current_candidates = await fetch_online_candidates(
+            panel_data,
+            group_ids=resolve_monitored_group_ids(config_data),
+            admin_usernames=resolve_monitored_admins(config_data),
+            status="active",
+            online_window=online_window,
+            page_size=int(config_data.get("api_ip_page_size") or 500),
+        )
+        if current_candidates is None:
+            raise ValueError("Current memberships unavailable")
+    except (ValueError, AttributeError, TypeError):
+        LAST_CYCLE_STATS["skipped_reason"] = "node scope confirmation failed"
+        return _CollectionResult("failure", False, "node scope confirmation failed", evidence)
+    current_by_name = {name: raw for name, _, raw in _prefilter_candidates(current_candidates)}
+    required_by_name = {}
+    for name, raw in raw_by_name.items():
+        current = current_by_name.get(name, {})
+        required = node_scope.required_nodes(raw)
+        same_membership = (
+            required is not None
+            and raw.get("id") == current.get("id")
+            and isinstance(raw.get("group_ids"), list)
+            and isinstance(current.get("group_ids"), list)
+            and all(type(gid) is int for gid in current["group_ids"])
+            and frozenset(raw["group_ids"]) == frozenset(current["group_ids"])
+        )
+        required_by_name[name] = (
+            required if same_membership and required == final_scope.required_nodes(current) else None
+        )
+    evidence = replace(evidence, eligible_node_ids=node_scope.available_nodes & final_scope.available_nodes)
+    LAST_CYCLE_STATS["unavailable_nodes"] = len(final_scope.monitored_nodes - final_scope.available_nodes)
+    retired = {name for name in payloads if required_by_name.get(name) is None}
+    new_users.unknown_users = frozenset(set(new_users.unknown_users) | retired)
+    for name in retired:
+        new_users.pop(name, None)
+    build_stats["unknown_scope_users"] = len(retired)
+    build_stats["users_with_ips"] = len(new_users)
+    build_stats["total_ips"] = sum(len(user.ip) for user in new_users.values())
     LAST_CYCLE_STATS["node_evidence_evaluated"] = True
 
     # Node coverage counts a healthy empty map as a response too. Individual
     # users with missing nodes are protected separately; this aggregate is for
-    # diagnostics and the optional fleet-wide coverage gate.
+    # diagnostics; it cannot veto complete per-user scopes.
     #
     # Computed before the gates below so a skipped cycle still records it. Leaving it
     # until after them meant the stats screen showed 0/0 on exactly the cycles an
@@ -914,11 +974,12 @@ async def _collect_api_cycle(
     if new_users.unknown_users:
         api_ip_logger.warning(
             "🛰️ API user evidence unavailable: %s missing-node, %s null-node, %s undatable, "
-            "%s future-dated users; missing node IDs: %s",
+            "%s future-dated, %s unknown-scope users; missing node IDs: %s",
             build_stats["missing_node_users"],
             build_stats["null_node_users"],
             build_stats["unknown_age_users"],
             build_stats["future_timestamp_users"],
+            build_stats["unknown_scope_users"],
             build_stats["missing_node_ids"],
         )
     if unknown_users == set(raw_by_name):
@@ -928,35 +989,21 @@ async def _collect_api_cycle(
         await _handle_coverage_skip("all user evidence unknown")
         return _CollectionResult("partial", False, "all user evidence unknown", evidence)
 
-    # Preserve the optional aggregate gate. It never makes an individual user's
-    # missing-node evidence complete, even when the configured floor is zero.
-    min_node_coverage = normalize_min_coverage(config_data.get("api_ip_min_node_coverage"), default=0.0)
-    # Deleted users need no node observation; their absence is definitive even
-    # if every candidate disappeared between the list and per-user requests.
-    if payloads and min_node_coverage and node_coverage < min_node_coverage:
-        # The build already ran, so report what it found. Without this the
-        # diagnostics show a cycle that collected nothing, which reads like a dead
-        # panel rather than a partial fleet - the opposite of the diagnosis needed.
-        LAST_CYCLE_STATS.update(build_stats)
-        LAST_CYCLE_STATS["skipped_reason"] = f"node coverage {node_coverage:.0%} below {min_node_coverage:.0%}"
-        LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
-        api_ip_logger.error(
-            f"🛰️ Skipping enforcement: only {build_stats['nodes_seen']} of "
-            f"{nodes_expected} connected nodes returned an IP map "
-            f"({node_coverage:.1%} < {min_node_coverage:.0%})"
-        )
-        reason = f"node coverage {node_coverage:.0%} below {min_node_coverage:.0%}"
-        await _handle_coverage_skip(reason)
-        return _CollectionResult("partial", False, reason, evidence)
-
-    evidence = replace(evidence, unknown_users=frozenset(unknown_users))
+    # Fleet percentages remain diagnostic: an unrelated missing node must not
+    # veto users with complete evidence in their own healthy-node scope.
+    absence_complete = node_scope == final_scope and final_scope.monitored_nodes == final_scope.available_nodes
+    evidence = replace(
+        evidence,
+        unknown_users=frozenset(unknown_users),
+        known_users=None if absence_complete else frozenset(set(raw_by_name) - unknown_users),
+    )
     if not await publish_api_snapshot(new_users, evidence):
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
         return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
 
     # Only here, past every gate: the streak means "cycles skipped since enforcement
     # last actually ran". Clearing it as soon as the fan-out looked healthy meant the
-    # evidence and node-coverage gates could skip forever without the
+    # evidence checks could skip forever without the
     # streak ever passing 1, so their alarm never fired.
     _consecutive_coverage_skips = 0
     _coverage_alert_sent = False

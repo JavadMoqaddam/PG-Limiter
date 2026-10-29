@@ -776,6 +776,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         )
 
     protected_users = set(api_evidence.unknown_users) if api_evidence else set()
+    if api_evidence and api_evidence.known_users is not None:
+        protected_users.update(set(warning_system.warnings) - api_evidence.known_users)
     cycle_warning_candidates = dict(warning_system.warnings)
     policy_names = set(active_users_snapshot) | set(warning_system.warnings)
     try:
