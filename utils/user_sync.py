@@ -10,6 +10,7 @@ from typing import Optional
 from urllib.parse import quote
 
 from utils.logs import get_logger
+from utils.panel_workload import serialized_panel_workload
 from utils.types import PanelType
 from utils.user_policy import evaluate_user_policy
 from utils.user_policy import get_max_group_limit as get_max_group_limit
@@ -298,6 +299,7 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
     """
     Sync all users from panel to local database.
     Mirror the validated panel list, confirming current absence before deletion.
+    Wait for API IP collection/rechecks before starting the full sync.
     Commit bounded batches so settings and enforcement writers can keep running.
     Failed fetches/parses never change membership; failed writes never prune it.
 
@@ -313,7 +315,7 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
         sync_logger.warning("Sync already in progress, skipping")
         return (0, 0, 0)
 
-    async with _sync_lock:
+    async with _sync_lock, serialized_panel_workload("user sync"):
         synced = 0
         errors = 0
         deleted = 0
@@ -641,7 +643,7 @@ async def run_user_sync_loop(panel_data: PanelType):
     await asyncio.sleep(30)
 
     # Initial sync
-    sync_logger.info("🔄 Running initial user sync...")
+    sync_logger.info("🔄 Initial user sync requested...")
     await sync_users_to_database(panel_data)
 
     while True:

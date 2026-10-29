@@ -29,6 +29,7 @@ from html import escape
 from typing import Optional
 
 from utils.logs import get_logger
+from utils.panel_workload import serialized_panel_workload
 from utils.read_config import get_config_revision, normalize_api_ip_freshness, normalize_min_coverage
 from utils.shared_state import (
     APISampleEvidence,
@@ -718,13 +719,15 @@ def _resolve_freshness_window(config_data: dict) -> int:
     return normalize_api_ip_freshness(config_data.get("api_ip_freshness"))
 
 
+@serialized_panel_workload("API IP refresh")
 async def recheck_api_user(
     panel_data: PanelType, username: str, config_data: dict, evidence: APISampleEvidence
 ) -> tuple[UserType, APIObservationWindow, bool] | None:
     """Re-observe only a pending punishment whose original request is too old.
 
     Metadata must still describe the same user and scope. The refreshed response
-    is counted as returned, just like the initial collection.
+    is counted as returned, just like the initial collection. Wait for any full
+    user sync before validating evidence and starting the new observation.
     """
     from utils.panel_api.users import get_user_details
 
@@ -930,12 +933,14 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
     Partial samples can still enforce known users while API remains selected.
     A committed fallback discards the sample and returns False. Cancellation,
     degraded local settings and superseded evidence never count as API outages.
+    Full user sync shares a workload slot; waiting does not start the sample or
+    consume the per-request timeout/breaker wait budget.
     """
     admission = monitoring_snapshot()
     await synchronize_monitoring()
     if not monitoring_is_current(admission):
         return False
-    async with _collection_lock:
+    async with _collection_lock, serialized_panel_workload("API IP collection"):
         if not monitoring_is_current(admission):
             return False
         source_config = config_data
