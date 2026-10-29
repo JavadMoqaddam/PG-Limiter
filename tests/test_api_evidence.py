@@ -347,7 +347,8 @@ async def test_unavailable_node_preserves_absent_warnings_but_allows_healthy_sco
 
     assert await api_cycle.run() is True
     if sample == "empty_ips":
-        assert api_cycle.warning.warnings == {}
+        assert api_cycle.warning.warnings == warnings
+        assert {name: record.consecutive_violations for name, record in warnings.items()} == before
     else:
         assert api_cycle.warning.warnings == warnings
         expected = {name: count + int(name in api_cycle.bodies) for name, count in before.items()}
@@ -471,7 +472,8 @@ async def test_successful_api_responses_explain_unusable_evidence(api_cycle, mon
 
     assert await api_cycle.run() is False
     stats = get_last_cycle_stats()
-    assert stats["coverage"] == 1.0
+    assert stats["http_coverage"] == 1.0
+    assert stats["coverage"] == 0.0
     assert stats["fetched_ok"] == 2
     assert stats["unknown_users"] == 2
     assert stats[reason_key] == 2

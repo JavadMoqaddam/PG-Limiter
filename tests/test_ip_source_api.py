@@ -231,9 +231,14 @@ def _patch_collector(
 
         resolved = api_mod.OnlineIPResults()
         resolved.update(payloads or {})
+        # Model explicit missing-user identities alongside the aggregate count.
+        missing_count = (counters or {}).get("not_found", 0)
+        resolved.not_found_users = set([name for name, _, _ in targets if name not in resolved][:missing_count])
         now = time.time()
         mono = monotonic_time()
-        resolved.observations = {name: APIObservationWindow(now, now, mono, mono) for name in resolved}
+        resolved.observations = {
+            name: APIObservationWindow(now, now, mono, mono) for name in set(resolved) | resolved.not_found_users
+        }
         return resolved, dict(counters or default), {name: now for name in resolved}
 
     async def fake_notify(message: str):
@@ -268,7 +273,7 @@ async def test_all_unknown_cycle_records_elapsed_collection_time(monkeypatch, pa
     assert stats["duration_ms"] == 242_000
 
 
-async def test_invalid_map_fallback_reports_transport_and_user_evidence_separately(monkeypatch, panel, api_config):
+async def test_invalid_maps_preserve_api_source_and_report_unusable_evidence(monkeypatch, panel, api_config):
     """Successful lookups cannot authorize null maps, even alongside missing maps."""
     from unittest.mock import AsyncMock
 
@@ -289,13 +294,17 @@ async def test_invalid_map_fallback_reports_transport_and_user_evidence_separate
 
     assert await api.collect_active_users_from_api(panel, api_config) is False
     assert await api.collect_active_users_from_api(panel, api_config) is False
-    message = next(text for text in notifications if "IP Source reverted to Logs" in text)
-    assert "2 consecutive API collections were incomplete" in message
+    stats = api.get_last_cycle_stats()
+    message = api.format_api_evidence_summary(stats)
     assert "HTTP lookups: <code>2</code> OK / <code>0</code> failed" in message
     assert "Nodes reporting across responses: <code>2/3</code>" in message
     assert "Nodes absent across all responses: <code>1</code>" in message
     assert "private-first" not in message and "private-second" not in message
-    assert api.get_last_cycle_stats()["consecutive_unsuccessful_cycles"] == 2
+    assert stats["consecutive_unsuccessful_cycles"] == 0
+    assert stats["coverage"] == 0
+    assert stats["http_coverage"] == 1
+    assert not stats["fallback_applied"]
+    assert not any("IP Source reverted to Logs" in text for text in notifications)
 
 
 async def test_usable_partial_samples_do_not_trigger_global_fallback(monkeypatch, panel, api_config):
@@ -828,7 +837,7 @@ class TestCollectFailSafe:
         assert get_last_cycle_stats()["skipped_reason"] == "no successful lookups"
 
     @pytest.mark.asyncio
-    async def test_low_coverage_skips_the_cycle(self, panel, api_config, monkeypatch):
+    async def test_low_coverage_keeps_valid_users(self, panel, api_config, monkeypatch):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
         from utils.shared_state import ACTIVE_USERS
         from utils.types import UserType
@@ -839,14 +848,16 @@ class TestCollectFailSafe:
             candidates=[{"username": f"u{i}", "id": i} for i in range(1, 5)],
             payloads={"u1": {1: {"5.6.7.8": fresh()}}},
             counters={"ok": 1, "failed": 3, "not_found": 0, "forbidden": 0, "unauthorized": 0},
+            node_name_map={1: "node"},
         )
 
         # 1 of 4 answered = 25% coverage, below the configured 80%.
-        assert await collect_active_users_from_api(panel, api_config) is False
-        assert list(ACTIVE_USERS) == ["carol"]
+        assert await collect_active_users_from_api(panel, api_config) is True
+        assert list(ACTIVE_USERS) == ["u1"]
         stats = get_last_cycle_stats()
         assert stats["coverage"] == 0.25
-        assert "below" in stats["skipped_reason"]
+        assert stats["unknown_users"] == 3
+        assert stats["consecutive_unsuccessful_cycles"] == 0
 
     @pytest.mark.asyncio
     async def test_not_found_counts_as_covered(self, panel, api_config, monkeypatch):
@@ -952,7 +963,9 @@ class TestCollectFailSafe:
         assert get_last_cycle_stats()["skipped_reason"] == ""
 
     @pytest.mark.asyncio
-    async def test_low_coverage_counts_as_one_unsuccessful_cycle(self, panel, api_config, monkeypatch):
+    async def test_successful_transport_without_usable_users_does_not_count_as_outage(
+        self, panel, api_config, monkeypatch
+    ):
         import utils.ip_source_api as api_mod
 
         _patch_collector(
@@ -961,7 +974,7 @@ class TestCollectFailSafe:
             counters={"ok": 1, "failed": 3, "not_found": 0, "forbidden": 0, "unauthorized": 0},
         )
         assert await api_mod.collect_active_users_from_api(panel, api_config) is False
-        assert api_mod._consecutive_dead_cycles == 1
+        assert api_mod._consecutive_dead_cycles == 0
 
     @pytest.mark.asyncio
     async def test_repeated_coverage_skips_raise_one_alert(self, panel, api_config, monkeypatch):

@@ -148,13 +148,16 @@ async def test_partial_preserves_under_limit_and_absent_records_while_warning_po
 
 
 @pytest.mark.parametrize("partial_cycle", ["device", "ip"], indirect=True)
-async def test_partial_nonmonotone_modes_cannot_warn_or_publish_completed_receipt(partial_cycle):
+async def test_partial_ip_and_device_modes_count_ordinary_observations(partial_cycle):
     cycle = partial_cycle
     await cycle.run([cycle.observed("alice")])
 
-    assert cycle.system.warnings == {}
+    if cycle.config["device_count_mode"] == "device":
+        assert cycle.system.warnings["alice"].ip_count == 2
+    else:
+        assert cycle.system.warnings == {}
     assert cycle.applied == []
-    assert get_last_completed_scan() is None
+    assert get_last_completed_scan().coverage_complete is False
 
 
 @pytest.mark.parametrize("partial_cycle", ["node", "inbound"], indirect=True)

@@ -97,7 +97,7 @@ async def test_failed_lookup_diagnostics_retain_unknown_users_and_known_fleet(
     if all_failed:
         cycle.bodies["bob"] = None
 
-    assert await cycle.run() is False
+    assert await cycle.run() is (not all_failed)
     stats = get_last_cycle_stats()
     assert stats["fetched_failed"] == expected_unknown
     assert stats["unknown_users"] == expected_unknown

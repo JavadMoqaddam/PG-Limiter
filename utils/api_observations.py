@@ -40,6 +40,7 @@ class APIUserContext:
     group_ids: frozenset[int]
     required_nodes: frozenset[int]
     live_nodes: frozenset[int]
+    applicable_nodes: frozenset[int] | None = None
 
 
 def xray_has_live_ip_map(version: str | None) -> bool:

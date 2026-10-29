@@ -24,7 +24,7 @@ import copy
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from html import escape
 from typing import Optional
 
@@ -61,13 +61,15 @@ LAST_CYCLE_STATS: dict = {
     "not_found": 0,
     "forbidden": 0,
     "coverage": 0.0,
+    "http_coverage": 0.0,
+    "invalid_responses": 0,
+    "partial_users": 0,
     "users_with_ips": 0,
     "total_ips": 0,
     "nodes_seen": 0,
     # How many nodes the panel says should be reporting, and the resulting ratio.
-    # `coverage` above is the per-USER answer rate and says nothing about nodes: a
-    # cycle where every user call returned 200 reads 1.0 even if two thirds of the
-    # nodes contributed no IPs at all, which under-counts devices silently.
+    # User evidence coverage and HTTP reachability are separate from this
+    # diagnostic union of reporting nodes across all responses.
     "nodes_expected": 0,
     "node_evidence_evaluated": False,
     "node_coverage": 0.0,
@@ -135,6 +137,8 @@ def format_api_evidence_summary(stats: dict) -> str:
         absent = "unknown"
     return (
         f"HTTP lookups: <code>{count('fetched_ok')}</code> OK / <code>{count('fetched_failed')}</code> failed\n"
+        f"Malformed HTTP 200 responses: <code>{count('invalid_responses')}</code>\n"
+        f"Users with partial node coverage: <code>{count('partial_users')}</code>\n"
         f"Timeouts (included in failed): <code>{count('fetched_timeouts')}</code>\n"
         f"Timeout phases: read {count('fetched_read_timeouts')}, connect {count('fetched_connect_timeouts')}, "
         f"pool {count('fetched_pool_timeouts')}, write {count('fetched_write_timeouts')}\n"
@@ -361,6 +365,7 @@ async def _fetch_all_online_ips(
     from utils.panel_api.online_ips import (
         OUTCOME_DEFERRED,
         OUTCOME_FORBIDDEN,
+        OUTCOME_INVALID,
         OUTCOME_NOT_FOUND,
         OUTCOME_OK,
         OUTCOME_UNAUTHORIZED,
@@ -370,6 +375,7 @@ async def _fetch_all_online_ips(
     from utils.panel_api.request_helper import online_stats_circuit_breaker as breaker
 
     counters = {"ok": 0, "failed": 0, "not_found": 0, "forbidden": 0, "unauthorized": 0, "deferred": 0, "timed_out": 0}
+    counters["invalid"] = 0
     counters.update({f"{kind}_timeouts": 0 for kind in ("read", "connect", "pool", "write")})
     admission = monitoring_snapshot()
     payloads = OnlineIPResults()
@@ -410,7 +416,7 @@ async def _fetch_all_online_ips(
         api_ip_logger.info(
             "🛰️ API IP requests: %s/%s (%.1f%% complete), success %.1f%% "
             "(%s ok), %s not found, %s forbidden, %s failed (%s unauthorized, %s timeouts: "
-            "%s read, %s connect, %s pool, %s write), %s unsent/deferred",
+            "%s read, %s connect, %s pool, %s write), %s invalid bodies, %s unsent/deferred",
             settled,
             len(targets),
             100 * settled / len(targets),
@@ -425,6 +431,7 @@ async def _fetch_all_online_ips(
             counters["connect_timeouts"],
             counters["pool_timeouts"],
             counters["write_timeouts"],
+            counters["invalid"],
             counters["deferred"],
         )
         last_progress = time.monotonic()
@@ -482,6 +489,9 @@ async def _fetch_all_online_ips(
                     payloads[username] = payload if payload is not None else {}
                     fetch_times[username] = observed.received_at
                     payloads.observations[username] = observed
+                elif outcome == OUTCOME_INVALID:
+                    # HTTP 200 establishes reachability, not usable user data.
+                    counters["invalid"] += 1
                 elif outcome == OUTCOME_NOT_FOUND:
                     counters["not_found"] += 1
                     payloads.not_found_users.add(username)
@@ -523,6 +533,14 @@ def _extract_admin_username(raw: dict) -> Optional[str]:
     return raw.get("admin_username")
 
 
+@dataclass
+class _IPValidationCache:
+    """Reuse admission decisions after final scope confirmation without I/O."""
+
+    verdicts: dict[str, bool] = field(default_factory=dict)
+    initialized: bool = False
+
+
 async def _build_users_from_payloads(
     payloads: dict[str, dict[int, dict[str, int] | None]],
     raw_by_name: dict[str, dict],
@@ -534,6 +552,7 @@ async def _build_users_from_payloads(
     required_nodes_by_user: dict[str, frozenset[int] | None] | None = None,
     observation_windows: dict[str, APIObservationWindow] | None = None,
     live_node_ids: frozenset[int] = frozenset(),
+    validation_cache: _IPValidationCache | None = None,
 ) -> tuple[dict[str, UserType], dict]:
     """Build per-request observations, retaining source timestamps and uncertainty.
 
@@ -586,6 +605,9 @@ async def _build_users_from_payloads(
                 pairs_by_user[username] = []
                 continue
             node_map = {nid: values for nid, values in node_map.items() if type(nid) is int and nid in required}
+            if required and not node_map:
+                unknown.add(username)
+                unknown_by_reason["unknown_scope_users"].add(username)
         if config_data.get("device_count_mode") == COUNT_MODE_NODE:
             # Unknown identities cannot supply a required map, even when bools
             # or floats compare equal to an integer node ID in Python.
@@ -622,7 +644,14 @@ async def _build_users_from_payloads(
                 raw_ips.add(ip)
         pairs_by_user[username] = pairs
 
-    accepted, stats["geo_lookups"] = await _validate_ips(raw_ips, config_data)
+    if validation_cache is None:
+        validation_cache = _IPValidationCache()
+    pending_ips = raw_ips - validation_cache.verdicts.keys()
+    if pending_ips or not validation_cache.initialized:
+        accepted, stats["geo_lookups"] = await _validate_ips(pending_ips, config_data)
+        validation_cache.verdicts.update({ip: ip in accepted for ip in pending_ips})
+        validation_cache.initialized = True
+    accepted = {ip for ip in raw_ips if validation_cache.verdicts[ip]}
     evaluated_at = time.time()
     users = ActiveUsersSnapshot()
     users.unknown_users = frozenset(unknown)
@@ -691,7 +720,7 @@ def _resolve_freshness_window(config_data: dict) -> int:
 
 async def recheck_api_user(
     panel_data: PanelType, username: str, config_data: dict, evidence: APISampleEvidence
-) -> tuple[UserType, APIObservationWindow] | None:
+) -> tuple[UserType, APIObservationWindow, bool] | None:
     """Re-observe only a pending punishment whose original request is too old.
 
     Metadata must still describe the same user and scope. The refreshed response
@@ -712,7 +741,8 @@ async def recheck_api_user(
         if username not in payloads:
             return None
         window = payloads.observations[username]
-        users, _stats = await _build_users_from_payloads(
+        validation_cache = _IPValidationCache()
+        _users, _stats = await _build_users_from_payloads(
             payloads,
             {username: raw_context},
             {},
@@ -721,23 +751,25 @@ async def recheck_api_user(
             required_nodes_by_user={username: context.required_nodes},
             observation_windows=payloads.observations,
             live_node_ids=context.live_nodes,
+            validation_cache=validation_cache,
         )
-        if username in users.unknown_users:
-            return None
         # Confirmation follows the new IP request and async IP validation, as in
         # the main collector. A changed scope cannot authorize the old incident.
         names, _disabled, monitored = await _resolve_node_context(panel_data, config_data)
         scope = await load_node_scope(panel_data, monitored)
         raw = await get_user_details(panel_data, username)
+        applicable = context.applicable_nodes if context.applicable_nodes is not None else context.required_nodes
+        stable = context.required_nodes & scope.available_nodes
         if (
             not isinstance(raw, dict)
             or type(raw.get("id")) is not int
             or raw.get("id") != context.user_id
             or raw.get("username") != username
             or raw.get("status") != "active"
-            or scope.required_nodes(raw) != context.required_nodes
+            or scope.applicable_nodes(raw) != applicable
+            or (applicable and not stable)
             or frozenset(raw["group_ids"]) != context.group_ids
-            or (scope.live_nodes & context.required_nodes) != context.live_nodes
+            or (scope.live_nodes & stable) != (context.live_nodes & stable)
         ):
             return None
         if (
@@ -746,10 +778,22 @@ async def recheck_api_user(
             or not monitoring_is_current(admission)
         ):
             return None
+        users, _stats = await _build_users_from_payloads(
+            payloads,
+            {username: raw},
+            names,
+            set(),
+            config_data,
+            required_nodes_by_user={username: stable},
+            observation_windows=payloads.observations,
+            live_node_ids=context.live_nodes,
+            validation_cache=validation_cache,
+        )
+        if username in users.unknown_users:
+            return None
         user = users.get(username, UserType(name=username, ip=[]))
-        for connection in user.device_info.connections:
-            connection.node_name = names.get(connection.node_id, connection.node_name)
-        return user, window
+        partial = stable != applicable
+        return user, window, partial
     except (ValueError, TypeError, AttributeError, KeyError):
         return None
 
@@ -787,6 +831,7 @@ class _CollectionResult:
     enforcement_ready: bool
     reason: str
     evidence: APISampleEvidence
+    fallback_eligible: bool = True
 
 
 async def _account_collection_cycle(config_data: dict, result: _CollectionResult) -> bool:
@@ -797,7 +842,7 @@ async def _account_collection_cycle(config_data: dict, result: _CollectionResult
     if _failure_revision != revision:
         _consecutive_dead_cycles = 0
         _failure_revision = revision
-    if result.outcome == "success" or result.enforcement_ready:
+    if result.outcome == "success" or result.enforcement_ready or not result.fallback_eligible:
         _consecutive_dead_cycles = 0
         LAST_CYCLE_STATS["consecutive_unsuccessful_cycles"] = 0
         return result.enforcement_ready
@@ -831,7 +876,7 @@ async def _account_collection_cycle(config_data: dict, result: _CollectionResult
         f"{LAST_CYCLE_STATS['consecutive_unsuccessful_cycles']} consecutive API collections were incomplete.\n"
         f"Latest reason: <code>{escape(result.reason)}</code>.\n\n"
         f"{format_api_evidence_summary(LAST_CYCLE_STATS)}\n\n"
-        "HTTP success does not confirm complete node evidence for each user.\n"
+        "User data errors and node health changes alone do not select Logs.\n"
         "The latest API enforcement cycle was skipped; warning counters and history were preserved.\n"
         "Logs were selected automatically. Fresh Logs evidence is required before enforcement resumes."
     )
@@ -839,15 +884,7 @@ async def _account_collection_cycle(config_data: dict, result: _CollectionResult
 
 
 async def _handle_coverage_skip(reason: str) -> None:
-    """
-    Track consecutive cycles skipped for insufficient coverage, and say so.
-
-    A coverage skip is the safe outcome for one cycle - a partial sample would
-    clear real offenders' counters. A *run* of them is a different thing: nobody is
-    being escalated or banned at all, and the only trace used to be one WARNING per
-    cycle that looks identical to the previous one. This diagnostic remains useful
-    when automatic fallback is disabled or its configuration write fails.
-    """
+    """Report repeated all-user uncertainty independently of transport fallback."""
     global _consecutive_coverage_skips, _coverage_alert_sent
 
     _consecutive_coverage_skips += 1
@@ -857,7 +894,7 @@ async def _handle_coverage_skip(reason: str) -> None:
     api_ip_logger.error(
         f"⛔ Enforcement has been skipped {_consecutive_coverage_skips} times since the "
         f"last usable sample ({reason}). Nobody is being warned or banned. Check the "
-        f"panel's online-stats endpoint, api_ip_timeout and api_ip_concurrency."
+        f"panel's online-stats endpoint, node health and returned evidence."
     )
     if _coverage_alert_sent:
         return
@@ -866,9 +903,8 @@ async def _handle_coverage_skip(reason: str) -> None:
         "🛰️ <b>API IP mode: enforcement has stopped</b>\n\n"
         f"{_consecutive_coverage_skips} cycles have been skipped since the last usable "
         f"sample because it was incomplete (<code>{reason}</code>).\n"
-        "Nobody is being warned or banned while this lasts. Raise "
-        "<code>api_ip_timeout</code>, lower <code>api_ip_concurrency</code>, or "
-        "switch the IP source back to Logs."
+        "Warning counters and history are preserved. Check panel availability, "
+        "node health, permissions and the returned user evidence."
     )
 
 
@@ -1021,6 +1057,7 @@ async def _collect_api_cycle(
             return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
         LAST_CYCLE_STATS["collection_outcome"] = "success"
         LAST_CYCLE_STATS["coverage"] = 1.0
+        LAST_CYCLE_STATS["http_coverage"] = 1.0
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         api_ip_logger.info("🛰️ No online candidates this cycle")
         return _CollectionResult("success", True, "", evidence)
@@ -1042,14 +1079,14 @@ async def _collect_api_cycle(
 
     # A 404 is a definitive answer (the user vanished from the panel), so it
     # counts as covered; 403/timeouts/5xx leave the user's state unknown.
-    answered = counters["ok"] + counters["not_found"]
+    answered = counters["ok"] + counters["not_found"] + counters.get("invalid", 0)
     coverage = answered / len(targets) if targets else 1.0
     answered_users = set(payloads) | getattr(payloads, "not_found_users", set())
     transport_unknown_users = {name for name, _, _ in targets} - answered_users
 
     LAST_CYCLE_STATS.update(
         {
-            "fetched_ok": counters["ok"],
+            "fetched_ok": counters["ok"] + counters.get("invalid", 0),
             "fetched_failed": counters["failed"],
             "fetched_deferred": counters.get("deferred", 0),
             "fetched_timeouts": counters.get("timed_out", 0),
@@ -1059,7 +1096,8 @@ async def _collect_api_cycle(
             },
             "not_found": counters["not_found"],
             "forbidden": counters["forbidden"],
-            "coverage": round(coverage, 4),
+            "http_coverage": round(coverage, 4),
+            "invalid_responses": counters.get("invalid", 0),
             "unknown_users": len(transport_unknown_users),
         }
     )
@@ -1074,31 +1112,13 @@ async def _collect_api_cycle(
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         return _CollectionResult("failure", False, "no successful lookups", evidence)
 
-    # An absent key means "use the documented default", not "no floor at all".
-    # `or 0.0` silently disabled the guard for any caller that assembled
-    # config_data without going through read_config. normalize_min_coverage owns
-    # both the default and the percent-versus-fraction rule, so this file no longer
-    # keeps its own copy of 0.8 to drift from read_config's.
-    min_coverage = normalize_min_coverage(config_data.get("api_ip_min_coverage"))
-
-    if coverage < min_coverage:
-        LAST_CYCLE_STATS["collection_outcome"] = "partial"
-        LAST_CYCLE_STATS["skipped_reason"] = f"coverage {coverage:.0%} below {min_coverage:.0%}"
-        LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
-        api_ip_logger.warning(
-            f"🛰️ Skipping enforcement: coverage {coverage:.1%} < {min_coverage:.0%} "
-            f"({counters['ok']} ok, {counters['failed']} failed, {counters.get('deferred', 0)} unsent/deferred of {len(targets)})"
-        )
-        reason = f"coverage {coverage:.0%} below {min_coverage:.0%}"
-        await _handle_coverage_skip(reason)
-        return _CollectionResult("partial", False, reason, evidence)
-
     _forbidden_alert_sent = False
 
     raw_by_name = {name: raw for name, _, raw in targets}
     required_by_name = {name: node_scope.required_nodes(raw) for name, raw in raw_by_name.items()}
     expected_node_ids = set().union(*(ids for ids in required_by_name.values() if ids is not None))
-    new_users, build_stats = await _build_users_from_payloads(
+    validation_cache = _IPValidationCache()
+    _initial_users, initial_stats = await _build_users_from_payloads(
         payloads,
         raw_by_name,
         node_name_map,
@@ -1109,6 +1129,7 @@ async def _collect_api_cycle(
         required_nodes_by_user=required_by_name,
         observation_windows=payloads.observations,
         live_node_ids=node_scope.live_nodes,
+        validation_cache=validation_cache,
     )
     # Confirm shared topology and paged memberships after the fan-out. No
     # per-user permission requests are added, and only affected users are retired.
@@ -1128,11 +1149,13 @@ async def _collect_api_cycle(
         return _CollectionResult("failure", False, "node scope confirmation failed", evidence)
     current_by_name = {name: raw for name, _, raw in _prefilter_candidates(current_candidates)}
     required_by_name = {}
+    partial_users = set()
     for name, raw in raw_by_name.items():
         current = current_by_name.get(name, {})
-        required = node_scope.required_nodes(raw)
+        applicable = node_scope.applicable_nodes(raw)
+        stable = (applicable or frozenset()) & node_scope.available_nodes & final_scope.available_nodes
         same_membership = (
-            required is not None
+            applicable is not None
             and raw.get("id") == current.get("id")
             and current.get("status", "active") == "active"
             and isinstance(raw.get("group_ids"), list)
@@ -1141,21 +1164,34 @@ async def _collect_api_cycle(
             and frozenset(raw["group_ids"]) == frozenset(current["group_ids"])
         )
         required_by_name[name] = (
-            required
+            stable
             if same_membership
-            and required == final_scope.required_nodes(current)
-            and (required & node_scope.live_nodes) == (required & final_scope.live_nodes)
+            and applicable == final_scope.applicable_nodes(current)
+            and (stable & node_scope.live_nodes) == (stable & final_scope.live_nodes)
+            and (not applicable or stable)
             else None
         )
+        if applicable is not None and stable != applicable:
+            partial_users.add(name)
     evidence = replace(evidence, eligible_node_ids=node_scope.available_nodes & final_scope.available_nodes)
-    LAST_CYCLE_STATS["unavailable_nodes"] = len(final_scope.monitored_nodes - final_scope.available_nodes)
-    retired = {name for name in payloads if required_by_name.get(name) is None}
-    new_users.unknown_users = frozenset(set(new_users.unknown_users) | retired)
-    for name in retired:
-        new_users.pop(name, None)
-    build_stats["unknown_scope_users"] = len(retired)
-    build_stats["users_with_ips"] = len(new_users)
-    build_stats["total_ips"] = sum(len(user.ip) for user in new_users.values())
+    LAST_CYCLE_STATS["unavailable_nodes"] = len(final_scope.monitored_nodes - evidence.eligible_node_ids)
+    expected_node_ids = set().union(*(ids for ids in required_by_name.values() if ids is not None))
+    # Rebuild after confirmation: a discarded node's bad map cannot contaminate
+    # stable healthy nodes. All retained IPs were validated above, so this pass
+    # does not suspend for geolocation after the final membership confirmation.
+    new_users, build_stats = await _build_users_from_payloads(
+        payloads,
+        raw_by_name,
+        node_name_map,
+        set(disabled_nodes),
+        config_data,
+        expected_node_ids=expected_node_ids,
+        required_nodes_by_user=required_by_name,
+        observation_windows=payloads.observations,
+        live_node_ids=node_scope.live_nodes,
+        validation_cache=validation_cache,
+    )
+    build_stats["geo_lookups"] += initial_stats["geo_lookups"]
     LAST_CYCLE_STATS["node_evidence_evaluated"] = True
 
     # Node coverage counts a healthy empty map as a response too. Individual
@@ -1175,7 +1211,18 @@ async def _collect_api_cycle(
     if not api_evidence_is_current(evidence) or source_config != config_data or not monitoring_is_current(admission):
         LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="configuration or collection changed")
         return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
+    coverage = (len(raw_by_name) - len(unknown_users)) / len(raw_by_name)
+    LAST_CYCLE_STATS["coverage"] = round(coverage, 4)
     LAST_CYCLE_STATS["unknown_users"] = len(unknown_users)
+    partial_users -= unknown_users
+    LAST_CYCLE_STATS["partial_users"] = len(partial_users)
+    min_coverage = normalize_min_coverage(config_data.get("api_ip_min_coverage"))
+    if coverage < min_coverage:
+        api_ip_logger.warning(
+            "API usable user coverage %.1f%% below diagnostic threshold %.1f%%; valid users continue",
+            coverage * 100,
+            min_coverage * 100,
+        )
     LAST_CYCLE_STATS.update(build_stats)
     if new_users.unknown_users:
         api_ip_logger.warning(
@@ -1190,7 +1237,7 @@ async def _collect_api_cycle(
         LAST_CYCLE_STATS.update(build_stats)
         LAST_CYCLE_STATS["skipped_reason"] = "all user evidence unknown"
         await _handle_coverage_skip("all user evidence unknown")
-        return _CollectionResult("partial", False, "all user evidence unknown", evidence)
+        return _CollectionResult("partial", False, "all user evidence unknown", evidence, fallback_eligible=False)
 
     # Fleet percentages remain diagnostic: an unrelated missing node must not
     # veto users with complete evidence in their own healthy-node scope.
@@ -1203,6 +1250,7 @@ async def _collect_api_cycle(
     evidence = replace(
         evidence,
         unknown_users=frozenset(unknown_users),
+        partial_users=frozenset(partial_users),
         known_users=None if absence_complete else frozenset(set(raw_by_name) - unknown_users),
         observation_windows=dict(payloads.observations),
         live_node_ids=node_scope.live_nodes,
@@ -1212,6 +1260,7 @@ async def _collect_api_cycle(
                 frozenset(raw["group_ids"]),
                 required_by_name[name],
                 required_by_name[name] & node_scope.live_nodes,
+                node_scope.applicable_nodes(raw),
             )
             for name, raw in raw_by_name.items()
             if name not in unknown_users and required_by_name.get(name) is not None
@@ -1229,7 +1278,7 @@ async def _collect_api_cycle(
     _coverage_alert_sent = False
 
     LAST_CYCLE_STATS.update(build_stats)
-    LAST_CYCLE_STATS["collection_outcome"] = "partial" if unknown_users else "success"
+    LAST_CYCLE_STATS["collection_outcome"] = "partial" if unknown_users or partial_users else "success"
     LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
 
     api_ip_logger.info(
@@ -1244,8 +1293,8 @@ async def _collect_api_cycle(
         f"{LAST_CYCLE_STATS['duration_ms']}ms)"
     )
     return _CollectionResult(
-        "partial" if unknown_users else "success",
+        "partial" if unknown_users or partial_users else "success",
         True,
-        "incomplete user evidence" if unknown_users else "",
+        "incomplete user evidence" if unknown_users or partial_users else "",
         evidence,
     )

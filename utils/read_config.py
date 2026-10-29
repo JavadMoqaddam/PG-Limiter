@@ -108,7 +108,7 @@ def _get_env(key: str, default: Any = None, cast_type: type = str) -> Any:
     return value
 
 
-# The coverage floor for API mode, as a fraction. This is the one place the default
+# The diagnostic user-coverage threshold for API mode, as a fraction. This is the one place the default
 # lives; ip_source_api and the settings screen import it rather than repeating 0.8.
 DEFAULT_API_IP_MIN_COVERAGE = 0.8
 DEFAULT_API_IP_FRESHNESS = 60
@@ -126,7 +126,7 @@ def normalize_api_ip_freshness(raw: Any, default: int = DEFAULT_API_IP_FRESHNESS
 
 def normalize_min_coverage(raw: Any, default: float = DEFAULT_API_IP_MIN_COVERAGE) -> float:
     """
-    Turn a configured coverage floor into a fraction between 0 and 1.
+    Turn a configured coverage threshold into a fraction between 0 and 1.
 
     Accepts both spellings, because the operator sets this as a percentage in the
     environment (``API_IP_MIN_COVERAGE=80``) while the database row and every
@@ -234,13 +234,10 @@ def load_env_config() -> Dict[str, Any]:
         "country_code": _get_env("COUNTRY_CODE", ""),
         # User sync settings
         "user_sync_interval": _get_env("USER_SYNC_INTERVAL", 5, int),  # Minutes
-        # Minimum share of candidates that must answer before an API-mode cycle is
-        # allowed to enforce. Set as a percentage; see normalize_min_coverage.
+        # Diagnostic threshold for usable user evidence. Valid users are handled
+        # independently; falling below this percentage logs a warning.
         "api_ip_min_coverage": normalize_min_coverage(os.environ.get("API_IP_MIN_COVERAGE")),
-        # Share of the connected node fleet that must report before an API-mode cycle
-        # enforces, as a percentage. 0 (the default) switches the gate off; a genuinely
-        # quiet node reports nothing, so the right floor has to be observed on a real
-        # fleet before it is enforced.
+        # Legacy configuration compatibility; node coverage remains diagnostic.
         "api_ip_min_node_coverage": normalize_min_coverage(os.environ.get("API_IP_MIN_NODE_COVERAGE"), default=0.0),
         "api_ip_freshness": normalize_api_ip_freshness(os.environ.get("API_IP_FRESHNESS")),
         # API settings (from ENV)
@@ -683,9 +680,8 @@ async def _merge_loaded_config(env_config, db_data, check_required_elements=Fals
     # keep the (ip, inbound) device-counting key shape intact.
     config["api_ip_sentinel_inbound"] = str(db_config.get("api_ip_sentinel_inbound", "API")).strip() or "API"
 
-    # Minimum successful-fetch ratio required to run enforcement for a cycle.
-    # Below this the cycle is skipped entirely so that a flaky panel cannot
-    # mass-reset the consecutive-violation counters of real offenders.
+    # Diagnostic usable-user threshold; each unknown user retains their own
+    # warning record regardless of the batch success percentage.
     #
     # The environment value already went through normalize_min_coverage in
     # load_env_config, so it is the fallback here and a database row still wins - the
@@ -695,15 +691,8 @@ async def _merge_loaded_config(env_config, db_data, check_required_elements=Fals
         default=config.get("api_ip_min_coverage", DEFAULT_API_IP_MIN_COVERAGE),
     )
 
-    # Fraction of the expected node fleet that must appear in the API payloads.
-    # ip_source_api reads this key, but nothing ever populated it, so the gate was
-    # permanently off: the "only 16 of 49 nodes reported" cycles passed as healthy.
-    # Default stays 0.0 (off) so wiring it up cannot change behaviour on its own.
-    #
-    # Shares normalize_min_coverage with the user-coverage floor so both accept the same
-    # spellings. The plain float() this used to do read a hand-written 80 as 80, clamped
-    # it to 100%, and would then have skipped every cycle - the trap being that the only
-    # way to set this was to write the row by hand in the first place.
+    # Legacy setting retained for compatibility; node percentages never gate
+    # otherwise usable user observations.
     config["api_ip_min_node_coverage"] = normalize_min_coverage(
         db_config.get("api_ip_min_node_coverage"),
         default=config.get("api_ip_min_node_coverage", 0.0),

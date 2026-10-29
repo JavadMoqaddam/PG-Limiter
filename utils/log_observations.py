@@ -8,7 +8,7 @@ import math
 import re
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import lru_cache
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -586,6 +586,35 @@ class LogObservations:
             required is not None and eligible == required and not global_reason,
             self.freshness_seconds,
         )
+
+    def retain_current_nodes(self, evidence: LogSampleEvidence | None) -> LogSampleEvidence | None:
+        """Drop retired node witnesses without admitting recovered nodes to a scan.
+
+        Source, settings, global uncertainty and timing guards still apply. Only
+        the captured nodes whose epochs survived may contribute positive evidence.
+        """
+        if evidence is None:
+            return None
+        if self.is_current(evidence, allow_partial=True):
+            return evidence
+        versions = tuple(
+            (node_id, epoch)
+            for node_id, epoch in evidence.node_versions
+            if self.node_epoch(node_id) == epoch and not self.node_unavailable_reason(node_id)
+        )
+        eligible = frozenset(node_id for node_id, _ in versions)
+        complete = (
+            evidence.coverage_complete
+            and eligible == evidence.eligible_node_ids
+            and evidence.required_node_ids == frozenset(self.required_nodes or ())
+        )
+        retained = replace(
+            evidence,
+            node_versions=versions,
+            eligible_node_ids=eligible,
+            coverage_complete=complete,
+        )
+        return retained if self.is_current(retained, allow_partial=True) else None
 
     def is_current(self, evidence: LogSampleEvidence | None, *, allow_partial: bool = False) -> bool:
         from utils.read_config import get_config_revision

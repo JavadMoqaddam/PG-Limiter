@@ -210,6 +210,7 @@ async def test_online_fanout_counts_rejected_keys_once(key_http, operational_top
 
     assert payloads == {} and fetch_times == {}
     assert counters == {
+        "invalid": 0,
         "ok": 0,
         "failed": 2,
         "not_found": 0,

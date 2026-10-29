@@ -35,6 +35,9 @@ class APISampleEvidence:
     observation_windows: dict[str, APIObservationWindow] = field(default_factory=dict)
     user_contexts: dict[str, APIUserContext] = field(default_factory=dict)
     live_node_ids: frozenset[int] = frozenset()
+    # Positive observations may prove a violation; missing nodes cannot prove
+    # normalization, even for a user with some valid observations.
+    partial_users: frozenset[str] = frozenset()
 
 
 class ActiveUsersSnapshot(dict[str, UserType]):

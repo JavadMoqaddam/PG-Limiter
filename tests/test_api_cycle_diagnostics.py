@@ -53,7 +53,7 @@ async def test_last_cycle_separates_missing_users_from_global_node_absence(monke
     assert "Users with unusable evidence: <code>2181</code>" in text
     assert "Nodes reporting across responses: <code>14/16</code>" in text
     assert "Nodes absent across all responses: <code>2</code>" in text
-    assert "Consecutive incomplete API collections: <code>2</code>" in text
+    assert "Consecutive API outage cycles: <code>2</code>" in text
     assert "2395 stale" in text
     assert "Historical" in text
 

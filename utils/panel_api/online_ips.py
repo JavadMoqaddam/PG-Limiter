@@ -29,6 +29,7 @@ OUTCOME_NOT_FOUND = "not_found"
 OUTCOME_FORBIDDEN = "forbidden"
 OUTCOME_UNAUTHORIZED = "unauthorized"
 OUTCOME_ERROR = "error"
+OUTCOME_INVALID = "invalid"
 OUTCOME_TIMEOUT = "timeout"
 OUTCOME_DEFERRED = "deferred"
 
@@ -222,7 +223,7 @@ async def fetch_user_online_ips(
                 return _parse_ip_payload(response.json()), OUTCOME_OK
             except Exception as parse_error:
                 online_ips_logger.debug(f"Unparseable online-IP body for user {user_id}: {type(parse_error).__name__}")
-                return None, OUTCOME_ERROR
+                return None, OUTCOME_INVALID
         if response.status_code == 404:
             # Only the panel's explicit missing-user response proves absence.
             # A missing route or proxy 404 leaves connection evidence unknown.

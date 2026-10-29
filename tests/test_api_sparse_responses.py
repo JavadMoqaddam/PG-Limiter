@@ -45,10 +45,14 @@ async def test_sparse_under_limit_response_clears_warning(two_groups, reply, exp
         ips = {"5.6.7.8": int(r.clock[0]) - 1000}
     r.bodies["alice"] = {"nodes": {} if reply == "missing" else {"31": {"ips": ips}}}
     assert await r.run()
-    assert "alice" not in r.warning.warnings
+    if reply == "missing":
+        assert r.warning.warnings["alice"] is record
+        assert record.consecutive_violations == 1
+    else:
+        assert "alice" not in r.warning.warnings
 
 
-async def test_successful_empty_responses_clear_warnings_without_fallback(two_groups):
+async def test_empty_aggregate_preserves_warnings_without_fallback(two_groups):
     from utils.ip_source_api import get_last_cycle_stats
 
     r = two_groups
@@ -59,9 +63,10 @@ async def test_successful_empty_responses_clear_warnings_without_fallback(two_gr
         r.advance()
         for name in r.bodies:
             r.bodies[name] = {"nodes": {}}
-        assert await r.run()
+        assert not await r.run()
         assert r.config["ip_source"] == "api"
-        assert r.warning.warnings == {}
+        assert set(r.warning.warnings) == {"alice", "bob"}
+        assert all(record.consecutive_violations == 1 for record in r.warning.warnings.values())
         assert get_last_cycle_stats()["consecutive_unsuccessful_cycles"] == 0
 
 

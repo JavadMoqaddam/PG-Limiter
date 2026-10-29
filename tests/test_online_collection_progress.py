@@ -60,6 +60,7 @@ async def test_final_progress_distinguishes_success_from_absence_and_rejected_re
                 key_http.panel, [("private_a", 1, {}), ("private_b", 2, {}), ("private_c", 3, {})], 3, 1
             )
     assert counters == {
+        "invalid": 0,
         "ok": 1,
         "failed": 0,
         "not_found": 1,

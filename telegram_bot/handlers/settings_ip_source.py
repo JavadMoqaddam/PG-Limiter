@@ -56,9 +56,6 @@ def _build_ip_source_text(config_data: dict) -> str:
     current_source = str(config_data.get("ip_source") or "logs")
     interval = config_data.get("check_interval", 60)
     freshness = normalize_api_ip_freshness(config_data.get("api_ip_freshness"))
-    # normalize_min_coverage rather than "or 0.0": an absent key means the documented
-    # default, and the old fallback would have shown 0% on this screen while the
-    # collector was actually enforcing 80%.
     coverage = normalize_min_coverage(config_data.get("api_ip_min_coverage"))
     auto_fallback = "✅ on" if config_data.get("api_ip_auto_fallback", True) else "❌ off"
 
@@ -93,15 +90,16 @@ def _build_ip_source_text(config_data: dict) -> str:
         "<b>API mode settings:</b>\n"
         f"• Check interval: <code>{interval}s</code>\n"
         "• Candidates: active users with <code>online=true</code> and Group Filter\n"
-        f"• Min coverage: <code>{coverage:.0%}</code>\n"
-        f"• Auto-fallback to logs: {auto_fallback}\n\n"
+        f"• Coverage alert threshold: <code>{coverage:.0%}</code>\n"
+        "• Valid users continue below this threshold.\n"
+        f"• Auto-fallback for API outages: {auto_fallback}\n\n"
         "<b>API observations:</b>\n"
         "• Xray 26.4.13+: open connections in the response count even with old opening timestamps.\n"
         "• WireGuard and older/unknown Xray: activity age is checked at that user's request.\n"
         "• Collection delays do not empty earlier users' scan results. Before punishment, "
         "observations older than Last seen are refreshed for that user.\n"
         "• Unknown user/node evidence preserves that user's warning record. "
-        "Valid empty or expired observations can clear it.\n"
+        "Healthy empty node maps or expired observations can clear it; an entirely empty aggregate cannot.\n"
         "• Inbound protocol is not exposed by the API, so per-inbound CDN grouping "
         "is inactive (use <b>CDN Nodes</b> instead).\n"
         "• Requires the <code>nodes:stats</code> panel permission."
@@ -403,7 +401,10 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
     else:
         verdict = "⚠️ Collection unavailable or still in progress; no usable sample recorded"
     if not skipped and not fallback and outcome == "partial":
-        verdict += f" ({stats.get('unknown_users', 0)} users protected: incomplete evidence)"
+        verdict += (
+            f" ({stats.get('unknown_users', 0)} users unknown; "
+            f"{stats.get('partial_users', 0)} users with partial node coverage)"
+        )
 
     dropped = [f"{stats.get('stale_ips', 0)} stale"]
     if stats.get("unknown_age_ips"):
@@ -417,7 +418,7 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
         f"{historical}"
         f"<b>Ran:</b> {age_label} in <code>{stats.get('duration_ms', 0)}ms</code>\n"
         f"{verdict}\n\n"
-        f"Consecutive incomplete API collections: <code>{stats.get('consecutive_unsuccessful_cycles', 0)}</code>\n\n"
+        f"Consecutive API outage cycles: <code>{stats.get('consecutive_unsuccessful_cycles', 0)}</code>\n\n"
         "<b>Candidate narrowing:</b>\n"
         f"• From panel: <code>{stats.get('candidates', 0)}</code>\n"
         f"• After local filters: <code>{stats.get('prefiltered', 0)}</code>\n\n"
@@ -428,7 +429,8 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
         f"• Unsent/deferred: <code>{stats.get('fetched_deferred', 0)}</code>\n"
         f"• Not found (404): <code>{stats.get('not_found', 0)}</code>\n"
         f"• Forbidden (403): <code>{stats.get('forbidden', 0)}</code>\n"
-        f"• Coverage: <code>{float(stats.get('coverage') or 0):.1%}</code>\n\n"
+        f"• HTTP coverage: <code>{float(stats.get('http_coverage') or 0):.1%}</code>\n"
+        f"• Usable user coverage: <code>{float(stats.get('coverage') or 0):.1%}</code>\n\n"
         "<b>Evidence:</b>\n"
         f"{format_api_evidence_summary(stats)}\n"
         "HTTP success does not confirm complete node evidence for each user.\n\n"

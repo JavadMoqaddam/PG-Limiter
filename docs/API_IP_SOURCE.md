@@ -73,18 +73,16 @@ Node-ID aliases that normalize to the same ID, such as `1` and `01`, or IP keys
 that become identical after trimming whitespace make the whole user's payload
 malformed. They cannot overwrite conflicting evidence and clear a warning.
 A successful, valid response is counted from its returned IPs. There is no
-requirement for every node available to a user to appear in the response, and no
-per-user missing-node comparison. A successful `{"nodes": {}}` response counts
-as zero. Counts above the user's limit follow normal warning/punishment rules;
-counts within the limit follow normal warning-clearing rules. Omitted maps do
-not preserve warnings or trigger automatic fallback.
-
-This accepts the panel's sparse result for enforcement: a node without a user
-counter and a node query omitted by the panel have the same effect on counting.
-Ordinary IP, subnet, CDN and High Trust counting rules apply without a separate
-partial-response counting mode. Failed requests, returned null maps, malformed
-bodies and invalid timestamps remain unknown. An 80% HTTP answer rate does not
-make the failed lookups known.
+requirement for every node available to a user to appear in the response.
+With unchanged healthy scope, a sparse response containing at least one valid
+applicable node map retains normal IP, subnet, CDN and High Trust counting.
+An explicit empty `{"ips": {}}` map or expired activity timestamps can establish
+zero observed usage. An aggregate `{"nodes": {}}` cannot: the panel also returns
+it when all eligible node queries are omitted. Such a user is skipped and their
+warning count, trust score and history are preserved, including expired warnings.
+Failed requests, returned null maps, malformed bodies and invalid timestamps
+remain unknown for that user. Other users continue independently of the success
+percentage; `API_IP_MIN_COVERAGE` is now a diagnostic threshold.
 
 Eligible node scope is resolved for each user from their enabled PasarGuard groups,
 those groups' inbound tags, and the effective core configuration of each included
@@ -95,8 +93,14 @@ are not used to infer authorization.
 
 Returned node maps are filtered to the user's applicable connected-node scope.
 An `error`/`connecting` node does not stop users being checked on healthy nodes,
-including users in the same group. This counts the healthy monitored scope;
-it does not prove that the excluded node has no live client connections.
+including users in the same group. Only nodes healthy in both the initial and
+final snapshots contribute to that scan; a reconnecting node waits for the next
+scan. Changed health alone does not invalidate unchanged user access.
+This partial sample can prove a violation but cannot prove normalization: absent
+and below-limit users retain warnings. For partial IP/Device samples, CDN groups
+use a conservative lower bound: the larger of the ordinary distinct-device count
+and one if any CDN observation exists. This avoids overcounting CDN buckets that
+missing observations could overlap. Complete healthy samples keep normal counting.
 Omitted maps add no connections; null maps invalidate that user. If
 none of a user's applicable nodes are healthy, their evidence remains unknown.
 
@@ -106,12 +110,13 @@ Nodes, groups and cores are read before collection and confirmed after IP
 preparation; current active memberships are fetched in batches of at most 200
 scanned user IDs, without an online predicate. Going offline during collection
 does not itself invalidate the observed IPs. An ignored ID filter fails the check
-instead of fetching the whole population. Observed membership or node-scope
-changes retire only the affected users. Failed topology/permission requests
+instead of fetching the whole population. Observed membership or access-scope
+changes retire only the affected users; health changes remove only affected nodes. Failed topology/permission requests
 cannot become empty scopes; check `groups.read` and `cores.read` permissions.
 
-A valid empty response (or expired activity timestamps on WireGuard/legacy cores)
-can clear warnings even when some or all node maps are omitted. During a fleet outage or
+A response with a valid empty applicable node map (or expired activity timestamps
+on WireGuard/legacy cores) can clear warnings within unchanged healthy scope,
+even when other maps are omitted. An entirely empty aggregate is unknown. During a fleet outage or
 topology change, retained warning users absent from the candidate list are
 protected as well. A complete empty candidate list can clear warnings only when
 the monitored fleet/topology remains available and unchanged through the query.
@@ -126,14 +131,17 @@ was complete, partially usable, or skipped.
 ## Reading Last API Cycle
 
 **Users with unusable evidence** counts failed, invalid or retired user
-observations. Omitted node maps do not add to this count. The per-user
+observations. A sparse response with a usable applicable map does not add to this count.
+`coverage` is the usable-user fraction, while `http_coverage` records HTTP 200 or
+confirmed missing-user responses. `invalid_responses` counts malformed HTTP 200
+bodies, and `partial_users` counts usable users with excluded unhealthy nodes. The per-user
 `missing_node_users` and `missing_node_ids` counters have been removed.
 **Nodes reporting across responses** counts eligible node IDs with valid maps
 present anywhere in the batch; **Nodes absent across all responses** is the
 eligible fleet minus that union. These fleet totals are diagnostic only and do
 not determine whether a user response is complete or may be evaluated.
 
-When an HTTP failure or user-coverage gate returns before node-map evaluation,
+When an HTTP failure returns before node-map evaluation,
 the report retains the known expected fleet and unknown-user count. With
 `node_evidence_evaluated=false`, reporting nodes and global absence are unknown;
 zero diagnostic counts do not establish that every node is absent.
@@ -156,14 +164,16 @@ or discarded fallback samples are not reported as available for enforcement.
 With `api_ip_auto_fallback` enabled (the default), two consecutive unsuccessful
 API collection cycles switch the source to Logs. Each cycle counts once,
 regardless of the number of failed user requests. Only cycles that cannot supply
-an enforceable sample count: unreachable panels, incomplete candidate/topology
-queries, insufficient HTTP coverage or all-user-unknown evidence. A usable partial
-cycle evaluates observed violations and does not trigger global fallback.
+an enforceable sample because the panel/query is unavailable count: unreachable
+panels, failed candidate/topology queries, or no successful online-IP HTTP lookups.
+A usable partial cycle evaluates observed violations and does not trigger global fallback.
 
 The panel can omit failed, None or user-not-found node results. Omitted node maps
 alone no longer trigger fallback, even when every response is sparse. Returned
-null maps, malformed data and invalid timestamps can still make all user evidence
-unusable despite successful HTTP transport and trigger fallback.
+null maps, malformed data and invalid timestamps may make all user evidence
+unusable, but successful HTTP transport with unusable evidence does not trigger
+fallback. Neither all-node outages nor health changes alone select Logs. These
+cycles preserve records, report the missing evidence and reset the outage streak.
 A later background mirror-pagination failure is a separate operation and does
 not explain that API cycle's missing-node result.
 
@@ -191,7 +201,7 @@ coverage diagnostics continue to report skipped enforcement.
 Builds containing API-key authentication require `PANEL_API_KEY` instead of
 `PANEL_USERNAME`/`PANEL_PASSWORD`; changing the process environment requires a
 restart or container recreation. This credential change preserves the
-scope, HTTP-coverage and timestamp checks described above. Accepting sparse node
+scope, per-user evidence and timestamp checks described above. Accepting sparse node
 maps requires no new setting or schema migration.
 
 `API_IP_FRESHNESS=60` supplies the default for new installations. Set any positive
@@ -243,11 +253,13 @@ progress at most once every ten seconds as requests finish, and a final
 summary. For example:
 
 ```text
-API IP requests: 800/1000 (80.0% complete), success 97.5% (780 ok), 5 not found, 5 forbidden, 10 failed (2 unauthorized, 3 timeouts: 2 read, 1 connect, 0 pool, 0 write), 0 unsent/deferred
+API IP requests: 800/1000 (80.0% complete), success 97.5% (780 ok), 5 not found, 5 forbidden, 10 failed (2 unauthorized, 3 timeouts: 2 read, 1 connect, 0 pool, 0 write), 0 invalid bodies, 0 unsent/deferred
 ```
 
 Completion and success are different percentages. Success is the fraction of
-completed lookups that returned a valid online-IP response. Confirmed missing
+completed lookups that returned a parseable HTTP 200 body. Malformed bodies
+lower that percentage and are counted separately. The final usable-user coverage
+also accounts for scope and timestamp validation. Confirmed missing
 users count toward coverage but not toward successful IP responses; rejected
 keys and failures remain visible in the totals. Timeouts are a subset of failed
 lookups. Unsent/deferred users remain unknown and do not contribute to coverage

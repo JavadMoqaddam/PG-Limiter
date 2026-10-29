@@ -101,8 +101,8 @@ class APINodeScope:
     def monitored_nodes(self) -> frozenset[int]:
         return frozenset(self.node_tags)
 
-    def required_nodes(self, raw: dict) -> frozenset[int] | None:
-        """None means unknown membership; an authoritative empty set is distinct."""
+    def applicable_nodes(self, raw: dict) -> frozenset[int] | None:
+        """Resolve access independently of transient node availability."""
         try:
             groups = _ids(raw.get("group_ids"))
         except ValueError:
@@ -114,7 +114,13 @@ class APINodeScope:
             self._combinations[groups] = frozenset(
                 n for n, inbound_tags in self.node_tags.items() if tags & inbound_tags
             )
-        applicable = self._combinations[groups]
+        return self._combinations[groups]
+
+    def required_nodes(self, raw: dict) -> frozenset[int] | None:
+        """None means unknown membership or no available applicable nodes."""
+        applicable = self.applicable_nodes(raw)
+        if applicable is None:
+            return None
         required = applicable & self.available_nodes
         # No healthy applicable node cannot establish that an existing warning
         # normalized. Other users/groups can still supply usable evidence.

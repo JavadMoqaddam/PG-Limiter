@@ -158,8 +158,6 @@ async def source_runtime(monkeypatch, tmp_path, operational_topics):
         "unavailable",
         "candidate_failure",
         "node_failure",
-        "invalid_response",
-        "missing_node",
         "route_not_found",
     ],
 )
@@ -355,12 +353,12 @@ async def test_stats_mutation_cannot_change_cycle_outcome(source_runtime, monkey
 
     async def skip(reason):
         await original(reason)
-        r.api.LAST_CYCLE_STATS["collection_outcome"] = "success"
+        r.api.LAST_CYCLE_STATS["collection_outcome"] = "failure"
 
     monkeypatch.setattr(r.api, "_handle_coverage_skip", skip)
     await r.collect("missing_node")
     await r.collect("missing_node")
-    assert (await r.config.read_config())["ip_source"] == "logs"
+    assert (await r.config.read_config())["ip_source"] == "api"
 
 
 async def test_settings_change_during_collection_is_not_an_outage(source_runtime, monkeypatch):
@@ -762,3 +760,17 @@ async def test_backup_config_batch_rolls_back_and_invalidates_on_failure(
     assert await r.config.get_config_value_from_db("disable_method") is None
     assert await r.config.get_config_value_from_db("check_interval") is None
     assert r.config.get_config_revision() > revision
+
+
+@pytest.mark.parametrize("invalid", ["invalid_response", "missing_node"])
+async def test_http_success_with_invalid_user_data_resets_outage_streak(source_runtime, invalid):
+    r = source_runtime
+    assert not await r.collect("failure")
+    assert not await r.collect(invalid)
+    assert r.api.get_last_cycle_stats()["consecutive_unsuccessful_cycles"] == 0
+    assert r.api.get_last_cycle_stats()["coverage"] == 0
+    assert r.api.get_last_cycle_stats()["http_coverage"] == 1
+    assert not await r.collect("failure")
+    assert (await r.config.read_config())["ip_source"] == "api"
+    assert not await r.collect("failure")
+    assert (await r.config.read_config())["ip_source"] == "logs"
