@@ -77,7 +77,7 @@ async def test_availability_probe_uses_key_and_configured_scheme(key_http, domai
     assert "Authorization" not in state.requests[0].headers
 
 
-@pytest.mark.parametrize("setting,expected_verify", [("true", True), ("false", False)])
+@pytest.mark.parametrize("setting,expected_verify", [(None, True), ("true", True), ("false", False), ("invalid", True)])
 async def test_rest_tls_verification_setting_reaches_http_client(monkeypatch, setting, expected_verify):
     real_client = httpx.AsyncClient
     options = []
@@ -86,7 +86,10 @@ async def test_rest_tls_verification_setting_reaches_http_client(monkeypatch, se
         options.append(kwargs)
         return real_client(**kwargs)
 
-    monkeypatch.setenv("PANEL_VERIFY_SSL", setting)
+    if setting is None:
+        monkeypatch.delenv("PANEL_VERIFY_SSL", raising=False)
+    else:
+        monkeypatch.setenv("PANEL_VERIFY_SSL", setting)
     monkeypatch.setattr(request_helper, "_panel_client", None)
     monkeypatch.setattr(request_helper.httpx, "AsyncClient", client_factory)
     async with await request_helper.get_panel_client():
@@ -247,7 +250,7 @@ def key_sse(monkeypatch, operational_topics):
     return collector, node
 
 
-@pytest.mark.parametrize("setting,expected_verify", [("true", True), ("false", False)])
+@pytest.mark.parametrize("setting,expected_verify", [(None, True), ("true", True), ("false", False), ("invalid", True)])
 async def test_sse_tls_verification_setting_reaches_http_client(key_sse, monkeypatch, setting, expected_verify):
     collector, node = key_sse
     real_client = httpx.AsyncClient
@@ -257,7 +260,10 @@ async def test_sse_tls_verification_setting_reaches_http_client(key_sse, monkeyp
         options.append(kwargs)
         return real_client(transport=httpx.MockTransport(lambda _request: httpx.Response(401)), **kwargs)
 
-    monkeypatch.setenv("PANEL_VERIFY_SSL", setting)
+    if setting is None:
+        monkeypatch.delenv("PANEL_VERIFY_SSL", raising=False)
+    else:
+        monkeypatch.setenv("PANEL_VERIFY_SSL", setting)
     monkeypatch.setattr(collector.httpx, "AsyncClient", client_factory)
     await collector.get_nodes_logs(SimpleNamespace(panel_domain="https://panel.invalid", panel_api_key=KEY), node)
 

@@ -28,9 +28,11 @@ response masks it.
 
 A domain without a scheme uses HTTPS. Explicit `http://` selects HTTP; HTTPS
 failures do not trigger an automatic HTTP retry. `PANEL_VERIFY_SSL` controls
-certificate verification for both REST and SSE. Its existing default is
-`false`; set it to `true` when the panel has a certificate trusted by the
-limiter. Supply an HTTPS domain for an encrypted connection.
+certificate verification for both REST and SSE. The default in 1.7.1 is `true`; REST and SSE reject an untrusted certificate before sending the key. Supply an HTTPS domain for encryption.
+
+Before upgrading an installation with a private/self-signed certificate, configure a trusted CA bundle with `SSL_CERT_FILE` in the limiter environment and mount that file read-only into the container. The bundle should contain any public roots needed by other HTTPS clients as well as your private CA. Its path must exist inside the container. Validate the certificate hostname against `PANEL_DOMAIN`.
+
+An existing explicit `PANEL_VERIFY_SSL=false` is still honored; this opts out of certificate verification and permits interception by an attacker on the network path. An installation that omitted the setting now uses verification, so prepare its certificate trust before upgrading. Unknown setting values do not disable verification. No automatic fallback to HTTP or disabled verification occurs.
 
 ## Permissions and user scope
 

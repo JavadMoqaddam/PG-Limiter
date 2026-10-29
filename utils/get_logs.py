@@ -421,7 +421,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
             # Match the API client instead of hardcoding False, so PANEL_VERIFY_SSL
             # covers the log streams too. Same host as the API calls, so a setting that
             # works there works here; the default stays off.
-            verify_ssl = os.getenv("PANEL_VERIFY_SSL", "false").lower() in ("true", "1", "yes")
+            verify_ssl = os.getenv("PANEL_VERIFY_SSL", "true").strip().lower() not in ("false", "0", "no", "off")
             async with httpx.AsyncClient(verify=verify_ssl, timeout=sse_timeout) as client:
                 logger.info(f"Establishing SSE connection for node {node.node_id}: {node.node_name}")
 

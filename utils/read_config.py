@@ -243,7 +243,7 @@ def load_env_config() -> Dict[str, Any]:
         # API settings (from ENV)
         "api": {
             "enabled": _get_env("API_ENABLED", False, bool),
-            "host": _get_env("API_HOST", "0.0.0.0"),
+            "host": _get_env("API_HOST", "127.0.0.1"),
             "port": _get_env("API_PORT", 8080, int),
             "username": _get_env("API_USERNAME", "admin"),
             "password": _get_env("API_PASSWORD", ""),

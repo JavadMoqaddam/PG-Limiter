@@ -8,6 +8,8 @@ Two independent group choices live here:
     can no longer be resolved on re-enable, so nobody ends up group-less.
 """
 
+from html import escape
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
@@ -116,7 +118,7 @@ async def handle_select_disabled_group_callback(query, _context: ContextTypes.DE
         await query.edit_message_text(
             text="🚫 <b>Disable Method</b>\n\n"
             f"✅ Method set to <b>By Group</b>\n"
-            f"Group: <b>{group_name}</b> (ID: {group_id})\n\n"
+            f"Group: <b>{escape(str(group_name))}</b> (ID: {group_id})\n\n"
             "• <b>By Status</b>: Set user status to 'disabled'\n"
             "• <b>By Group</b>: Move user to a disabled group",
             reply_markup=create_disable_method_keyboard("group", group_name),
@@ -125,7 +127,7 @@ async def handle_select_disabled_group_callback(query, _context: ContextTypes.DE
 
     except Exception as e:
         await query.edit_message_text(
-            text=f"❌ Error: {str(e)}",
+            text=f"❌ Error: {escape(str(e))}",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("« Back", callback_data=CallbackData.DISABLE_BY_GROUP)]]
             ),
@@ -202,7 +204,7 @@ async def handle_fallback_group_menu_callback(query, _context: ContextTypes.DEFA
     try:
         await query.edit_message_text(
             text="🔄 <b>Fallback Group</b>\n\n"
-            f"Current: <b>{current_name}</b>\n\n"
+            f"Current: <b>{escape(str(current_name))}</b>\n\n"
             "Select the group that will be assigned to users when:\n"
             "• Their original groups cannot be found when re-enabling\n"
             "• All active users should have this group\n\n"
@@ -237,7 +239,7 @@ async def handle_select_fallback_group_callback(query, _context: ContextTypes.DE
 
         await query.edit_message_text(
             text="🚫 <b>Disable Method</b>\n\n"
-            f"✅ Fallback group set to <b>{group_name}</b> (ID: {group_id})\n\n"
+            f"✅ Fallback group set to <b>{escape(str(group_name))}</b> (ID: {group_id})\n\n"
             "• <b>By Status</b>: Set user status to 'disabled'\n"
             "• <b>By Group</b>: Move user to a disabled group\n"
             "• <b>Fallback Group</b>: Default group for re-enabled users",
@@ -247,7 +249,7 @@ async def handle_select_fallback_group_callback(query, _context: ContextTypes.DE
 
     except Exception as e:
         await query.edit_message_text(
-            text=f"❌ Error: {str(e)}",
+            text=f"❌ Error: {escape(str(e))}",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("« Back", callback_data=CallbackData.FALLBACK_GROUP_MENU)]]
             ),
@@ -284,7 +286,7 @@ async def handle_clear_fallback_group_callback(query, _context: ContextTypes.DEF
 
     except Exception as e:
         await query.edit_message_text(
-            text=f"❌ Error: {str(e)}",
+            text=f"❌ Error: {escape(str(e))}",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("« Back", callback_data=CallbackData.FALLBACK_GROUP_MENU)]]
             ),

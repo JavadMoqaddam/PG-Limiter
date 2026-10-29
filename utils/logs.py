@@ -90,7 +90,7 @@ def setup_logging():
     # File handler - detailed logs (with error handling)
     try:
         # Try to create log file in current directory or /var/lib/pg-limiter/logs
-        log_paths = ["app.log", "/var/lib/pg-limiter/logs/app.log", "/tmp/pg-limiter.log"]
+        log_paths = ["app.log", "/var/lib/pg-limiter/logs/app.log"]
         file_handler = None
 
         for log_path in log_paths:

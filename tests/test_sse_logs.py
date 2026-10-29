@@ -28,7 +28,7 @@ async def test_sse_logs():
     domain = panel_data.panel_domain.removeprefix("https://").removeprefix("http://")
     url = f"{scheme}://{domain}/api/node/{node.node_id}/logs"
     headers = {**get_panel_headers(panel_data), "Accept": "text/event-stream", "Cache-Control": "no-cache"}
-    verify_ssl = os.getenv("PANEL_VERIFY_SSL", "false").lower() in ("true", "1", "yes")
+    verify_ssl = os.getenv("PANEL_VERIFY_SSL", "true").strip().lower() not in ("false", "0", "no", "off")
     timeout = httpx.Timeout(connect=10, read=None, write=10, pool=10)
     async with httpx.AsyncClient(verify=verify_ssl, timeout=timeout) as client:
         async with client.stream("GET", url, headers=headers) as response:

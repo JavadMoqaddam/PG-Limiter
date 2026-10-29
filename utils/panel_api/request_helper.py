@@ -127,7 +127,7 @@ async def get_panel_client() -> httpx.AsyncClient:
     global _panel_client
     if _panel_client is None or _panel_client.is_closed:
         limits = httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=30.0)
-        verify_ssl = os.getenv("PANEL_VERIFY_SSL", "false").lower() in ("true", "1", "yes")
+        verify_ssl = os.getenv("PANEL_VERIFY_SSL", "true").strip().lower() not in ("false", "0", "no", "off")
         _panel_client = httpx.AsyncClient(
             verify=verify_ssl,
             timeout=30.0,

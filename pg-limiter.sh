@@ -260,7 +260,7 @@ create_env_file() {
 PANEL_DOMAIN=your-panel-domain.com:8443
 PANEL_API_KEY=your_panel_api_key
 # Covers panel REST requests and node log streams.
-PANEL_VERIFY_SSL=false
+PANEL_VERIFY_SSL=true
 
 # Telegram Bot (Required)
 BOT_TOKEN=YOUR_BOT_TOKEN
