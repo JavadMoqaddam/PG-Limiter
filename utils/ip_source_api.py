@@ -22,6 +22,8 @@ Collection is a two-stage process:
 import asyncio
 import copy
 import time
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from html import escape
 from typing import Optional
@@ -50,6 +52,12 @@ LAST_CYCLE_STATS: dict = {
     "prefiltered": 0,
     "fetched_ok": 0,
     "fetched_failed": 0,
+    "fetched_deferred": 0,
+    "fetched_timeouts": 0,
+    "fetched_read_timeouts": 0,
+    "fetched_connect_timeouts": 0,
+    "fetched_pool_timeouts": 0,
+    "fetched_write_timeouts": 0,
     "not_found": 0,
     "forbidden": 0,
     "coverage": 0.0,
@@ -72,7 +80,6 @@ LAST_CYCLE_STATS: dict = {
     "future_ips": 0,
     "unknown_age_ips": 0,
     # Reasons can overlap; each counter counts affected users, not IPs or nodes.
-    "missing_node_users": 0,
     "null_node_users": 0,
     "unknown_age_users": 0,
     "future_timestamp_users": 0,
@@ -80,7 +87,6 @@ LAST_CYCLE_STATS: dict = {
     "unavailable_nodes": 0,
     "live_connection_nodes": 0,
     "activity_timestamp_nodes": 0,
-    "missing_node_ids": (),
     "skipped_reason": "",
     # Separate remote collection health from the bool returned to enforcement:
     # complete users may still be judged during a partial collection.
@@ -129,13 +135,16 @@ def format_api_evidence_summary(stats: dict) -> str:
         absent = "unknown"
     return (
         f"HTTP lookups: <code>{count('fetched_ok')}</code> OK / <code>{count('fetched_failed')}</code> failed\n"
+        f"Timeouts (included in failed): <code>{count('fetched_timeouts')}</code>\n"
+        f"Timeout phases: read {count('fetched_read_timeouts')}, connect {count('fetched_connect_timeouts')}, "
+        f"pool {count('fetched_pool_timeouts')}, write {count('fetched_write_timeouts')}\n"
+        f"Unsent/deferred lookups: <code>{count('fetched_deferred')}</code>\n"
         f"Forbidden lookups (403): <code>{count('forbidden')}</code>\n"
-        f"Users with incomplete evidence: <code>{count('unknown_users')}</code>\n"
+        f"Users with unusable evidence: <code>{count('unknown_users')}</code>\n"
         f"Users with unavailable or changed node scope: <code>{count('unknown_scope_users')}</code>\n"
         f"Unavailable monitored nodes: <code>{count('unavailable_nodes')}</code>\n"
         f"Connected nodes by IP evidence: <code>{count('live_connection_nodes')}</code> live maps / "
         f"<code>{count('activity_timestamp_nodes')}</code> activity timestamps\n"
-        f"Users missing required node evidence: <code>{count('missing_node_users')}</code>\n"
         f"Nodes reporting across responses: {reporting}\n"
         f"Nodes absent across all responses: {absent}\n"
         f"Stale source observations dropped: <code>{count('stale_ips')}</code>"
@@ -336,6 +345,9 @@ async def _fetch_all_online_ips(
     targets: list[tuple[str, int, dict]],
     concurrency: int,
     timeout: float,
+    *,
+    max_breaker_wait: float = 65.0,
+    is_current: Callable[[], bool] | None = None,
 ) -> tuple[OnlineIPResults, dict[str, int], dict[str, float]]:
     """
     Run the bounded-concurrency fan-out over the candidate users.
@@ -347,67 +359,157 @@ async def _fetch_all_online_ips(
     actual request window, captured after it acquires a concurrency slot.
     """
     from utils.panel_api.online_ips import (
+        OUTCOME_DEFERRED,
         OUTCOME_FORBIDDEN,
         OUTCOME_NOT_FOUND,
         OUTCOME_OK,
         OUTCOME_UNAUTHORIZED,
+        OUTCOME_TIMEOUT,
         fetch_user_online_ips,
     )
+    from utils.panel_api.request_helper import online_stats_circuit_breaker as breaker
 
-    counters = {"ok": 0, "failed": 0, "not_found": 0, "forbidden": 0, "unauthorized": 0}
+    counters = {"ok": 0, "failed": 0, "not_found": 0, "forbidden": 0, "unauthorized": 0, "deferred": 0, "timed_out": 0}
+    counters.update({f"{kind}_timeouts": 0 for kind in ("read", "connect", "pool", "write")})
     admission = monitoring_snapshot()
     payloads = OnlineIPResults()
     fetch_times: dict[str, float] = {}
     if not targets or not monitoring_is_current(admission):
         return payloads, counters, fetch_times
 
-    semaphore = asyncio.Semaphore(max(1, concurrency))
+    def current() -> bool:
+        return monitoring_is_current(admission) and (is_current is None or is_current())
 
     async def _one(username: str, user_id: int):
-        async with semaphore:
-            if not monitoring_is_current(admission):
-                return None
-            started_at, started_monotonic = time.time(), monotonic_time()
-            payload, outcome = await fetch_user_online_ips(panel_data, user_id, timeout=timeout)
-            observed = APIObservationWindow(started_at, time.time(), started_monotonic, monotonic_time())
-            if not monitoring_is_current(admission):
-                return None
-            return username, user_id, payload, outcome, observed
+        if not current():
+            return None
+        started_at, started_monotonic = time.time(), monotonic_time()
+        payload, outcome = await fetch_user_online_ips(panel_data, user_id, timeout=timeout)
+        observed = APIObservationWindow(started_at, time.time(), started_monotonic, monotonic_time())
+        if not current():
+            return None
+        return username, user_id, payload, outcome, observed
 
-    async def _run(batch: list[tuple[str, int]]) -> None:
-        """Execute one pass and preserve the outcome of rejected API keys."""
-        results = await asyncio.gather(
-            *[_one(name, uid) for name, uid in batch],
-            return_exceptions=True,
+    completed = 0
+    last_progress = time.monotonic()
+    api_ip_logger.info(
+        "🛰️ API IP requests started: %s users (timeout %.1fs, concurrency %s, breaker wait budget %.1fs)",
+        len(targets),
+        timeout,
+        max(1, concurrency),
+        max_breaker_wait,
+    )
+    queued = deque((name, uid) for name, uid, _ in targets)
+    tasks: dict[asyncio.Task, tuple[str, int]] = {}
+    waited = 0.0
+    waiting_announced = False
+
+    def progress():
+        nonlocal last_progress
+        settled = completed + counters["deferred"]
+        api_ip_logger.info(
+            "🛰️ API IP requests: %s/%s (%.1f%% complete), success %.1f%% "
+            "(%s ok), %s not found, %s forbidden, %s failed (%s unauthorized, %s timeouts: "
+            "%s read, %s connect, %s pool, %s write), %s unsent/deferred",
+            settled,
+            len(targets),
+            100 * settled / len(targets),
+            100 * counters["ok"] / completed if completed else 0.0,
+            counters["ok"],
+            counters["not_found"],
+            counters["forbidden"],
+            counters["failed"],
+            counters["unauthorized"],
+            counters["timed_out"],
+            counters["read_timeouts"],
+            counters["connect_timeouts"],
+            counters["pool_timeouts"],
+            counters["write_timeouts"],
+            counters["deferred"],
         )
-        for item in results:
-            if isinstance(item, asyncio.CancelledError):
-                raise item
-            if not isinstance(item, tuple):
-                counters["failed"] += 1
-                continue
-            username, user_id, payload, outcome, observed = item
-            if outcome == OUTCOME_OK:
-                counters["ok"] += 1
-                payloads[username] = payload if payload is not None else {}
-                fetch_times[username] = observed.received_at
-                payloads.observations[username] = observed
-            elif outcome == OUTCOME_NOT_FOUND:
-                counters["not_found"] += 1
-                payloads.not_found_users.add(username)
-                fetch_times[username] = observed.received_at
-                payloads.observations[username] = observed
-            elif outcome == OUTCOME_FORBIDDEN:
-                counters["forbidden"] += 1
-            elif outcome == OUTCOME_UNAUTHORIZED:
-                counters["unauthorized"] += 1
-                counters["failed"] += 1
+        last_progress = time.monotonic()
+
+    try:
+        while queued or tasks:
+            if not current():
+                break
+            if breaker.state == breaker.STATE_CLOSED:
+                capacity = max(1, concurrency)
+                waiting_announced = False
             else:
-                counters["failed"] += 1
+                # Drain earlier attempts before probing. A HALF_OPEN probe owns
+                # the only admission; no other queued calls are sent beside it.
+                capacity = 0
+                if not tasks and queued:
+                    if waited >= max_breaker_wait:
+                        break
+                    delay = breaker.recovery_delay() if breaker.state == breaker.STATE_OPEN else 0.25
+                    if delay > 0:
+                        if not waiting_announced:
+                            api_ip_logger.info("🛰️ Holding %s queued IP lookups for breaker recovery", len(queued))
+                            waiting_announced = True
+                        before = time.monotonic()
+                        await asyncio.sleep(min(delay, 0.25, max_breaker_wait - waited))
+                        waited += max(0.0, time.monotonic() - before)
+                        continue
+                    capacity = 1
+            while queued and len(tasks) < capacity:
+                name, uid = queued.popleft()
+                tasks[asyncio.create_task(_one(name, uid))] = (name, uid)
+            if not tasks:
+                break
+            done, _ = await asyncio.wait(tasks, timeout=0.25, return_when=asyncio.FIRST_COMPLETED)
+            # Preserve queue order when multiple completions arrive together;
+            # iterating the done set would randomly reorder downstream users.
+            for task in [task for task in tasks if task in done]:
+                target = tasks.pop(task)
+                try:
+                    item = task.result()
+                except Exception:
+                    item = None
+                if not current():
+                    continue
+                if not isinstance(item, tuple):
+                    counters["failed"] += 1
+                    completed += 1
+                    continue
+                username, user_id, payload, outcome, observed = item
+                if outcome == OUTCOME_DEFERRED:
+                    queued.appendleft(target)
+                    continue
+                if outcome == OUTCOME_OK:
+                    counters["ok"] += 1
+                    payloads[username] = payload if payload is not None else {}
+                    fetch_times[username] = observed.received_at
+                    payloads.observations[username] = observed
+                elif outcome == OUTCOME_NOT_FOUND:
+                    counters["not_found"] += 1
+                    payloads.not_found_users.add(username)
+                    fetch_times[username] = observed.received_at
+                    payloads.observations[username] = observed
+                elif outcome == OUTCOME_FORBIDDEN:
+                    counters["forbidden"] += 1
+                elif outcome == OUTCOME_UNAUTHORIZED:
+                    counters["unauthorized"] += 1
+                    counters["failed"] += 1
+                else:
+                    counters["failed"] += 1
+                    if outcome == OUTCOME_TIMEOUT:
+                        counters["timed_out"] += 1
+                        kind = getattr(outcome, "timeout_kind", None)
+                        if kind in {"read", "connect", "pool", "write"}:
+                            counters[f"{kind}_timeouts"] += 1
+                completed += 1
+            if completed < len(targets) and time.monotonic() - last_progress >= 10:
+                progress()
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-    batch = [(name, uid) for name, uid, _ in targets]
-    await _run(batch)
-
+    counters["deferred"] = len(targets) - completed
+    progress()
     return payloads, counters, fetch_times
 
 
@@ -438,6 +540,8 @@ async def _build_users_from_payloads(
     Verified live maps establish connection presence independently of opening
     time. Other producers use source age at request start. A later batch delay
     cannot expire either observation; missing request timing stays unknown.
+    Successful responses are counted as returned, without requiring every node
+    in the user's scope. Null or invalid returned maps remain unknown.
     """
     from utils.panel_api.online_ips import STALE_EPOCH_FLOOR
 
@@ -447,13 +551,11 @@ async def _build_users_from_payloads(
     pairs_by_user = {}
     unknown = set()
     unknown_by_reason = {
-        "missing_node_users": set(),
         "null_node_users": set(),
         "unknown_age_users": set(),
         "future_timestamp_users": set(),
         "unknown_scope_users": set(),
     }
-    missing_node_ids = set()
     nodes_seen = set()
     stats = {
         "geo_lookups": 0,
@@ -472,6 +574,9 @@ async def _build_users_from_payloads(
             unknown_by_reason["unknown_age_users"].add(username)
             continue
         latest_at = window.received_at if window else now
+        if config_data.get("device_count_mode") == COUNT_MODE_NODE and any(type(nid) is not int for nid in node_map):
+            unknown.add(username)
+            unknown_by_reason["unknown_scope_users"].add(username)
         required = expected_node_ids
         if required_nodes_by_user is not None:
             required = required_nodes_by_user.get(username)
@@ -491,11 +596,7 @@ async def _build_users_from_payloads(
             }
             if required is None:
                 unknown.add(username)
-                unknown_by_reason["missing_node_users"].add(username)
-        if required and not required.issubset(node_map):
-            unknown.add(username)
-            unknown_by_reason["missing_node_users"].add(username)
-            missing_node_ids.update(node_id for node_id in required - node_map.keys() if type(node_id) is int)
+                unknown_by_reason["unknown_scope_users"].add(username)
         pairs = []
         for node_id, ip_values in node_map.items():
             if node_id in disabled_nodes:
@@ -575,7 +676,6 @@ async def _build_users_from_payloads(
         nodes_seen=len(nodes_seen), total_ips=sum(len(u.ip) for u in users.values()), users_with_ips=len(users)
     )
     stats.update({reason: len(names) for reason, names in unknown_by_reason.items()})
-    stats["missing_node_ids"] = tuple(sorted(missing_node_ids))
     return users, stats
 
 
@@ -594,8 +694,8 @@ async def recheck_api_user(
 ) -> tuple[UserType, APIObservationWindow] | None:
     """Re-observe only a pending punishment whose original request is too old.
 
-    Metadata must still describe the same user and required scope. Failure or
-    an incomplete response cannot authorize a mutation or erase the incident.
+    Metadata must still describe the same user and scope. The refreshed response
+    is counted as returned, just like the initial collection.
     """
     from utils.panel_api.users import get_user_details
 
@@ -607,7 +707,7 @@ async def recheck_api_user(
         raw_context = {"id": context.user_id, "username": username, "group_ids": list(context.group_ids)}
         api_ip_logger.info("API IP observation expired before punishment; refreshing user %s", username)
         payloads, _counts, _times = await _fetch_all_online_ips(
-            panel_data, [(username, context.user_id, raw_context)], 1, float(config_data.get("api_ip_timeout") or 8)
+            panel_data, [(username, context.user_id, raw_context)], 1, float(config_data.get("api_ip_timeout") or 20)
         )
         if username not in payloads:
             return None
@@ -659,7 +759,6 @@ def _reset_cycle_stats() -> None:
     for key in LAST_CYCLE_STATS:
         LAST_CYCLE_STATS[key] = "" if key == "skipped_reason" else 0
     LAST_CYCLE_STATS.update(node_evidence_evaluated=False, fallback_applied=False)
-    LAST_CYCLE_STATS["missing_node_ids"] = ()
     LAST_CYCLE_STATS["ran_at"] = time.time()
     LAST_CYCLE_STATS["collection_outcome"] = "failure"
 
@@ -839,7 +938,7 @@ async def _collect_api_cycle(
     """Build a cycle-owned result; global stats are only for diagnostics."""
     global _forbidden_alert_sent, _consecutive_coverage_skips, _coverage_alert_sent
 
-    from utils.panel_api.online_ips import fetch_online_candidates
+    from utils.panel_api.online_ips import fetch_online_candidates, fetch_user_memberships
     from utils.panel_api.request_helper import is_panel_available
 
     started = time.perf_counter()
@@ -912,7 +1011,11 @@ async def _collect_api_cycle(
         except (ValueError, AttributeError, TypeError):
             LAST_CYCLE_STATS["skipped_reason"] = "node scope confirmation failed"
             return _CollectionResult("failure", False, "node scope confirmation failed", evidence)
-        if node_scope != final_scope or final_scope.monitored_nodes != final_scope.available_nodes:
+        if (
+            node_scope != final_scope
+            or final_scope.monitored_nodes != final_scope.available_nodes
+            or getattr(candidates, "pagination_changed", False)
+        ):
             evidence = replace(evidence, known_users=frozenset())
         if not await publish_api_snapshot({}, evidence):
             return _CollectionResult("superseded", False, "configuration or collection changed", evidence)
@@ -926,7 +1029,11 @@ async def _collect_api_cycle(
         panel_data,
         targets,
         concurrency=int(config_data.get("api_ip_concurrency") or 20),
-        timeout=float(config_data.get("api_ip_timeout") or 8.0),
+        timeout=float(config_data.get("api_ip_timeout") or 20.0),
+        # Queue waiting happens before a request owns any observation. Its
+        # budget must allow the 60s breaker cooldown even with short freshness.
+        max_breaker_wait=65.0,
+        is_current=lambda: api_evidence_is_current(evidence) and source_config == config_data,
     )
 
     if not api_evidence_is_current(evidence) or source_config != config_data or not monitoring_is_current(admission):
@@ -944,6 +1051,12 @@ async def _collect_api_cycle(
         {
             "fetched_ok": counters["ok"],
             "fetched_failed": counters["failed"],
+            "fetched_deferred": counters.get("deferred", 0),
+            "fetched_timeouts": counters.get("timed_out", 0),
+            **{
+                f"fetched_{kind}_timeouts": counters.get(f"{kind}_timeouts", 0)
+                for kind in ("read", "connect", "pool", "write")
+            },
             "not_found": counters["not_found"],
             "forbidden": counters["forbidden"],
             "coverage": round(coverage, 4),
@@ -974,7 +1087,7 @@ async def _collect_api_cycle(
         LAST_CYCLE_STATS["duration_ms"] = int((time.perf_counter() - started) * 1000)
         api_ip_logger.warning(
             f"🛰️ Skipping enforcement: coverage {coverage:.1%} < {min_coverage:.0%} "
-            f"({counters['ok']} ok, {counters['failed']} failed of {len(targets)})"
+            f"({counters['ok']} ok, {counters['failed']} failed, {counters.get('deferred', 0)} unsent/deferred of {len(targets)})"
         )
         reason = f"coverage {coverage:.0%} below {min_coverage:.0%}"
         await _handle_coverage_skip(reason)
@@ -1002,13 +1115,11 @@ async def _collect_api_cycle(
     try:
         _names, _disabled, final_monitored = await _resolve_node_context(panel_data, config_data)
         final_scope = await load_node_scope(panel_data, final_monitored)
-        current_candidates = await fetch_online_candidates(
+        current_candidates = await fetch_user_memberships(
             panel_data,
+            user_ids=[uid for _, uid, _ in targets],
             group_ids=resolve_monitored_group_ids(config_data),
             admin_usernames=resolve_monitored_admins(config_data),
-            status="active",
-            online_window=online_window,
-            page_size=int(config_data.get("api_ip_page_size") or 500),
         )
         if current_candidates is None:
             raise ValueError("Current memberships unavailable")
@@ -1023,6 +1134,7 @@ async def _collect_api_cycle(
         same_membership = (
             required is not None
             and raw.get("id") == current.get("id")
+            and current.get("status", "active") == "active"
             and isinstance(raw.get("group_ids"), list)
             and isinstance(current.get("group_ids"), list)
             and all(type(gid) is int for gid in current["group_ids"])
@@ -1047,8 +1159,8 @@ async def _collect_api_cycle(
     LAST_CYCLE_STATS["node_evidence_evaluated"] = True
 
     # Node coverage counts a healthy empty map as a response too. Individual
-    # users with missing nodes are protected separately; this aggregate is for
-    # diagnostics; it cannot veto complete per-user scopes.
+    # scopes select which returned maps count; omitted maps do not block users.
+    # This aggregate is diagnostic and cannot veto per-user observations.
     #
     # Computed before the gates below so a skipped cycle still records it. Leaving it
     # until after them meant the stats screen showed 0/0 on exactly the cycles an
@@ -1067,14 +1179,11 @@ async def _collect_api_cycle(
     LAST_CYCLE_STATS.update(build_stats)
     if new_users.unknown_users:
         api_ip_logger.warning(
-            "🛰️ API user evidence unavailable: %s missing-node, %s null-node, %s undatable, "
-            "%s future-dated, %s unknown-scope users; missing node IDs: %s",
-            build_stats["missing_node_users"],
+            "🛰️ API user evidence unavailable: %s null-node, %s undatable, %s future-dated, %s unknown-scope users",
             build_stats["null_node_users"],
             build_stats["unknown_age_users"],
             build_stats["future_timestamp_users"],
             build_stats["unknown_scope_users"],
-            build_stats["missing_node_ids"],
         )
     if unknown_users == set(raw_by_name):
         LAST_CYCLE_STATS["collection_outcome"] = "partial"
@@ -1085,7 +1194,12 @@ async def _collect_api_cycle(
 
     # Fleet percentages remain diagnostic: an unrelated missing node must not
     # veto users with complete evidence in their own healthy-node scope.
-    absence_complete = node_scope == final_scope and final_scope.monitored_nodes == final_scope.available_nodes
+    absence_complete = (
+        node_scope == final_scope
+        and final_scope.monitored_nodes == final_scope.available_nodes
+        and not getattr(candidates, "pagination_changed", False)
+        and not getattr(current_candidates, "pagination_changed", False)
+    )
     evidence = replace(
         evidence,
         unknown_users=frozenset(unknown_users),
@@ -1130,5 +1244,8 @@ async def _collect_api_cycle(
         f"{LAST_CYCLE_STATS['duration_ms']}ms)"
     )
     return _CollectionResult(
-        "partial" if unknown_users else "success", True, "incomplete user evidence" if unknown_users else "", evidence
+        "partial" if unknown_users else "success",
+        True,
+        "incomplete user evidence" if unknown_users else "",
+        evidence,
     )

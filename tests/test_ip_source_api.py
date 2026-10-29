@@ -53,7 +53,9 @@ async def test_candidate_http_query_uses_online_flag(monkeypatch, panel, api_con
     )
     api_config.update(check_interval=interval, group_filter={"enabled": True, "mode": "include", "group_ids": [7, 9]})
     assert await api.collect_active_users_from_api(panel, api_config)
-    assert seen == [{"offset": 0, "limit": 500, "status": "active", "group": [7, 9], "online": "true"}]
+    assert seen == [
+        {"offset": 0, "limit": 500, "status": "active", "group": [7, 9], "online": "true", "sort": "username"}
+    ]
 
 
 @pytest.mark.parametrize("bad_page", [None, {}, {"users": None, "total": 2}])
@@ -238,6 +240,7 @@ def _patch_collector(
         notifications.append(message)
 
     monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", fake_candidates)
+    monkeypatch.setattr(online_ips_mod, "fetch_user_memberships", fake_candidates)
     monkeypatch.setattr(request_helper_mod, "is_panel_available", lambda: panel_available)
     monkeypatch.setattr(api_mod, "_resolve_node_context", fake_node_context)
     monkeypatch.setattr(api_mod, "load_node_scope", fake_scope)
@@ -253,7 +256,7 @@ async def test_all_unknown_cycle_records_elapsed_collection_time(monkeypatch, pa
     _patch_collector(
         monkeypatch,
         candidates=[{"id": 1, "username": "sample", "status": "active"}],
-        payloads={"sample": {1: {}}},
+        payloads={"sample": {1: None}},
         node_name_map={1: "first", 2: "second"},
     )
     clock = iter([1000.0, 1000.0, 1242.0])
@@ -265,8 +268,8 @@ async def test_all_unknown_cycle_records_elapsed_collection_time(monkeypatch, pa
     assert stats["duration_ms"] == 242_000
 
 
-async def test_missing_node_fallback_reports_transport_and_user_evidence_separately(monkeypatch, panel, api_config):
-    """Complete global node coverage must not hide per-user missing maps in fallback."""
+async def test_invalid_map_fallback_reports_transport_and_user_evidence_separately(monkeypatch, panel, api_config):
+    """Successful lookups cannot authorize null maps, even alongside missing maps."""
     from unittest.mock import AsyncMock
 
     import utils.ip_source_api as api
@@ -278,7 +281,7 @@ async def test_missing_node_fallback_reports_transport_and_user_evidence_separat
             {"id": 1, "username": "private-first", "status": "active"},
             {"id": 2, "username": "private-second", "status": "active"},
         ],
-        payloads={"private-first": {1: {}, 2: {}}, "private-second": {1: {}, 3: {}}},
+        payloads={"private-first": {1: None, 2: {}}, "private-second": {1: None, 3: {}}},
         node_name_map={1: "first", 2: "second", 3: "third"},
     )
     api_config["api_ip_auto_fallback"] = True
@@ -289,9 +292,8 @@ async def test_missing_node_fallback_reports_transport_and_user_evidence_separat
     message = next(text for text in notifications if "IP Source reverted to Logs" in text)
     assert "2 consecutive API collections were incomplete" in message
     assert "HTTP lookups: <code>2</code> OK / <code>0</code> failed" in message
-    assert "Users missing required node evidence: <code>2</code>" in message
-    assert "Nodes reporting across responses: <code>3/3</code>" in message
-    assert "Nodes absent across all responses: <code>0</code>" in message
+    assert "Nodes reporting across responses: <code>2/3</code>" in message
+    assert "Nodes absent across all responses: <code>1</code>" in message
     assert "private-first" not in message and "private-second" not in message
     assert api.get_last_cycle_stats()["consecutive_unsuccessful_cycles"] == 2
 
@@ -309,7 +311,7 @@ async def test_usable_partial_samples_do_not_trigger_global_fallback(monkeypatch
             {"id": 1, "username": "known", "status": "active"},
             {"id": 2, "username": "unknown", "status": "active"},
         ],
-        payloads={"known": {1: {}, 2: {}}, "unknown": {1: {}}},
+        payloads={"known": {1: {}, 2: {}}, "unknown": {1: None}},
         node_name_map={1: "first", 2: "second"},
     )
     api_config["api_ip_auto_fallback"] = True
@@ -617,11 +619,9 @@ class TestBuildUsersFromPayloads:
             "future_ips": 0,
             "unknown_age_ips": 0,
             "unknown_scope_users": 0,
-            "missing_node_users": 0,
             "null_node_users": 0,
             "unknown_age_users": 0,
             "future_timestamp_users": 0,
-            "missing_node_ids": (),
         }
 
     @pytest.mark.asyncio
@@ -877,9 +877,8 @@ class TestCollectFailSafe:
         )
 
         # Per-user coverage is a perfect 1.0 while two of three nodes said nothing.
-        # That is exactly the blind spot the node ratio exists to expose, so the
-        # cycle is unknown regardless of the optional global coverage gate.
-        assert await collect_active_users_from_api(panel, api_config) is False
+        # Omitted maps are diagnostic and cannot discard the one observed IP.
+        assert await collect_active_users_from_api(panel, api_config) is True
         stats = get_last_cycle_stats()
         assert stats["coverage"] == 1.0
         assert stats["nodes_seen"] == 1
@@ -887,7 +886,9 @@ class TestCollectFailSafe:
         assert stats["node_coverage"] == 0.3333
 
     @pytest.mark.asyncio
-    async def test_low_node_coverage_skips_the_cycle_when_configured(self, panel, api_config, monkeypatch):
+    async def test_low_node_coverage_retains_current_ips_without_merging_old_cycles(
+        self, panel, api_config, monkeypatch
+    ):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
         from utils.shared_state import ACTIVE_USERS
         from utils.types import UserType
@@ -902,12 +903,13 @@ class TestCollectFailSafe:
             node_name_map={1: "de", 2: "nl", 3: "fr"},
         )
 
-        assert await collect_active_users_from_api(panel, api_config) is False
-        assert list(ACTIVE_USERS) == ["carol"]
+        assert await collect_active_users_from_api(panel, api_config) is True
+        assert list(ACTIVE_USERS) == ["alice"]
+        assert ACTIVE_USERS["alice"].ip == ["5.6.7.8"]
         stats = get_last_cycle_stats()
-        assert "unknown" in stats["skipped_reason"]
-        assert stats["users_with_ips"] == 0
-        assert stats["total_ips"] == 0
+        assert stats["skipped_reason"] == ""
+        assert stats["users_with_ips"] == 1
+        assert stats["total_ips"] == 1
         assert stats["nodes_seen"] == 1
 
     @pytest.mark.asyncio

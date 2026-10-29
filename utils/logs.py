@@ -92,7 +92,7 @@ def setup_logging():
         # Try to create log file in current directory or /var/lib/pg-limiter/logs
         log_paths = ["app.log", "/var/lib/pg-limiter/logs/app.log", "/tmp/pg-limiter.log"]
         file_handler = None
-        
+
         for log_path in log_paths:
             try:
                 log_dir = os.path.dirname(log_path)
@@ -107,7 +107,7 @@ def setup_logging():
                 break
             except (PermissionError, OSError):
                 continue
-        
+
         if file_handler:
             file_handler.setLevel(logging.DEBUG)
             file_format = logging.Formatter(
@@ -177,15 +177,11 @@ def log_function_call(func: Callable) -> Callable:
             result = await func(*args, **kwargs)
             elapsed = (time.perf_counter() - start_time) * 1000
             result_repr = repr(result)[:100] if result is not None else "None"
-            func_logger.debug(
-                f"← EXIT  {func.__name__} [{elapsed:.1f}ms] → {result_repr}"
-            )
+            func_logger.debug(f"← EXIT  {func.__name__} [{elapsed:.1f}ms] → {result_repr}")
             return result
         except Exception as e:
             elapsed = (time.perf_counter() - start_time) * 1000
-            func_logger.error(
-                f"✗ ERROR {func.__name__} [{elapsed:.1f}ms]: {type(e).__name__}: {e}"
-            )
+            func_logger.error(f"✗ ERROR {func.__name__} [{elapsed:.1f}ms]: {type(e).__name__}: {e}")
             func_logger.debug(f"Traceback:\n{traceback.format_exc()}")
             raise
 
@@ -203,15 +199,11 @@ def log_function_call(func: Callable) -> Callable:
             result = func(*args, **kwargs)
             elapsed = (time.perf_counter() - start_time) * 1000
             result_repr = repr(result)[:100] if result is not None else "None"
-            func_logger.debug(
-                f"← EXIT  {func.__name__} [{elapsed:.1f}ms] → {result_repr}"
-            )
+            func_logger.debug(f"← EXIT  {func.__name__} [{elapsed:.1f}ms] → {result_repr}")
             return result
         except Exception as e:
             elapsed = (time.perf_counter() - start_time) * 1000
-            func_logger.error(
-                f"✗ ERROR {func.__name__} [{elapsed:.1f}ms]: {type(e).__name__}: {e}"
-            )
+            func_logger.error(f"✗ ERROR {func.__name__} [{elapsed:.1f}ms]: {type(e).__name__}: {e}")
             func_logger.debug(f"Traceback:\n{traceback.format_exc()}")
             raise
 
@@ -226,6 +218,8 @@ def log_api_request(
     status: int = None,
     duration_ms: float = None,
     error: str = None,
+    *,
+    debug_only: bool = False,
 ):
     """
     Log an API request with structured information.
@@ -236,6 +230,7 @@ def log_api_request(
         status: HTTP status code (if successful)
         duration_ms: Request duration in milliseconds
         error: Error message (if failed)
+        debug_only: Keep request details out of aggregate collection logs.
     """
     api_logger = get_logger("api")
 
@@ -243,20 +238,18 @@ def log_api_request(
         msg = f"🌐 {method:6} {url} → ERROR: {error}"
         if duration_ms:
             msg += f" [{duration_ms:.0f}ms]"
-        api_logger.error(msg)
+        (api_logger.debug if debug_only else api_logger.error)(msg)
     elif status:
         emoji = "✓" if 200 <= status < 300 else "⚠" if 300 <= status < 400 else "✗"
         msg = f"🌐 {method:6} {url} → {emoji} {status}"
         if duration_ms:
             msg += f" [{duration_ms:.0f}ms]"
-        api_logger.info(msg)
+        (api_logger.debug if debug_only else api_logger.info)(msg)
     else:
         api_logger.debug(f"🌐 {method:6} {url} → pending...")
 
 
-def log_user_action(
-    action: str, username: str, details: str = None, success: bool = True
-):
+def log_user_action(action: str, username: str, details: str = None, success: bool = True):
     """
     Log a user-related action.
 
@@ -318,7 +311,7 @@ def log_shutdown_info(component: str, reason: str = None):
 def log_crash_info(exc_type, exc_value, exc_tb, component: str = "Unknown"):
     """
     Log detailed crash information with exact file and line number.
-    
+
     Args:
         exc_type: Exception type
         exc_value: Exception value
@@ -326,41 +319,41 @@ def log_crash_info(exc_type, exc_value, exc_tb, component: str = "Unknown"):
         component: Name of the component that crashed
     """
     crash_logger = get_logger("crash")
-    
+
     crash_logger.error("")
     crash_logger.error("╔═══════════════════════════════════════════════════════════════╗")
     crash_logger.error("║                    💥 CRASH DETECTED 💥                        ║")
     crash_logger.error("╚═══════════════════════════════════════════════════════════════╝")
     crash_logger.error(f"Component: {component}")
     crash_logger.error("")
-    
+
     # Extract the exact error location from traceback
     if exc_tb:
         # Walk to the last frame (actual error location)
         tb = exc_tb
         while tb.tb_next:
             tb = tb.tb_next
-        
+
         filename = tb.tb_frame.f_code.co_filename
         lineno = tb.tb_lineno
         func_name = tb.tb_frame.f_code.co_name
-        
+
         # Try to read the actual line of code
         try:
-            with open(filename, 'r', encoding='utf-8') as f:
+            with open(filename, "r", encoding="utf-8") as f:
                 lines = f.readlines()
                 if 0 < lineno <= len(lines):
                     error_line = lines[lineno - 1].strip()
                 else:
-                    error_line = '<line not available>'
+                    error_line = "<line not available>"
         except (FileNotFoundError, IOError):
-            error_line = '<could not read file>'
+            error_line = "<could not read file>"
     else:
-        filename = 'unknown'
+        filename = "unknown"
         lineno = 0
-        func_name = 'unknown'
-        error_line = '<no traceback>'
-    
+        func_name = "unknown"
+        error_line = "<no traceback>"
+
     crash_logger.error(f"Error Type: {exc_type.__name__}")
     crash_logger.error(f"Error Message: {exc_value}")
     crash_logger.error(f"File: {filename}")
@@ -369,25 +362,26 @@ def log_crash_info(exc_type, exc_value, exc_tb, component: str = "Unknown"):
     crash_logger.error(f"Code: {error_line}")
     crash_logger.error("")
     crash_logger.error("─── Full Traceback ───")
-    
+
     # Log full traceback
     tb_lines = traceback.format_exception(exc_type, exc_value, exc_tb)
     for line in tb_lines:
-        for subline in line.rstrip().split('\n'):
+        for subline in line.rstrip().split("\n"):
             crash_logger.error(subline)
-    
+
     crash_logger.error("───────────────────────")
     crash_logger.error("")
-    
+
     # Also write to crash log file
     try:
         import datetime
+
         crash_log_path = "/var/lib/pg-limiter/logs/crash.log"
         # Ensure directory exists
         os.makedirs(os.path.dirname(crash_log_path), exist_ok=True)
-        
-        with open(crash_log_path, 'a', encoding='utf-8') as crash_file:
-            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        with open(crash_log_path, "a", encoding="utf-8") as crash_file:
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             crash_file.write(f"\n")
             crash_file.write(f"═══════════════════════════════════════════════════════════════\n")
             crash_file.write(f"CRASH REPORT - {timestamp}\n")
@@ -424,11 +418,7 @@ class PerformanceTimer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         elapsed = (time.perf_counter() - self.start_time) * 1000
         if exc_type:
-            self.logger.error(
-                f"⏱ {self.operation} failed after {elapsed:.1f}ms: {exc_val}"
-            )
+            self.logger.error(f"⏱ {self.operation} failed after {elapsed:.1f}ms: {exc_val}")
         else:
-            self.logger.log(
-                self.log_level, f"⏱ {self.operation} completed in {elapsed:.1f}ms"
-            )
+            self.logger.log(self.log_level, f"⏱ {self.operation} completed in {elapsed:.1f}ms")
         return False

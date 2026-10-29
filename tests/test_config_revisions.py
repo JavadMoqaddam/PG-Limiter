@@ -53,6 +53,14 @@ async def test_direct_committed_crud_write_invalidates_merged_config(settings_db
     assert (await config.read_config())["limits"]["general"] == 7
 
 
+@pytest.mark.parametrize("stored,expected", [(None, 20.0), ("invalid", 20.0), ("8.0", 8.0), ("13", 13.0)])
+async def test_ip_timeout_default_preserves_persisted_override(settings_db, stored, expected):
+    if stored is not None:
+        async with database.get_db() as db:
+            await ConfigCRUD.set(db, "api_ip_timeout", stored)
+    assert (await config.read_config())["api_ip_timeout"] == expected
+
+
 async def test_local_exception_commit_invalidates_merged_config(settings_db):
     async with database.get_db() as db:
         await UserCRUD.create_or_update(db, "alice")

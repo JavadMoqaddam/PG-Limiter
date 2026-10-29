@@ -30,11 +30,9 @@ def cycle_stats():
         "future_ips": 0,
         "unknown_age_ips": 0,
         "unknown_users": 2181,
-        "missing_node_users": 2181,
         "null_node_users": 0,
         "unknown_age_users": 0,
         "future_timestamp_users": 0,
-        "missing_node_ids": tuple(range(1, 17)),
         "consecutive_unsuccessful_cycles": 2,
         "geo_lookups": 0,
     }
@@ -52,7 +50,7 @@ async def test_last_cycle_separates_missing_users_from_global_node_absence(monke
 
     assert "242000ms" in text
     assert "HTTP lookups: <code>2181</code> OK / <code>0</code> failed" in text
-    assert "Users missing required node evidence: <code>2181</code>" in text
+    assert "Users with unusable evidence: <code>2181</code>" in text
     assert "Nodes reporting across responses: <code>14/16</code>" in text
     assert "Nodes absent across all responses: <code>2</code>" in text
     assert "Consecutive incomplete API collections: <code>2</code>" in text

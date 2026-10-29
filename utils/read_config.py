@@ -673,9 +673,9 @@ async def _merge_loaded_config(env_config, db_data, check_required_elements=Fals
 
     # Timeout for a single per-user online-IP request
     try:
-        config["api_ip_timeout"] = float(db_config.get("api_ip_timeout", "8.0"))
+        config["api_ip_timeout"] = float(db_config.get("api_ip_timeout", "20.0"))
     except (ValueError, TypeError):
-        config["api_ip_timeout"] = 8.0
+        config["api_ip_timeout"] = 20.0
     config["api_ip_timeout"] = max(2.0, min(60.0, config["api_ip_timeout"]))
 
     # Placeholder inbound protocol name: the panel API returns {ip: timestamp}

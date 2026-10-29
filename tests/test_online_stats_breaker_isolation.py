@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from utils.panel_api import request_helper
-from utils.panel_api.online_ips import OUTCOME_ERROR, OUTCOME_OK, fetch_user_online_ips
+from utils.panel_api.online_ips import OUTCOME_DEFERRED, OUTCOME_ERROR, OUTCOME_OK, fetch_user_online_ips
 from utils.panel_api.users import fetch_all_users_raw
 from utils.types import PanelType
 
@@ -38,7 +38,7 @@ async def test_failed_stats_burst_does_not_block_complete_user_snapshot(panel_tr
     panel, calls, _ = panel_transport
     for user_id in range(1, 6):
         assert await fetch_user_online_ips(panel, user_id) == (None, OUTCOME_ERROR)
-    assert await fetch_user_online_ips(panel, 6) == (None, OUTCOME_ERROR)
+    assert await fetch_user_online_ips(panel, 6) == (None, OUTCOME_DEFERRED)
     assert len(calls) == 5  # Further stats work is still bounded by its own breaker.
     users = await fetch_all_users_raw(panel, strict=True, limit=1)
     assert [row["id"] for row in users] == [1, 2]

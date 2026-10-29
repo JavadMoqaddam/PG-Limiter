@@ -3,8 +3,8 @@
 PG-Limiter uses `PANEL_API_KEY` as its sole panel credential. REST requests,
 SSE node-log streams and panel availability/startup probes send
 `X-Api-Key: <key>`. There is no panel username/password login or token-refresh
-fallback. These instructions apply to builds containing the API-key change;
-the published `v1.7.0` installer and image predate it.
+fallback. These instructions apply to version 1.7.1 and later;
+the `v1.7.0` installer and image predate API-key-only authentication.
 
 ## Configure the key
 
@@ -60,7 +60,7 @@ must be unexpired and unrevoked.
 
 ## Upgrade or rotate credentials
 
-1. Prepare a limiter build containing this change and create a panel API key
+1. Prepare the version 1.7.1 upgrade and create a panel API key
    with the necessary permissions and scopes.
 2. Set `PANEL_API_KEY` in `.env`, retaining the intended `PANEL_DOMAIN` and
    `PANEL_VERIFY_SSL`. Remove `PANEL_USERNAME` and `PANEL_PASSWORD`; they are no

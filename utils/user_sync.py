@@ -273,10 +273,10 @@ async def get_all_users_with_details(panel_data: PanelType, status: str | None =
     """
     from utils.panel_api.users import fetch_all_users_raw
 
-    # Membership deletion requires a complete, consistent response. A failed
-    # page must never look like users removed from the panel. Username supplies
-    # deterministic ordering on the full /api/users endpoint.
-    return await fetch_all_users_raw(panel_data, status=status, sort="username", strict=True)
+    # Validate every page while allowing natural population changes. The caller
+    # defers membership deletion when this listing reports churn. Username
+    # supplies deterministic ordering on the full /api/users endpoint.
+    return await fetch_all_users_raw(panel_data, status=status, sort="username", strict=True, allow_live_changes=True)
 
 
 async def _panel_confirms_user_absent(panel_data: PanelType, username: str) -> bool:
@@ -340,6 +340,7 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
 
             # Fetch ALL users from panel (all statuses) to avoid losing disabled users
             users = await get_all_users_with_details(panel_data, status=None)
+            pagination_changed = getattr(users, "pagination_changed", False)
 
             sync_logger.info(f"📥 Processing {len(users)} users...")
 
@@ -378,6 +379,12 @@ async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
             async with get_db() as db:
                 local_usernames = await UserCRUD.get_all_usernames(db)
             potentially_deleted = sorted(local_usernames - panel_usernames)
+            if pagination_changed:
+                # Refresh validated observations, but do not turn gaps in a live
+                # offset listing into membership changes or a deletion fan-out.
+                potentially_deleted = []
+                errors += 1
+                sync_logger.warning("Live user listing changed; observed users refreshed, membership cleanup deferred")
             confirmation_slots = asyncio.Semaphore(10)
 
             async def confirm_absence(username):

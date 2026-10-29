@@ -90,6 +90,36 @@ async def test_two_disjoint_groups_are_monitored_with_all_nodes_included(two_gro
     assert {w.consecutive_violations for w in r.warning.warnings.values()} == {1}
 
 
+async def test_user_going_offline_during_scan_keeps_valid_membership(two_groups, monkeypatch):
+    from utils.ip_source_api import get_last_cycle_stats
+    from utils.panel_api import request_helper
+
+    r = two_groups
+    original = request_helper.panel_get
+    queries = []
+
+    async def get(panel, path, **kwargs):
+        if path == "/api/users":
+            params = kwargs["params"]
+            queries.append(params)
+            # Bob's online timestamp ages out during collection; his access and
+            # membership have not changed, so ID-based lookup still returns him.
+            if len(queries) > 1 and params.get("online") == "true":
+                return SimpleNamespace(
+                    status_code=200,
+                    json=lambda: {"users": [{"id": 1, "username": "alice", "group_ids": [1]}], "total": 1},
+                )
+        return await original(panel, path, **kwargs)
+
+    monkeypatch.setattr(request_helper, "panel_get", get)
+    assert await r.run()
+    assert set(r.warning.warnings) == {"alice", "bob"}
+    assert get_last_cycle_stats()["unknown_scope_users"] == 0
+    assert queries[0]["online"] == "true"
+    assert queries[1]["ids"] == [1, 2]
+    assert "online" not in queries[1] and "online_after" not in queries[1]
+
+
 async def test_disconnected_node_only_protects_its_users_and_does_not_trigger_fallback(two_groups):
     r = two_groups
     assert await r.run() is True
@@ -107,18 +137,20 @@ async def test_disconnected_node_only_protects_its_users_and_does_not_trigger_fa
         assert r.config["ip_source"] == "api"
 
 
-async def test_multigroup_user_requires_the_union_of_both_node_sets(two_groups):
+async def test_multigroup_user_can_violate_with_only_one_groups_node_map(two_groups):
     r = two_groups
     r.memberships["alice"] = [1, 2]
     assert await r.run() is True
-    assert set(r.warning.warnings) == {"bob"}
+    assert set(r.warning.warnings) == {"alice", "bob"}
+    r.advance()
     r.bodies["alice"]["nodes"]["24"] = {"ips": {}}
     assert await r.run() is True
     assert set(r.warning.warnings) == {"alice", "bob"}
+    assert r.warning.warnings["alice"].consecutive_violations == 2
 
 
-@pytest.mark.parametrize("bad", [{"nodes": {}}, {"nodes": {"24": None}}, None])
-async def test_incomplete_user_is_skipped_without_resetting_its_warning(two_groups, bad):
+@pytest.mark.parametrize("bad", [{"nodes": {"24": None}}, None])
+async def test_invalid_user_response_is_skipped_without_resetting_its_warning(two_groups, bad):
     from utils.ip_source_api import get_last_cycle_stats
 
     r = two_groups
@@ -235,7 +267,7 @@ async def test_topology_changed_during_ip_admission_retires_only_affected_user(t
     assert r.warning.warnings["alice"].consecutive_violations == 2
 
 
-async def test_expired_incomplete_warning_retains_history_until_complete_evidence(two_groups):
+async def test_expired_invalid_warning_retains_history_until_valid_evidence(two_groups):
     from copy import deepcopy
 
     r = two_groups
@@ -244,7 +276,7 @@ async def test_expired_incomplete_warning_retains_history_until_complete_evidenc
     bob.monitoring_end_time -= 1000
     history = deepcopy(bob.monitoring_history)
     r.advance()
-    r.bodies["bob"] = {"nodes": {}}
+    r.bodies["bob"] = {"nodes": {"24": None}}
     assert await r.run()
     assert r.warning.warnings["bob"] is bob
     assert bob.consecutive_violations == 1

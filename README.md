@@ -3,7 +3,7 @@
   <img src="https://img.shields.io/badge/License-AGPL--3.0-green" alt="License">
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white" alt="Docker">
-  <img src="https://img.shields.io/badge/Version-1.7.0-orange" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.7.1-orange" alt="Version">
 </p>
 
 <h1 align="center">🛡️ PG-Limiter</h1>
@@ -89,27 +89,27 @@
 
 ### Quick Install with Docker (Recommended)
 
-The commands below install v1.7.0, which predates API-key-only authentication.
-To use `PANEL_API_KEY`, build and install a version containing the API-key change
-as described in the [panel API-key guide](docs/PANEL_API_KEY.md).
+Version 1.7.1 requires `PANEL_API_KEY`. Before upgrading from 1.7.0, prepare
+the key and permission scopes described in the
+[panel API-key guide](docs/PANEL_API_KEY.md).
 
 Run the one-line installer:
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.0/pg-limiter.sh) install
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.1/pg-limiter.sh) install
 ```
 
 Or download and run step-by-step:
 
 ```bash
 # Download the installer
-curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.0/pg-limiter.sh -o /tmp/pg-limiter.sh
+curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.1/pg-limiter.sh -o /tmp/pg-limiter.sh
 
 # Run installation
 sudo bash /tmp/pg-limiter.sh install
 ```
 
-An installer containing the API-key change will:
+The installer will:
 
 1. Check and install Docker & Docker Compose if missing.
 2. Setup directories at `/etc/opt/pg-limiter/` and `/var/lib/pg-limiter/`.
@@ -220,7 +220,7 @@ The connected IPs of each user can come from either of two sources, switchable a
 | Transport | One persistent SSE stream per node | `GET /api/node/online_stats/{id}/ip`, once per online user per cycle |
 | Timing | Original Xray printed timestamps checked against shared Last seen at evaluation | Original Xray IP timestamps checked against the same Last seen threshold |
 | Inbound detail | Real inbound name per connection | Single sentinel inbound (`API`) |
-| Requires | API key with `nodes.logs`, reachable SSE, explicit Xray process timezones and independently ready nodes after conservative warm-up | API key with `nodes.stats` and complete evidence from relevant enabled nodes |
+| Requires | API key with `nodes.logs`, reachable SSE, explicit Xray process timezones and independently ready nodes after conservative warm-up | API key with `nodes.stats`, known user/node scope and valid observations from relevant nodes |
 
 Both modes publish source-specific snapshots through the shared `ACTIVE_USERS` structure. Existing device counting, subnet/CDN/high-trust grouping, trust scoring and punishment continue to apply, with configurable `CHECK_INTERVAL` and `MAX_WARNING_COUNT`. API observations carry no real inbound names; inbound-only monitoring requires Logs.
 
@@ -232,11 +232,11 @@ When Last seen exceeds the cadence, Logs keeps eligible observations across succ
 
 * **Candidate narrowing.** `GET /api/users` uses `status=active` and `online=true`, independently of `CHECK_INTERVAL`. Include group IDs are sent together; empty Include selects nobody. Exclusions, administrator filters and exceptions still apply. Group Limits set limits and never replace the Group Filter.
 * **Exact Last seen threshold.** Edit a positive whole number of seconds T in **Settings → IP Source → Last seen**. Both API and Logs use that value exactly, with no 30-second buffer. A long-lived connection can have an old timestamp; this is recent source evidence, not a byte-traffic meter. API and Logs counts can differ.
-* **Unknown evidence protection.** Failed requests, malformed bodies, invalid timestamps and missing expected node responses protect affected users from warnings, punishment and false clearing. Incomplete candidate/node lists or a relevant enabled node in `error`/`connecting` skip the whole cycle, including an empty candidate list, preserving existing warnings. Explicitly operator-disabled nodes are excluded. The configurable coverage gates (user coverage defaults to **80%**) can skip collection; a high answer rate never makes missing evidence known. Healthy empty maps, valid expired observations and confirmed deleted users can clear warnings.
-* **Auto-fallback.** With automatic fallback enabled, exactly two consecutive unsuccessful completed API collection cycles persist the source as Logs and attempt one Telegram alert. A complete successful cycle, including a genuinely empty one, resets the streak. Logs then waits for its timezone/readiness requirements and conservative warm-up.
+* **Unknown evidence protection.** Failed requests, malformed bodies, null maps and invalid timestamps protect affected users from warnings, punishment and false clearing. Successful responses are counted from the returned IPs without requiring every eligible node. Omitted maps add no connections; within-limit or empty successful responses can clear warnings. Current group/core scope and the HTTP answer-rate gate (default **80%**) still apply. An unavailable node does not veto observations from healthy nodes; absent users' warnings remain protected during fleet outages or changing pagination. Valid expired activity observations and confirmed deleted users can also clear warnings.
+* **Auto-fallback.** With automatic fallback enabled, two consecutive unusable API collection cycles persist the source as Logs and attempt one Telegram alert. Usable partial cycles and valid empty results reset the streak; omitted node maps alone do not trigger fallback. Logs then waits for its timezone/readiness requirements and conservative warm-up.
 * **Per-inbound CDN grouping is inactive** in API mode because the panel reports no inbound names — use **CDN Nodes** (per-node) instead of CDN Inbounds.
 
-Switching to API mode runs a pre-flight probe against a real online user first, and refuses to switch if the endpoint is not reachable. **Settings → 🛰️ IP Source → 📊 Last API Cycle** separates successful requests, users missing required node evidence, expected nodes reporting across responses, globally absent nodes and elapsed time. HTTP 200 alone does not prove a complete per-user node map. Missing-node IDs across users are a union, not a list missing from every user; aggregate node coverage is a separate measure. If collection stops before node-map evaluation, reporting and absence remain unknown. After switching to Logs, the API report is historical.
+Switching to API mode runs a pre-flight probe against a real online user first, and refuses to switch if the endpoint is not reachable. **Settings → 🛰️ IP Source → 📊 Last API Cycle** separates successful requests, unusable user evidence, eligible nodes reporting across responses, globally absent nodes and elapsed time. Node coverage is diagnostic only; omitted node maps do not block counting or warning clearing. If collection stops before node-map evaluation, reporting and absence remain unknown. After switching to Logs, the API report is historical.
 
 Logs preserves Xray's original printed process-local time and rejects retained replay records across reconnects. Configure `LOG_NODE_TIMEZONES` and/or an explicit `LOG_TIMEZONE` for the Xray process/container; host or panel timezone alone does not establish it. Unknown zones, fleet or transport readiness preserve warnings while enforcement waits. A source/settings change or transport recovery requires `max(CHECK_INTERVAL, Last seen)` of warm-up before Logs resumes. See [Panel API IP source](docs/API_IP_SOURCE.md) and [Node Logs source and readiness](docs/LOG_SOURCE.md) for configuration, recovery and protocol limits.
 
@@ -298,14 +298,14 @@ COUNTRY_CODE=IR
 TZ=UTC
 ```
 
-The panel API key is the sole panel credential for builds containing this change.
+The panel API key is the sole panel credential in version 1.7.1.
 REST requests, SSE log streams and startup probes send it in `X-Api-Key`.
 Panel username/password login is unsupported. Changing `PANEL_DOMAIN` or
 `PANEL_API_KEY` requires restarting the process or recreating its container.
 See the [panel API-key guide](docs/PANEL_API_KEY.md) for permission scopes,
-upgrading an existing `.env` and TLS settings. The released `v1.7.0` installer
-and image linked above predate this change; deploy a build containing it before
-migrating your credentials. The optional management API keeps its separate
+upgrading an existing `.env` and TLS settings. Version 1.7.0 used panel
+username/password credentials; configure the key before upgrading to 1.7.1.
+The optional management API keeps its separate
 `API_USERNAME` and `API_PASSWORD` authentication.
 
 ---
@@ -412,7 +412,7 @@ PG-Limiter/
 
 <details>
 <summary><b>Does PG-Limiter ban users who disconnect during a scan?</b></summary>
-No. With the 3-cycle consecutive verification system, if a user disconnects or normalizes their connection before reaching 3 consecutive scans, their violation counter is automatically cleared with zero penalty.
+With the 3-cycle consecutive verification system, a valid within-limit observation clears the violation counter with zero penalty. In API mode, a successful response is counted as returned, including empty or omitted node maps. Failed requests and invalid observations preserve existing warnings.
 </details>
 
 <details>
@@ -422,7 +422,7 @@ When Subnet Grouping is enabled, multiple connections originating from the same 
 
 <details>
 <summary><b>When should I switch the IP source to the panel API?</b></summary>
-Use API mode when node logs are unavailable or too noisy to stream reliably. It queries <code>online_stats</code> once per online user per cycle; panel load depends on candidate count, node RPC latency and concurrency. It needs a panel API key with the <code>nodes.stats</code> permission. With automatic fallback enabled, two unsuccessful collection cycles switch to Logs, including cycles whose HTTP requests succeed but whose per-user node evidence is incomplete. Grant <code>nodes.logs</code> too when using automatic fallback.
+Use API mode when node logs are unavailable or too noisy to stream reliably. It queries <code>online_stats</code> once per online user per cycle; panel load depends on candidate count, node RPC latency and concurrency. It needs a panel API key with the <code>nodes.stats</code> permission. With automatic fallback enabled, two unusable collection cycles switch to Logs. Omitted node maps alone do not trigger fallback: returned IPs determine both excess usage and normalization. Grant <code>nodes.logs</code> too when using automatic fallback. See <a href="docs/API_IP_SOURCE.md">API collection behavior</a> for counting and error handling.
 </details>
 
 <details>

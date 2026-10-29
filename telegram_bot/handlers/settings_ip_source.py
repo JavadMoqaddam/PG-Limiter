@@ -424,6 +424,8 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
         "<b>Per-user lookups:</b>\n"
         f"• OK: <code>{stats.get('fetched_ok', 0)}</code>\n"
         f"• Failed: <code>{stats.get('fetched_failed', 0)}</code>\n"
+        f"• Timeouts (in failed): <code>{stats.get('fetched_timeouts', 0)}</code>\n"
+        f"• Unsent/deferred: <code>{stats.get('fetched_deferred', 0)}</code>\n"
         f"• Not found (404): <code>{stats.get('not_found', 0)}</code>\n"
         f"• Forbidden (403): <code>{stats.get('forbidden', 0)}</code>\n"
         f"• Coverage: <code>{float(stats.get('coverage') or 0):.1%}</code>\n\n"

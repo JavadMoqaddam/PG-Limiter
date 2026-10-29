@@ -117,7 +117,10 @@ async def test_wireguard_activity_age_is_evaluated_at_its_own_request(observed_c
     assert set(r.warning.warnings) == expected
 
 
-@pytest.mark.parametrize("reply, applied", [("over", ["alice"]), ("normal", []), ("incomplete", [])])
+@pytest.mark.parametrize(
+    "reply, applied",
+    [("over", ["alice"]), ("normal", []), ("incomplete", []), ("partial_over", ["alice"]), ("partial_normal", [])],
+)
 @pytest.mark.parametrize("expired", [False, True])
 async def test_delayed_punishment_checks_a_new_response_without_resetting_unknown_warning(
     observed_cycle, monkeypatch, reply, applied, expired
@@ -128,6 +131,18 @@ async def test_delayed_punishment_checks_a_new_response_without_resetting_unknow
     from utils.enforcement_guard import EnforcementProtected, start_enforcement_effect, validate_enforcement
 
     r = observed_cycle
+    if reply.startswith("partial_"):
+        r.nodes.append(
+            SimpleNamespace(
+                node_id=32,
+                node_name="ordinary-2",
+                node_ip="192.0.2.32",
+                status="connected",
+                core_config_id=1,
+                core_version="26.10.21",
+            )
+        )
+        r.bodies["alice"]["nodes"]["32"] = {"ips": {}}
     r.config["max_warning_count"] = 3
     assert await r.run()
     record = r.warning.warnings["alice"]
@@ -149,7 +164,7 @@ async def test_delayed_punishment_checks_a_new_response_without_resetting_unknow
             delayed_once = True
             r.clock[0] += 300
             ips = {"5.6.7.8": int(r.clock[0]), "9.9.9.9": int(r.clock[0])}
-            if reply == "normal":
+            if reply in ("normal", "partial_normal"):
                 ips.pop("9.9.9.9")
             r.bodies["alice"] = {"nodes": {"31": {"ips": ips}}} if reply != "incomplete" else {"nodes": {}}
         return result
@@ -172,7 +187,7 @@ async def test_delayed_punishment_checks_a_new_response_without_resetting_unknow
     assert effects == applied
     assert r.lookups.count("alice") == 2
     assert r.lookups.count("bob") == 1
-    if reply == "incomplete":
+    if reply in ("incomplete", "partial_normal"):
         assert r.warning.warnings["alice"] is record
         assert record.consecutive_violations == 3
 

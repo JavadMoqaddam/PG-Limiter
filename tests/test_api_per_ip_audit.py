@@ -112,12 +112,10 @@ async def test_unexpected_reported_node_cannot_mask_a_missing_required_node(per_
     cycle.bodies["alice"] = {"nodes": {"1": {"ips": {}}, "3": {"ips": {}}}}
     cycle.bodies["bob"] = {"nodes": {"1": {"ips": {}}}}
 
-    assert await cycle.run() is False
+    assert await cycle.run() is True
     stats = get_last_cycle_stats()
     assert stats["coverage"] == 1.0
-    assert stats["missing_node_users"] == 2
-    assert stats["missing_node_ids"] == (2,)
-    assert stats["unknown_users"] == 2
+    assert stats["unknown_users"] == 0
     assert stats["nodes_expected"] == 2
     assert stats["nodes_seen"] == 1
     assert stats["node_coverage"] == 0.5
@@ -312,7 +310,7 @@ async def test_per_ip_request_observations_survive_preparation(per_ip_cycle, mon
     }
 
 
-@pytest.mark.parametrize("kind", ["http_failure", "missing_node", "null_node", "invalid_timestamp", "future"])
+@pytest.mark.parametrize("kind", ["http_failure", "null_node", "invalid_timestamp", "future"])
 @pytest.mark.parametrize("expired", [False, True])
 async def test_unknown_per_ip_user_preserves_persisted_warning_while_complete_user_clears(
     per_ip_cycle, monkeypatch, kind, expired
@@ -333,8 +331,6 @@ async def test_unknown_per_ip_user_preserves_persisted_warning_while_complete_us
     cycle.bodies["bob"] = cycle.body(("5.6.7.8",))
     if kind == "http_failure":
         cycle.bodies["alice"] = None
-    elif kind == "missing_node":
-        cycle.bodies["alice"] = {"nodes": {"1": {"ips": {}}}}
     elif kind == "null_node":
         cycle.bodies["alice"] = {"nodes": {"1": None, "2": {"ips": {}}}}
     elif kind == "invalid_timestamp":

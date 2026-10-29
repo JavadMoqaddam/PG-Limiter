@@ -29,6 +29,18 @@ OUTCOME_NOT_FOUND = "not_found"
 OUTCOME_FORBIDDEN = "forbidden"
 OUTCOME_UNAUTHORIZED = "unauthorized"
 OUTCOME_ERROR = "error"
+OUTCOME_TIMEOUT = "timeout"
+OUTCOME_DEFERRED = "deferred"
+
+
+class OnlineIPTimeout(str):
+    """Keep the timeout outcome compatible while retaining its transport phase."""
+
+    def __new__(cls, timeout_kind: str | None):
+        instance = super().__new__(cls, OUTCOME_TIMEOUT)
+        instance.timeout_kind = timeout_kind
+        return instance
+
 
 # Panel-side fixed window used by the `online=true` filter (app/db/crud/user.py)
 PANEL_ONLINE_WINDOW_SECONDS = 120
@@ -50,7 +62,7 @@ async def fetch_online_candidates(
     status: Optional[str] = "active",
     online_window: int = 0,
     page_size: int = 500,
-    max_concurrent: int = 5,
+    max_concurrent: int = 1,
 ) -> Optional[list[dict]]:
     """
     Fetch the users that are candidates for an online-IP lookup.
@@ -77,6 +89,8 @@ async def fetch_online_candidates(
         or ``None`` if the query itself failed. The distinction matters: an
         empty list means nobody is online, while ``None`` means the candidate
         set is unknown and the caller must not treat the panel as idle.
+        A changing live listing carries ``pagination_changed=True``: its
+        observed users can be checked, but omitted users are not proven offline.
     """
     from utils.panel_api.users import fetch_all_users_raw
 
@@ -90,11 +104,50 @@ async def fetch_online_candidates(
             max_concurrent=max_concurrent,
             online=online_window > 0,
             online_after=None,
+            sort="username",
             strict=True,
+            allow_live_changes=True,
+            quiet_requests=True,
         )
     except Exception as error:
         online_ips_logger.error(f"Failed to fetch online candidates: {error}")
         return None
+
+
+async def fetch_user_memberships(
+    panel_data: PanelType,
+    user_ids: list[int],
+    group_ids: Optional[list[int]] = None,
+    admin_usernames: Optional[list[str]] = None,
+) -> Optional[list[dict]]:
+    """Confirm scanned users' current access independently of online presence."""
+    from utils.panel_api.users import PanelUserListing, fetch_all_users_raw
+
+    if any(type(uid) is not int or uid < 1 for uid in user_ids):
+        return None
+    identities = sorted(set(user_ids))
+    result = PanelUserListing([])
+    try:
+        for offset in range(0, len(identities), 200):
+            rows = await fetch_all_users_raw(
+                panel_data,
+                ids=identities[offset : offset + 200],
+                status="active",
+                admin=admin_usernames or None,
+                group=group_ids or None,
+                limit=200,
+                max_concurrent=1,
+                sort="username",
+                strict=True,
+                allow_live_changes=True,
+                quiet_requests=True,
+            )
+            result.extend(rows)
+            result.pagination_changed |= rows.pagination_changed
+    except Exception as error:
+        online_ips_logger.error("Failed to confirm user memberships: %s", type(error).__name__)
+        return None
+    return result
 
 
 def _parse_ip_payload(payload: dict) -> dict[int, dict[str, int] | None]:
@@ -136,7 +189,7 @@ def _parse_ip_payload(payload: dict) -> dict[int, dict[str, int] | None]:
 async def fetch_user_online_ips(
     panel_data: PanelType,
     user_id: int,
-    timeout: float = 8.0,
+    timeout: float = 20.0,
 ) -> tuple[Optional[dict[int, dict[str, int] | None]], str]:
     """
     Fetch the online IPs of one user across every healthy node.
@@ -153,13 +206,14 @@ async def fetch_user_online_ips(
     """
     from utils.panel_api.request_helper import online_stats_circuit_breaker, panel_request
 
-    response, _ = await panel_request(
+    response, error = await panel_request(
         panel_data,
         "GET",
         f"/api/node/online_stats/{user_id}/ip",
         timeout=timeout,
         max_retries=1,
         breaker=online_stats_circuit_breaker,
+        quiet=True,
     )
 
     if response is not None:
@@ -185,6 +239,10 @@ async def fetch_user_online_ips(
             return None, OUTCOME_FORBIDDEN
         return None, OUTCOME_ERROR
 
+    if getattr(error, "reason", None) == "deferred":
+        return None, OUTCOME_DEFERRED
+    if getattr(error, "reason", None) == "timeout":
+        return None, OnlineIPTimeout(getattr(error, "timeout_kind", None))
     return None, OUTCOME_ERROR
 
 

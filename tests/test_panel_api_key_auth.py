@@ -209,7 +209,19 @@ async def test_online_fanout_counts_rejected_keys_once(key_http, operational_top
     )
 
     assert payloads == {} and fetch_times == {}
-    assert counters == {"ok": 0, "failed": 2, "not_found": 0, "forbidden": 0, "unauthorized": 2}
+    assert counters == {
+        "ok": 0,
+        "failed": 2,
+        "not_found": 0,
+        "forbidden": 0,
+        "unauthorized": 2,
+        "deferred": 0,
+        "timed_out": 0,
+        "read_timeouts": 0,
+        "connect_timeouts": 0,
+        "pool_timeouts": 0,
+        "write_timeouts": 0,
+    }
     assert sorted(request.url.path for request in state.requests) == [
         "/api/node/online_stats/1/ip",
         "/api/node/online_stats/2/ip",

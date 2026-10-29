@@ -233,6 +233,10 @@ def render_health(facts: ReportFacts, *, now: float | None = None) -> str:
         lines.extend([f"<b>{historical}API collection diagnostics</b>", f"started {_timestamp(started, now)}"])
         if "fetched_failed" in stats:
             lines.append(f"Lookup failures: {_count(stats['fetched_failed'])}")
+        if "fetched_timeouts" in stats:
+            lines.append(f"Lookup timeouts (in failures): {_count(stats['fetched_timeouts'])}")
+        if "fetched_deferred" in stats:
+            lines.append(f"Unsent/deferred lookups: {_count(stats['fetched_deferred'])}")
         for label, key in [("User coverage", "coverage"), ("Node coverage", "node_coverage")]:
             value = stats.get(key)
             if (

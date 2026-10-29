@@ -9,22 +9,35 @@ This module provides a unified way to make panel API requests with:
 """
 
 import asyncio
+from asyncio import CancelledError
 import os
 import random
 import re
 import time
+from contextlib import nullcontext
 from ssl import SSLError
-from typing import Optional, Any, Literal
+from typing import Optional, Literal
 
 import httpx
 
 from utils.logs import log_api_request, get_logger
 from utils.types import PanelType
 from utils.panel_api.auth import get_panel_headers
+from utils.panel_api.pagination import page_request_slot
 from utils.enforcement_guard import EnforcementProtected, start_enforcement_effect, validate_enforcement
 
 # Module logger
 request_logger = get_logger("panel_api.request")
+
+
+class PanelRequestError(str):
+    """A compatible error string with a non-sensitive machine-readable cause."""
+
+    def __new__(cls, message: str, reason: str, timeout_kind: str | None = None):
+        instance = super().__new__(cls, message)
+        instance.reason = reason
+        instance.timeout_kind = timeout_kind if timeout_kind in {"read", "connect", "pool", "write"} else None
+        return instance
 
 
 class PanelCircuitBreaker:
@@ -35,39 +48,51 @@ class PanelCircuitBreaker:
     States:
     - CLOSED: Normal operation, requests flow freely.
     - OPEN: Consecutive server/network failures (5+) tripped breaker. Fail-fast for cooldown.
-    - HALF_OPEN: Cooldown expired, testing 1 request.
+    - HALF_OPEN: Cooldown expired. Online stats admit only one probe; the
+      general breaker also permits nested permission reads during a mutation.
     """
 
     STATE_CLOSED = "CLOSED"
     STATE_OPEN = "OPEN"
     STATE_HALF_OPEN = "HALF_OPEN"
 
-    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0):
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0, *, single_probe: bool = False):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
+        self.single_probe = single_probe
         self.state = self.STATE_CLOSED
         self.consecutive_failures = 0
-        self.last_state_change = time.time()
+        self.last_state_change = time.monotonic()
+
+    def recovery_delay(self) -> float:
+        """Seconds until an open breaker can admit its single recovery probe."""
+        return max(0.0, self.recovery_timeout - (time.monotonic() - self.last_state_change))
+
+    def release_probe(self) -> None:
+        """Allow a later probe if this one was cancelled before a result."""
+        if self.state == self.STATE_HALF_OPEN:
+            self.state = self.STATE_OPEN
+            self.last_state_change = time.monotonic()
 
     def allow_request(self) -> bool:
         """Check if request is allowed by circuit breaker state."""
-        now = time.time()
+        now = time.monotonic()
         if self.state == self.STATE_CLOSED:
             return True
         elif self.state == self.STATE_OPEN:
-            if now - self.last_state_change > self.recovery_timeout:
+            if now - self.last_state_change >= self.recovery_timeout:
                 self.state = self.STATE_HALF_OPEN
                 self.last_state_change = now
                 request_logger.info("🟡 Circuit Breaker enters HALF_OPEN state: Testing Panel API connectivity...")
                 return True
             return False
         elif self.state == self.STATE_HALF_OPEN:
-            return True
+            return not self.single_probe
         return True
 
     def record_result(self, is_server_failure: bool):
         """Record success or server/network failure (ignoring 4xx client errors)."""
-        now = time.time()
+        now = time.monotonic()
         if is_server_failure:
             self.consecutive_failures += 1
             if self.consecutive_failures >= self.failure_threshold and self.state != self.STATE_OPEN:
@@ -88,7 +113,7 @@ class PanelCircuitBreaker:
 circuit_breaker = PanelCircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
 # Online-stat fan-out has different upstream failure modes from user snapshots
 # and mutations. Its bursts must not suppress those independent operations.
-online_stats_circuit_breaker = PanelCircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
+online_stats_circuit_breaker = PanelCircuitBreaker(failure_threshold=5, recovery_timeout=60.0, single_probe=True)
 
 # Shared persistent httpx.AsyncClient with connection pooling
 _panel_client: Optional[httpx.AsyncClient] = None
@@ -277,6 +302,7 @@ async def panel_request(
     max_retries: int = 3,
     retry_delay: float = 1.0,
     breaker: PanelCircuitBreaker | None = None,
+    quiet: bool = False,
 ) -> tuple[Optional[httpx.Response], Optional[str]]:
     """
     Make a panel API request with automatic retry and scheme fallback.
@@ -291,6 +317,8 @@ async def panel_request(
         timeout: Request timeout in seconds
         max_retries: Maximum number of retry attempts
         retry_delay: Initial delay between retries (doubles each retry)
+        quiet: Send individual request diagnostics to DEBUG; collection callers
+            must report aggregate outcomes and failures.
 
     Returns:
         Tuple of (response, error_message)
@@ -298,10 +326,12 @@ async def panel_request(
         - On failure: (None, error_message)
     """
     active_breaker = circuit_breaker if breaker is None else breaker
+    request_warning = request_logger.debug if quiet else request_logger.warning
+    request_error = request_logger.debug if quiet else request_logger.error
     # Check Circuit Breaker before making network requests
     if not active_breaker.allow_request():
-        request_logger.warning(f"⚡ Circuit Breaker OPEN: Panel API unavailable, failing fast for {endpoint}")
-        return None, "Circuit Breaker OPEN: Panel API unavailable"
+        request_warning(f"⚡ Circuit Breaker OPEN: Panel API unavailable, failing fast for {endpoint}")
+        return None, PanelRequestError("Circuit Breaker OPEN: Panel API unavailable", "deferred")
 
     headers = get_panel_headers(panel_data)
     last_error = None
@@ -327,7 +357,10 @@ async def panel_request(
                     await validate_enforcement()
                     start_enforcement_effect()
                 if method == "GET":
-                    response = await client.get(url, headers=headers, params=params, timeout=timeout)
+                    slot = page_request_slot() if endpoint.rstrip("/") == "/api/users" else nullcontext()
+                    async with slot:
+                        start_time = time.perf_counter()
+                        response = await client.get(url, headers=headers, params=params, timeout=timeout)
                 elif method == "POST":
                     if form_data:
                         response = await client.post(
@@ -347,7 +380,7 @@ async def panel_request(
                     )
 
                 elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request(method, url, response.status_code, elapsed)
+                log_api_request(method, url, response.status_code, elapsed, debug_only=quiet)
 
                 # Any response means panel server is reachable
                 _record_connection_success()
@@ -376,7 +409,7 @@ async def panel_request(
                 if response.status_code == 429:
                     _record_failure(scheme)
                     last_error = f"Rate limited (429) on {url}"
-                    request_logger.warning(last_error)
+                    request_warning(last_error)
                     await asyncio.sleep(retry_delay * 2 + random.uniform(0.1, 0.5))
                     continue
 
@@ -385,7 +418,7 @@ async def panel_request(
                     active_breaker.record_result(is_server_failure=True)
                     _record_failure(scheme)
                     last_error = f"Server error ({response.status_code}) on {url}"
-                    request_logger.warning(last_error)
+                    request_warning(last_error)
                     continue
 
                 # Other errors
@@ -395,25 +428,45 @@ async def panel_request(
                 last_error = f"HTTP {response.status_code}"
 
             except EnforcementProtected:
+                active_breaker.release_probe()
+                raise
+            except CancelledError:
+                active_breaker.release_probe()
                 raise
             except (SSLError, httpx.TimeoutException, httpx.ConnectError, httpx.RequestError) as e:
                 elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request(method, url, None, elapsed, type(e).__name__)
+                log_api_request(method, url, None, elapsed, type(e).__name__, debug_only=quiet)
                 _record_failure(scheme)
                 _record_connection_failure()
                 # Server/network failure - trip Circuit Breaker
                 active_breaker.record_result(is_server_failure=True)
-                last_error = f"Network/Server error on {url}: {type(e).__name__}"
-                request_logger.warning(last_error)
+                last_error = PanelRequestError(
+                    f"Network/Server error on {url}: {type(e).__name__}",
+                    "timeout" if isinstance(e, httpx.TimeoutException) else "network",
+                    next(
+                        (
+                            kind
+                            for kind, exception in (
+                                ("read", httpx.ReadTimeout),
+                                ("connect", httpx.ConnectTimeout),
+                                ("pool", httpx.PoolTimeout),
+                                ("write", httpx.WriteTimeout),
+                            )
+                            if isinstance(e, exception)
+                        ),
+                        None,
+                    ),
+                )
+                request_warning(last_error)
                 continue
 
             except Exception as e:
                 elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request(method, url, None, elapsed, type(e).__name__)
+                log_api_request(method, url, None, elapsed, type(e).__name__, debug_only=quiet)
                 _record_failure(scheme)
                 active_breaker.record_result(is_server_failure=True)
                 last_error = f"Error on {url}: {type(e).__name__}"
-                request_logger.error(last_error)
+                request_error(last_error)
                 continue
 
         # All schemes failed for this attempt, wait before retry with proportional jitter
