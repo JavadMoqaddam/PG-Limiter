@@ -4,8 +4,11 @@ Periodically syncs users from the panel to local database for efficient filterin
 """
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from html import escape
+from time import monotonic
 from typing import Optional
 from urllib.parse import quote
 
@@ -21,6 +24,9 @@ sync_logger = get_logger("user_sync")
 # Last sync timestamp and sync lock
 _last_sync_time: Optional[datetime] = None
 _sync_lock: asyncio.Lock = asyncio.Lock()
+# Scheduling follows completed attempts, independently of the last full success.
+_last_sync_attempt_finished_at: float | None = None
+_sync_schedule_ready_at: float | None = None
 
 # In-Memory User Metadata Cache populated during User Sync
 # Factual entries: {username: {"group_ids": [...], "owner_username": "..."}}
@@ -295,162 +301,169 @@ async def _panel_confirms_user_absent(panel_data: PanelType, username: str) -> b
         return False
 
 
-async def sync_users_to_database(panel_data: PanelType) -> tuple[int, int, int]:
+async def sync_users_to_database(panel_data: PanelType, *, only_if_due: bool = False) -> tuple[int, int, int]:
+    """Mirror panel users, serializing with IP collection and other full syncs.
+
+    Scheduled callers recheck the configured deadline after admission, so a
+    manual sync or another scheduled caller can satisfy the pending request.
+    Manual callers retain the existing already-in-progress skip behavior.
+    Return (synced_count, error_count, deleted_count).
     """
-    Sync all users from panel to local database.
-    Mirror the validated panel list, confirming current absence before deletion.
-    Wait for API IP collection/rechecks before starting the full sync.
-    Commit bounded batches so settings and enforcement writers can keep running.
-    Failed fetches/parses never change membership; failed writes never prune it.
+    global _last_sync_attempt_finished_at
 
-    Args:
-        panel_data: Panel connection data
-
-    Returns:
-        Tuple of (synced_count, error_count, deleted_count)
-    """
-    global _last_sync_time
-
-    if _sync_lock.locked():
+    if only_if_due and await _due_sync_interval() is None:
+        return (0, 0, 0)
+    if _sync_lock.locked() and not only_if_due:
         sync_logger.warning("Sync already in progress, skipping")
         return (0, 0, 0)
 
     async with _sync_lock, serialized_panel_workload("user sync"):
-        synced = 0
-        errors = 0
-        deleted = 0
-        deleted_usernames = []
+        if only_if_due and await _due_sync_interval() is None:
+            return (0, 0, 0)
+        result = await _sync_users_while_admitted(panel_data)
+        # Include incomplete/failed attempts to avoid retrying a bulk mirror
+        # before every IP cycle. Cancellation leaves the deadline due.
+        _last_sync_attempt_finished_at = monotonic()
+        return result
 
-        try:
-            sync_logger.info("🔄 Starting user sync from panel to database...")
-            start_time = datetime.now(timezone.utc)
 
-            # Snapshot local rows before any network wait, then close the read
-            # transaction. Later edits and inserts belong to concurrent writers.
-            from db.database import get_db
-            from db.crud.users import UserCRUD
-            from db.models import User
-            from sqlalchemy import select, text
+async def _sync_users_while_admitted(panel_data: PanelType) -> tuple[int, int, int]:
+    """Run a full mirror while the caller owns the sync and panel workload locks."""
+    global _last_sync_time
 
-            batch_size = 500
-            columns = tuple(User.__table__.columns.keys())
-            async with get_db() as db:
-                result = await db.execute(select(User))
-                deletion_snapshots = {
-                    user.username: tuple(getattr(user, column) for column in columns) for user in result.scalars()
-                }
+    synced = 0
+    errors = 0
+    deleted = 0
+    deleted_usernames = []
 
-            # Fetch ALL users from panel (all statuses) to avoid losing disabled users
-            users = await get_all_users_with_details(panel_data, status=None)
-            pagination_changed = getattr(users, "pagination_changed", False)
+    try:
+        sync_logger.info("🔄 Starting user sync from panel to database...")
+        start_time = datetime.now(timezone.utc)
 
-            sync_logger.info(f"📥 Processing {len(users)} users...")
+        # Snapshot local rows before any network wait, then close the read
+        # transaction. Later edits and inserts belong to concurrent writers.
+        from db.database import get_db
+        from db.crud.users import UserCRUD
+        from db.models import User
+        from sqlalchemy import select, text
 
-            # Parse the entire validated snapshot before making any writes.
-            users_to_upsert = []
-            for user_data in users:
-                try:
-                    parsed = _parse_panel_user_dict(user_data)
-                    if parsed is None:
-                        raise ValueError("Invalid panel user")
-                    users_to_upsert.append(parsed)
-                except Exception:
-                    errors += 1
-            if errors:
-                sync_logger.error(f"❌ User sync skipped: {errors} invalid panel records")
-                return (0, errors, 0)
-            panel_usernames = {user["username"] for user in users_to_upsert}
+        batch_size = 500
+        columns = tuple(User.__table__.columns.keys())
+        async with get_db() as db:
+            result = await db.execute(select(User))
             deletion_snapshots = {
-                name: snapshot for name, snapshot in deletion_snapshots.items() if name not in panel_usernames
+                user.username: tuple(getattr(user, column) for column in columns) for user in result.scalars()
             }
 
-            sync_logger.info("📂 Opening database connection for sync...")
+        # Fetch ALL users from panel (all statuses) to avoid losing disabled users
+        users = await get_all_users_with_details(panel_data, status=None)
+        pagination_changed = getattr(users, "pagination_changed", False)
 
-            async with get_db() as db:
-                sync_logger.info("✅ Database connection opened")
-                for offset in range(0, len(users_to_upsert), batch_size):
-                    count = await UserCRUD.bulk_upsert_users(db, users_to_upsert[offset : offset + batch_size])
-                    await db.commit()
-                    synced += count
-                    # Give other ready writers an opportunity between batches.
-                    await asyncio.sleep(0)
+        sync_logger.info(f"📥 Processing {len(users)} users...")
 
-            # Offset pagination can span same-count membership changes. Validate
-            # each proposed deletion against the current user-detail endpoint,
-            # with no database transaction retained during these network waits.
-            async with get_db() as db:
-                local_usernames = await UserCRUD.get_all_usernames(db)
-            potentially_deleted = sorted(local_usernames - panel_usernames)
-            if pagination_changed:
-                # Refresh validated observations, but do not turn gaps in a live
-                # offset listing into membership changes or a deletion fan-out.
-                potentially_deleted = []
+        # Parse the entire validated snapshot before making any writes.
+        users_to_upsert = []
+        for user_data in users:
+            try:
+                parsed = _parse_panel_user_dict(user_data)
+                if parsed is None:
+                    raise ValueError("Invalid panel user")
+                users_to_upsert.append(parsed)
+            except Exception:
                 errors += 1
-                sync_logger.warning("Live user listing changed; observed users refreshed, membership cleanup deferred")
-            confirmation_slots = asyncio.Semaphore(10)
+        if errors:
+            sync_logger.error(f"❌ User sync skipped: {errors} invalid panel records")
+            return (0, errors, 0)
+        panel_usernames = {user["username"] for user in users_to_upsert}
+        deletion_snapshots = {
+            name: snapshot for name, snapshot in deletion_snapshots.items() if name not in panel_usernames
+        }
 
-            async def confirm_absence(username):
-                async with confirmation_slots:
-                    return await _panel_confirms_user_absent(panel_data, username)
+        sync_logger.info("📂 Opening database connection for sync...")
 
-            for offset in range(0, len(potentially_deleted), batch_size):
-                batch = potentially_deleted[offset : offset + batch_size]
-                # A newly inserted local row belongs to a later writer. Leave it
-                # for a subsequent sync even if this run's panel view is older.
-                existing = [name for name in batch if name in deletion_snapshots]
-                errors += len(batch) - len(existing)
-                confirmed = await asyncio.gather(*(confirm_absence(name) for name in existing))
-                errors += sum(not absent for absent in confirmed)
-                absent_names = [name for name, absent in zip(existing, confirmed) if absent]
-                if not absent_names:
-                    continue
-
-                async with get_db() as db:
-                    # Serialize the comparison and delete with other writers.
-                    # Full rows include policy, recovery state and panel refresh
-                    # times, all of which must survive a concurrent update.
-                    if db.bind.dialect.name == "sqlite":
-                        await db.execute(text("BEGIN IMMEDIATE"))
-                    result = await db.execute(select(User).where(User.username.in_(absent_names)).with_for_update())
-                    unchanged = []
-                    for user in result.scalars():
-                        if tuple(getattr(user, column) for column in columns) == deletion_snapshots[user.username]:
-                            unchanged.append(user.username)
-                        else:
-                            errors += 1
-                    count = await UserCRUD.delete_many(db, unchanged)
-                    await db.commit()
-                deleted += count
-                deleted_usernames.extend(unchanged)
+        async with get_db() as db:
+            sync_logger.info("✅ Database connection opened")
+            for offset in range(0, len(users_to_upsert), batch_size):
+                count = await UserCRUD.bulk_upsert_users(db, users_to_upsert[offset : offset + batch_size])
+                await db.commit()
+                synced += count
+                # Give other ready writers an opportunity between batches.
                 await asyncio.sleep(0)
 
-            # Publish the cache after committed membership cleanup.
-            await refresh_user_metadata_cache()
-
-            elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-            if errors:
-                sync_logger.warning(
-                    f"⚠️ User sync incomplete: {synced} synced, {deleted} deleted, "
-                    f"{errors} unconfirmed or changed users in {elapsed:.1f}s"
-                )
-            else:
-                _last_sync_time = datetime.now(timezone.utc)
-                sync_logger.info(
-                    f"✅ User sync completed: {synced} synced, {deleted} deleted, 0 errors in {elapsed:.1f}s"
-                )
-
-            # Send Telegram notification for deleted users
-            if deleted_usernames:
-                await _notify_deleted_users(deleted_usernames)
-
-        except Exception as e:
-            import traceback
-
+        # Offset pagination can span same-count membership changes. Validate
+        # each proposed deletion against the current user-detail endpoint,
+        # with no database transaction retained during these network waits.
+        async with get_db() as db:
+            local_usernames = await UserCRUD.get_all_usernames(db)
+        potentially_deleted = sorted(local_usernames - panel_usernames)
+        if pagination_changed:
+            # Refresh validated observations, but do not turn gaps in a live
+            # offset listing into membership changes or a deletion fan-out.
+            potentially_deleted = []
             errors += 1
-            sync_logger.error(f"❌ User sync failed: {type(e).__name__}: {e}")
-            sync_logger.error(f"Traceback: {traceback.format_exc()}")
+            sync_logger.warning("Live user listing changed; observed users refreshed, membership cleanup deferred")
+        confirmation_slots = asyncio.Semaphore(10)
 
-        return (synced, errors, deleted)
+        async def confirm_absence(username):
+            async with confirmation_slots:
+                return await _panel_confirms_user_absent(panel_data, username)
+
+        for offset in range(0, len(potentially_deleted), batch_size):
+            batch = potentially_deleted[offset : offset + batch_size]
+            # A newly inserted local row belongs to a later writer. Leave it
+            # for a subsequent sync even if this run's panel view is older.
+            existing = [name for name in batch if name in deletion_snapshots]
+            errors += len(batch) - len(existing)
+            confirmed = await asyncio.gather(*(confirm_absence(name) for name in existing))
+            errors += sum(not absent for absent in confirmed)
+            absent_names = [name for name, absent in zip(existing, confirmed) if absent]
+            if not absent_names:
+                continue
+
+            async with get_db() as db:
+                # Serialize the comparison and delete with other writers.
+                # Full rows include policy, recovery state and panel refresh
+                # times, all of which must survive a concurrent update.
+                if db.bind.dialect.name == "sqlite":
+                    await db.execute(text("BEGIN IMMEDIATE"))
+                result = await db.execute(select(User).where(User.username.in_(absent_names)).with_for_update())
+                unchanged = []
+                for user in result.scalars():
+                    if tuple(getattr(user, column) for column in columns) == deletion_snapshots[user.username]:
+                        unchanged.append(user.username)
+                    else:
+                        errors += 1
+                count = await UserCRUD.delete_many(db, unchanged)
+                await db.commit()
+            deleted += count
+            deleted_usernames.extend(unchanged)
+            await asyncio.sleep(0)
+
+        # Publish the cache after committed membership cleanup.
+        await refresh_user_metadata_cache()
+
+        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+        if errors:
+            sync_logger.warning(
+                f"⚠️ User sync incomplete: {synced} synced, {deleted} deleted, "
+                f"{errors} unconfirmed or changed users in {elapsed:.1f}s"
+            )
+        else:
+            _last_sync_time = datetime.now(timezone.utc)
+            sync_logger.info(f"✅ User sync completed: {synced} synced, {deleted} deleted, 0 errors in {elapsed:.1f}s")
+
+        # Send Telegram notification for deleted users
+        if deleted_usernames:
+            await _notify_deleted_users(deleted_usernames)
+
+    except Exception as e:
+        import traceback
+
+        errors += 1
+        sync_logger.error(f"❌ User sync failed: {type(e).__name__}: {e}")
+        sync_logger.error(f"Traceback: {traceback.format_exc()}")
+
+    return (synced, errors, deleted)
 
 
 async def _notify_deleted_users(usernames: list[str]) -> None:
@@ -610,57 +623,72 @@ async def get_last_sync_time() -> Optional[datetime]:
 
 
 async def is_sync_needed(sync_interval_minutes: int) -> bool:
-    """
-    Check if a sync is needed based on interval.
+    """Whether the configured interval has elapsed since a completed attempt.
 
-    Args:
-        sync_interval_minutes: Sync interval in minutes
-
-    Returns:
-        True if sync is needed
+    The UI's last successful sync timestamp is deliberately separate: natural
+    pagination changes or an API error must not trigger a retry every IP cycle.
     """
-    if _last_sync_time is None:
+    if _last_sync_attempt_finished_at is None:
         return True
+    return monotonic() - _last_sync_attempt_finished_at >= sync_interval_minutes * 60
 
-    elapsed = (datetime.now(timezone.utc) - _last_sync_time).total_seconds()
-    return elapsed >= sync_interval_minutes * 60
+
+async def _due_sync_interval() -> int | None:
+    """Read current settings at admission, preserving the startup grace period."""
+    if _sync_schedule_ready_at is None or monotonic() < _sync_schedule_ready_at:
+        return None
+
+    from utils.read_config import read_config
+
+    config = await read_config()
+    if config.get("config_degraded"):
+        return None
+    interval = config.get("user_sync_interval", 5)
+    if isinstance(interval, bool) or not isinstance(interval, int) or interval <= 0:
+        # Invalid legacy settings must not create an endless sync/admission loop.
+        interval = 5
+    return interval if await is_sync_needed(interval) else None
+
+
+@asynccontextmanager
+async def api_collection_after_due_sync(panel_data: PanelType) -> AsyncIterator[None]:
+    """Admit an IP cycle only after any due full sync has completed.
+
+    Check after queueing, then release the non-reentrant workload lock before
+    requesting the sync. A pending manual/periodic sync can satisfy it. Recheck
+    on re-entry; observation timestamps and timeout budgets start after yield.
+    """
+    while True:
+        async with serialized_panel_workload("API IP collection"):
+            interval = await _due_sync_interval()
+            if interval is None:
+                yield
+                return
+        sync_logger.info("User sync due before API IP collection (configured interval: %s minutes)", interval)
+        await sync_users_to_database(panel_data, only_if_due=True)
 
 
 async def run_user_sync_loop(panel_data: PanelType):
-    """
-    Run the user sync loop. This should be started as a background task.
-
-    Args:
-        panel_data: Panel connection data
-    """
-    from utils.read_config import read_config
+    """Schedule full mirrors; IP-cycle admission also checks the same deadline."""
+    global _sync_schedule_ready_at
 
     sync_logger.info("🚀 Starting user sync background loop...")
-
-    # Delay initial sync to allow other startup operations to complete
-    # This reduces memory pressure during startup
-    sync_logger.info("⏳ Waiting 30 seconds before initial user sync...")
-    await asyncio.sleep(30)
-
-    # Initial sync
-    sync_logger.info("🔄 Initial user sync requested...")
-    await sync_users_to_database(panel_data)
-
-    while True:
-        try:
-            config = await read_config()
-            sync_interval = config.get("user_sync_interval", 5)  # Default 5 minutes
-
-            # Wait for interval
-            await asyncio.sleep(sync_interval * 60)
-
-            # Check if sync is needed
-            if await is_sync_needed(sync_interval):
-                await sync_users_to_database(panel_data)
-
-        except asyncio.CancelledError:
-            sync_logger.info("User sync loop cancelled")
-            break
-        except Exception as e:
-            sync_logger.error(f"Error in user sync loop: {e}")
-            await asyncio.sleep(60)  # Wait before retry
+    _sync_schedule_ready_at = monotonic() + 30
+    try:
+        # Preserve the initial grace period and avoid duplicate startup syncs
+        # if a manual request or cycle admission already performed the mirror.
+        sync_logger.info("⏳ Waiting 30 seconds before initial user sync...")
+        await asyncio.sleep(30)
+        while True:
+            try:
+                await sync_users_to_database(panel_data, only_if_due=True)
+            except Exception as e:
+                sync_logger.error(f"Error in user sync loop: {e}")
+            # Re-read settings at least every minute, including in Logs mode.
+            # The collection boundary checks due work without this polling lag.
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        sync_logger.info("User sync loop cancelled")
+        raise
+    finally:
+        _sync_schedule_ready_at = None

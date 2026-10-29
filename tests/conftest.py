@@ -119,10 +119,13 @@ def mock_httpx_client():
 @pytest.fixture(autouse=True)
 def reset_globals(monkeypatch):
     """Reset global state before each test"""
-    from utils import panel_workload
+    from utils import panel_workload, user_sync
 
     monkeypatch.setattr(panel_workload, "_workload_lock", asyncio.Lock())
     monkeypatch.setattr(panel_workload, "_active_workload", "")
+    monkeypatch.setattr(user_sync, "_sync_lock", asyncio.Lock())
+    monkeypatch.setattr(user_sync, "_sync_schedule_ready_at", None)
+    monkeypatch.setattr(user_sync, "_last_sync_attempt_finished_at", None)
 
     # Import and reset globals that might persist between tests
     try:

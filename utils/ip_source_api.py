@@ -40,6 +40,7 @@ from utils.shared_state import (
 )
 from utils.monitoring_gate import monitoring_is_current, monitoring_snapshot, synchronize_monitoring
 from utils.types import ConnectionInfo, PanelType, UserType
+from utils.user_sync import api_collection_after_due_sync
 from utils.device_count import COUNT_MODE_NODE
 from utils.api_node_scope import load_node_scope
 from utils.api_observations import APIObservationWindow, APIUserContext, monotonic_time
@@ -940,7 +941,7 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
     await synchronize_monitoring()
     if not monitoring_is_current(admission):
         return False
-    async with _collection_lock, serialized_panel_workload("API IP collection"):
+    async with _collection_lock, api_collection_after_due_sync(panel_data):
         if not monitoring_is_current(admission):
             return False
         source_config = config_data
