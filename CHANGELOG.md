@@ -6,6 +6,12 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-10-30
+
+### Added
+
+- Aggregate API lookup timings in existing progress logs: elapsed batch time, completed lookups per second, and mean/p95/maximum duration. Diagnostics include failed attempts without logging user identities or sending additional panel requests.
+
 ### Fixed
 
 - Keep each API monitoring cycle's workload slot through user enforcement and required punishment IP refreshes. Full user sync waits until the cycle finishes, so local mirror cleanup cannot invalidate a collected sample midway through enforcement. Due sync still runs before the next collection; cancellation and genuine policy changes retain their safeguards.

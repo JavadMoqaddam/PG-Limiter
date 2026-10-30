@@ -27,6 +27,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from html import escape
+from math import ceil
 from typing import Optional
 
 from utils.logs import get_logger
@@ -391,18 +392,31 @@ async def _fetch_all_online_ips(
     def current() -> bool:
         return monitoring_is_current(admission) and (is_current is None or is_current())
 
+    # Per-batch diagnostics only. Keep no user identity and do not count a
+    # deferred admission or cancelled lookup as a completed request.
+    lookup_durations: list[float] = []
+
     async def _one(username: str, user_id: int):
         if not current():
             return None
+        lookup_started = time.monotonic()
         started_at, started_monotonic = time.time(), monotonic_time()
-        payload, outcome = await fetch_user_online_ips(panel_data, user_id, timeout=timeout)
+        try:
+            payload, outcome = await fetch_user_online_ips(panel_data, user_id, timeout=timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            lookup_durations.append(max(0.0, time.monotonic() - lookup_started))
+            raise
+        if outcome != OUTCOME_DEFERRED:
+            lookup_durations.append(max(0.0, time.monotonic() - lookup_started))
         observed = APIObservationWindow(started_at, time.time(), started_monotonic, monotonic_time())
         if not current():
             return None
         return username, user_id, payload, outcome, observed
 
     completed = 0
-    last_progress = time.monotonic()
+    batch_started = last_progress = time.monotonic()
     api_ip_logger.info(
         "🛰️ API IP requests started: %s users (timeout %.1fs, concurrency %s, breaker wait budget %.1fs)",
         len(targets),
@@ -418,10 +432,21 @@ async def _fetch_all_online_ips(
     def progress():
         nonlocal last_progress
         settled = completed + counters["deferred"]
+        elapsed = max(0.0, time.monotonic() - batch_started)
+        count = len(lookup_durations)
+        rate = count / elapsed if elapsed > 0 else 0.0
+        timing = "lookup time: n/a (0 completed)"
+        if count:
+            durations = sorted(lookup_durations)
+            timing = (
+                f"lookup time ({count} completed): avg {sum(durations) / count * 1000:.0f}ms, "
+                f"p95 {durations[ceil(0.95 * count) - 1] * 1000:.0f}ms, max {durations[-1] * 1000:.0f}ms"
+            )
         api_ip_logger.info(
             "🛰️ API IP requests: %s/%s (%.1f%% complete), success %.1f%% "
             "(%s ok), %s not found, %s forbidden, %s failed (%s unauthorized, %s timeouts: "
-            "%s read, %s connect, %s pool, %s write), %s invalid bodies, %s unsent/deferred",
+            "%s read, %s connect, %s pool, %s write), %s invalid bodies, %s unsent/deferred; "
+            "elapsed %.1fs, rate %.2f/s; %s",
             settled,
             len(targets),
             100 * settled / len(targets),
@@ -438,6 +463,9 @@ async def _fetch_all_online_ips(
             counters["write_timeouts"],
             counters["invalid"],
             counters["deferred"],
+            elapsed,
+            rate,
+            timing,
         )
         last_progress = time.monotonic()
 
