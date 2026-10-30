@@ -6,6 +6,10 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep each API monitoring cycle's workload slot through user enforcement and required punishment IP refreshes. Full user sync waits until the cycle finishes, so local mirror cleanup cannot invalidate a collected sample midway through enforcement. Due sync still runs before the next collection; cancellation and genuine policy changes retain their safeguards.
+
 ## [1.7.1] - 2026-10-30
 
 ### Security and maintenance

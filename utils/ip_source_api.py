@@ -23,7 +23,8 @@ import asyncio
 import copy
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from html import escape
 from typing import Optional
@@ -105,6 +106,7 @@ LAST_CYCLE_STATS: dict = {
 _consecutive_dead_cycles = 0
 _failure_revision: int | None = None
 _collection_lock = asyncio.Lock()
+_api_cycle_owner: asyncio.Task | None = None
 _forbidden_alert_sent = False
 
 # Separate diagnostics for repeated enforcement skips, including when automatic
@@ -721,15 +723,50 @@ def _resolve_freshness_window(config_data: dict) -> int:
     return normalize_api_ip_freshness(config_data.get("api_ip_freshness"))
 
 
-@serialized_panel_workload("API IP refresh")
+@asynccontextmanager
+async def api_monitoring_cycle(panel_data: PanelType) -> AsyncIterator[None]:
+    """Keep collection and enforcement in one turn, after any due full sync.
+
+    The daemon holds this through enforcement; standalone collectors hold it
+    through collection only. Nesting in the same task borrows the existing turn
+    without checking sync deadlines again or reacquiring either lock. Child
+    tasks do not inherit ownership. Always acquire the collection lock first,
+    so a standalone collector cannot invert the daemon's lock order.
+    """
+    global _api_cycle_owner
+
+    task = asyncio.current_task()
+    if _api_cycle_owner is not None and _api_cycle_owner is task:
+        yield
+        return
+    async with _collection_lock, api_collection_after_due_sync(panel_data):
+        _api_cycle_owner = task
+        try:
+            yield
+        finally:
+            _api_cycle_owner = None
+
+
+@asynccontextmanager
+async def _api_refresh_workload() -> AsyncIterator[None]:
+    """Reuse this task's active cycle; standalone refreshes take their own turn."""
+    if _api_cycle_owner is not None and _api_cycle_owner is asyncio.current_task():
+        yield
+        return
+    async with serialized_panel_workload("API IP refresh"):
+        yield
+
+
+@_api_refresh_workload()
 async def recheck_api_user(
     panel_data: PanelType, username: str, config_data: dict, evidence: APISampleEvidence
 ) -> tuple[UserType, APIObservationWindow, bool] | None:
     """Re-observe only a pending punishment whose original request is too old.
 
     Metadata must still describe the same user and scope. The refreshed response
-    is counted as returned, just like the initial collection. Wait for any full
-    user sync before validating evidence and starting the new observation.
+    is counted as returned, just like the initial collection. An active cycle
+    keeps its turn through the refresh. Standalone callers wait for any full
+    sync before validating evidence and starting the new observation.
     """
     from utils.panel_api.users import get_user_details
 
@@ -943,7 +980,7 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
     await synchronize_monitoring()
     if not monitoring_is_current(admission):
         return False
-    async with _collection_lock, api_collection_after_due_sync(panel_data):
+    async with api_monitoring_cycle(panel_data):
         if not monitoring_is_current(admission):
             return False
         source_config = config_data
