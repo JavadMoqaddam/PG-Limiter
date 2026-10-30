@@ -108,6 +108,7 @@ async def test_progress_is_visible_before_last_request_finishes(monkeypatch, key
                     break
             assert not task.done()
             assert "1/2" in caplog.text and "success 100.0%" in caplog.text
+            assert "lookup time (1 completed)" in caplog.text
         finally:
             release.set()
             await task
@@ -132,3 +133,76 @@ async def test_fast_collection_does_not_emit_a_progress_line_for_each_user(
     progress = [record.message for record in caplog.records if "API IP requests" in record.message]
     assert len(progress) == 2
     assert "100/100" in progress[-1] and "success 100.0%" in progress[-1]
+
+
+async def test_lookup_timing_includes_failures_without_logging_user_details(
+    monkeypatch, key_http, operational_topics, caplog
+):
+    import utils.ip_source_api as api
+    import utils.panel_api.online_ips as online
+
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(api, "time", SimpleNamespace(time=__import__("time").time, monotonic=lambda: clock[0]))
+
+    async def fetch(_panel, uid, **_kwargs):
+        calls.append(uid)
+        clock[0] += uid / 10
+        if uid == 20:
+            raise RuntimeError("private exception detail")
+        return {}, "ok"
+
+    monkeypatch.setattr(online, "fetch_user_online_ips", fetch)
+    with caplog.at_level(logging.INFO):
+        _, counters, _ = await api._fetch_all_online_ips(
+            key_http.panel, [(f"private_{uid}", uid, {}) for uid in range(1, 21)], 1, 20
+        )
+    final = [r.message for r in caplog.records if "API IP requests: 20/20" in r.message][0]
+    assert "elapsed 21.0s, rate 0.95/s" in final
+    assert "lookup time (20 completed): avg 1050ms, p95 1900ms, max 2000ms" in final
+    assert counters["ok"] == 19 and counters["failed"] == 1
+    assert calls == list(range(1, 21))
+    assert "private_" not in caplog.text and "private exception detail" not in caplog.text
+    assert key_http.panel.panel_api_key not in caplog.text
+
+
+async def test_lookup_timing_excludes_unsent_attempts_and_resets_per_batch(
+    monkeypatch, key_http, operational_topics, caplog
+):
+    import utils.ip_source_api as api
+    import utils.panel_api.online_ips as online
+
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(api, "time", SimpleNamespace(time=__import__("time").time, monotonic=lambda: clock[0]))
+
+    async def fetch(_panel, uid, **_kwargs):
+        calls.append(uid)
+        if len(calls) == 1:
+            clock[0] += 10
+            return None, online.OUTCOME_DEFERRED
+        clock[0] += 0.25
+        return {}, "ok"
+
+    monkeypatch.setattr(online, "fetch_user_online_ips", fetch)
+    with caplog.at_level(logging.INFO):
+        for _ in range(2):
+            await api._fetch_all_online_ips(key_http.panel, [("private_user", 1, {})], 1, 20)
+    final = [r.message for r in caplog.records if "API IP requests: 1/1" in r.message]
+    assert len(final) == 2
+    assert "elapsed 10.2s, rate 0.10/s" in final[0]
+    assert "elapsed 0.2s, rate 4.00/s" in final[1]
+    assert all("lookup time (1 completed): avg 250ms, p95 250ms, max 250ms" in line for line in final)
+    assert calls == [1, 1, 1]
+
+
+async def test_unstarted_lookup_has_no_fabricated_latency(monkeypatch, key_http, operational_topics, caplog):
+    import utils.ip_source_api as api
+
+    with caplog.at_level(logging.INFO):
+        _, counters, _ = await api._fetch_all_online_ips(
+            key_http.panel, [("private_user", 1, {})], 1, 20, is_current=lambda: False
+        )
+    assert counters["deferred"] == 1
+    assert "lookup time: n/a (0 completed)" in caplog.text
+    assert "avg 0ms" not in caplog.text

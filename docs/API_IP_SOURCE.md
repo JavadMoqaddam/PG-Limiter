@@ -276,6 +276,30 @@ and cancels pending requests. User synchronization uses its own breaker.
 Individual collection request URLs, status codes and transport errors are
 DEBUG details. Other panel operations retain their normal request logging.
 
+Starting in 1.7.2, each existing progress line also reports elapsed batch time,
+average completed lookups per second, and mean/p95/maximum lookup duration in
+milliseconds. For example, the timing suffix may read:
+
+```text
+elapsed 120.0s, rate 8.00/s; lookup time (960 completed): avg 610ms, p95 1400ms, max 3200ms
+```
+
+These are cumulative statistics for this lookup batch, refreshed with the
+existing ten-second progress messages and at completion. A punishment refresh
+starts its own batch. p95 is the nearest-rank value: at least 95% of completed
+lookups took no longer than that duration. Successful and failed attempts,
+including timeouts, contribute; queued, deferred and cancelled calls do not.
+No completed calls means `lookup time: n/a (0 completed)`.
+
+Lookup duration uses a monotonic clock around the per-user API call and includes
+client connection/pool time, panel/node/network waiting and response parsing.
+It excludes waiting in the collection's user queue or for breaker admission;
+batch elapsed time and average rate do include the batch's queue/recovery time.
+These metrics do not separate panel, node and network latency. They add no
+requests or user identifiers and do not change concurrency, timeouts, freshness,
+counting or warning policy. Full sync, candidate listing and final membership
+checks remain outside this IP-lookup batch timer.
+
 The default `api_ip_timeout` is 20 seconds; an explicitly saved value takes
 precedence. Upgrading the code does not overwrite a stored timeout. This is the
 HTTP client's timeout for each transport phase, not a deadline for a whole
