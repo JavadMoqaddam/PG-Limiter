@@ -1,6 +1,6 @@
 # Testing a reviewed PR with Docker
 
-The GitHub PR workflow validates the Docker build, but its `pull_request` run does not publish to GHCR. A successful build does not provide a pullable PR tag. A local build of the reviewed commit allows a trial before merging.
+The GitHub PR workflow runs code, test and security checks. Docker image building and GHCR publication run through the gated release workflow; a passing PR does not provide a pullable image tag. A local build of the reviewed commit allows a trial before merging.
 
 Use the reviewed operator-provided trial and rollback procedure for activation. It should freeze a full commit SHA, build before stopping the existing service, and start the prepared container only after verification.
 
@@ -52,6 +52,8 @@ Full user synchronization (initial, periodic or manual) and API IP collection no
 Before admitting each new API collection, the daemon also checks whether full synchronization is due, using the current **User Sync Interval** (`user_sync_interval`, in minutes). For a configured interval of 15 minutes, a due sync finishes before the next IP collection starts, even if the background timer has not queued it yet. The deadline and setting are checked again after waiting for the workload slot. An active collection finishes normally when the deadline passes; it is not interrupted. A queued or completed manual/periodic sync can satisfy the same deadline without an extra full sync. Look for `User sync due before API IP collection (configured interval: 15 minutes)` when collection yields to a due sync; an already queued sync can finish first without this extra message.
 
 The interval runs from the end of the previous completed sync attempt, including an incomplete or failed attempt. Live pagination changes therefore do not cause a bulk sync before every cycle. The **Last sync** display still records only a fully successful mirror; an incomplete attempt must not be reported as successful. Cancellation does not postpone a due retry. Startup retains its separate 30-second grace period; a manual sync during that period satisfies the initial request. The background loop checks the configured deadline at least once per minute while idle, including in Logs mode. No settings or warning counters are changed by this scheduling rule.
+
+If sync cleanup changes the configuration revision while collection is queued, the unstarted collection retries with fresh settings after five seconds. It does not consume a full check interval, start an API sample or count as a panel outage. Collections already started retain the configured cadence and discard superseded evidence safely.
 
 Choose **Per Node** first, then **API**. Confirm the settings committed and a new user synchronization succeeded. Observe an actual fresh API collection cycle with a nonempty workload; record completion, successful/failed requests, unknown users and node coverage. Start success, cached results or an empty cycle alone do not establish working enforcement. Partial or unknown coverage must remain explicit.
 

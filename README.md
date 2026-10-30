@@ -3,7 +3,7 @@
   <img src="https://img.shields.io/badge/License-AGPL--3.0-green" alt="License">
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white" alt="Docker">
-  <img src="https://img.shields.io/badge/Development-1.7.1-orange" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.7.1-blue" alt="Version">
 </p>
 
 <h1 align="center">🛡️ PG-Limiter</h1>
@@ -17,7 +17,7 @@
 
 ---
 
-Development toward **1.7.1** is in progress; the latest published release is [1.7.0](https://github.com/JavadMoqaddam/PG-Limiter/releases/tag/v1.7.0). The behavior described here follows this development branch. See the [draft release notes](docs/releases/v1.7.1.md) for migration requirements.
+**PG-Limiter 1.7.1** includes API-key authentication, isolated node/user failures and serialized user synchronization. Read the [release notes](docs/releases/v1.7.1.md) and credential migration instructions before upgrading from 1.7.0.
 
 ## 📑 Table of Contents
 
@@ -95,17 +95,17 @@ Version 1.7.1 requires `PANEL_API_KEY`. Before upgrading from 1.7.0, prepare
 the key and permission scopes described in the
 [panel API-key guide](docs/PANEL_API_KEY.md).
 
-For the published stable release, run the versioned installer. Its setup and credentials are described in the [1.7.0 documentation](https://github.com/JavadMoqaddam/PG-Limiter/tree/v1.7.0#-installation); the API-key migration above applies to the upcoming 1.7.1 upgrade:
+Run the versioned 1.7.1 installer. Existing installations must configure their panel API key and intended TLS verification setting before upgrading:
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.0/pg-limiter.sh) install
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.1/pg-limiter.sh) install
 ```
 
 Or download and run step-by-step:
 
 ```bash
 # Download the installer
-curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.0/pg-limiter.sh -o /tmp/pg-limiter.sh
+curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.1/pg-limiter.sh -o /tmp/pg-limiter.sh
 
 # Run installation
 sudo bash /tmp/pg-limiter.sh install

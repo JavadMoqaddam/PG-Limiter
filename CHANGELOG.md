@@ -6,7 +6,7 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
-## [1.7.1] - Unreleased
+## [1.7.1] - 2026-10-30
 
 ### Security and maintenance
 
@@ -26,6 +26,8 @@ All notable changes to PG-Limiter are recorded here. Format follows
 - Serialize user-page requests with a one-second pause after each response or error, including retries. Confirm membership with batches of scanned user IDs independently of online status.
 - Hold queued IP requests through a bounded breaker recovery and resume with one probe. The 65-second wait budget is independent of observation freshness; unsent requests remain unknown.
 - Forward container shutdown signals promptly to Python and wait for its cleanup.
+- Serialize full user sync, API collection and punishment IP refresh. A due sync takes priority using the configured interval, measured from the previous attempt's completion.
+- Retry an unstarted API collection after five seconds when sync invalidates its cached settings. Preserve the normal cadence for started scans and panel outages, without resetting skipped users' warnings.
 
 ### Changed
 

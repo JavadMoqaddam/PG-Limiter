@@ -67,11 +67,19 @@ must be unexpired and unrevoked.
 2. Set `PANEL_API_KEY` in `.env`, retaining the intended `PANEL_DOMAIN` and
    `PANEL_VERIFY_SSL`. Remove `PANEL_USERNAME` and `PANEL_PASSWORD`; they are no
    longer read and cannot substitute for a missing key.
+   Edit the existing file; do not replace it with `.env.example`, which would
+   overwrite your bot credentials and other settings. Set the key before the
+   upgraded container starts.
 3. Restart a local Python process. For Docker, recreate the container so it
    receives the edited environment, for example `docker compose up -d
    --force-recreate` from the directory containing its Compose file.
 4. Check startup, user synchronization and the selected IP source. After
    confirming a rotated key works, revoke the old key in the panel.
+
+`docker restart` alone does not reload an edited `.env`. An active private
+trial must retain its recorded Compose files, mounts and environment overrides;
+use its reviewed transition/rollback procedure instead of the ordinary
+installed updater. Never share the real key in logs, issues or chat.
 
 An empty or invalid header value prevents key-only startup. An HTTP 401 or 403
 does not trigger password login, token refresh or a scheme change. Check the
