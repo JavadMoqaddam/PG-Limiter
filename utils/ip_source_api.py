@@ -98,6 +98,7 @@ LAST_CYCLE_STATS: dict = {
     "unknown_users": 0,
     "consecutive_unsuccessful_cycles": 0,
     "fallback_applied": False,
+    "retry_pending_collection": False,
 }
 
 # Unsuccessful collection cycles, scoped to the configuration that produced them.
@@ -806,7 +807,7 @@ def _reset_cycle_stats() -> None:
     """Zero the per-cycle counters before a new collection run."""
     for key in LAST_CYCLE_STATS:
         LAST_CYCLE_STATS[key] = "" if key == "skipped_reason" else 0
-    LAST_CYCLE_STATS.update(node_evidence_evaluated=False, fallback_applied=False)
+    LAST_CYCLE_STATS.update(node_evidence_evaluated=False, fallback_applied=False, retry_pending_collection=False)
     LAST_CYCLE_STATS["ran_at"] = time.time()
     LAST_CYCLE_STATS["collection_outcome"] = "failure"
 
@@ -937,6 +938,7 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
     Full user sync shares a workload slot; waiting does not start the sample or
     consume the per-request timeout/breaker wait budget.
     """
+    LAST_CYCLE_STATS["retry_pending_collection"] = False
     admission = monitoring_snapshot()
     await synchronize_monitoring()
     if not monitoring_is_current(admission):
@@ -949,6 +951,17 @@ async def collect_active_users_from_api(panel_data: PanelType, config_data: dict
         if config_data.get("config_degraded") or config_data.get("ip_source", "api") != "api":
             _reset_cycle_stats()
             LAST_CYCLE_STATS.update(collection_outcome="superseded", skipped_reason="API configuration unavailable")
+            return False
+        # Sync can invalidate settings while this caller waits for its slot.
+        # No sample has started yet: reload through the usage loop without
+        # consuming a normal scan interval or counting a remote API failure.
+        if config_data.get("_revision", get_config_revision()) != get_config_revision():
+            _reset_cycle_stats()
+            LAST_CYCLE_STATS.update(
+                collection_outcome="superseded",
+                skipped_reason="configuration changed before API collection started",
+                retry_pending_collection=True,
+            )
             return False
         evidence = APISampleEvidence(
             begin_api_collection(),

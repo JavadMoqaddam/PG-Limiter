@@ -1476,6 +1476,7 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
         failure_reason = ""
         completed_receipt = None
         enforcement_wait_reason = ""
+        retry_pending_collection = False
 
         # In API mode the connected IPs are collected right here, immediately
         # before enforcement, instead of being streamed in continuously by the
@@ -1511,9 +1512,9 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
                 if not run_enforcement:
                     from utils.ip_source_api import get_last_cycle_stats
 
-                    skip_reason = (
-                        get_last_cycle_stats().get("skipped_reason") or "API sample unavailable or source changed"
-                    )
+                    stats = get_last_cycle_stats()
+                    skip_reason = stats.get("skipped_reason") or "API sample unavailable or source changed"
+                    retry_pending_collection = bool(stats.get("retry_pending_collection"))
             except Exception as error:  # pylint: disable=broad-except
                 logger.error(f"🛰️ API IP collection failed: {error}")
                 run_enforcement = False
@@ -1614,4 +1615,7 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
                 f"Consecutive-scan timing is degraded - lower the API fan-out cost or raise "
                 f"the interval."
             )
-        await wait_for_monitoring_change(admission, max(5.0, check_interval - elapsed))
+        if retry_pending_collection:
+            logger.info("API collection has not started: settings changed while queued; retrying in 5s")
+        delay = 5.0 if retry_pending_collection else max(5.0, check_interval - elapsed)
+        await wait_for_monitoring_change(admission, delay)
