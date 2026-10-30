@@ -9,6 +9,7 @@ import html
 import re
 import time
 from collections.abc import Mapping
+from contextlib import AsyncExitStack
 from dataclasses import replace
 
 from telegram_bot.send_message import send_logs, send_user_message
@@ -1478,72 +1479,76 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
         enforcement_wait_reason = ""
         retry_pending_collection = False
 
-        # In API mode the connected IPs are collected right here, immediately
-        # before enforcement, instead of being streamed in continuously by the
-        # SSE log tasks. When the collector reports an untrustworthy sample the
-        # cycle is skipped entirely: feeding partial data to check_users_usage
-        # would clear the consecutive-violation counters of real offenders.
-        run_enforcement = True
-        if not monitoring_is_current(admission):
-            run_enforcement = False
-            skip_reason = admission.reason or "Topics monitoring changed"
-        elif config_data.get("config_degraded"):
-            # read_config could not reach the database, so the whitelist, the special
-            # limits and the group limits are all unknown - and a group_filter that
-            # reads as disabled means "limit every user". Enforcing on that would ban
-            # excepted users and users whose real limit is higher than the general one.
-            logger.critical(
-                "⛔ Configuration is degraded (database settings unavailable) - skipping "
-                "enforcement this cycle. Counters keep their values."
-            )
-            run_enforcement = False
-            skip_reason = "Database configuration is unavailable"
-        elif config_data.get("device_count_mode") == COUNT_MODE_INBOUND and config_data.get("ip_source") == "api":
-            logger.error(
-                "⛔ Per Inbound requires node logs - skipping collection and enforcement; counters are preserved"
-            )
-            run_enforcement = False
-            skip_reason = "Per Inbound requires node logs"
-        elif str(config_data.get("ip_source") or "logs") == "api":
-            from utils.ip_source_api import collect_active_users_from_api
-
-            try:
-                run_enforcement = await collect_active_users_from_api(panel_data, config_data)
-                if not run_enforcement:
-                    from utils.ip_source_api import get_last_cycle_stats
-
-                    stats = get_last_cycle_stats()
-                    skip_reason = stats.get("skipped_reason") or "API sample unavailable or source changed"
-                    retry_pending_collection = bool(stats.get("retry_pending_collection"))
-            except Exception as error:  # pylint: disable=broad-except
-                logger.error(f"🛰️ API IP collection failed: {error}")
+        # Release the API turn only after enforcement has completed or exited.
+        # The owner can refresh a punishment without queueing behind a full sync.
+        async with AsyncExitStack() as cycle_workload:
+            # In API mode the connected IPs are collected right here, immediately
+            # before enforcement, instead of being streamed in continuously by the
+            # SSE log tasks. When the collector reports an untrustworthy sample the
+            # cycle is skipped entirely: feeding partial data to check_users_usage
+            # would clear the consecutive-violation counters of real offenders.
+            run_enforcement = True
+            if not monitoring_is_current(admission):
                 run_enforcement = False
-                failure_reason = str(error)
-
-        if run_enforcement and monitoring_is_current(admission):
-            # One cycle must not be able to end the process. check_users_usage is
-            # awaited directly inside limiter.py's TaskGroup, so anything raising
-            # here - one malformed user, one Telegram error, one DB hiccup - used to
-            # abort the whole group and exit non-zero for a supervisor restart. The
-            # restart then ran a fresh cycle, and because consecutive_violations
-            # counts add_warning calls rather than elapsed time, a crash loop could
-            # walk a user from first sighting to ban far faster than
-            # check_interval * max_warnings.
-            try:
-                previous_receipt = get_last_completed_scan()
-                enforcement_wait_reason = await check_users_usage(panel_data, config_data=config_data)
-                receipt = get_last_completed_scan()
-                if receipt is None or receipt is previous_receipt:
-                    skip_reason = "Scan did not complete: source evidence or policy unavailable"
-                else:
-                    completed_receipt = receipt
-            except Exception as error:  # pylint: disable=broad-except
-                logger.error(
-                    f"❌ Enforcement cycle failed and was abandoned: {error}. "
-                    f"Counters keep their values; the next cycle re-evaluates everyone.",
-                    exc_info=True,
+                skip_reason = admission.reason or "Topics monitoring changed"
+            elif config_data.get("config_degraded"):
+                # read_config could not reach the database, so the whitelist, the special
+                # limits and the group limits are all unknown - and a group_filter that
+                # reads as disabled means "limit every user". Enforcing on that would ban
+                # excepted users and users whose real limit is higher than the general one.
+                logger.critical(
+                    "⛔ Configuration is degraded (database settings unavailable) - skipping "
+                    "enforcement this cycle. Counters keep their values."
                 )
-                failure_reason = str(error)
+                run_enforcement = False
+                skip_reason = "Database configuration is unavailable"
+            elif config_data.get("device_count_mode") == COUNT_MODE_INBOUND and config_data.get("ip_source") == "api":
+                logger.error(
+                    "⛔ Per Inbound requires node logs - skipping collection and enforcement; counters are preserved"
+                )
+                run_enforcement = False
+                skip_reason = "Per Inbound requires node logs"
+            elif str(config_data.get("ip_source") or "logs") == "api":
+                from utils.ip_source_api import api_monitoring_cycle, collect_active_users_from_api
+
+                try:
+                    await cycle_workload.enter_async_context(api_monitoring_cycle(panel_data))
+                    run_enforcement = await collect_active_users_from_api(panel_data, config_data)
+                    if not run_enforcement:
+                        from utils.ip_source_api import get_last_cycle_stats
+
+                        stats = get_last_cycle_stats()
+                        skip_reason = stats.get("skipped_reason") or "API sample unavailable or source changed"
+                        retry_pending_collection = bool(stats.get("retry_pending_collection"))
+                except Exception as error:  # pylint: disable=broad-except
+                    logger.error(f"🛰️ API IP collection failed: {error}")
+                    run_enforcement = False
+                    failure_reason = str(error)
+
+            if run_enforcement and monitoring_is_current(admission):
+                # One cycle must not be able to end the process. check_users_usage is
+                # awaited directly inside limiter.py's TaskGroup, so anything raising
+                # here - one malformed user, one Telegram error, one DB hiccup - used to
+                # abort the whole group and exit non-zero for a supervisor restart. The
+                # restart then ran a fresh cycle, and because consecutive_violations
+                # counts add_warning calls rather than elapsed time, a crash loop could
+                # walk a user from first sighting to ban far faster than
+                # check_interval * max_warnings.
+                try:
+                    previous_receipt = get_last_completed_scan()
+                    enforcement_wait_reason = await check_users_usage(panel_data, config_data=config_data)
+                    receipt = get_last_completed_scan()
+                    if receipt is None or receipt is previous_receipt:
+                        skip_reason = "Scan did not complete: source evidence or policy unavailable"
+                    else:
+                        completed_receipt = receipt
+                except Exception as error:  # pylint: disable=broad-except
+                    logger.error(
+                        f"❌ Enforcement cycle failed and was abandoned: {error}. "
+                        f"Counters keep their values; the next cycle re-evaluates everyone.",
+                        exc_info=True,
+                    )
+                    failure_reason = str(error)
 
         if not monitoring_is_current(admission):
             current = monitoring_snapshot()
