@@ -9,6 +9,7 @@ import html
 import re
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 
 from telegram_bot.send_message import send_logs, send_user_message
 from utils.logs import logger
@@ -59,7 +60,7 @@ from utils.shared_state import (
     pop_api_users_snapshot,
     api_evidence_is_current,
     refresh_api_user,
-    retain_log_interval,
+    refresh_log_user,
     tracked_node_count,
 )
 
@@ -343,22 +344,46 @@ async def check_ip_used(
         active_users_snapshot, "log_evidence", None
     )
     eligible_node_ids = getattr(evidence, "eligible_node_ids", None)
-    if config_data.get("device_count_mode") == COUNT_MODE_NODE:
-        if eligible_node_ids is None:
+    if config_data.get("device_count_mode") in (COUNT_MODE_NODE, COUNT_MODE_INBOUND):
+        if config_data.get("device_count_mode") == COUNT_MODE_NODE and eligible_node_ids is None:
             return {}
         if config_data.get("ip_source") == "api":
+            if config_data.get("device_count_mode") == COUNT_MODE_INBOUND:
+                return {}
             if not getattr(active_users_snapshot, "api_evidence", None) or not api_evidence_is_current(evidence):
                 return {}
             # Keep unknown observations in the enforcement-owned mapping so its
             # later freshness check can protect their warning records.
             active_users_snapshot = dict(active_users_snapshot)
             for username, user in list(active_users_snapshot.items()):
-                if username in evidence.unknown_users or not refresh_api_user(user, evidence.freshness_seconds):
+                if username in evidence.unknown_users or not refresh_api_user(
+                    user, evidence.freshness_seconds, evidence=evidence
+                ):
                     del active_users_snapshot[username]
-        else:
-            if not LOG_OBSERVATIONS.is_current(evidence):
-                return {}
-            retain_log_interval(active_users_snapshot, evidence.interval_start, evidence.interval_end)
+        elif not LOG_OBSERVATIONS.is_current(evidence, allow_partial=True):
+            return {}
+
+    log_evidence = getattr(active_users_snapshot, "log_evidence", None)
+    if log_evidence is not None:
+        # A report can await configuration or Telegram before enforcement resumes.
+        # Keep its visible population separate while aging the original user data.
+        active_users_snapshot = dict(active_users_snapshot)
+
+    def refresh_report_evidence() -> bool:
+        nonlocal log_evidence
+        if log_evidence is None:
+            return True
+        retained = LOG_OBSERVATIONS.retain_current_nodes(log_evidence)
+        if retained is None:
+            return False
+        log_evidence = retained
+        for username, user in list(active_users_snapshot.items()):
+            if not refresh_log_user(user, log_evidence) or not user.ip:
+                del active_users_snapshot[username]
+        return True
+
+    if not refresh_report_evidence():
+        return {}
     device_config = DeviceCountingConfig.from_config(config_data, eligible_node_ids=eligible_node_ids)
     if user_policies is None:
         snapshot = await read_config_snapshot(usernames=active_users_snapshot)
@@ -368,7 +393,7 @@ async def check_ip_used(
             name: evaluate_user_policy(username=name, config=snapshot.config, facts=snapshot.user_facts.get(name))
             for name in active_users_snapshot
         }
-    if not monitoring_is_current(admission):
+    if not monitoring_is_current(admission) or not refresh_report_evidence():
         return {}
     logger.info(f"📊 Processing {len(active_users_snapshot)} active users...")
 
@@ -465,7 +490,13 @@ async def check_ip_used(
             user_info,
             original_user,
             show_enhanced_details,
-            device_config=device_config,
+            device_config=replace(
+                device_config,
+                partial_evidence=bool(
+                    (log_evidence and not log_evidence.coverage_complete)
+                    or (getattr(evidence, "partial_users", frozenset()) and email in evidence.partial_users)
+                ),
+            ),
             user_trust_score=user_trust_score,
         )
         all_user_device_counts[email] = device_count
@@ -706,6 +737,8 @@ def _sample_is_trustworthy(all_users_actual_ips: dict, check_interval: int) -> b
 async def check_users_usage(panel_data: PanelType, config_data: dict | None = None):
     """
     Check device usage and monitor consecutive violations before applying punishment.
+
+    Return the initial Logs wait reason when source evidence blocks the scan.
     """
     global isp_detector
 
@@ -735,19 +768,33 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     if config_data.get("device_count_mode") == COUNT_MODE_NODE and eligible_node_ids is None:
         logger.warning("Per Node enforcement waiting: missing authoritative node evidence")
         return
-    if not api_mode and not LOG_OBSERVATIONS.is_current(log_evidence):
+    if not api_mode and not LOG_OBSERVATIONS.is_current(log_evidence, allow_partial=True):
         reason = log_evidence.unavailable_reason if log_evidence else "missing Logs evidence"
         logger.warning(f"Logs enforcement waiting: {reason}")
-        return
+        return reason
 
     def cycle_is_current():
+        nonlocal log_evidence, eligible_node_ids
+        if log_evidence is not None:
+            retained = LOG_OBSERVATIONS.retain_current_nodes(log_evidence)
+            if retained is None:
+                return False
+            log_evidence = retained
+            eligible_node_ids = retained.eligible_node_ids
+            active_users_snapshot.log_evidence = retained
         return (
             policy_monitoring_is_current()
             and monitoring_is_current(admission)
-            and (api_evidence_is_current(api_evidence) if api_evidence else LOG_OBSERVATIONS.is_current(log_evidence))
+            and (
+                api_evidence_is_current(api_evidence)
+                if api_evidence
+                else LOG_OBSERVATIONS.is_current(log_evidence, allow_partial=True)
+            )
         )
 
     protected_users = set(api_evidence.unknown_users) if api_evidence else set()
+    if api_evidence and api_evidence.known_users is not None:
+        protected_users.update(set(warning_system.warnings) - api_evidence.known_users)
     cycle_warning_candidates = dict(warning_system.warnings)
     policy_names = set(active_users_snapshot) | set(warning_system.warnings)
     try:
@@ -789,13 +836,26 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # This is critical for warning system to work correctly
     all_users_actual_ips = {}  # Maps username to set of actual unique IPs
     all_users_data = {}  # Maps username to UserType with full data
+    untrustworthy_users = set()
 
-    for email in list(active_users_snapshot.keys()):
-        data = active_users_snapshot[email]
-        # Get ALL unique IPs for this user (not just filtered ones)
-        unique_ips = set(data.ip)
-        all_users_actual_ips[email] = unique_ips
-        all_users_data[email] = data
+    def refresh_sample_users() -> None:
+        for username, user in active_users_snapshot.items():
+            trustworthy = (
+                refresh_api_user(user, api_evidence.freshness_seconds, evidence=api_evidence)
+                if api_evidence
+                else refresh_log_user(user, log_evidence)
+            )
+            if not trustworthy:
+                protected_users.add(username)
+                untrustworthy_users.add(username)
+        all_users_actual_ips.clear()
+        all_users_data.clear()
+        for username, user in active_users_snapshot.items():
+            if username not in (protected_users if api_evidence else untrustworthy_users):
+                all_users_actual_ips[username] = set(user.ip)
+                all_users_data[username] = user
+
+    refresh_sample_users()
 
     logger.info("📊 Found %s active users", len(all_users_actual_ips))
 
@@ -805,21 +865,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     if not cycle_is_current():
         return
 
-    if not cycle_is_current():
-        return
-    if api_evidence:
-        if not api_evidence_is_current(api_evidence):
-            logger.info("🛰️ Discarding API evidence after a source/settings change")
-            return
-        # Preparation can await the database and reporting. Count
-        # original timestamps at evaluation, never the time we received the IP.
-        for username, user in active_users_snapshot.items():
-            if not refresh_api_user(user, api_evidence.freshness_seconds):
-                protected_users.add(username)
-        all_users_actual_ips = {
-            name: set(user.ip) for name, user in active_users_snapshot.items() if name not in protected_users
-        }
-        all_users_data = {name: user for name, user in active_users_snapshot.items() if name not in protected_users}
+    # History persistence is another await; recency uses original source times.
+    refresh_sample_users()
 
     # ------------------------------------------------------------------
     # Single source of truth for the device count of this cycle.
@@ -828,6 +875,18 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     # violation path just issued (or vice versa).
     # ------------------------------------------------------------------
     device_config = DeviceCountingConfig.from_config(config_data, eligible_node_ids=eligible_node_ids)
+
+    def user_has_partial_evidence(username: str) -> bool:
+        return bool(
+            (log_evidence and not log_evidence.coverage_complete)
+            or (api_evidence and username in api_evidence.partial_users)
+        )
+
+    def counting_config(username: str) -> DeviceCountingConfig:
+        return replace(
+            device_config, partial_evidence=user_has_partial_evidence(username), eligible_node_ids=eligible_node_ids
+        )
+
     all_users_device_counts: dict[str, int] = {}
     cycle_trust_scores = {name: warning.trust_score for name, warning in warning_system.warnings.items()}
     for _u_name, _u_ips in all_users_actual_ips.items():
@@ -835,7 +894,7 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         _w_curr = warning_system.warnings.get(_u_name)
         all_users_device_counts[_u_name] = count_devices(
             _u_data,
-            device_config,
+            counting_config(_u_name),
             trust_score=_w_curr.trust_score if _w_curr else 0.0,
             # No connection detail for this user, so the addresses are all there
             # is. This used to pass len(_u_ips) - the raw IP count - which ignores
@@ -849,23 +908,70 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         # This is a local age/configuration check, with no network refetch.
         if not cycle_is_current() or username in protected_users:
             return False
-        if log_evidence:
-            return True
+        if api_evidence:
+            observed = api_evidence.observation_windows.get(username)
+            if observed is not None and not observed.clock_is_current():
+                protected_users.add(username)
+                return False
         user = active_users_snapshot.get(username)
-        if user is None:
+        if user is not None:
+            trustworthy = (
+                refresh_api_user(user, api_evidence.freshness_seconds, evidence=api_evidence)
+                if api_evidence
+                else refresh_log_user(user, log_evidence)
+            )
+            if not trustworthy:
+                protected_users.add(username)
+                return False
+            ips = set(user.ip)
+            all_users_actual_ips[username] = ips
+            all_users_data[username] = user
+            all_users_device_counts[username] = count_devices(
+                user,
+                counting_config(username),
+                trust_score=cycle_trust_scores.get(username, 0.0),
+                fallback_count=count_devices_from_ips(ips, device_config),
+            )
+        if user_has_partial_evidence(username):
+            policy = user_policies.get(username)
+            if policy is None or not policy.eligible or all_users_device_counts.get(username, 0) <= policy.limit:
+                # A lower bound can expire or a policy await can raise the limit.
+                # Neither proves normalization or absence on missing nodes.
+                protected_users.add(username)
+                return False
+        return True
+
+    # Ordinary scan decisions keep their own request snapshot. A panel mutation
+    # additionally needs a recent request for this user, not for the whole fleet.
+    def punishment_observation_is_current(username: str) -> bool:
+        if api_evidence is None:
             return True
-        if not refresh_api_user(user, api_evidence.freshness_seconds):
+        window = api_evidence.observation_windows.get(username)
+        return window is not None and window.is_fresh(api_evidence.freshness_seconds)
+
+    async def refresh_punishment_observation(username: str) -> bool:
+        nonlocal api_evidence
+        if not cycle_is_current() or username in protected_users:
+            return False
+        if api_evidence is None or punishment_observation_is_current(username):
+            return True
+        from utils.ip_source_api import recheck_api_user
+
+        refreshed = await recheck_api_user(panel_data, username, config_data, api_evidence)
+        if refreshed is None or not cycle_is_current():
             protected_users.add(username)
             return False
-        ips = set(user.ip)
-        all_users_actual_ips[username] = ips
-        all_users_device_counts[username] = count_devices(
-            user,
-            device_config,
-            trust_score=cycle_trust_scores.get(username, 0.0),
-            fallback_count=count_devices_from_ips(ips, device_config),
+        user, window, partial = refreshed
+        partial_users = set(api_evidence.partial_users)
+        if partial:
+            partial_users.add(username)
+        api_evidence = replace(
+            api_evidence,
+            observation_windows={**api_evidence.observation_windows, username: window},
+            partial_users=frozenset(partial_users),
         )
-        return True
+        active_users_snapshot[username] = user
+        return refresh_user_evidence(username) and punishment_observation_is_current(username)
 
     async def refresh_current_policy(username: str) -> UserPolicy | None:
         """Recheck factual eligibility and evidence after every preparation await."""
@@ -904,6 +1010,21 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         f"{total_ips_cycle} per-user IPs (summed per user, not de-duplicated)"
     )
 
+    # A lower bound can prove a violation, but cannot normalize a warning.
+    # Include retained names so absent/expired records stay protected too.
+    protected_users.update(
+        name
+        for name, policy in user_policies.items()
+        if user_has_partial_evidence(name) and policy.eligible and all_users_device_counts.get(name, 0) <= policy.limit
+    )
+    if log_evidence and not log_evidence.coverage_complete:
+        logger.info(
+            "Logs enforcement has partial coverage: %s/%s included nodes ready; %s user records protected",
+            len(log_evidence.eligible_node_ids),
+            len(log_evidence.required_node_ids),
+            len(protected_users),
+        )
+
     # Judge the sample BEFORE the second ban path runs. This used to be computed
     # ~200 lines below, after check_persistent_violations had already deleted every
     # expired record - so the guard meant to stop a partial view from wiping counters
@@ -920,6 +1041,8 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
         refresh_user_evidence=refresh_user_evidence,
         user_policies=user_policies,
         refresh_user_policy=refresh_current_policy,
+        refresh_punishment_evidence=refresh_punishment_observation,
+        punishment_evidence_is_current=punishment_observation_is_current,
         enforcement_is_current=lambda: cycle_is_current() and get_config_revision() == cycle_snapshot.local_revision,
     )
 
@@ -995,6 +1118,12 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                     continue
                 if current_warning is not None:
                     cycle_warning_candidates[user_name] = current_warning
+                if not refresh_user_evidence(user_name):
+                    continue
+                effective_device_count = all_users_device_counts[user_name]
+                unique_ips = all_users_actual_ips[user_name]
+                if effective_device_count <= user_policies[user_name].limit:
+                    continue
                 if result == "violation_limit_reached":
                     candidate_warning = warning_system.warnings.get(user_name)
                     if candidate_warning is None or candidate_warning.consecutive_violations < (
@@ -1023,9 +1152,13 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                             and candidate_warning.consecutive_violations
                             >= warning_system.effective_max_warnings(candidate_warning)
                             and refresh_user_evidence(user_name)
+                            and punishment_observation_is_current(user_name)
+                            and all_users_device_counts.get(user_name, 0) > user_policies[user_name].limit
                         )
 
                     async def revalidate_punishment():
+                        if not await refresh_punishment_observation(user_name):
+                            return False
                         policy = await refresh_current_policy(user_name)
                         return (
                             policy is not None
@@ -1033,6 +1166,9 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
                             and all_users_device_counts[user_name] > policy.limit
                         )
 
+                    if not await revalidate_punishment():
+                        protected_users.add(user_name)
+                        continue
                     with enforcement_guard(revalidate_punishment, punishment_is_current):
                         punishment_result = await safe_disable_user_with_punishment(
                             panel_data, UserType(name=user_name, ip=[])
@@ -1313,6 +1449,16 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
             protected_users_count=len(protected_users),
             metadata_unknown_users_count=len(unknown_metadata_users),
             failed_users_count=len(failed_users),
+            coverage_complete=(
+                log_evidence.coverage_complete
+                if log_evidence
+                else not (
+                    api_evidence.unknown_users or api_evidence.partial_users or api_evidence.known_users is not None
+                )
+            ),
+            required_node_ids=log_evidence.required_node_ids if log_evidence else None,
+            eligible_node_ids=log_evidence.eligible_node_ids if log_evidence else None,
+            device_count_mode=device_config.count_mode,
         )
 
     all_users_log.clear()
@@ -1328,6 +1474,9 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
         source = str(config_data.get("ip_source") or "logs")
         skip_reason = ""
         failure_reason = ""
+        completed_receipt = None
+        enforcement_wait_reason = ""
+        retry_pending_collection = False
 
         # In API mode the connected IPs are collected right here, immediately
         # before enforcement, instead of being streamed in continuously by the
@@ -1363,9 +1512,9 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
                 if not run_enforcement:
                     from utils.ip_source_api import get_last_cycle_stats
 
-                    skip_reason = (
-                        get_last_cycle_stats().get("skipped_reason") or "API sample unavailable or source changed"
-                    )
+                    stats = get_last_cycle_stats()
+                    skip_reason = stats.get("skipped_reason") or "API sample unavailable or source changed"
+                    retry_pending_collection = bool(stats.get("retry_pending_collection"))
             except Exception as error:  # pylint: disable=broad-except
                 logger.error(f"🛰️ API IP collection failed: {error}")
                 run_enforcement = False
@@ -1382,9 +1531,12 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
             # check_interval * max_warnings.
             try:
                 previous_receipt = get_last_completed_scan()
-                await check_users_usage(panel_data, config_data=config_data)
-                if get_last_completed_scan() is previous_receipt:
+                enforcement_wait_reason = await check_users_usage(panel_data, config_data=config_data)
+                receipt = get_last_completed_scan()
+                if receipt is None or receipt is previous_receipt:
                     skip_reason = "Scan did not complete: source evidence or policy unavailable"
+                else:
+                    completed_receipt = receipt
             except Exception as error:  # pylint: disable=broad-except
                 logger.error(
                     f"❌ Enforcement cycle failed and was abandoned: {error}. "
@@ -1410,10 +1562,60 @@ async def run_check_users_usage(panel_data: PanelType) -> None:
         # minutes in API mode) is added on top of the interval and the monitoring
         # window expires before the required consecutive scans can complete.
         elapsed = time.monotonic() - cycle_start
+        # General health delivery cannot abort enforcement or shorten its cadence.
+        # Successful scan facts come from the immutable receipt, never a newer
+        # live node snapshot. Failure details stay in local logs.
+        try:
+            from utils.node_health_notifications import report_cycle, report_node_health
+
+            outcome = "failed" if failure_reason else "skipped" if skip_reason else "completed"
+            receipt = completed_receipt if outcome == "completed" else None
+            reason = (
+                "Enforcement cycle failed"
+                if failure_reason
+                else "Current source evidence or policy unavailable"
+                if skip_reason
+                else ""
+            )
+            # A later live warmup must not hide an unrelated skipped scan.
+            if (
+                outcome == "skipped"
+                and source == "logs"
+                and LOG_OBSERVATIONS.source == "logs"
+                and enforcement_wait_reason == "collecting a complete check interval"
+                and monitoring_is_current(admission)
+                and get_config_revision() == config_revision
+            ):
+                reason = enforcement_wait_reason
+            await report_cycle(
+                receipt.admission if receipt else admission,
+                receipt.source if receipt else source,
+                outcome,
+                device_count_mode=receipt.device_count_mode
+                if receipt
+                else config_data.get("device_count_mode", "device"),
+                coverage_complete=receipt.coverage_complete if receipt else source != "logs",
+                required_node_ids=receipt.required_node_ids if receipt else None,
+                eligible_node_ids=receipt.eligible_node_ids if receipt else None,
+                users_counted=receipt.users_counted if receipt else 0,
+                protected_users_count=receipt.protected_users_count if receipt else 0,
+                duration_seconds=elapsed,
+                reason=reason,
+                config_revision=receipt.config_revision if receipt else config_revision,
+            )
+            if source == "logs" and monitoring_is_current(admission) and get_config_revision() == config_revision:
+                await report_node_health(admission)
+        except Exception:
+            logger.warning("Node health reporting failed; the enforcement cycle result is preserved")
+
+        elapsed = time.monotonic() - cycle_start
         if elapsed > check_interval:
             logger.warning(
                 f"⏱️ Cycle took {elapsed:.1f}s, longer than check_interval={check_interval}s. "
                 f"Consecutive-scan timing is degraded - lower the API fan-out cost or raise "
                 f"the interval."
             )
-        await wait_for_monitoring_change(admission, max(5.0, check_interval - elapsed))
+        if retry_pending_collection:
+            logger.info("API collection has not started: settings changed while queued; retrying in 5s")
+        delay = 5.0 if retry_pending_collection else max(5.0, check_interval - elapsed)
+        await wait_for_monitoring_change(admission, delay)

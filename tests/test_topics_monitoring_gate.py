@@ -8,7 +8,7 @@ import pytest
 
 from utils.types import NodeType, PanelType, UserType
 
-PANEL = PanelType("admin", "test", "panel.local")
+PANEL = PanelType(panel_domain="panel.local", panel_api_key="pg_key_test")
 NODE = NodeType(1, "node", "192.0.2.1", "connected")
 
 
@@ -211,13 +211,13 @@ async def test_disable_during_usage_preparation_skips_history_and_warnings(
     await usage.check_users_usage(PANEL, {"ip_source": "logs"})
 
 
-async def test_paused_sse_entry_does_not_request_token(paused_topics, monkeypatch):
+async def test_paused_sse_entry_does_not_open_http_client(paused_topics, monkeypatch):
     import utils.get_logs as logs
 
     async def forbidden(*args, **kwargs):
-        pytest.fail("paused SSE stream requested panel token")
+        pytest.fail("paused SSE stream opened HTTP client")
 
-    monkeypatch.setattr(logs, "get_token", forbidden)
+    monkeypatch.setattr(logs.httpx, "AsyncClient", forbidden)
     await logs.get_nodes_logs(PANEL, NODE)
 
 
@@ -290,7 +290,7 @@ async def test_paused_daemon_starts_management_and_timed_reenable_without_nodes(
     monkeypatch.setattr(
         limiter,
         "read_config",
-        AsyncMock(return_value={"panel": {"username": "a", "password": "b", "domain": "panel.local"}}),
+        AsyncMock(return_value={"panel": {"api_key": "pg_key_test", "domain": "panel.local"}}),
     )
     monkeypatch.setattr(limiter, "get_nodes", forbidden)
     monkeypatch.setattr(limiter, "run_check_users_usage", finish)
@@ -438,11 +438,11 @@ async def test_scheduled_sse_task_keeps_its_admission_before_first_execution(ope
             scheduled.append(coroutine)
             return object()
 
-    async def token(*args):
-        requested.append("token")
+    def client(*args, **kwargs):
+        requested.append("client")
         raise asyncio.CancelledError
 
-    monkeypatch.setattr(logs, "get_token", token)
+    monkeypatch.setattr(logs.httpx, "AsyncClient", client)
     monkeypatch.setattr(logs, "_ip_source_is_api", AsyncMock(return_value=False))
     await logs.create_node_task(PANEL, Group(), NODE)
     await operational_topics.set_enabled(False)
@@ -489,9 +489,8 @@ async def test_queued_api_requests_do_not_start_after_disable(operational_topics
     import utils.panel_api.online_ips as online
 
     requests = []
-    monkeypatch.setattr(online, "resolve_panel_token", AsyncMock(return_value="token"))
 
-    async def fetch(_panel, user_id, token, **kwargs):
+    async def fetch(_panel, user_id, **kwargs):
         requests.append(user_id)
         await operational_topics.set_enabled(False)
         return {}, online.OUTCOME_OK

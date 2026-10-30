@@ -30,21 +30,11 @@ def create_node_settings_keyboard():
 async def _get_nodes_list():
     """Helper to get nodes list from panel."""
     config_data = await read_config()
-    panel_config = config_data.get("panel", {})
-
-    if not panel_config.get("domain") or not panel_config.get("password"):
-        return None, "Panel not configured"
-
     from utils.types import PanelType
     from utils.panel_api.nodes import get_nodes
 
-    panel_data = PanelType(
-        panel_config.get("username", "admin"),
-        panel_config.get("password", ""),
-        panel_config.get("domain", "")
-    )
-
     try:
+        panel_data = PanelType.from_config(config_data)
         nodes = await get_nodes(panel_data, enabled_only=False)
         if isinstance(nodes, ValueError):
             return None, str(nodes)
@@ -60,8 +50,7 @@ async def node_settings_menu_callback(query, context: ContextTypes.DEFAULT_TYPE)
     disabled_nodes = config_data.get("disabled_nodes", [])
 
     status_text = (
-        f"<b>CDN Nodes:</b> {len(cdn_nodes)} configured\n"
-        f"<b>Disabled Nodes:</b> {len(disabled_nodes)} configured"
+        f"<b>CDN Nodes:</b> {len(cdn_nodes)} configured\n<b>Disabled Nodes:</b> {len(disabled_nodes)} configured"
     )
 
     try:
@@ -77,7 +66,7 @@ async def node_settings_menu_callback(query, context: ContextTypes.DEFAULT_TYPE)
                 "Use for nodes you don't want to monitor."
             ),
             reply_markup=create_node_settings_keyboard(),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     except BadRequest as e:
         if "Message is not modified" in str(e):
@@ -105,9 +94,7 @@ async def node_cdn_menu_callback(query, context: ContextTypes.DEFAULT_TYPE):
     if error:
         try:
             await query.edit_message_text(
-                text=f"❌ Failed to get nodes: {error}",
-                reply_markup=create_node_settings_keyboard(),
-                parse_mode="HTML"
+                text=f"❌ Failed to get nodes: {error}", reply_markup=create_node_settings_keyboard(), parse_mode="HTML"
             )
         except BadRequest:
             pass
@@ -116,9 +103,7 @@ async def node_cdn_menu_callback(query, context: ContextTypes.DEFAULT_TYPE):
     if not nodes:
         try:
             await query.edit_message_text(
-                text="❌ No nodes found in panel.",
-                reply_markup=create_node_settings_keyboard(),
-                parse_mode="HTML"
+                text="❌ No nodes found in panel.", reply_markup=create_node_settings_keyboard(), parse_mode="HTML"
             )
         except BadRequest:
             pass
@@ -148,7 +133,7 @@ async def node_cdn_menu_callback(query, context: ContextTypes.DEFAULT_TYPE):
                 "<i>Click a node to toggle CDN mode:</i>"
             ),
             reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     except BadRequest as e:
         if "Message is not modified" in str(e):
@@ -198,9 +183,7 @@ async def node_disabled_menu_callback(query, context: ContextTypes.DEFAULT_TYPE)
     if error:
         try:
             await query.edit_message_text(
-                text=f"❌ Failed to get nodes: {error}",
-                reply_markup=create_node_settings_keyboard(),
-                parse_mode="HTML"
+                text=f"❌ Failed to get nodes: {error}", reply_markup=create_node_settings_keyboard(), parse_mode="HTML"
             )
         except BadRequest:
             pass
@@ -209,9 +192,7 @@ async def node_disabled_menu_callback(query, context: ContextTypes.DEFAULT_TYPE)
     if not nodes:
         try:
             await query.edit_message_text(
-                text="❌ No nodes found in panel.",
-                reply_markup=create_node_settings_keyboard(),
-                parse_mode="HTML"
+                text="❌ No nodes found in panel.", reply_markup=create_node_settings_keyboard(), parse_mode="HTML"
             )
         except BadRequest:
             pass
@@ -242,7 +223,7 @@ async def node_disabled_menu_callback(query, context: ContextTypes.DEFAULT_TYPE)
                 "✅ = Monitored | 🚫 = Disabled"
             ),
             reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     except BadRequest as e:
         if "Message is not modified" in str(e):

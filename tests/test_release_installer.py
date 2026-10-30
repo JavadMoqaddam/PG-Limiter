@@ -33,7 +33,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / "pg-limiter.sh"
 def test_install_fetches_matching_tag_and_refuses_invalid_download(tmp_path, download):
     source = SCRIPT.read_text()
     if download == "valid_previous_version":
-        source = source.replace('VERSION="1.7.0"', 'VERSION="1.6.1"', 1)
+        source = re.sub(r'^VERSION="[^"]+"$', 'VERSION="1.6.1"', source, count=1, flags=re.MULTILINE)
     version = re.search(r'^VERSION="([^"]+)"$', source, re.MULTILINE).group(1)
     assignment = f'VERSION="{version}"'
     candidate = source

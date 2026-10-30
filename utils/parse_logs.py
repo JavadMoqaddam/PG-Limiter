@@ -16,7 +16,7 @@ from utils.ip_facts import (
     is_public_ip,
 )
 from utils.read_config import read_config, get_config_revision
-from utils.log_observations import LOG_OBSERVATIONS
+from utils.log_observations import LOG_OBSERVATIONS, FutureTimestampError
 from utils.monitoring_gate import monitoring_is_current, monitoring_snapshot, synchronize_monitoring
 from utils.types import ConnectionInfo, DeviceInfo, UserType
 from utils.logs import get_logger
@@ -218,6 +218,7 @@ async def set_current_node_info(node_id: int, node_name: str) -> None:
 _PARSER_CONFIG_CACHE: dict | None = None
 _PARSER_CONFIG_CACHE_TIME: float = 0.0
 _PARSER_CONFIG_REVISION: int = -1
+_PARSER_OBSERVATION_CONFIG: tuple[dict, int, int] | None = None
 
 
 async def get_cached_parser_config() -> dict:
@@ -327,6 +328,9 @@ async def parse_logs(
     node_id: int = None,
     node_name: str = None,
     config_data: dict | None = None,
+    *,
+    received_wall: float | None = None,
+    received_monotonic: float | None = None,
 ) -> dict[str, UserType] | dict:  # pylint: disable=too-many-branches
     """
     Asynchronously parse logs to extract and validate IP addresses, emails, and inbound protocols.
@@ -340,6 +344,10 @@ async def parse_logs(
     Returns:
         dict[str, UserType]: Dictionary of users with their connection information
     """
+    global _PARSER_OBSERVATION_CONFIG
+
+    received_wall = time.time() if received_wall is None else received_wall
+    received_monotonic = time.monotonic() if received_monotonic is None else received_monotonic
     admission = monitoring_snapshot()
     await synchronize_monitoring()
     if not monitoring_is_current(admission):
@@ -355,13 +363,28 @@ async def parse_logs(
     async with ACTIVE_USERS_LOCK:
         if revision != get_config_revision() or not monitoring_is_current(admission):
             return ACTIVE_USERS
-        if LOG_OBSERVATIONS.configure(data):
-            ACTIVE_USERS.clear()
+        configured = _PARSER_OBSERVATION_CONFIG
+        authoritative_cached_config = (
+            config_data is None and data is _PARSER_CONFIG_CACHE and _PARSER_CONFIG_REVISION == revision
+        )
+        if (
+            not authoritative_cached_config
+            or configured is None
+            or configured[0] is not data
+            or configured[1] != revision
+            or configured[2] != LOG_OBSERVATIONS.generation
+        ):
+            if LOG_OBSERVATIONS.configure(data):
+                ACTIVE_USERS.clear()
+            _PARSER_OBSERVATION_CONFIG = (
+                (data, revision, LOG_OBSERVATIONS.generation) if authoritative_cached_config else None
+            )
         # An excluded stream may still finish a pending read. Reject its records
         # before timezone conversion or any preparation can affect Logs evidence.
         if not LOG_OBSERVATIONS.monitors(current_node_id):
             return ACTIVE_USERS
         generation = LOG_OBSERVATIONS.generation
+        node_epoch = LOG_OBSERVATIONS.node_epoch(current_node_id)
     if data.get("INVALID_IPS"):
         INVALID_IPS.update(data.get("INVALID_IPS"))
 
@@ -369,33 +392,41 @@ async def parse_logs(
     cdn_inbounds = data.get("cdn_inbounds", [])
     use_xff = data.get("cdn_use_xff", True)
 
-    from db.database import get_db
-    from db.crud.users import UserCRUD
-
-    lines = log.splitlines()
-    observed_times = {}
-    for line in lines:
-        if "accepted" not in line or "BLOCK]" in line or not EMAIL_REGEX.search(line):
-            continue
-        if not (IP_V6_REGEX.search(line) or IP_V4_REGEX.search(line)):
-            continue
-        try:
-            observed_times[line] = LOG_OBSERVATIONS.timestamp(line, current_node_id)
-        except ValueError:
-            observed_times[line] = None
-
-    # Pre-resolve unknown numeric IDs in a single DB query to avoid per-line sessions
+    prepared_records = []
     unknown_ids = set()
-    for line in lines:
+    for line in log.splitlines():
         if "accepted" not in line or "BLOCK]" in line:
             continue
         email_match = EMAIL_REGEX.search(line)
-        if email_match:
-            email = email_match.group(1)
-            if email.isdigit() and email not in LOCAL_ID_CACHE:
-                unknown_ids.add(email)
+        if email_match is None:
+            continue
+        raw_email = email_match.group(1)
+        if raw_email.isdigit() and raw_email not in LOCAL_ID_CACHE:
+            unknown_ids.add(raw_email)
+        ip_match = IP_V6_REGEX.search(line) or IP_V4_REGEX.search(line)
+        if ip_match is None:
+            continue
+        inbound_match = INBOUND_REGEX.search(line)
+        inbound_protocol = inbound_match.group(1).strip() if inbound_match else "Unknown"
+        observed_at = None
+        timestamp_fault = ""
+        future_fault = None
+        try:
+            observed_at = LOG_OBSERVATIONS.timestamp(line, current_node_id)
+        except FutureTimestampError as error:
+            timestamp_fault = "future_timestamp"
+            future_fault = error
+        except ValueError as error:
+            timestamp_fault = LOG_OBSERVATIONS.timestamp_failure_reason(error)
+        prepared_records.append(
+            (line, ip_match.group(1), raw_email, inbound_protocol, observed_at, timestamp_fault, future_fault)
+        )
 
+    # Pre-resolve unknown numeric IDs once, using the matches already captured.
     if unknown_ids:
+        from db.database import get_db
+        from db.crud.users import UserCRUD
+
         try:
             async with get_db() as db:
                 if not monitoring_is_current(admission):
@@ -409,31 +440,9 @@ async def parse_logs(
         except Exception as e:
             parse_logger.error(f"Error batch-resolving numeric IDs: {e}")
 
-    for line in lines:
+    for line, ip, raw_email, inbound_protocol, observed_at, timestamp_fault, future_fault in prepared_records:
         if not monitoring_is_current(admission):
             return ACTIVE_USERS
-        if "accepted" not in line:
-            continue
-        if "BLOCK]" in line:
-            continue
-
-        # Extract inbound protocol first (needed for CDN check)
-        inbound_match = INBOUND_REGEX.search(line)
-        inbound_protocol = "Unknown"
-        if inbound_match:
-            inbound_protocol = inbound_match.group(1).strip()
-
-        # Extract IP address
-        ip_v6_match = IP_V6_REGEX.search(line)
-        ip_v4_match = IP_V4_REGEX.search(line)
-        email_match = EMAIL_REGEX.search(line)
-
-        if ip_v6_match:
-            ip = ip_v6_match.group(1)
-        elif ip_v4_match:
-            ip = ip_v4_match.group(1)
-        else:
-            continue
 
         # Check if this inbound is a CDN inbound - if so, try to get real IP from X-Forwarded-For
         is_cdn_inbound = inbound_protocol in cdn_inbounds
@@ -456,42 +465,51 @@ async def parse_logs(
             continue
 
         # Extract email
-        if email_match:
-            raw_email = email_match.group(1)
-            # Decide "panel id" vs "username" on the RAW field, before the "<id>."
-            # prefix is stripped. Stripping first turned "9999.1234" into "1234", which
-            # was then re-interpreted as a panel id: a user whose panel username is
-            # numeric had every log line dropped, and if that number happened to match
-            # another user's panel id their IPs were credited to that other user.
-            if raw_email.isdigit():
-                resolved = LOCAL_ID_CACHE.get(raw_email)
-                if not resolved:
-                    # ID was not found in batch pre-resolution, skip it
-                    continue
-                email = resolved
-            else:
-                email = await remove_id_from_username(raw_email)
-            # Skip empty usernames or invalid emails
-            if not email or not email.strip() or email in INVALID_EMAILS:
+        # Decide panel ID vs username before stripping a numeric prefix, so a
+        # prefixed numeric username cannot be credited to a different panel ID.
+        if raw_email.isdigit():
+            email = LOCAL_ID_CACHE.get(raw_email)
+            if not email:
                 continue
         else:
+            email = await remove_id_from_username(raw_email)
+        if not email or not email.strip() or email in INVALID_EMAILS:
             continue
-
-        observed_at = observed_times.get(line)
         # Preparation may have awaited country or numeric-user resolution. Commit
         # the fingerprint only now, under the same lock as the observation.
         async with ACTIVE_USERS_LOCK:
             if (
                 generation != LOG_OBSERVATIONS.generation
+                or node_epoch != LOG_OBSERVATIONS.node_epoch(current_node_id)
                 or revision != get_config_revision()
                 or not LOG_OBSERVATIONS.monitors(current_node_id)
                 or not monitoring_is_current(admission)
             ):
                 continue
             if observed_at is None:
-                LOG_OBSERVATIONS.mark_uncertain()
+                until = future_fault.source_epoch + LOG_OBSERVATIONS.freshness_seconds if future_fault else None
+                LOG_OBSERVATIONS.mark_uncertain(
+                    until, node_id=current_node_id, reason=timestamp_fault or "invalid_timestamp"
+                )
+                if future_fault:
+                    LOG_OBSERVATIONS.record_timestamp_fault(
+                        current_node_id,
+                        future_fault.source_epoch,
+                        phase="timestamp_parse",
+                        evaluation_wall=future_fault.evaluation_wall,
+                        evaluation_monotonic=future_fault.evaluation_monotonic,
+                        line=line,
+                        received_wall=received_wall,
+                        received_monotonic=received_monotonic,
+                    )
                 continue
-            if not LOG_OBSERVATIONS.admit(current_node_id, line, observed_at):
+            if not LOG_OBSERVATIONS.admit(
+                current_node_id,
+                line,
+                observed_at,
+                received_wall=received_wall,
+                received_monotonic=received_monotonic,
+            ):
                 continue
             user = ACTIVE_USERS.get(email)
             if user:

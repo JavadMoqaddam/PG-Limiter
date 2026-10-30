@@ -3,10 +3,13 @@ REST API Server for Limiter
 Run with: python api_server.py
 """
 
+import copy
 import logging
+import math
 import os
 import time
 from contextlib import asynccontextmanager
+from threading import Lock
 from typing import AsyncGenerator, Dict, List, Optional
 
 import secrets
@@ -24,20 +27,13 @@ logger = logging.getLogger(__name__)
 # Security
 security = HTTPBasic()
 
-# Failed-auth throttle: too many wrong credentials from one client within the window
-# are refused with 429 instead of letting an unthrottled 0.0.0.0 bind be brute-forced.
+# A bounded per-client failed-auth budget, checked before comparing credentials.
 _AUTH_MAX_FAILURES = 5
 _AUTH_WINDOW_SECONDS = 60.0
+_AUTH_MAX_CLIENTS = 4096
 _failed_auth_attempts: Dict[str, List[float]] = {}
-
-
-def _record_auth_failure(client: str) -> int:
-    """Record a failed auth for a client and return its live failure count in the window."""
-    now = time.time()
-    recent = [t for t in _failed_auth_attempts.get(client, []) if now - t < _AUTH_WINDOW_SECONDS]
-    recent.append(now)
-    _failed_auth_attempts[client] = recent
-    return len(recent)
+_auth_lock = Lock()  # Sync FastAPI dependencies can execute in multiple threads.
+_auth_now = time.monotonic
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -151,17 +147,13 @@ async def get_panel_data():
     from utils.types import PanelType
 
     config = await _read_settings()
-    panel_config = config.get("panel", {})
-    if not panel_config.get("domain"):
+    try:
+        return PanelType.from_config(config)
+    except ValueError as error:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Panel not configured",
-        )
-    return PanelType(
-        panel_username=panel_config.get("username", ""),
-        panel_password=panel_config.get("password", ""),
-        panel_domain=panel_config["domain"],
-    )
+            detail=str(error),
+        ) from error
 
 
 def verify_credentials(request: Request = None, credentials: HTTPBasicCredentials = Depends(security)):
@@ -195,24 +187,41 @@ def verify_credentials(request: Request = None, credentials: HTTPBasicCredential
             detail="API password is not configured; the API is disabled",
         )
 
-    is_correct_username = secrets.compare_digest(credentials.username.encode("utf8"), correct_username.encode("utf8"))
-    is_correct_password = secrets.compare_digest(credentials.password.encode("utf8"), correct_password.encode("utf8"))
-
-    if not (is_correct_username and is_correct_password):
-        client = request.client.host if request and request.client else "unknown"
-        if _record_auth_failure(client) > _AUTH_MAX_FAILURES:
+    client = request.client.host if request and request.client else "unknown"
+    with _auth_lock:
+        now = _auth_now()
+        recent = [t for t in _failed_auth_attempts.get(client, []) if now - t < _AUTH_WINDOW_SECONDS]
+        if len(recent) >= _AUTH_MAX_FAILURES:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Too many failed authentication attempts; try again later",
-                headers={"Retry-After": str(int(_AUTH_WINDOW_SECONDS))},
+                headers={"Retry-After": str(max(1, math.ceil(_AUTH_WINDOW_SECONDS - (now - recent[0]))))},
             )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials",
-            headers={"WWW-Authenticate": "Basic"},
+
+        is_correct_username = secrets.compare_digest(
+            credentials.username.encode("utf8"), correct_username.encode("utf8")
         )
-    # A clean login clears the client's failure streak.
-    _failed_auth_attempts.pop(request.client.host if request and request.client else "unknown", None)
+        is_correct_password = secrets.compare_digest(
+            credentials.password.encode("utf8"), correct_password.encode("utf8")
+        )
+        if not (is_correct_username and is_correct_password):
+            if client not in _failed_auth_attempts and len(_failed_auth_attempts) >= _AUTH_MAX_CLIENTS:
+                # Keep memory bounded even when requests arrive from many peers.
+                expired = [
+                    key for key, times in _failed_auth_attempts.items() if now - times[-1] >= _AUTH_WINDOW_SECONDS
+                ]
+                for key in expired:
+                    del _failed_auth_attempts[key]
+                if len(_failed_auth_attempts) >= _AUTH_MAX_CLIENTS:
+                    del _failed_auth_attempts[next(iter(_failed_auth_attempts))]
+            recent.append(now)
+            _failed_auth_attempts[client] = recent
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
+                headers={"WWW-Authenticate": "Basic"},
+            )
+        _failed_auth_attempts.pop(client, None)
     return credentials.username
 
 
@@ -282,7 +291,7 @@ _DOCS_ON = _docs_enabled()
 app = FastAPI(
     title="Limiter API",
     description="REST API for IP Connection Limiter Management",
-    version="1.7.0",
+    version="1.7.1",
     lifespan=lifespan,
     docs_url="/docs" if _DOCS_ON else None,
     redoc_url="/redoc" if _DOCS_ON else None,
@@ -492,8 +501,10 @@ async def enable_all_disabled_users(username: str = Depends(verify_credentials))
 @app.get("/config", tags=["Configuration"])
 async def get_config(username: str = Depends(verify_credentials)):
     """Present copied canonical settings with credentials masked."""
-    config = await _read_settings()
-    for section, credential in (("panel", "password"), ("telegram", "bot_token"), ("api", "password")):
+    config = copy.deepcopy(await _read_settings())
+    if "database_url" in config:
+        config["database_url"] = "***"
+    for section, credential in (("panel", "api_key"), ("telegram", "bot_token"), ("api", "password")):
         if credential in config.get(section, {}):
             config[section][credential] = "***"
     config = {key: value for key, value in config.items() if not key.startswith("_") and key != "config_degraded"}
@@ -551,16 +562,10 @@ async def cleanup_deleted_users(username: str = Depends(verify_credentials)):
 
     try:
         config = await read_config()
-        panel_config = config.get("panel", {})
-
-        if not panel_config.get("domain"):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Panel not configured")
-
-        panel_data = PanelType(
-            panel_username=panel_config.get("username", ""),
-            panel_password=panel_config.get("password", ""),
-            panel_domain=panel_config.get("domain", ""),
-        )
+        try:
+            panel_data = PanelType.from_config(config)
+        except ValueError as error:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
 
         result = await do_cleanup(panel_data)
 

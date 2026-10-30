@@ -53,6 +53,7 @@ class DeviceCountingConfig:
     high_trust_threshold: int = 20
     count_mode: str = COUNT_MODE_DEVICE
     eligible_node_ids: frozenset[int] | None = None
+    partial_evidence: bool = False
 
     def __post_init__(self) -> None:
         self.subnet_grouping_mode = "/24"
@@ -273,6 +274,12 @@ def count_devices(
                 unique_devices.add(key)
                 direct_observations.add(observation)
                 non_cdn_node_observations.add(observation)
+
+    if config.partial_evidence:
+        # Missing ordinary observations can suppress several CDN buckets. Direct
+        # keys remain monotone; CDN evidence proves only at least one device.
+        # This lower bound cannot exceed the count of any completed sample.
+        return max(len(unique_devices), int(bool(cdn_node_observations or cdn_inbound_observations)))
 
     # Suppress a broad CDN bucket if one of its observations is already counted
     # outside it. Do not union all overlapping buckets: that would merge distinct

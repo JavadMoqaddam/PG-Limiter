@@ -28,9 +28,6 @@ from telegram_bot.constants import (
     CallbackData,
     START_MESSAGE,
     HELP_TEXT,
-    GET_DOMAIN,
-    GET_USERNAME,
-    GET_PASSWORD,
     GET_CONFIRMATION,
     GET_CHAT_ID,
     GET_SPECIAL_LIMIT,
@@ -113,9 +110,6 @@ from telegram_bot.handlers.users import (
 )
 from telegram_bot.handlers.settings import (
     set_panel_domain,
-    get_domain,
-    get_username,
-    get_password,
     set_ipinfo_token,
     ipinfo_token_handler,
     handle_enhanced_menu_callback,
@@ -392,12 +386,7 @@ async def _show_disable_method_menu(update, query, context) -> None:
             from utils.user_group_filter import get_all_groups
             from utils.types import PanelType
 
-            panel_config = config_data.get("panel", {})
-            panel_data = PanelType(
-                panel_config.get("username", ""),
-                panel_config.get("password", ""),
-                panel_config.get("domain", ""),
-            )
+            panel_data = PanelType.from_config(config_data)
             for group in await get_all_groups(panel_data):
                 if disabled_group_id and group.get("id") == int(disabled_group_id):
                     disabled_group_name = group.get("name", "Unknown")
@@ -1165,18 +1154,7 @@ application.add_handler(
 application.add_handler(CommandHandler("admins_list", admins_list))
 
 # Config management
-application.add_handler(
-    ScopedConversationHandler(
-        application,
-        entry_points=[CommandHandler("create_config", set_panel_domain)],
-        states={
-            GET_DOMAIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_domain))],
-            GET_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_username))],
-            GET_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, require_admin_continuation(get_password))],
-        },
-        fallbacks=[],
-    )
-)
+application.add_handler(CommandHandler("create_config", set_panel_domain))
 
 # Limits management
 application.add_handler(

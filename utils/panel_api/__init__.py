@@ -2,7 +2,7 @@
 Panel API module for interacting with the Marzban panel.
 
 This module provides functions to interact with the panel API including:
-- Authentication and token management
+- API-key authentication
 - User operations (list, enable, disable, etc.)
 - Node operations
 - Group operations
@@ -11,8 +11,7 @@ This module provides functions to interact with the panel API including:
 
 # Auth functions
 from utils.panel_api.auth import (
-    get_token,
-    invalidate_token_cache,
+    get_panel_headers,
     safe_send_logs_panel,
 )
 
@@ -55,7 +54,6 @@ from utils.panel_api.online_ips import (
     fetch_online_candidates,
     fetch_user_online_ips,
     check_online_stats_permission,
-    resolve_panel_token,
     build_online_after,
     PANEL_ONLINE_WINDOW_SECONDS,
     OUTCOME_OK,
@@ -81,8 +79,7 @@ from utils.panel_api.request_helper import (
 
 __all__ = [
     # Auth
-    "get_token",
-    "invalidate_token_cache",
+    "get_panel_headers",
     "safe_send_logs_panel",
     # Users
     "all_user",
@@ -112,7 +109,6 @@ __all__ = [
     "fetch_online_candidates",
     "fetch_user_online_ips",
     "check_online_stats_permission",
-    "resolve_panel_token",
     "build_online_after",
     "PANEL_ONLINE_WINDOW_SECONDS",
     "OUTCOME_OK",

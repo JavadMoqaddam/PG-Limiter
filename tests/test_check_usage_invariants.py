@@ -1,10 +1,4 @@
-"""A consumed active-users batch must survive a mid-cycle failure.
-
-pop_active_users_snapshot() clears ACTIVE_USERS, so any dependency failure after it
-(e.g. metadata unavailable) would lose the batch and let the next cycle clear the
-warnings of users who are still connected but did not re-emit. The batch is requeued
-on failure, merged by connection identity, never overwriting a newer observation.
-"""
+"""Failed preparation preserves rolling observations without replacing newer data."""
 
 from utils.shared_state import (
     ACTIVE_USERS,
@@ -21,12 +15,18 @@ async def test_metadata_failure_requeues_consumed_batch_without_overwriting_new_
     ACTIVE_USERS["alice"] = UserType(name="alice", ip=["1.1.1.1"])
     ACTIVE_USERS["bob"] = UserType(name="bob", ip=["2.2.2.2"])
 
-    # The cycle consumes the batch.
+    # The cycle detaches a batch while retaining original source times in the store.
     for user in ACTIVE_USERS.values():
         user.device_info.connections = [ConnectionInfo(ip, 1, "node", "Vless", time.time() - 1) for ip in user.ip]
     batch = await pop_active_users_snapshot()
     assert set(batch) == {"alice", "bob"}
-    assert ACTIVE_USERS == {}
+    assert set(ACTIVE_USERS) == {"alice", "bob"}
+    original_seen = batch["alice"].device_info.connections[0].last_seen
+    assert ACTIVE_USERS["alice"].device_info.connections[0].last_seen == original_seen
+    assert batch["alice"] is not ACTIVE_USERS["alice"]
+
+    # A missing live entry can still be restored after failed preparation.
+    del ACTIVE_USERS["alice"]
 
     # A newer event for bob arrives while the cycle is running.
     ACTIVE_USERS["bob"] = UserType(name="bob", ip=["9.9.9.9"])
@@ -37,6 +37,7 @@ async def test_metadata_failure_requeues_consumed_batch_without_overwriting_new_
     assert set(ACTIVE_USERS) == {"alice", "bob"}
     # Absent user is restored from the batch...
     assert ACTIVE_USERS["alice"].ip == ["1.1.1.1"]
+    assert ACTIVE_USERS["alice"].device_info.connections[0].last_seen == original_seen
     assert restored == 1
     # ...but the newer bob observation is kept, not overwritten by the stale batch.
     assert ACTIVE_USERS["bob"].ip == ["9.9.9.9"]

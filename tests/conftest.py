@@ -74,7 +74,7 @@ def mock_panel_type():
     """Provide a mock PanelType for tests"""
     from utils.types import PanelType
 
-    return PanelType(panel_username="test_admin", panel_password="test_password", panel_domain="test.panel.com")
+    return PanelType(panel_domain="test.panel.com", panel_api_key="pg_key_test")
 
 
 @pytest.fixture
@@ -119,6 +119,14 @@ def mock_httpx_client():
 @pytest.fixture(autouse=True)
 def reset_globals(monkeypatch):
     """Reset global state before each test"""
+    from utils import panel_workload, user_sync
+
+    monkeypatch.setattr(panel_workload, "_workload_lock", asyncio.Lock())
+    monkeypatch.setattr(panel_workload, "_active_workload", "")
+    monkeypatch.setattr(user_sync, "_sync_lock", asyncio.Lock())
+    monkeypatch.setattr(user_sync, "_sync_schedule_ready_at", None)
+    monkeypatch.setattr(user_sync, "_last_sync_attempt_finished_at", None)
+
     # Import and reset globals that might persist between tests
     try:
         import utils.handel_dis_users as dis_mod
@@ -222,6 +230,8 @@ def completed_logs_evidence(operational_topics):
         note_node_event(1)
         LOG_OBSERVATIONS.fleet_floor = LOG_OBSERVATIONS.floor
         LOG_OBSERVATIONS.transport_floor = LOG_OBSERVATIONS.floor
+        for node_id in LOG_OBSERVATIONS.required_nodes or ():
+            LOG_OBSERVATIONS.node_states[node_id].floor = LOG_OBSERVATIONS.floor
         return LOG_OBSERVATIONS.evidence()
 
     return build

@@ -48,9 +48,15 @@ async def notice_cycle(tmp_path, monkeypatch, completed_logs_evidence, settings_
     config = await read_config()
 
     def snapshot(config):
-        from utils.shared_state import ActiveUsersSnapshot
+        from utils.shared_state import _clone_user_map
 
-        batch = ActiveUsersSnapshot(users.copy())
+        batch = _clone_user_map(users)
+        for user in batch.values():
+            if not user.device_info.connections:
+                # IP-only fixtures model newly observed traffic in each scan.
+                # Preserve explicit inbound observations and isolate fixture data
+                # from the enforcement path's local freshness pruning.
+                user.device_info.connections = [ConnectionInfo(ip, 1, "node", "Vless", now[0]) for ip in user.ip]
         batch.log_evidence = completed_logs_evidence(config)
         return batch
 
@@ -128,7 +134,7 @@ async def notice_cycle(tmp_path, monkeypatch, completed_logs_evidence, settings_
 
 
 async def run_cycle(case):
-    await usage.check_users_usage(PanelType("admin", "secret", "panel.example"), case["config"])
+    await usage.check_users_usage(PanelType(panel_domain="panel.example", panel_api_key="pg_key_test"), case["config"])
 
 
 @pytest.mark.parametrize("action", ["disabled", "revoked", "warning", "error"])
@@ -207,14 +213,15 @@ async def test_inbound_counting_fetches_isp_only_after_two_inbounds_cause_disabl
         assert "alice" not in case["system"].warnings
         assert case["requests"] == []
 
-        observe(["Vless TCP", "Vless WS"])
         for _ in range(2):
             case["now"][0] += 60
+            observe(["Vless TCP", "Vless WS"])
             await run_cycle(case)
         assert case["system"].warnings["alice"].consecutive_violations == 2
         assert case["requests"] == []
 
         case["now"][0] += 60
+        observe(["Vless TCP", "Vless WS"])
         await run_cycle(case)
         assert case["outcomes"] == ["alice"]
         assert len(case["requests"]) == 2

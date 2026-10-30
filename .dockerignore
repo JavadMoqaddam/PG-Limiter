@@ -1,71 +1,49 @@
-# Git
-.git
-.gitignore
-.github
-
-# Python
-__pycache__
-*.py[cod]
-*.pyo
-*.pyd
-.Python
-*.egg-info
-.eggs
-*.egg
-.pytest_cache
-.mypy_cache
-.ruff_cache
-
-# Virtual environments
-venv
-.venv
-env
-.env.local
-
-# Secrets - the Dockerfile does `COPY . .`, so without this a local `docker build`
-# bakes the operator's panel password, bot token and API password into the image
-# layers. The `env` entry above only matches a file literally named `env`.
-.env
-.env.*
-!.env.example
-
-# IDE
-.idea
-.vscode
-*.code-workspace
-*.swp
-*.swo
-
-# Docker
-Dockerfile*
-docker-compose*.yml
-.docker*
-
-# Documentation
-*.md
+# Runtime source allowlist. A local workspace can contain operator secrets,
+# backups and trial bundles; none should be sent to the build service.
+**
+!Dockerfile
+!requirements.txt
+!alembic.ini
+!limiter.py
+!api_server.py
+!cli_main.py
+!run_telegram.py
+!start.sh
+!cli_wrapper.sh
+!LICENSE
 !README.md
-docs/
+!utils/
+!utils/**
+!db/
+!db/**
+!telegram_bot/
+!telegram_bot/**
+!cli/
+!cli/**
+!api/
+!api/**
+!tools/
+!tools/**
 
-# Tests
-tests/
-*.test.py
-conftest.py
-
-# Local config (will be mounted)
-config.json
-.disable_users.json
-backup.json
-*.log
-
-# Build artifacts
-*.spec
-dist/
-build/
-
-# Other projects in workspace
-nobetci-main/
-nobetnode-main/
-dockerized-example/
-
-# License
-LICENSE
+# Private/generated state remains excluded even inside source directories.
+**/__pycache__/
+**/*.py[cod]
+**/.env
+**/.env.*
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite-*
+**/*.sqlite3
+**/*.sqlite3-*
+**/*.log
+**/*.zip
+**/*.tar
+**/*.tar.*
+**/*.gz
+**/*.bak
+**/*.backup
+**/*.private*
+**/backups/
+**/backup/
+**/data/

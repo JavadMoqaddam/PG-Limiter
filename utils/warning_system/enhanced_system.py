@@ -671,6 +671,8 @@ class EnhancedWarningSystem:
         user_policies: Mapping[str, UserPolicy] | None = None,
         refresh_user_policy: Callable[[str], Awaitable[UserPolicy | None]] | None = None,
         enforcement_is_current: Callable[[], bool] | None = None,
+        refresh_punishment_evidence: Callable[[str], Awaitable[bool]] | None = None,
+        punishment_evidence_is_current: Callable[[str], bool] | None = None,
     ) -> tuple[Set[str], Set[str]]:
         """
         Check for users who still violate limits after the monitoring window ended.
@@ -694,6 +696,10 @@ class EnhancedWarningSystem:
                 judgment. Default calls read canonical settings and factual fields.
             enforcement_is_current: Pure original cycle/revision check at the panel
                 effect boundary. Default captures the current configuration revision.
+            refresh_punishment_evidence: Optional awaited final source observation
+                check, used only for users reaching a punishment threshold.
+            punishment_evidence_is_current: Synchronous age check between final
+                observation validation and the first panel mutation.
 
         Returns:
             Tuple[Set[str], Set[str]]: (disabled_users, warned_users) - sets of users who were disabled or warned
@@ -828,6 +834,12 @@ class EnhancedWarningSystem:
                         f"⚠️ User {username}: {device_count} devices / {len(current_ips)} IPs (limit: {user_limit_number}, violations: {warning.consecutive_violations}/{required_violations}), trust={trust_score:.0f}"
                     )
 
+                    if device_count > user_limit_number and warning.consecutive_violations < required_violations:
+                        # The main scan must advance this record through add_warning,
+                        # whose current scan-gap rule decides whether the streak
+                        # continues or resets after settings changes or downtime.
+                        continue
+
                     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                     if device_count > user_limit_number and warning.consecutive_violations >= required_violations:
@@ -841,13 +853,29 @@ class EnhancedWarningSystem:
                                     and not warning.is_monitoring_active()
                                     and warning.consecutive_violations >= self.effective_max_warnings(warning)
                                     and (refresh_user_evidence is None or refresh_user_evidence(username))
+                                    and (
+                                        punishment_evidence_is_current is None
+                                        or punishment_evidence_is_current(username)
+                                    )
+                                    and (device_counts or {}).get(username, len(all_users_actual_ips.get(username, ())))
+                                    > user_limit_number
                                 )
 
                             async def revalidate_punishment():
+                                nonlocal user_limit_number
+                                if refresh_punishment_evidence is not None and not await refresh_punishment_evidence(
+                                    username
+                                ):
+                                    return False
                                 policy = await current_policy(username)
-                                count = (device_counts or {}).get(username, len(all_users_actual_ips.get(username, ())))
-                                return policy is not None and punishment_is_current() and count > policy.limit
+                                if policy is None:
+                                    return False
+                                user_limit_number = policy.limit
+                                return punishment_is_current()
 
+                            if not await revalidate_punishment():
+                                protected_users.add(username)
+                                continue
                             with enforcement_guard(revalidate_punishment, punishment_is_current):
                                 punishment_result = await safe_disable_user_with_punishment(
                                     panel_data, UserType(name=username, ip=[])

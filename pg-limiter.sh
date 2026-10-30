@@ -4,7 +4,7 @@ set -e
 # PG-Limiter Management Script
 # https://github.com/JavadMoqaddam/PG-Limiter
 
-VERSION="1.7.0"
+VERSION="1.7.1"
 
 # Configuration
 REPO_OWNER="JavadMoqaddam"
@@ -258,8 +258,9 @@ create_env_file() {
 
 # Panel Configuration (Required)
 PANEL_DOMAIN=your-panel-domain.com:8443
-PANEL_USERNAME=admin
-PANEL_PASSWORD=your_password
+PANEL_API_KEY=your_panel_api_key
+# Covers panel REST requests and node log streams.
+PANEL_VERIFY_SSL=true
 
 # Telegram Bot (Required)
 BOT_TOKEN=YOUR_BOT_TOKEN
@@ -301,7 +302,7 @@ COUNTRY_CODE=
 TZ=UTC
 DATABASE_URL=sqlite+aiosqlite:////var/lib/pg-limiter/data/pg_limiter.db
 EOF
-    # The .env holds the panel password and bot token; keep it owner-only.
+    # The .env holds the panel API key and bot token; keep it owner-only.
     chmod 600 "$ENV_FILE"
 }
 
@@ -318,9 +319,11 @@ replace_or_append_env_var() {
     if grep -q "^$key=" "$target_file"; then
         # `|| true`: grep -v exits 1 when it filters out every line, which under
         # `set -e` (top of file) would abort the installer.
-        grep -v "^$key=" "$target_file" > "$target_file.tmp" || true
-        cat "$target_file.tmp" > "$target_file"
-        rm -f "$target_file.tmp"
+        local temporary_file
+        temporary_file=$(mktemp "$target_file.tmp.XXXXXX")
+        grep -v "^$key=" "$target_file" > "$temporary_file" || true
+        cat "$temporary_file" > "$target_file"
+        rm -f "$temporary_file"
     fi
     printf '%s=%s\n' "$key" "$value" >> "$target_file"
 }
@@ -341,18 +344,17 @@ configure_interactive() {
         colorized_echo red "Panel domain is required"
     done
     
-    # Panel username
-    read -p "Panel username [admin]: " panel_username
-    panel_username=${panel_username:-admin}
-    
-    # Panel password
+    # Preserve the API key literally and keep it out of terminal output.
+    local panel_api_key
+    local LC_ALL=C
+    local panel_api_key_pattern='^[!-~]+$'
     while true; do
-        read -sp "Panel password: " panel_password
+        read -rsp "Panel API key: " panel_api_key
         echo ""
-        if [[ -n "$panel_password" ]]; then
+        if [[ "$panel_api_key" =~ $panel_api_key_pattern ]]; then
             break
         fi
-        colorized_echo red "Panel password is required"
+        colorized_echo red "Panel API key is required and must contain only visible ASCII characters"
     done
     
     # Bot token
@@ -395,8 +397,11 @@ configure_interactive() {
     
     # Update .env file
     replace_or_append_env_var "PANEL_DOMAIN" "$panel_domain"
-    replace_or_append_env_var "PANEL_USERNAME" "$panel_username"
-    replace_or_append_env_var "PANEL_PASSWORD" "$panel_password"
+    # Single quoting prevents Compose interpolation. Escape quotes/backslashes
+    # as dotenv data; this file is consumed by Compose, never sourced by bash.
+    local quoted_panel_api_key="${panel_api_key//\\/\\\\}"
+    quoted_panel_api_key="${quoted_panel_api_key//\'/\\\'}"
+    replace_or_append_env_var "PANEL_API_KEY" "'$quoted_panel_api_key'"
     replace_or_append_env_var "BOT_TOKEN" "$bot_token"
     replace_or_append_env_var "ADMIN_IDS" "$admin_ids"
     replace_or_append_env_var "GENERAL_LIMIT" "$general_limit"
@@ -1044,25 +1049,25 @@ cmd_edit() {
 
 cmd_shell() {
     check_running_as_root
+    detect_compose
     
     if ! is_running; then
         colorized_echo red "PG-Limiter is not running"
         exit 1
     fi
     
-    detect_compose
     $COMPOSE -f "$COMPOSE_FILE" exec pg-limiter /bin/bash
 }
 
 cmd_cli() {
     check_running_as_root
+    detect_compose
     
     if ! is_running; then
         colorized_echo red "PG-Limiter is not running"
         exit 1
     fi
     
-    detect_compose
     shift
     $COMPOSE -f "$COMPOSE_FILE" exec pg-limiter python cli_main.py "$@"
 }

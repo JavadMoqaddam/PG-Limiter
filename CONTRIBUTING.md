@@ -1,4 +1,4 @@
-# Contributing to Limiter
+# Contributing to PG-Limiter
 
 Thank you for your interest in contributing to Limiter!
 
@@ -14,8 +14,7 @@ Thank you for your interest in contributing to Limiter!
    ```bash
    python3 -m venv .venv
    source .venv/bin/activate
-   pip install -r requirements.txt
-   pip install -r requirements-dev.txt
+   pip install -r requirements.txt -r requirements-dev.txt
    ```
 
 ## Development
@@ -31,6 +30,8 @@ python3 limiter.py
 ```bash
 python3 -m pytest tests/ --ignore=tests/core_test.py --ignore=tests/test_minimal.py
 ```
+
+For a Docker trial before merging, follow [Testing a reviewed PR with Docker](docs/PR_TESTING.md).
 
 Dependabot checks Python dependencies each weekday at 09:00 Asia/Tehran and GitHub
 Actions and Docker images weekly on Monday at 09:00. It opens grouped minor/patch update
@@ -64,3 +65,9 @@ When reporting issues, please include:
 ## License
 
 By contributing, you agree that your contributions will be licensed under the AGPL-3.0 License.
+
+## Security and release work
+
+Report vulnerabilities privately using [SECURITY.md](SECURITY.md). Do not put real credentials, operator logs, database copies or internal investigation notes in issues, pull requests or source archives. Use synthetic data in regression tests. Historical investigations belong outside the distributable tree; Git history retains earlier tracked documents.
+
+Keep runtime fixes, security changes and repository maintenance in focused commits. Before a release, follow [release preparation](docs/RELEASING.md). Development release notes must say they are unreleased until publication. Keep the AGPL license and upstream attribution when changing project branding or repository hosting.

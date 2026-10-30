@@ -80,7 +80,7 @@ async def test_unknown_active_users_are_queued_once_without_default_enforcement(
     monkeypatch.setattr(check_usage, "resolve_effective_limit", fail_resolve)
 
     await check_usage.check_users_usage(
-        PanelType("admin", "secret", "panel.example"),
+        PanelType(panel_domain="panel.example", panel_api_key="pg_key_test"),
         config_data={"limits": {"general": 1}, "check_interval": 60},
     )
 

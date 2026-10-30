@@ -38,16 +38,24 @@ async def test_candidate_http_query_uses_online_flag(monkeypatch, panel, api_con
     async def get(_panel, path, **kwargs):
         assert path == "/api/users"
         seen.append(kwargs["params"])
-        return SimpleNamespace(json=lambda: {"users": [], "total": 0})
+        return SimpleNamespace(status_code=200, json=lambda: {"users": [], "total": 0})
 
     async def nodes(*args):
         return {1: "node"}, set(), {1}
 
     monkeypatch.setattr(requests, "panel_get", get)
     monkeypatch.setattr(api, "_resolve_node_context", nodes)
+    from unittest.mock import AsyncMock
+    from utils.api_node_scope import APINodeScope
+
+    monkeypatch.setattr(
+        api, "load_node_scope", AsyncMock(return_value=APINodeScope({}, {1: frozenset()}, frozenset({1})))
+    )
     api_config.update(check_interval=interval, group_filter={"enabled": True, "mode": "include", "group_ids": [7, 9]})
     assert await api.collect_active_users_from_api(panel, api_config)
-    assert seen == [{"offset": 0, "limit": 500, "status": "active", "group": [7, 9], "online": "true"}]
+    assert seen == [
+        {"offset": 0, "limit": 500, "status": "active", "group": [7, 9], "online": "true", "sort": "username"}
+    ]
 
 
 @pytest.mark.parametrize("bad_page", [None, {}, {"users": None, "total": 2}])
@@ -59,7 +67,7 @@ async def test_partial_candidate_pages_are_unknown(monkeypatch, panel, bad_page)
 
     async def get(_panel, _path, **kwargs):
         data = {"users": [{"id": 1, "username": "alice"}], "total": 2} if kwargs["params"]["offset"] == 0 else bad_page
-        return None if data is None else SimpleNamespace(json=lambda: data)
+        return None if data is None else SimpleNamespace(status_code=200, json=lambda: data)
 
     monkeypatch.setattr(requests, "panel_get", get)
     assert await fetch_online_candidates(panel, page_size=1) is None
@@ -72,7 +80,9 @@ async def test_duplicate_candidates_on_first_page_are_unknown(monkeypatch, panel
     from utils.panel_api.online_ips import fetch_online_candidates
 
     body = {"users": [{"id": 1, "username": "alice"}, {"id": 1, "username": "alice"}], "total": 2}
-    monkeypatch.setattr(requests, "panel_get", AsyncMock(return_value=SimpleNamespace(json=lambda: body)))
+    monkeypatch.setattr(
+        requests, "panel_get", AsyncMock(return_value=SimpleNamespace(status_code=200, json=lambda: body))
+    )
     assert await fetch_online_candidates(panel) is None
 
 
@@ -114,7 +124,7 @@ def panel():
     """Panel credentials; every network call is patched out."""
     from utils.types import PanelType
 
-    return PanelType("admin", "pass", "panel.local")
+    return PanelType(panel_domain="panel.local", panel_api_key="pg_key_test")
 
 
 @pytest.fixture
@@ -191,11 +201,15 @@ def _patch_collector(
     import utils.ip_source_api as api_mod
     import utils.panel_api.online_ips as online_ips_mod
     import utils.panel_api.request_helper as request_helper_mod
+    from utils.api_node_scope import APINodeScope
+    import copy
 
     notifications: list[str] = []
 
     async def fake_candidates(*_args, **_kwargs):
-        return candidates
+        if candidates is None:
+            return None
+        return [{"group_ids": [1], **copy.deepcopy(row)} for row in candidates]
 
     async def fake_node_context(*_args, **_kwargs):
         names = dict(node_name_map or {})
@@ -208,21 +222,137 @@ def _patch_collector(
         expected = set(expected_node_ids) if expected_node_ids is not None else set(names) - disabled
         return names, disabled, expected
 
+    async def fake_scope(_panel, monitored):
+        return APINodeScope({1: frozenset({"test"})}, {n: frozenset({"test"}) for n in monitored}, frozenset(monitored))
+
     async def fake_fetch(_panel, targets, **_kwargs):
         default = {"ok": len(targets), "failed": 0, "not_found": 0, "forbidden": 0, "unauthorized": 0}
-        resolved = dict(payloads or {})
+        from utils.api_observations import APIObservationWindow, monotonic_time
+
+        resolved = api_mod.OnlineIPResults()
+        resolved.update(payloads or {})
+        # Model explicit missing-user identities alongside the aggregate count.
+        missing_count = (counters or {}).get("not_found", 0)
+        resolved.not_found_users = set([name for name, _, _ in targets if name not in resolved][:missing_count])
         now = time.time()
+        mono = monotonic_time()
+        resolved.observations = {
+            name: APIObservationWindow(now, now, mono, mono) for name in set(resolved) | resolved.not_found_users
+        }
         return resolved, dict(counters or default), {name: now for name in resolved}
 
     async def fake_notify(message: str):
         notifications.append(message)
 
     monkeypatch.setattr(online_ips_mod, "fetch_online_candidates", fake_candidates)
+    monkeypatch.setattr(online_ips_mod, "fetch_user_memberships", fake_candidates)
     monkeypatch.setattr(request_helper_mod, "is_panel_available", lambda: panel_available)
     monkeypatch.setattr(api_mod, "_resolve_node_context", fake_node_context)
+    monkeypatch.setattr(api_mod, "load_node_scope", fake_scope)
     monkeypatch.setattr(api_mod, "_fetch_all_online_ips", fake_fetch)
     monkeypatch.setattr(api_mod, "_notify", fake_notify)
     return notifications
+
+
+async def test_all_unknown_cycle_records_elapsed_collection_time(monkeypatch, panel, api_config):
+    """An incomplete sample must report its real collection cost, not a default zero."""
+    import utils.ip_source_api as api
+
+    _patch_collector(
+        monkeypatch,
+        candidates=[{"id": 1, "username": "sample", "status": "active"}],
+        payloads={"sample": {1: None}},
+        node_name_map={1: "first", 2: "second"},
+    )
+    clock = iter([1000.0, 1000.0, 1242.0])
+    monkeypatch.setattr(api.time, "perf_counter", lambda: next(clock))
+
+    assert await api.collect_active_users_from_api(panel, api_config) is False
+    stats = api.get_last_cycle_stats()
+    assert stats["skipped_reason"] == "all user evidence unknown"
+    assert stats["duration_ms"] == 242_000
+
+
+async def test_invalid_maps_preserve_api_source_and_report_unusable_evidence(monkeypatch, panel, api_config):
+    """Successful lookups cannot authorize null maps, even alongside missing maps."""
+    from unittest.mock import AsyncMock
+
+    import utils.ip_source_api as api
+    import utils.read_config as config
+
+    notifications = _patch_collector(
+        monkeypatch,
+        candidates=[
+            {"id": 1, "username": "private-first", "status": "active"},
+            {"id": 2, "username": "private-second", "status": "active"},
+        ],
+        payloads={"private-first": {1: None, 2: {}}, "private-second": {1: None, 3: {}}},
+        node_name_map={1: "first", 2: "second", 3: "third"},
+    )
+    api_config["api_ip_auto_fallback"] = True
+    monkeypatch.setattr(config, "save_config_value", AsyncMock(return_value=True))
+
+    assert await api.collect_active_users_from_api(panel, api_config) is False
+    assert await api.collect_active_users_from_api(panel, api_config) is False
+    stats = api.get_last_cycle_stats()
+    message = api.format_api_evidence_summary(stats)
+    assert "HTTP lookups: <code>2</code> OK / <code>0</code> failed" in message
+    assert "Nodes reporting across responses: <code>2/3</code>" in message
+    assert "Nodes absent across all responses: <code>1</code>" in message
+    assert "private-first" not in message and "private-second" not in message
+    assert stats["consecutive_unsuccessful_cycles"] == 0
+    assert stats["coverage"] == 0
+    assert stats["http_coverage"] == 1
+    assert not stats["fallback_applied"]
+    assert not any("IP Source reverted to Logs" in text for text in notifications)
+
+
+async def test_usable_partial_samples_do_not_trigger_global_fallback(monkeypatch, panel, api_config):
+    """Unknown users must not interrupt other users' complete observations."""
+    from unittest.mock import AsyncMock
+
+    import utils.ip_source_api as api
+    import utils.read_config as config
+
+    _patch_collector(
+        monkeypatch,
+        candidates=[
+            {"id": 1, "username": "known", "status": "active"},
+            {"id": 2, "username": "unknown", "status": "active"},
+        ],
+        payloads={"known": {1: {}, 2: {}}, "unknown": {1: None}},
+        node_name_map={1: "first", 2: "second"},
+    )
+    api_config["api_ip_auto_fallback"] = True
+    monkeypatch.setattr(config, "save_config_value", AsyncMock(return_value=True))
+
+    assert await api.collect_active_users_from_api(panel, api_config) is True
+    assert await api.collect_active_users_from_api(panel, api_config) is True
+    assert api.get_last_cycle_stats()["fallback_applied"] is False
+    assert api.get_last_cycle_stats()["consecutive_unsuccessful_cycles"] == 0
+
+
+async def test_permission_denied_fallback_reports_forbidden_lookups(monkeypatch, panel, api_config):
+    """403 responses must remain visible when they are separate from failed lookups."""
+    from unittest.mock import AsyncMock
+
+    import utils.ip_source_api as api
+    import utils.read_config as config
+
+    notifications = _patch_collector(
+        monkeypatch,
+        candidates=[{"id": 1, "username": "sample", "status": "active"}],
+        counters={"ok": 0, "failed": 0, "not_found": 0, "forbidden": 1, "unauthorized": 0},
+        node_name_map={1: "first"},
+    )
+    api_config["api_ip_auto_fallback"] = True
+    monkeypatch.setattr(config, "save_config_value", AsyncMock(return_value=True))
+
+    assert await api.collect_active_users_from_api(panel, api_config) is False
+    assert await api.collect_active_users_from_api(panel, api_config) is False
+    message = next(text for text in notifications if "IP Source reverted to Logs" in text)
+    assert "HTTP lookups: <code>0</code> OK / <code>0</code> failed" in message
+    assert "Forbidden lookups (403): <code>1</code>" in message
 
 
 class TestResolveMonitoredGroupIds:
@@ -497,6 +627,10 @@ class TestBuildUsersFromPayloads:
             "stale_ips": 0,
             "future_ips": 0,
             "unknown_age_ips": 0,
+            "unknown_scope_users": 0,
+            "null_node_users": 0,
+            "unknown_age_users": 0,
+            "future_timestamp_users": 0,
         }
 
     @pytest.mark.asyncio
@@ -703,7 +837,7 @@ class TestCollectFailSafe:
         assert get_last_cycle_stats()["skipped_reason"] == "no successful lookups"
 
     @pytest.mark.asyncio
-    async def test_low_coverage_skips_the_cycle(self, panel, api_config, monkeypatch):
+    async def test_low_coverage_keeps_valid_users(self, panel, api_config, monkeypatch):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
         from utils.shared_state import ACTIVE_USERS
         from utils.types import UserType
@@ -714,14 +848,16 @@ class TestCollectFailSafe:
             candidates=[{"username": f"u{i}", "id": i} for i in range(1, 5)],
             payloads={"u1": {1: {"5.6.7.8": fresh()}}},
             counters={"ok": 1, "failed": 3, "not_found": 0, "forbidden": 0, "unauthorized": 0},
+            node_name_map={1: "node"},
         )
 
         # 1 of 4 answered = 25% coverage, below the configured 80%.
-        assert await collect_active_users_from_api(panel, api_config) is False
-        assert list(ACTIVE_USERS) == ["carol"]
+        assert await collect_active_users_from_api(panel, api_config) is True
+        assert list(ACTIVE_USERS) == ["u1"]
         stats = get_last_cycle_stats()
         assert stats["coverage"] == 0.25
-        assert "below" in stats["skipped_reason"]
+        assert stats["unknown_users"] == 3
+        assert stats["consecutive_unsuccessful_cycles"] == 0
 
     @pytest.mark.asyncio
     async def test_not_found_counts_as_covered(self, panel, api_config, monkeypatch):
@@ -752,9 +888,8 @@ class TestCollectFailSafe:
         )
 
         # Per-user coverage is a perfect 1.0 while two of three nodes said nothing.
-        # That is exactly the blind spot the node ratio exists to expose, so the
-        # cycle is unknown regardless of the optional global coverage gate.
-        assert await collect_active_users_from_api(panel, api_config) is False
+        # Omitted maps are diagnostic and cannot discard the one observed IP.
+        assert await collect_active_users_from_api(panel, api_config) is True
         stats = get_last_cycle_stats()
         assert stats["coverage"] == 1.0
         assert stats["nodes_seen"] == 1
@@ -762,7 +897,9 @@ class TestCollectFailSafe:
         assert stats["node_coverage"] == 0.3333
 
     @pytest.mark.asyncio
-    async def test_low_node_coverage_skips_the_cycle_when_configured(self, panel, api_config, monkeypatch):
+    async def test_low_node_coverage_retains_current_ips_without_merging_old_cycles(
+        self, panel, api_config, monkeypatch
+    ):
         from utils.ip_source_api import collect_active_users_from_api, get_last_cycle_stats
         from utils.shared_state import ACTIVE_USERS
         from utils.types import UserType
@@ -777,12 +914,13 @@ class TestCollectFailSafe:
             node_name_map={1: "de", 2: "nl", 3: "fr"},
         )
 
-        assert await collect_active_users_from_api(panel, api_config) is False
-        assert list(ACTIVE_USERS) == ["carol"]
+        assert await collect_active_users_from_api(panel, api_config) is True
+        assert list(ACTIVE_USERS) == ["alice"]
+        assert ACTIVE_USERS["alice"].ip == ["5.6.7.8"]
         stats = get_last_cycle_stats()
-        assert "unknown" in stats["skipped_reason"]
-        assert stats["users_with_ips"] == 0
-        assert stats["total_ips"] == 0
+        assert stats["skipped_reason"] == ""
+        assert stats["users_with_ips"] == 1
+        assert stats["total_ips"] == 1
         assert stats["nodes_seen"] == 1
 
     @pytest.mark.asyncio
@@ -825,7 +963,9 @@ class TestCollectFailSafe:
         assert get_last_cycle_stats()["skipped_reason"] == ""
 
     @pytest.mark.asyncio
-    async def test_low_coverage_counts_as_one_unsuccessful_cycle(self, panel, api_config, monkeypatch):
+    async def test_successful_transport_without_usable_users_does_not_count_as_outage(
+        self, panel, api_config, monkeypatch
+    ):
         import utils.ip_source_api as api_mod
 
         _patch_collector(
@@ -834,7 +974,7 @@ class TestCollectFailSafe:
             counters={"ok": 1, "failed": 3, "not_found": 0, "forbidden": 0, "unauthorized": 0},
         )
         assert await api_mod.collect_active_users_from_api(panel, api_config) is False
-        assert api_mod._consecutive_dead_cycles == 1
+        assert api_mod._consecutive_dead_cycles == 0
 
     @pytest.mark.asyncio
     async def test_repeated_coverage_skips_raise_one_alert(self, panel, api_config, monkeypatch):

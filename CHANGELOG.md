@@ -6,6 +6,42 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-10-30
+
+### Security and maintenance
+
+- Default the optional API to loopback, enforce failed-auth cooldowns before checking credentials, and redact database URLs from configuration responses.
+- Escape panel group names in Telegram HTML and use console logging if writable application log paths are unavailable, without a shared `/tmp` fallback.
+- Verify panel TLS by default for REST and SSE. Existing explicit `PANEL_VERIFY_SSL=false` remains supported; private certificates need an explicitly trusted CA bundle before upgrading.
+- Restrict Docker inputs to runtime source and include license/attribution. Route image publication through the verified release workflow and require an intentional tag or manual dispatch.
+- Cover development-target PRs with CI/CodeQL. Make the paid Claude reviewer opt-in and remove the hardcoded third-party API gateway.
+- Retire internal release-review and implementation notes from the distributable tree, remove the duplicated 1.7.0 release document, and clarify development status, supported behavior, private security reporting and repository independence preparation. Published 1.7.0 notes remain on the GitHub release and version tag.
+
+### Fixed
+
+- Recover SSE transport after gaps while retaining source timestamps, replay protection and per-node readiness. Share Last seen across collection and enforcement and report incomplete source evidence accurately.
+- Resolve API node scope from each user's groups and effective node cores. Successful responses count their valid IPs without requiring a map for every applicable node; unknown or changed identity/group scope remains protected.
+- Evaluate API observations at each user's request time. Recognize live connection maps on Xray 26.4.13+ and refresh stale observations before punishment.
+- Tolerate changing user totals during validated live pagination. Preserve warnings for unobserved users and defer local membership deletion when the background listing changes; malformed pages and authentication failures still stop the affected collection.
+- Serialize user-page requests with a one-second pause after each response or error, including retries. Confirm membership with batches of scanned user IDs independently of online status.
+- Hold queued IP requests through a bounded breaker recovery and resume with one probe. The 65-second wait budget is independent of observation freshness; unsent requests remain unknown.
+- Forward container shutdown signals promptly to Python and wait for its cleanup.
+- Serialize full user sync, API collection and punishment IP refresh. A due sync takes priority using the configured interval, measured from the previous attempt's completion.
+- Retry an unstarted API collection after five seconds when sync invalidates its cached settings. Preserve the normal cadence for started scans and panel outages, without resetting skipped users' warnings.
+
+### Changed
+
+- Panel REST, SSE and startup checks require `PANEL_API_KEY` in `X-Api-Key`; panel username/password login and token refresh are removed. See the [API-key migration guide](docs/PANEL_API_KEY.md) before upgrading from 1.7.0.
+- Online-IP collection logs aggregate progress and a separate successful-lookup percentage, with individual HTTP details at DEBUG. Normal logs retain failure totals and the final evidence/coverage result.
+- Default per-user IP timeouts to 20 seconds while retaining saved overrides. Report read/connect/pool/write timeouts and the effective collection settings.
+- No new database schema revision. Existing settings, warning counters, Trust and histories are retained.
+
+### Upgrade notes
+
+- API collection needs `nodes.read`, `nodes.stats`, `groups.read`, `cores.read` and appropriately scoped `users.read`; grant the separate permissions for SSE and configured punishment actions as described in the API-key guide.
+- API Per Device has no real inbound tags in panel IP responses. It cannot establish physical device counts or distinguish multiple real inbounds behind the same IP as SSE can.
+- Panel HTTP 500 errors remain upstream failures. Live pagination recovery does not turn missing or malformed responses into successful evidence.
+
 ## [1.7.0] - 2026-10-25
 
 Node-based connection limits and private daily ban summaries, with more reliable monitoring, management and recovery.

@@ -63,6 +63,8 @@ async def real_node_punishment(node_cycle, operational_topics, completed_logs_ev
         LOG_OBSERVATIONS.zones[str(node_id)] = LOG_OBSERVATIONS._zone("UTC")
         note_node_event(node_id)
     LOG_OBSERVATIONS.fleet_floor = LOG_OBSERVATIONS.floor
+    for node_id in LOG_OBSERVATIONS.required_nodes:
+        LOG_OBSERVATIONS.node_states[node_id].floor = LOG_OBSERVATIONS.floor
     LOG_OBSERVATIONS.transport_floor = LOG_OBSERVATIONS.floor
     return system, get_db, messages, config, journal, disable, original_time
 
@@ -312,7 +314,7 @@ async def test_prepared_fact_preserves_replaced_warning_or_retired_evidence(
 
 @pytest.mark.parametrize("expired", [False, True])
 @pytest.mark.parametrize("step", ["disable", "plain"])
-@pytest.mark.parametrize("boundary", ["read_provenance", "prepare_provenance", "group_details", "token", "client"])
+@pytest.mark.parametrize("boundary", ["read_provenance", "prepare_provenance", "group_details", "client"])
 @pytest.mark.parametrize("change", ["pause", "factual_group"])
 async def test_late_plain_or_timed_disable_preparation_preserves_warning(
     real_node_punishment, operational_topics, completed_logs_evidence, monkeypatch, expired, step, boundary, change
@@ -340,18 +342,18 @@ async def test_late_plain_or_timed_disable_preparation_preserves_warning(
         [NodeType(0, "core", "192.0.2.1", "connected"), NodeType(2, "node", "192.0.2.2", "connected")]
     )
     LOG_OBSERVATIONS.fleet_floor = LOG_OBSERVATIONS.floor
+    for node_id in LOG_OBSERVATIONS.required_nodes:
+        LOG_OBSERVATIONS.node_states[node_id].floor = LOG_OBSERVATIONS.floor
     await prepare_overflow((system, get_db, [], config, journal, disable, _time), "logs", expired)
     monkeypatch.setattr(users, "disable_user_by_status", disable.real_status)
     monkeypatch.setattr(users, "get_user_details", AsyncMock(return_value={"group_ids": []}))
     client = MagicMock(put=AsyncMock(return_value=MagicMock(status_code=200)))
     monkeypatch.setattr(requests, "get_panel_client", AsyncMock(return_value=client))
-    monkeypatch.setattr(requests, "_get_token_for_request", AsyncMock(return_value="token"))
     monkeypatch.setattr(requests, "circuit_breaker", requests.PanelCircuitBreaker())
     targets = {
         "read_provenance": (users, "_read_disable_provenance"),
         "prepare_provenance": (users, "_prepare_disable_provenance"),
         "group_details": (users, "get_user_details"),
-        "token": (requests, "_get_token_for_request"),
         "client": (requests, "get_panel_client"),
     }
     entered, release = suspend_return(monkeypatch, *targets[boundary])
@@ -423,7 +425,6 @@ async def test_started_revoke_retains_incident_ownership(
 
     client = MagicMock(post=AsyncMock(side_effect=panel_effect))
     monkeypatch.setattr(requests, "get_panel_client", AsyncMock(return_value=client))
-    monkeypatch.setattr(requests, "_get_token_for_request", AsyncMock(return_value="token"))
     monkeypatch.setattr(requests, "circuit_breaker", requests.PanelCircuitBreaker())
     caller = asyncio.create_task(usage.check_users_usage(PANEL, config_data=config))
     try:

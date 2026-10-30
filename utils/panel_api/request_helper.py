@@ -4,27 +4,40 @@ Panel API Request Helper with Fallback and Retry
 This module provides a unified way to make panel API requests with:
 - Automatic retry with exponential backoff
 - Fallback between HTTPS and HTTP
-- Token refresh on 401 errors
+- API-key authentication without login or authentication retries
 - Proper error logging
 """
 
 import asyncio
+from asyncio import CancelledError
 import os
 import random
 import re
 import time
+from contextlib import nullcontext
 from ssl import SSLError
-from typing import Optional, Any, Literal
+from typing import Optional, Literal
 
 import httpx
 
 from utils.logs import log_api_request, get_logger
 from utils.types import PanelType
-from utils.panel_api.auth import get_token, invalidate_token_cache
+from utils.panel_api.auth import get_panel_headers
+from utils.panel_api.pagination import page_request_slot
 from utils.enforcement_guard import EnforcementProtected, start_enforcement_effect, validate_enforcement
 
 # Module logger
 request_logger = get_logger("panel_api.request")
+
+
+class PanelRequestError(str):
+    """A compatible error string with a non-sensitive machine-readable cause."""
+
+    def __new__(cls, message: str, reason: str, timeout_kind: str | None = None):
+        instance = super().__new__(cls, message)
+        instance.reason = reason
+        instance.timeout_kind = timeout_kind if timeout_kind in {"read", "connect", "pool", "write"} else None
+        return instance
 
 
 class PanelCircuitBreaker:
@@ -35,39 +48,51 @@ class PanelCircuitBreaker:
     States:
     - CLOSED: Normal operation, requests flow freely.
     - OPEN: Consecutive server/network failures (5+) tripped breaker. Fail-fast for cooldown.
-    - HALF_OPEN: Cooldown expired, testing 1 request.
+    - HALF_OPEN: Cooldown expired. Online stats admit only one probe; the
+      general breaker also permits nested permission reads during a mutation.
     """
 
     STATE_CLOSED = "CLOSED"
     STATE_OPEN = "OPEN"
     STATE_HALF_OPEN = "HALF_OPEN"
 
-    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0):
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0, *, single_probe: bool = False):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
+        self.single_probe = single_probe
         self.state = self.STATE_CLOSED
         self.consecutive_failures = 0
-        self.last_state_change = time.time()
+        self.last_state_change = time.monotonic()
+
+    def recovery_delay(self) -> float:
+        """Seconds until an open breaker can admit its single recovery probe."""
+        return max(0.0, self.recovery_timeout - (time.monotonic() - self.last_state_change))
+
+    def release_probe(self) -> None:
+        """Allow a later probe if this one was cancelled before a result."""
+        if self.state == self.STATE_HALF_OPEN:
+            self.state = self.STATE_OPEN
+            self.last_state_change = time.monotonic()
 
     def allow_request(self) -> bool:
         """Check if request is allowed by circuit breaker state."""
-        now = time.time()
+        now = time.monotonic()
         if self.state == self.STATE_CLOSED:
             return True
         elif self.state == self.STATE_OPEN:
-            if now - self.last_state_change > self.recovery_timeout:
+            if now - self.last_state_change >= self.recovery_timeout:
                 self.state = self.STATE_HALF_OPEN
                 self.last_state_change = now
                 request_logger.info("🟡 Circuit Breaker enters HALF_OPEN state: Testing Panel API connectivity...")
                 return True
             return False
         elif self.state == self.STATE_HALF_OPEN:
-            return True
+            return not self.single_probe
         return True
 
     def record_result(self, is_server_failure: bool):
         """Record success or server/network failure (ignoring 4xx client errors)."""
-        now = time.time()
+        now = time.monotonic()
         if is_server_failure:
             self.consecutive_failures += 1
             if self.consecutive_failures >= self.failure_threshold and self.state != self.STATE_OPEN:
@@ -86,6 +111,9 @@ class PanelCircuitBreaker:
 
 # Shared circuit breaker instance
 circuit_breaker = PanelCircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
+# Online-stat fan-out has different upstream failure modes from user snapshots
+# and mutations. Its bursts must not suppress those independent operations.
+online_stats_circuit_breaker = PanelCircuitBreaker(failure_threshold=5, recovery_timeout=60.0, single_probe=True)
 
 # Shared persistent httpx.AsyncClient with connection pooling
 _panel_client: Optional[httpx.AsyncClient] = None
@@ -99,7 +127,7 @@ async def get_panel_client() -> httpx.AsyncClient:
     global _panel_client
     if _panel_client is None or _panel_client.is_closed:
         limits = httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=30.0)
-        verify_ssl = os.getenv("PANEL_VERIFY_SSL", "false").lower() in ("true", "1", "yes")
+        verify_ssl = os.getenv("PANEL_VERIFY_SSL", "true").strip().lower() not in ("false", "0", "no", "off")
         _panel_client = httpx.AsyncClient(
             verify=verify_ssl,
             timeout=30.0,
@@ -150,7 +178,7 @@ def _get_scheme_order(domain: str = "") -> list[str]:
     ``host:port`` form used in .env.example) means HTTPS only. There used to be a
     trailing ``["https", "http"]`` fallback, but the test above it made it
     unreachable - and reaching it would have been worse than the bug, since it would
-    retry the admin login over plaintext HTTP after an HTTPS failure.
+    send credentials over plaintext HTTP after an HTTPS failure.
     """
     if domain.startswith("http://"):
         return ["http"]
@@ -208,7 +236,7 @@ async def check_panel_availability(panel_data: PanelType, timeout: float = 5.0) 
     for scheme in _get_scheme_order(panel_data.panel_domain):
         url = f"{scheme}://{bare_domain}/api/"
         try:
-            response = await client.get(url, timeout=timeout)
+            response = await client.get(url, headers=get_panel_headers(panel_data), timeout=timeout)
             # Any response (even 401/404) means panel is up
             if response.status_code < 500:
                 _record_connection_success()
@@ -267,13 +295,14 @@ async def panel_request(
     panel_data: PanelType,
     method: Literal["GET", "POST", "PUT", "DELETE"],
     endpoint: str,
-    token: str,
     params: Optional[dict] = None,
     json_data: Optional[dict] = None,
     form_data: Optional[dict] = None,
     timeout: float = 30.0,
     max_retries: int = 3,
     retry_delay: float = 1.0,
+    breaker: PanelCircuitBreaker | None = None,
+    quiet: bool = False,
 ) -> tuple[Optional[httpx.Response], Optional[str]]:
     """
     Make a panel API request with automatic retry and scheme fallback.
@@ -282,25 +311,29 @@ async def panel_request(
         panel_data: Panel connection data
         method: HTTP method
         endpoint: API endpoint (e.g., "/api/users")
-        token: Bearer token for authorization
         params: Query parameters for GET/POST/etc. requests
         json_data: JSON body for POST/PUT requests
         form_data: Form data for POST requests
         timeout: Request timeout in seconds
         max_retries: Maximum number of retry attempts
         retry_delay: Initial delay between retries (doubles each retry)
+        quiet: Send individual request diagnostics to DEBUG; collection callers
+            must report aggregate outcomes and failures.
 
     Returns:
         Tuple of (response, error_message)
         - On success: (response, None)
         - On failure: (None, error_message)
     """
+    active_breaker = circuit_breaker if breaker is None else breaker
+    request_warning = request_logger.debug if quiet else request_logger.warning
+    request_error = request_logger.debug if quiet else request_logger.error
     # Check Circuit Breaker before making network requests
-    if not circuit_breaker.allow_request():
-        request_logger.warning(f"⚡ Circuit Breaker OPEN: Panel API unavailable, failing fast for {endpoint}")
-        return None, "Circuit Breaker OPEN: Panel API unavailable"
+    if not active_breaker.allow_request():
+        request_warning(f"⚡ Circuit Breaker OPEN: Panel API unavailable, failing fast for {endpoint}")
+        return None, PanelRequestError("Circuit Breaker OPEN: Panel API unavailable", "deferred")
 
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_panel_headers(panel_data)
     last_error = None
 
     for attempt in range(max_retries):
@@ -318,13 +351,16 @@ async def panel_request(
             try:
                 client = await get_panel_client()
                 if method != "GET":
-                    # Authentication/client acquisition may suspend after the
+                    # Client acquisition may suspend after the
                     # journal and provenance checks. Refresh facts once more,
                     # then own the first mutation with no intervening await.
                     await validate_enforcement()
                     start_enforcement_effect()
                 if method == "GET":
-                    response = await client.get(url, headers=headers, params=params, timeout=timeout)
+                    slot = page_request_slot() if endpoint.rstrip("/") == "/api/users" else nullcontext()
+                    async with slot:
+                        start_time = time.perf_counter()
+                        response = await client.get(url, headers=headers, params=params, timeout=timeout)
                 elif method == "POST":
                     if form_data:
                         response = await client.post(
@@ -344,7 +380,7 @@ async def panel_request(
                     )
 
                 elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request(method, url, response.status_code, elapsed)
+                log_api_request(method, url, response.status_code, elapsed, debug_only=quiet)
 
                 # Any response means panel server is reachable
                 _record_connection_success()
@@ -352,17 +388,17 @@ async def panel_request(
                 # 4xx Client Errors (400, 401, 403, 404): Panel is UP and functioning!
                 # Reset/don't trip Circuit Breaker on 4xx business responses
                 if response.status_code < 500:
-                    circuit_breaker.record_result(is_server_failure=False)
+                    active_breaker.record_result(is_server_failure=False)
 
                 # Success
                 if response.status_code in (200, 201, 204):
                     _record_success(scheme)
                     return response, None
 
-                # Auth error - caller should refresh token
-                if response.status_code == 401:
+                # A rejected API key cannot be refreshed. Do not retry or change schemes.
+                if response.status_code in (401, 403):
                     _record_failure(scheme)
-                    return response, "Unauthorized - token may be expired"
+                    return response, f"Panel API key rejected: HTTP {response.status_code}"
 
                 # Not found
                 if response.status_code == 404:
@@ -373,16 +409,16 @@ async def panel_request(
                 if response.status_code == 429:
                     _record_failure(scheme)
                     last_error = f"Rate limited (429) on {url}"
-                    request_logger.warning(last_error)
+                    request_warning(last_error)
                     await asyncio.sleep(retry_delay * 2 + random.uniform(0.1, 0.5))
                     continue
 
                 # 5xx Server error - count as server failure for Circuit Breaker
                 if response.status_code >= 500:
-                    circuit_breaker.record_result(is_server_failure=True)
+                    active_breaker.record_result(is_server_failure=True)
                     _record_failure(scheme)
                     last_error = f"Server error ({response.status_code}) on {url}"
-                    request_logger.warning(last_error)
+                    request_warning(last_error)
                     continue
 
                 # Other errors
@@ -392,25 +428,45 @@ async def panel_request(
                 last_error = f"HTTP {response.status_code}"
 
             except EnforcementProtected:
+                active_breaker.release_probe()
+                raise
+            except CancelledError:
+                active_breaker.release_probe()
                 raise
             except (SSLError, httpx.TimeoutException, httpx.ConnectError, httpx.RequestError) as e:
                 elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request(method, url, None, elapsed, type(e).__name__)
+                log_api_request(method, url, None, elapsed, type(e).__name__, debug_only=quiet)
                 _record_failure(scheme)
                 _record_connection_failure()
                 # Server/network failure - trip Circuit Breaker
-                circuit_breaker.record_result(is_server_failure=True)
-                last_error = f"Network/Server error on {url}: {type(e).__name__}: {str(e)[:50]}"
-                request_logger.warning(last_error)
+                active_breaker.record_result(is_server_failure=True)
+                last_error = PanelRequestError(
+                    f"Network/Server error on {url}: {type(e).__name__}",
+                    "timeout" if isinstance(e, httpx.TimeoutException) else "network",
+                    next(
+                        (
+                            kind
+                            for kind, exception in (
+                                ("read", httpx.ReadTimeout),
+                                ("connect", httpx.ConnectTimeout),
+                                ("pool", httpx.PoolTimeout),
+                                ("write", httpx.WriteTimeout),
+                            )
+                            if isinstance(e, exception)
+                        ),
+                        None,
+                    ),
+                )
+                request_warning(last_error)
                 continue
 
             except Exception as e:
                 elapsed = (time.perf_counter() - start_time) * 1000
-                log_api_request(method, url, None, elapsed, str(e)[:50])
+                log_api_request(method, url, None, elapsed, type(e).__name__, debug_only=quiet)
                 _record_failure(scheme)
-                circuit_breaker.record_result(is_server_failure=True)
-                last_error = f"Error on {url}: {type(e).__name__}: {str(e)[:50]}"
-                request_logger.error(last_error)
+                active_breaker.record_result(is_server_failure=True)
+                last_error = f"Error on {url}: {type(e).__name__}"
+                request_error(last_error)
                 continue
 
         # All schemes failed for this attempt, wait before retry with proportional jitter
@@ -424,55 +480,25 @@ async def panel_request(
     return None, last_error or "All attempts failed"
 
 
-async def _get_token_for_request(panel_data: PanelType, force_refresh: bool = False) -> Optional[str]:
-    """Get a valid token for making requests."""
-    try:
-        token_result = await get_token(panel_data, force_refresh=force_refresh)
-        if isinstance(token_result, ValueError):
-            request_logger.error(f"Failed to get token: {token_result}")
-            return None
-        return token_result.panel_token
-    except Exception as e:
-        request_logger.error(f"Token acquisition error: {e}")
-        return None
-
-
 async def _execute_panel_request(
     panel_data: PanelType,
     method: Literal["GET", "POST", "PUT", "DELETE"],
     endpoint: str,
-    force_refresh: bool = False,
     json_data: Optional[dict] = None,
     form_data: Optional[dict] = None,
     params: Optional[dict] = None,
     **kwargs,
 ) -> Optional[httpx.Response]:
-    """Internal helper executing panel requests with automatic token handling and 401 retry."""
-    token = await _get_token_for_request(panel_data, force_refresh)
-    if not token:
-        return None
-
-    response, error = await panel_request(
-        panel_data, method, endpoint, token, params=params, json_data=json_data, form_data=form_data, **kwargs
+    """Execute a request using the configured API key with no auth retry."""
+    response, _ = await panel_request(
+        panel_data, method, endpoint, params=params, json_data=json_data, form_data=form_data, **kwargs
     )
-
-    # On 401, retry once with fresh token
-    if response and response.status_code == 401 and not force_refresh:
-        await invalidate_token_cache()
-        token = await _get_token_for_request(panel_data, force_refresh=True)
-        if token:
-            response, error = await panel_request(
-                panel_data, method, endpoint, token, params=params, json_data=json_data, form_data=form_data, **kwargs
-            )
-
     return response
 
 
-async def panel_get(
-    panel_data: PanelType, endpoint: str, force_refresh: bool = False, **kwargs
-) -> Optional[httpx.Response]:
-    """Convenience wrapper for GET requests with automatic token handling."""
-    return await _execute_panel_request(panel_data, "GET", endpoint, force_refresh=force_refresh, **kwargs)
+async def panel_get(panel_data: PanelType, endpoint: str, **kwargs) -> Optional[httpx.Response]:
+    """Send a GET request using the configured API key."""
+    return await _execute_panel_request(panel_data, "GET", endpoint, **kwargs)
 
 
 async def panel_post(
@@ -480,29 +506,24 @@ async def panel_post(
     endpoint: str,
     json_data: Optional[dict] = None,
     form_data: Optional[dict] = None,
-    force_refresh: bool = False,
     **kwargs,
 ) -> Optional[httpx.Response]:
-    """Convenience wrapper for POST requests with automatic token handling."""
+    """Send a POST request using the configured API key."""
     return await _execute_panel_request(
-        panel_data, "POST", endpoint, force_refresh=force_refresh, json_data=json_data, form_data=form_data, **kwargs
+        panel_data, "POST", endpoint, json_data=json_data, form_data=form_data, **kwargs
     )
 
 
 async def panel_put(
-    panel_data: PanelType, endpoint: str, json_data: Optional[dict] = None, force_refresh: bool = False, **kwargs
+    panel_data: PanelType, endpoint: str, json_data: Optional[dict] = None, **kwargs
 ) -> Optional[httpx.Response]:
-    """Convenience wrapper for PUT requests with automatic token handling."""
-    return await _execute_panel_request(
-        panel_data, "PUT", endpoint, force_refresh=force_refresh, json_data=json_data, **kwargs
-    )
+    """Send a PUT request using the configured API key."""
+    return await _execute_panel_request(panel_data, "PUT", endpoint, json_data=json_data, **kwargs)
 
 
-async def panel_delete(
-    panel_data: PanelType, endpoint: str, force_refresh: bool = False, **kwargs
-) -> Optional[httpx.Response]:
-    """Convenience wrapper for DELETE requests with automatic token handling."""
-    return await _execute_panel_request(panel_data, "DELETE", endpoint, force_refresh=force_refresh, **kwargs)
+async def panel_delete(panel_data: PanelType, endpoint: str, **kwargs) -> Optional[httpx.Response]:
+    """Send a DELETE request using the configured API key."""
+    return await _execute_panel_request(panel_data, "DELETE", endpoint, **kwargs)
 
 
 def get_panel_health() -> dict:

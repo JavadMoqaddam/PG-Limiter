@@ -1,9 +1,9 @@
 name: Release PG-Limiter
 
+# Stable publication requires an intentional version tag or manual dispatch.
+# Merging a development version into main does not publish it automatically.
 on:
   push:
-    branches: [main]
-    paths: [limiter.py, .github/workflows/release.yml]
     tags: ['v*']
   workflow_dispatch:
 

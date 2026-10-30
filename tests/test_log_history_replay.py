@@ -25,7 +25,12 @@ async def logs(monkeypatch, operational_topics):
     clock = [EPOCH]
     monkeypatch.setattr(time, "time", lambda: clock[0])
     monkeypatch.setattr(parser, "is_ip_accepted", AsyncMock(return_value=True))
-    config = {"ip_source": "logs", "check_interval": 60, "log_node_timezones": {"1": "UTC", "2": "Europe/Istanbul"}}
+    config = {
+        "ip_source": "logs",
+        "check_interval": 60,
+        "api_ip_freshness": 60,
+        "log_node_timezones": {"1": "UTC", "2": "Europe/Istanbul"},
+    }
     # Start observing a complete ordinary interval before the first enforcement.
     await parse_logs("", 1, "node", config)
     ready_fleet(1)
@@ -38,11 +43,68 @@ async def test_preserves_printed_microsecond_time(logs):
     assert ACTIVE_USERS["alice"].device_info.connections[0].last_seen == EPOCH + 20.123456
 
 
+@pytest.mark.parametrize("handling_offset", [60.5, 62.0, 122.0])
+async def test_future_parse_retains_original_expiry_across_preparation(logs, monkeypatch, handling_offset):
+    """An early rejection must not lose its original expiry or become activity."""
+    import utils.parse_logs as parser
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    async def prepare(*_args):
+        logs.clock[0] = EPOCH + handling_offset
+        return True
+
+    monkeypatch.setattr(parser, "is_ip_accepted", prepare)
+    await parse_logs(record("2026/10/23 10:01:01.000001"), 1, "node", logs.config)
+    assert ACTIVE_USERS == {}
+    assert LOG_OBSERVATIONS.node_states[1].uncertain_until == pytest.approx(EPOCH + 121.000001, rel=0, abs=0.000001)
+    assert LOG_OBSERVATIONS.seen.get(1, {}) == {}
+
+
+async def test_future_fault_captures_exact_parse_and_receipt_clocks(logs, monkeypatch):
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    monkeypatch.setattr(time, "monotonic", lambda: 1234.5)
+    await parse_logs(record("2026/10/23 10:01:01.000001", user="private-user"), 1, "private-node", logs.config)
+    faults = LOG_OBSERVATIONS.uncertainty_diagnostics()["timestamp_faults"]
+    assert len(faults) == 1
+    fault = faults[0]
+    assert fault["phase"] == "timestamp_parse"
+    assert fault["node_id"] == 1
+    assert fault["timezone"] == "UTC"
+    assert fault["source_epoch"] == pytest.approx(EPOCH + 61.000001, rel=0, abs=0.000001)
+    assert fault["evaluation_wall"] == EPOCH + 60
+    assert fault["received_wall"] == EPOCH + 60
+    assert fault["evaluation_monotonic"] == 1234.5
+    assert fault["received_monotonic"] == 1234.5
+    assert fault["source_minus_evaluation_seconds"] == pytest.approx(1.000001)
+    assert all(secret not in str(faults) for secret in ("private-user", "private-node", "5.6.7.8", "accepted"))
+
+
+async def test_backward_step_diagnostics_identify_admission_comparison(logs, monkeypatch):
+    import utils.parse_logs as parser
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    async def prepare(*_args):
+        logs.clock[0] = EPOCH + 19
+        return True
+
+    monkeypatch.setattr(parser, "is_ip_accepted", prepare)
+    await parse_logs(record(), 1, "node", logs.config)
+    assert ACTIVE_USERS == {}
+    fault = LOG_OBSERVATIONS.uncertainty_diagnostics()["timestamp_faults"][0]
+    assert fault["phase"] == "admission"
+    assert fault["evaluation_wall"] == EPOCH + 19
+    assert fault["received_wall"] == EPOCH + 60
+    assert fault["source_minus_evaluation_seconds"] == pytest.approx(1.123456)
+
+
 async def test_replay_after_snapshot_is_not_new_activity(logs):
     await parse_logs(record(), 1, "node", logs.config)
     assert "alice" in await pop_active_users_snapshot()
     await parse_logs(record(), 1, "node", logs.config)
-    assert ACTIVE_USERS == {}
+    connection = ACTIVE_USERS["alice"].device_info.connections[0]
+    assert connection.connection_count == 1
+    assert connection.last_seen == EPOCH + 20.123456
     await parse_logs(record("2026/10/23 10:00:40.654321"), 1, "node", logs.config)
     assert ACTIVE_USERS["alice"].device_info.connections[0].last_seen == EPOCH + 40.654321
 
@@ -143,6 +205,7 @@ async def test_rejected_ip_with_invalid_time_does_not_poison_live_evidence(logs,
     monkeypatch.setattr(parser, "is_ip_accepted", AsyncMock(return_value=False))
     await parse_logs(record("bad time"), 1, "node", logs.config)
     assert not LOG_OBSERVATIONS.evidence().unavailable_reason
+    assert LOG_OBSERVATIONS.uncertainty_diagnostics()["reason_counts"] == {}
 
 
 @pytest.mark.parametrize("zones", [{"1": "UTC"}, {"1": "UTC", "2": "bad/zone"}])
@@ -196,6 +259,138 @@ async def test_capacity_eviction_blocks_until_forgotten_record_expires(logs):
     assert len(LOG_OBSERVATIONS.seen[1]) == 1
 
 
+@pytest.mark.parametrize(
+    "stamp, reason, remaining",
+    [
+        ("private malformed timestamp", "invalid_timestamp", 60),
+        ("2026/13/23 10:00:20.123456", "invalid_timestamp", 60),
+        ("2026/10/23 10:01:01.000001", "future_timestamp", 61.000001),
+    ],
+)
+async def test_uncertainty_diagnostics_distinguish_timestamp_faults_without_raw_records(
+    logs, caplog, stamp, reason, remaining
+):
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    await parse_logs(record(stamp, user="private-user"), 1, "private-node", logs.config)
+    diagnostics = LOG_OBSERVATIONS.uncertainty_diagnostics()
+    assert diagnostics["reason_counts"] == {reason: 1}
+    assert diagnostics["nodes"] == [{"node_id": 1, "reason_counts": {reason: 1}, "cache_entries": 0}]
+    assert diagnostics["remaining_seconds"] == pytest.approx(remaining)
+    assert not any("Logs uncertainty diagnostics:" in entry.getMessage() for entry in caplog.records)
+    assert LOG_OBSERVATIONS.unavailable_reason() == "timestamp or replay uncertainty in the current interval"
+    messages = [entry.getMessage() for entry in caplog.records if "Logs uncertainty diagnostics:" in entry.getMessage()]
+    assert len(messages) == 1
+    assert reason in messages[0]
+    # A validated timestamp prefix is intentional clock evidence, never a raw record.
+    assert all(secret not in messages[0] for secret in (record(stamp), "private-user", "private-node", "5.6.7.8"))
+
+
+async def test_live_eviction_diagnostics_keep_original_expiry(logs):
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    config = dict(logs.config, log_replay_cache_size=1)
+    logs.clock[0] = EPOCH
+    await parse_logs("", 1, "node", config)
+    logs.clock[0] = EPOCH + 60
+    ready_fleet(1)
+    await parse_logs(record(), 1, "node", config)
+    await parse_logs(record("2026/10/23 10:00:40.000000"), 1, "node", config)
+    diagnostics = LOG_OBSERVATIONS.uncertainty_diagnostics()
+    assert diagnostics["reason_counts"] == {"live_cache_eviction": 1}
+    assert diagnostics["nodes"] == [{"node_id": 1, "reason_counts": {"live_cache_eviction": 1}, "cache_entries": 1}]
+    assert diagnostics["cache_capacity"] == 1
+    assert diagnostics["remaining_seconds"] == pytest.approx(20.123456)
+    logs.clock[0] = EPOCH + 80.123456
+    assert not LOG_OBSERVATIONS.unavailable_reason()
+
+
+async def test_cache_capacity_reduction_diagnostics_identify_affected_node(logs):
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    await parse_logs(record(), 1, "node", logs.config)
+    await parse_logs(record(port=54321), 1, "node", logs.config)
+    await pop_active_users_snapshot(dict(logs.config, log_replay_cache_size=1))
+    diagnostics = LOG_OBSERVATIONS.uncertainty_diagnostics()
+    assert diagnostics["reason_counts"] == {"cache_capacity_reduction": 1}
+    assert diagnostics["nodes"] == [
+        {"node_id": 1, "reason_counts": {"cache_capacity_reduction": 1}, "cache_entries": 1}
+    ]
+
+
+async def test_known_replay_and_old_history_do_not_create_uncertainty_diagnostics(logs, caplog):
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    await parse_logs(record(), 1, "node", logs.config)
+    await pop_active_users_snapshot()
+    before = LOG_OBSERVATIONS.fault_version
+    await parse_logs(record(), 1, "node", logs.config)
+    await parse_logs(record("2026/10/23 09:59:59.999999"), 1, "node", logs.config)
+    assert LOG_OBSERVATIONS.fault_version == before
+    assert LOG_OBSERVATIONS.uncertainty_diagnostics()["reason_counts"] == {}
+    assert not LOG_OBSERVATIONS.unavailable_reason()
+    assert not any("Logs uncertainty diagnostics:" in entry.getMessage() for entry in caplog.records)
+
+
+async def test_frequent_timestamp_faults_aggregate_under_global_log_throttle(logs, monkeypatch, caplog):
+    import json
+    from utils.log_observations import LOG_OBSERVATIONS
+
+    monkeypatch.setattr(time, "monotonic", lambda: logs.clock[0] - EPOCH)
+    ready_fleet(1, 2)
+    for index in range(100):
+        await parse_logs(record("bad timestamp"), (index % 2) + 1, "node", logs.config)
+        assert "uncertainty" in LOG_OBSERVATIONS.unavailable_reason()
+    messages = [entry.getMessage() for entry in caplog.records if "Logs uncertainty diagnostics:" in entry.getMessage()]
+    assert len(messages) == 1
+    assert LOG_OBSERVATIONS.uncertainty_diagnostics()["reason_counts"] == {"invalid_timestamp": 100}
+    logs.clock[0] += 59
+    assert "uncertainty" in LOG_OBSERVATIONS.unavailable_reason()
+    assert len([entry for entry in caplog.records if "Logs uncertainty diagnostics:" in entry.getMessage()]) == 1
+    logs.clock[0] += 1
+    assert "uncertainty" not in LOG_OBSERVATIONS.unavailable_reason()
+    await parse_logs(record("bad timestamp"), 1, "node", logs.config)
+    assert "uncertainty" in LOG_OBSERVATIONS.unavailable_reason()
+    messages = [entry.getMessage() for entry in caplog.records if "Logs uncertainty diagnostics:" in entry.getMessage()]
+    assert len(messages) == 2
+    diagnostics = json.loads(messages[-1].split("Logs uncertainty diagnostics: ", 1)[1])
+    assert diagnostics["reason_counts"] == {"invalid_timestamp": 1}
+
+
+@pytest.mark.parametrize("retirement", ["excluded", "revision"])
+async def test_excluded_or_superseded_timestamp_faults_do_not_create_diagnostics(logs, monkeypatch, retirement):
+    import utils.parse_logs as parser
+    from utils.log_observations import LOG_OBSERVATIONS
+    from utils.read_config import invalidate_config_cache
+
+    config = logs.config
+    if retirement == "excluded":
+        config = dict(config, disabled_nodes=[1])
+    else:
+
+        async def retire_during_admission(_ip, _config):
+            await invalidate_config_cache()
+            return True
+
+        monkeypatch.setattr(parser, "is_ip_accepted", retire_during_admission)
+    await parse_logs(record("bad timestamp"), 1, "node", config)
+    assert LOG_OBSERVATIONS.uncertainty_diagnostics()["reason_counts"] == {}
+
+
+def test_uncertainty_diagnostics_bound_node_details_and_whitelist_reasons():
+    from utils.log_observations import LogObservations
+
+    observations = LogObservations()
+    for node_id in range(1000):
+        observations.mark_uncertain(node_id=node_id, reason="future_timestamp")
+    observations.mark_uncertain(node_id="private-node", reason="private raw timestamp")
+    diagnostics = observations.uncertainty_diagnostics()
+    assert len(diagnostics["nodes"]) <= 129
+    assert diagnostics["reason_counts"] == {"future_timestamp": 1000, "unknown": 1}
+    assert all(type(node["node_id"]) is int or node["node_id"] is None for node in diagnostics["nodes"])
+    assert "private" not in str(diagnostics)
+
+
 async def test_preparation_delay_retains_original_event_time(logs, monkeypatch):
     import utils.parse_logs as parser
 
@@ -223,7 +418,7 @@ async def test_source_switch_during_parser_preparation_cannot_write_api_map(logs
     assert set(ACTIVE_USERS) == {"api-only"}
 
 
-async def test_fixed_completed_interval_survives_slow_enforcement_preparation(api_cycle, logs, monkeypatch):
+async def test_original_observations_expire_during_slow_enforcement_preparation(api_cycle, logs, monkeypatch):
     import utils.check_usage as usage
 
     api_cycle.config.update(logs.config)
@@ -231,16 +426,17 @@ async def test_fixed_completed_interval_survives_slow_enforcement_preparation(ap
     await parse_logs(record(), 1, "node", api_cycle.config)
     await parse_logs(record(ip="9.9.9.9"), 1, "node", api_cycle.config)
 
-    prepare = usage.get_active_users_metadata_batch
+    prepare = usage.read_config_snapshot
 
     async def slow_metadata(*args, **kwargs):
-        metadata = await prepare(*args, **kwargs)
+        snapshot = await prepare(*args, **kwargs)
         logs.clock[0] = EPOCH + 125
-        return metadata
+        ready_fleet(1)
+        return snapshot
 
-    monkeypatch.setattr(usage, "get_active_users_metadata_batch", slow_metadata)
+    monkeypatch.setattr(usage, "read_config_snapshot", slow_metadata)
     await usage.check_users_usage(api_cycle.panel, api_cycle.config)
-    assert api_cycle.warning.warnings["alice"].consecutive_violations == 1
+    assert api_cycle.warning.warnings == {}
 
 
 async def test_valid_empty_completed_interval_clears_warning(api_cycle, logs):
@@ -289,13 +485,15 @@ async def test_reconnect_preserves_pending_observation_and_ignores_history(logs,
             return Response()
 
     monkeypatch.setattr(streams.httpx, "AsyncClient", Client)
-    monkeypatch.setattr(streams, "get_token", AsyncMock(return_value=SimpleNamespace(panel_token="test")))
     monkeypatch.setattr(streams, "_ip_source_is_api", AsyncMock(return_value=False))
     monkeypatch.setattr(streams, "_update_node_status", AsyncMock())
     monkeypatch.setattr("utils.read_config.read_config", AsyncMock(return_value=logs.config))
     monkeypatch.setattr("utils.parse_logs.get_cached_parser_config", AsyncMock(return_value=logs.config))
     with pytest.raises(asyncio.CancelledError):
-        await streams.get_nodes_logs(PanelType("a", "b", "panel.local"), NodeType(1, "node", "192.0.2.1", "connected"))
+        await streams.get_nodes_logs(
+            PanelType(panel_domain="panel.local", panel_api_key="pg_key_test"),
+            NodeType(1, "node", "192.0.2.1", "connected"),
+        )
     assert ACTIVE_USERS["alice"].device_info.connections[0].connection_count == 1
     assert ACTIVE_USERS["alice"].device_info.connections[0].last_seen == EPOCH + 20.123456
 
@@ -615,7 +813,6 @@ async def test_real_reconnect_heartbeat_cannot_clear_warning_before_full_interva
             return Response()
 
     monkeypatch.setattr(streams.httpx, "AsyncClient", Client)
-    monkeypatch.setattr(streams, "get_token", AsyncMock(return_value=SimpleNamespace(panel_token="test")))
     monkeypatch.setattr(streams, "_ip_source_is_api", AsyncMock(return_value=False))
     monkeypatch.setattr(streams, "_update_node_status", AsyncMock())
     monkeypatch.setattr("utils.read_config.read_config", AsyncMock(return_value=api_cycle.config))

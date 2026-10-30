@@ -7,13 +7,25 @@ import time
 from urllib.parse import quote
 
 from utils import handel_dis_users as dis_users
-from utils.logs import logger, log_api_request, log_user_action, get_logger
+from utils.logs import log_user_action, get_logger
 from utils.read_config import read_config
 from utils.types import PanelType, UserType
-from utils.panel_api.auth import get_token, invalidate_token_cache, safe_send_logs_panel
+from utils.panel_api.auth import safe_send_logs_panel
 
 # Module logger
 users_logger = get_logger("panel_api.users")
+
+
+class _PanelAuthenticationError(ValueError):
+    """Reject a user snapshot when the panel refuses its API key."""
+
+
+class PanelUserListing(list[dict]):
+    """Validated observations; a changing listing cannot establish absence."""
+
+    def __init__(self, rows: list[dict], *, pagination_changed: bool = False):
+        super().__init__(rows)
+        self.pagination_changed = pagination_changed
 
 
 async def fetch_all_users_raw(
@@ -23,14 +35,17 @@ async def fetch_all_users_raw(
     group: list[int] | None = None,
     search: str | None = None,
     limit: int = 1000,
-    max_concurrent: int = 10,
+    max_concurrent: int = 1,
     online: bool = False,
     online_after: str | None = None,
     sort: str | None = None,
     strict: bool = False,
+    allow_live_changes: bool = False,
+    quiet_requests: bool = False,
+    ids: list[int] | None = None,
 ) -> list[dict]:
     """
-    Unified high-performance fetch of all users from Panel API using parallel pagination.
+    Fetch validated user pages with shared completion-based HTTP pacing.
 
     Args:
         panel_data: Panel connection configuration.
@@ -39,7 +54,8 @@ async def fetch_all_users_raw(
         group: Optional group ID filter.
         search: Optional search query.
         limit: Number of users per page (default: 1000).
-        max_concurrent: Max concurrent requests for remaining pages (default: 10).
+        max_concurrent: Max pending page tasks (default: 1). HTTP attempts are
+            always serialized with a one-second pause after each completion.
         online: If True, panel restricts results to users seen online within
             its own 2-minute window (online_at >= now - 2min).
         online_after: ISO-8601 timestamp; panel restricts results to
@@ -47,11 +63,28 @@ async def fetch_all_users_raw(
             freshness window is wider than the panel's fixed 2 minutes.
         sort: Optional sort expression (e.g. '-online_at').
         strict: Reject malformed or incomplete pages instead of returning a partial list.
+        allow_live_changes: With strict validation, accept changing totals and
+            return a PanelUserListing marking absence as unknown. Fetch at most
+            one extra batch of tail pages; new arrivals can wait for the next scan.
+        quiet_requests: Log HTTP details at DEBUG while retaining listing summaries.
+        ids: Limit the response to these numeric identities. Requires strict
+            validation so an ignored filter cannot expand into a fleet query.
 
     Returns:
         list[dict]: List of raw user dictionaries from the panel API.
     """
     from utils.panel_api.request_helper import panel_get
+
+    if limit < 1 or max_concurrent < 1 or (allow_live_changes and not strict):
+        raise ValueError("Live pagination requires strict validation and positive page limits")
+    requested_ids = None
+    if ids is not None:
+        if not strict or any(type(uid) is not int or uid < 1 for uid in ids):
+            raise ValueError("ID-filtered pagination requires strict validation and positive integer IDs")
+        requested_ids = set(ids)
+        if not requested_ids:
+            return PanelUserListing([]) if allow_live_changes else []
+    observed_totals: set[int] = set()
 
     filter_desc = []
     if status:
@@ -84,6 +117,8 @@ async def fetch_all_users_raw(
         params["online_after"] = online_after
     if sort:
         params["sort"] = sort
+    if requested_ids is not None:
+        params["ids"] = sorted(requested_ids)
 
     start_time = time.perf_counter()
     response = await panel_get(
@@ -92,24 +127,38 @@ async def fetch_all_users_raw(
         params=params,
         timeout=60.0,
         max_retries=3,
+        quiet=quiet_requests,
     )
     if response is None:
         message = "Failed to fetch first page of users from Panel API"
         users_logger.error(message)
         raise ValueError(message)
 
+    if response.status_code in (401, 403):
+        raise _PanelAuthenticationError(f"Panel API key rejected while fetching users: HTTP {response.status_code}")
+
     try:
         data = response.json()
     except Exception as e:
-        users_logger.error(f"Failed to parse JSON response from /api/users: {e}")
-        raise ValueError(f"Invalid JSON from /api/users: {e}") from e
+        users_logger.error(f"Failed to parse JSON response from /api/users: {type(e).__name__}")
+        raise ValueError("Invalid JSON from /api/users") from None
 
     def validate_page(body, offset, expected_total=None):
         if not isinstance(body, dict) or not isinstance(body.get("users"), list):
             raise ValueError("Invalid /api/users page")
+        if "total" not in body:
+            raise ValueError(f"Missing /api/users total at offset {offset}")
         total = body.get("total")
-        if type(total) is not int or total < 0 or (expected_total is not None and total != expected_total):
-            raise ValueError("Missing or changing /api/users total")
+        if type(total) is not int:
+            raise ValueError(f"Invalid /api/users total at offset {offset}: type={type(total).__name__}")
+        if total < 0:
+            raise ValueError(f"Negative /api/users total at offset {offset}")
+        if requested_ids is not None and total > len(requested_ids):
+            raise ValueError(f"Panel ignored /api/users ID filter at offset {offset}")
+        if expected_total is not None and total != expected_total and not allow_live_changes:
+            raise ValueError(
+                f"Changed /api/users total at offset {offset}: expected={expected_total}, received={total}"
+            )
         rows = body["users"]
         if len(rows) != min(limit, max(0, total - offset)):
             raise ValueError("Incomplete /api/users page")
@@ -121,8 +170,11 @@ async def fetch_all_users_raw(
                 or type(row.get("id")) is not int
             ):
                 raise ValueError("Invalid /api/users candidate")
+            if requested_ids is not None and row["id"] not in requested_ids:
+                raise ValueError("Unexpected identity in ID-filtered /api/users page")
         if len({row["id"] for row in rows}) != len(rows) or len({row["username"] for row in rows}) != len(rows):
             raise ValueError("Duplicate candidates in /api/users page")
+        observed_totals.add(total)
         return rows, total
 
     if strict:
@@ -143,66 +195,128 @@ async def fetch_all_users_raw(
     if len(first_page_users) >= total_users or len(first_page_users) < limit:
         elapsed = (time.perf_counter() - start_time) * 1000
         users_logger.info(f"📋 Fetched {len(first_page_users)} users in {elapsed:.0f}ms")
-        return first_page_users
+        return PanelUserListing(first_page_users) if allow_live_changes else first_page_users
 
     # Calculate remaining offsets for parallel fetching
     offsets = list(range(limit, total_users, limit))
-    users_logger.info(f"📥 Fetching {len(offsets)} remaining pages in parallel (max {max_concurrent} concurrent)...")
+    users_logger.info(f"📥 Fetching {len(offsets)} remaining pages sequentially with a 1s completion pause...")
 
     semaphore = asyncio.Semaphore(max_concurrent)
+    pagination_failed = False
 
     async def fetch_page_task(offset: int) -> list[dict]:
+        nonlocal pagination_failed
         async with semaphore:
-            page_params = dict(params)
-            page_params["offset"] = offset
-            page_resp = await panel_get(
-                panel_data,
-                "/api/users",
-                params=page_params,
-                timeout=60.0,
-                max_retries=3,
-            )
-            if page_resp is None:
-                users_logger.warning(f"Failed to fetch page at offset {offset}")
-                if strict:
-                    raise ValueError(f"Unavailable /api/users page at {offset}")
+            # Set before releasing the semaphore on any fatal page failure.
+            # Queued tasks may acquire it before gather delivers that exception.
+            if strict and pagination_failed:
                 return []
             try:
-                page_data = page_resp.json()
+                page_params = dict(params)
+                page_params["offset"] = offset
+                page_resp = await panel_get(
+                    panel_data,
+                    "/api/users",
+                    params=page_params,
+                    timeout=60.0,
+                    max_retries=3,
+                    quiet=quiet_requests,
+                )
+                if page_resp is None:
+                    users_logger.warning(f"Failed to fetch page at offset {offset}")
+                    if strict:
+                        raise ValueError(f"Unavailable /api/users page at {offset}")
+                    return []
+                if page_resp.status_code in (401, 403):
+                    raise _PanelAuthenticationError(
+                        f"Panel API key rejected while fetching users: HTTP {page_resp.status_code}"
+                    )
+                try:
+                    page_data = page_resp.json()
+                except Exception as parse_err:
+                    users_logger.warning(f"Error parsing page at offset {offset}: {type(parse_err).__name__}")
+                    if strict:
+                        raise ValueError(f"Invalid /api/users page at {offset}") from None
+                    return []
                 if strict:
-                    return validate_page(page_data, offset, total_users)[0]
+                    try:
+                        return validate_page(page_data, offset, total_users)[0]
+                    except ValueError as validation_error:
+                        # Our validator reports only fixed reasons, offsets and
+                        # numeric totals, never the payload or decoder text.
+                        users_logger.warning(f"Invalid page at offset {offset}: {validation_error}")
+                        raise
                 if isinstance(page_data, dict) and "users" in page_data:
                     return page_data["users"]
                 elif isinstance(page_data, list):
                     return page_data
                 return []
-            except Exception as parse_err:
-                users_logger.warning(f"Error parsing page at offset {offset}: {parse_err}")
+            except BaseException:
                 if strict:
-                    raise ValueError(f"Invalid /api/users page at {offset}") from parse_err
-                return []
+                    pagination_failed = True
+                raise
 
-    tasks = [fetch_page_task(off) for off in offsets]
-    pages = await asyncio.gather(*tasks, return_exceptions=True)
+    async def fetch_pages(page_offsets):
+        tasks = [asyncio.create_task(fetch_page_task(off)) for off in page_offsets]
+        try:
+            return await asyncio.gather(*tasks, return_exceptions=not strict)
+        except BaseException as error:
+            # Invalid pages still invalidate the listing. Settle every request
+            # before returning, including a bounded live-tail extension.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if strict and isinstance(error, Exception):
+                raise ValueError("Incomplete /api/users pagination") from error
+            raise
+
+    pages = await fetch_pages(offsets)
+    if allow_live_changes:
+        tail_start = ((total_users + limit - 1) // limit) * limit
+        tail_end = min(max(observed_totals), tail_start + limit * max_concurrent)
+        extra_offsets = range(tail_start, tail_end, limit)
+        if extra_offsets:
+            pages.extend(await fetch_pages(extra_offsets))
 
     all_users = list(first_page_users)
     for i, page in enumerate(pages):
+        if isinstance(page, _PanelAuthenticationError):
+            raise page
         if isinstance(page, Exception):
-            users_logger.error(f"Exception fetching page {i + 1}: {page}")
+            users_logger.error(f"Exception fetching page {i + 1}: {type(page).__name__}")
             if strict:
-                raise ValueError("Incomplete /api/users pagination") from page
+                raise ValueError("Incomplete /api/users pagination") from None
             continue
         if isinstance(page, list):
             all_users.extend(page)
 
-    if strict and (
+    pagination_changed = len(observed_totals) > 1
+    if allow_live_changes and pagination_changed:
+        by_id: dict[int, dict] = {}
+        by_name: dict[str, int] = {}
+        for row in all_users:
+            previous = by_id.get(row["id"])
+            if (previous is not None and previous["username"] != row["username"]) or (
+                row["username"] in by_name and by_name[row["username"]] != row["id"]
+            ):
+                raise ValueError("Conflicting identities in /api/users pagination")
+            by_id[row["id"]] = row
+            by_name[row["username"]] = row["id"]
+        all_users = list(by_id.values())
+        users_logger.info(
+            "Live /api/users listing changed (total %s..%s); retained %s validated users, absence is unknown",
+            min(observed_totals),
+            max(observed_totals),
+            len(all_users),
+        )
+    elif strict and (
         len({row["id"] for row in all_users}) != total_users
         or len({row["username"] for row in all_users}) != total_users
     ):
         raise ValueError("Duplicate candidates in /api/users pagination")
     elapsed = (time.perf_counter() - start_time) * 1000
-    users_logger.info(f"📋 Fetched all {len(all_users)} users in {elapsed:.0f}ms")
-    return all_users
+    users_logger.info(f"📋 Fetched {len(all_users)} users in {elapsed:.0f}ms")
+    return PanelUserListing(all_users, pagination_changed=pagination_changed) if allow_live_changes else all_users
 
 
 async def all_user(panel_data: PanelType) -> list[UserType] | ValueError:
@@ -275,7 +389,7 @@ async def check_user_exists(panel_data: PanelType, username: str) -> bool:
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
         username (str): The username to check.
 
     Returns:
@@ -329,8 +443,8 @@ async def get_user_details(panel_data: PanelType, username: str) -> dict | None 
                 users_logger.debug(f"👤 Got details for {username}: groups={user_data.get('group_ids', [])}")
                 return user_data
             except Exception as json_error:
-                users_logger.error(f"Failed to parse JSON for {username}: {json_error}")
-                raise ValueError(f"Failed to parse JSON for {username}: {json_error}") from json_error
+                users_logger.error(f"Failed to parse JSON for {username}: {type(json_error).__name__}")
+                raise ValueError(f"Failed to parse JSON for {username}") from None
         elif response.status_code == 404:
             users_logger.warning(f"User {username} not found")
             return None
@@ -376,7 +490,7 @@ async def update_user_groups(panel_data: PanelType, username: str, group_ids: li
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
         username (str): The username to update.
         group_ids (list[int]): The list of group IDs to set for the user.
 
@@ -417,7 +531,7 @@ async def enable_all_user(panel_data: PanelType) -> None | ValueError:
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
 
     Returns:
         None
@@ -637,7 +751,7 @@ async def enable_selected_users(panel_data: PanelType, inactive_users: set[str])
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
         inactive_users (set[str]): A list of user str that are currently inactive.
 
     Returns:
@@ -853,7 +967,7 @@ async def _disable_user(
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
         username (user): The username of the user to disable.
         duration_seconds (int): Optional custom disable duration in seconds.
         permanent (bool): If True, user will never be auto-enabled (manual only).
@@ -930,7 +1044,7 @@ async def disable_user_with_punishment(panel_data: PanelType, username: UserType
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
         username (UserType): The username of the user to disable.
 
     Returns:
@@ -1304,7 +1418,7 @@ async def cleanup_deleted_users(panel_data: PanelType) -> dict:
 
     Args:
         panel_data (PanelType): A PanelType object containing
-        the username, password, and domain for the panel API.
+        the API key and domain for the panel API.
 
     Returns:
         dict: Empty result as function is disabled.

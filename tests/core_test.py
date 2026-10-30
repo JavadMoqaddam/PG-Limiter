@@ -24,7 +24,6 @@ from utils.panel_api import (
     enable_dis_user,
     enable_selected_users,
     get_nodes,
-    get_token,
 )
 from utils.parse_logs import INVALID_EMAILS, check_ip, parse_logs
 from utils.read_config import read_config
@@ -34,7 +33,7 @@ parser = argparse.ArgumentParser(description="Help message")
 parser.add_argument("--version", action="version", version="1.3.1")
 args = parser.parse_args()
 
-panel_data = PanelType("admin", "admin", "192.168.1.37:8000")
+panel_data = PanelType(panel_domain="192.168.1.37:8000", panel_api_key="pg_key_test")
 users = [
     UserType(name="Test2"),
     UserType(name="Test"),
@@ -111,11 +110,6 @@ async def main():  # pylint: disable=too-many-statements
     print("Print All Active Users After 'check_ip_used' Test: ", ACTIVE_USERS)
     print("Parser Test: ", await parse_logs(LOGS))
     print("Check Ip Test: ", await check_ip("2a01:5ec0:5011:9962:d8ed:c723:c32:ac2a"))
-    try:
-        print("Get Token Test: ", await get_token(panel_data))
-    except ValueError as error:
-        print(error)
-        return
     dis_users = await dis_registry.clear_all()
     print("Disabled users cleared from the registry Test:", dis_users)
     await enable_selected_users(panel_data, dis_users)
@@ -181,10 +175,5 @@ async def main():  # pylint: disable=too-many-statements
 
 
 if __name__ == "__main__":
-    if (
-        input(
-            "This is test file and it may break your data. So if you want to continue Enter y: "
-        )
-        == "y"
-    ):
+    if input("This is test file and it may break your data. So if you want to continue Enter y: ") == "y":
         asyncio.run(main())

@@ -37,10 +37,7 @@ async def group_filter_status(update: Update, _context: ContextTypes.DEFAULT_TYP
         config_data = await read_config()
 
         # Get panel data for group lookup
-        panel_config = config_data.get("panel", {})
-        panel_data = PanelType(
-            panel_config.get("username", ""), panel_config.get("password", ""), panel_config.get("domain", "")
-        )
+        panel_data = PanelType.from_config(config_data)
 
         # Get all groups for name lookup
         groups = await get_all_groups(panel_data)
@@ -223,10 +220,7 @@ async def _get_groups_from_panel():
         from utils.types import PanelType
 
         config_data = await read_config()
-        panel_config = config_data.get("panel", {})
-        panel_data = PanelType(
-            panel_config.get("username", ""), panel_config.get("password", ""), panel_config.get("domain", "")
-        )
+        panel_data = PanelType.from_config(config_data)
 
         groups = await get_all_groups(panel_data)
         return groups, config_data

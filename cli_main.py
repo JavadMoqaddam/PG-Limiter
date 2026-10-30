@@ -156,7 +156,7 @@ def version():
 
     console = Console()
     console.print(BANNER)
-    console.print("Version: 1.7.0")
+    console.print("Version: 1.7.1")
 
 
 if __name__ == "__main__":

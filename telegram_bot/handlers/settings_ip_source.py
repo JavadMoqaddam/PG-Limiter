@@ -25,12 +25,7 @@ def _build_panel_data(config_data: dict):
     """Build a PanelType from the stored panel configuration."""
     from utils.types import PanelType
 
-    panel_config = config_data.get("panel", {})
-    return PanelType(
-        panel_config.get("username", ""),
-        panel_config.get("password", ""),
-        panel_config.get("domain", ""),
-    )
+    return PanelType.from_config(config_data)
 
 
 def create_ip_source_keyboard(current_source: str, concurrency: int, freshness: int = 60):
@@ -45,7 +40,11 @@ def create_ip_source_keyboard(current_source: str, concurrency: int, freshness: 
                 f"⚡ API Concurrency: {concurrency}", callback_data=CallbackData.IP_SOURCE_SET_CONCURRENCY
             )
         ],
-        [InlineKeyboardButton(f"🕒 Last seen: {freshness}s", callback_data=CallbackData.IP_SOURCE_SET_FRESHNESS)],
+        [
+            InlineKeyboardButton(
+                f"🕒 Last seen (API + Logs): {freshness}s", callback_data=CallbackData.IP_SOURCE_SET_FRESHNESS
+            )
+        ],
         [InlineKeyboardButton("📊 Last API Cycle", callback_data=CallbackData.IP_SOURCE_STATS)],
         [InlineKeyboardButton("« Back to Settings", callback_data=CallbackData.SETTINGS_MENU)],
     ]
@@ -57,9 +56,6 @@ def _build_ip_source_text(config_data: dict) -> str:
     current_source = str(config_data.get("ip_source") or "logs")
     interval = config_data.get("check_interval", 60)
     freshness = normalize_api_ip_freshness(config_data.get("api_ip_freshness"))
-    # normalize_min_coverage rather than "or 0.0": an absent key means the documented
-    # default, and the old fallback would have shown 0% on this screen while the
-    # collector was actually enforcing 80%.
     coverage = normalize_min_coverage(config_data.get("api_ip_min_coverage"))
     auto_fallback = "✅ on" if config_data.get("api_ip_auto_fallback", True) else "❌ off"
 
@@ -67,7 +63,8 @@ def _build_ip_source_text(config_data: dict) -> str:
         active = "🛰️ <b>Panel API</b>"
         active_note = (
             "IPs are pulled from <code>/api/node/online_stats/{id}/ip</code> once "
-            "per check cycle. The SSE log streams are parked while this mode is active."
+            "per check cycle, with targeted refreshes before punishment when needed. "
+            "The SSE log streams are parked while this mode is active."
         )
     else:
         active = "📜 <b>Node Logs (SSE)</b>"
@@ -82,20 +79,27 @@ def _build_ip_source_text(config_data: dict) -> str:
         f"<b>Logs evidence:</b> {logs_readiness}\n"
         "Set <code>LOG_NODE_TIMEZONES</code> (or explicit <code>LOG_TIMEZONE</code>) for Xray containers. "
         "Missing zones, incomplete fleet or replay uncertainty preserve warning history. "
-        "A source/settings change requires one complete check interval.\n\n"
+        "After source/settings changes or transport gaps, Logs needs a complete observation warm-up "
+        "of <code>max(Check interval, Last seen)</code>.\n\n"
+        "<b>Observation timing:</b>\n"
+        f"• Last seen: <code>{freshness}s</code> for API and Logs\n"
+        "• API: each user's request supplies one scan observation\n"
+        "• Logs: original event age is checked at evaluation\n"
+        "• Independent of <code>CHECK_INTERVAL</code>\n"
+        "• Does not measure ongoing byte traffic\n\n"
         "<b>API mode settings:</b>\n"
         f"• Check interval: <code>{interval}s</code>\n"
         "• Candidates: active users with <code>online=true</code> and Group Filter\n"
-        f"• Last seen: <code>{freshness}s</code> (independent of check interval)\n"
-        f"• Min coverage: <code>{coverage:.0%}</code>\n"
-        f"• Auto-fallback to logs: {auto_fallback}\n\n"
+        f"• Coverage alert threshold: <code>{coverage:.0%}</code>\n"
+        "• Valid users continue below this threshold.\n"
+        f"• Auto-fallback for API outages: {auto_fallback}\n\n"
         "<b>API observations:</b>\n"
-        "• An IP counts only when its original timestamp is less than Last seen "
-        "seconds old at evaluation. Future or invalid timestamps are unknown.\n"
-        "• Xray updates this timestamp when a tracked connection opens; a "
-        "long-lived connection can have an old timestamp.\n"
+        "• Xray 26.4.13+: open connections in the response count even with old opening timestamps.\n"
+        "• WireGuard and older/unknown Xray: activity age is checked at that user's request.\n"
+        "• Collection delays do not empty earlier users' scan results. Before punishment, "
+        "observations older than Last seen are refreshed for that user.\n"
         "• Unknown user/node evidence preserves that user's warning record. "
-        "Valid empty or expired observations can clear it.\n"
+        "Healthy empty node maps or expired observations can clear it; an entirely empty aggregate cannot.\n"
         "• Inbound protocol is not exposed by the API, so per-inbound CDN grouping "
         "is inactive (use <b>CDN Nodes</b> instead).\n"
         "• Requires the <code>nodes:stats</code> panel permission."
@@ -140,34 +144,48 @@ async def _find_preflight_user_id(panel_data, config_data) -> tuple[int, str]:
     """
     Pick one real user id to probe the online-stats endpoint with.
 
-    Online users are queried first because that response is tiny; only if
-    nobody is currently online does it fall back to the wider query.
+    Each query requests at most one user. Only a confirmed empty online
+    list falls back to the wider active-user query.
 
     Returns:
         ``(user_id, error)`` — ``user_id`` is ``0`` when no probe target could
         be resolved, in which case ``error`` explains why.
     """
     from utils.ip_source_api import resolve_monitored_group_ids
-    from utils.panel_api.online_ips import fetch_online_candidates
+    from utils.panel_api.request_helper import panel_get
 
     group_ids = resolve_monitored_group_ids(config_data)
-    for window in (110, 0):
-        candidates = await fetch_online_candidates(
-            panel_data,
-            group_ids=group_ids,
-            status="active",
-            online_window=window,
-            page_size=100 if window else 500,
-        )
-        if candidates is None:
-            return 0, "Could not query the panel user list."
-        for raw in candidates:
-            try:
-                user_id = int(raw.get("id"))
-            except (ValueError, TypeError):
-                continue
-            if user_id > 0:
-                return user_id, ""
+    query_error = (0, "Could not query the panel user list.")
+    for online in (True, False):
+        params = {"offset": 0, "limit": 1, "status": "active"}
+        if group_ids:
+            params["group"] = group_ids
+        if online:
+            params["online"] = "true"
+        try:
+            response = await panel_get(panel_data, "/api/users", params=params, timeout=60.0, max_retries=3)
+            if response is None or response.status_code != 200:
+                return query_error
+            data = response.json()
+        except Exception:
+            return query_error
+        if not isinstance(data, dict) or not isinstance(data.get("users"), list):
+            return query_error
+        total = data.get("total")
+        if type(total) is not int or total < 0 or len(data["users"]) != min(1, total):
+            return query_error
+        if not data["users"]:
+            continue
+        raw = data["users"][0]
+        if (
+            not isinstance(raw, dict)
+            or type(raw.get("id")) is not int
+            or raw["id"] <= 0
+            or not isinstance(raw.get("username"), str)
+            or not raw["username"].strip()
+        ):
+            return query_error
+        return raw["id"], ""
     return 0, "No active user was found to probe the endpoint with."
 
 
@@ -195,8 +213,8 @@ async def handle_ip_source_set_api_callback(query, context: ContextTypes.DEFAULT
 
     from utils.panel_api.online_ips import check_online_stats_permission
 
-    panel_data = _build_panel_data(config_data)
     try:
+        panel_data = _build_panel_data(config_data)
         user_id, probe_error = await _find_preflight_user_id(panel_data, config_data)
         if not user_id:
             ok, reason = False, probe_error
@@ -295,9 +313,11 @@ async def handle_ip_source_freshness_callback(query, context: ContextTypes.DEFAU
         text=(
             "🕒 <b>Last seen</b>\n\n"
             f"Current: <code>{current}s</code>\n\n"
-            "Count an IP only while its Xray timestamp is younger than this value. "
-            "Xray updates the timestamp when a tracked connection opens, so a "
-            "long-lived connection may have an old timestamp.\n\n"
+            "API keeps each user's request result for its scan and refreshes old observations "
+            "before punishment. Supported Xray cores count open connections; WireGuard and "
+            "older/unknown Xray use activity age at request time. "
+            "Logs counts original events younger than this value at evaluation. "
+            "Independent of <code>CHECK_INTERVAL</code>; does not measure ongoing byte traffic.\n\n"
             "Send a positive whole number of seconds, or /cancel."
         ),
         reply_markup=InlineKeyboardMarkup(
@@ -331,14 +351,14 @@ async def ip_source_freshness_handler(update: Update, context: ContextTypes.DEFA
         context.user_data["waiting_for"] = "ip_source_freshness"
         return await update.message.reply_html("❌ Could not save Last seen. Try again or /cancel.")
     await update.message.reply_html(
-        f"✅ Last seen set to <code>{value}s</code>.",
+        f"✅ Last seen for API and Logs set to <code>{value}s</code>.",
         reply_markup=create_ip_source_keyboard(source, concurrency, value),
     )
 
 
 async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_TYPE):
     """Show the statistics of the most recent API collection cycle."""
-    from utils.ip_source_api import get_last_cycle_stats
+    from utils.ip_source_api import format_api_evidence_summary, get_last_cycle_stats
 
     config_data = await read_config()
     stats = get_last_cycle_stats()
@@ -370,45 +390,54 @@ async def handle_ip_source_stats_callback(query, _context: ContextTypes.DEFAULT_
     age = max(0, int(time.time() - ran_at))
     age_label = f"{age}s ago" if age < 120 else f"{age // 60}m ago"
     skipped = stats.get("skipped_reason") or ""
-    verdict = f"⚠️ Cycle skipped — {skipped}" if skipped else "✅ Sample available for enforcement"
-    if not skipped and stats.get("collection_outcome") == "partial":
-        verdict += f" ({stats.get('unknown_users', 0)} users protected: incomplete evidence)"
+    outcome = stats.get("collection_outcome")
+    fallback = stats.get("fallback_applied", False)
+    if skipped:
+        verdict = f"⚠️ Cycle skipped — {escape(str(skipped))}"
+    elif fallback:
+        verdict = "⚠️ Cycle skipped — IP source reverted to Logs"
+    elif outcome in {"success", "partial"}:
+        verdict = "✅ Sample available for enforcement"
+    else:
+        verdict = "⚠️ Collection unavailable or still in progress; no usable sample recorded"
+    if not skipped and not fallback and outcome == "partial":
+        verdict += (
+            f" ({stats.get('unknown_users', 0)} users unknown; "
+            f"{stats.get('partial_users', 0)} users with partial node coverage)"
+        )
 
-    # Nodes seen was rendered without its denominator, which is the number that matters:
-    # a per-user coverage of 100% says nothing about a fleet where two thirds of the
-    # nodes went quiet. The guard is required - node_coverage is set to 1.0 with
-    # nodes_expected 0 when the node list could not be read, and "1/0 (100%)" is a lie.
-    nodes_seen = stats.get("nodes_seen", 0)
-    nodes_expected = int(stats.get("nodes_expected") or 0)
-    nodes_label = (
-        f"{nodes_seen}/{nodes_expected} ({float(stats.get('node_coverage') or 0):.0%})"
-        if nodes_expected
-        else f"{nodes_seen}"
-    )
     dropped = [f"{stats.get('stale_ips', 0)} stale"]
     if stats.get("unknown_age_ips"):
         dropped.append(f"{stats['unknown_age_ips']} undatable")
     if stats.get("future_ips"):
         dropped.append(f"{stats['future_ips']} future-dated")
+    historical = "Historical API collection; current source is Logs.\n" if config_data.get("ip_source") != "api" else ""
 
     text = (
         "📊 <b>Last API Cycle</b>\n\n"
+        f"{historical}"
         f"<b>Ran:</b> {age_label} in <code>{stats.get('duration_ms', 0)}ms</code>\n"
         f"{verdict}\n\n"
+        f"Consecutive API outage cycles: <code>{stats.get('consecutive_unsuccessful_cycles', 0)}</code>\n\n"
         "<b>Candidate narrowing:</b>\n"
         f"• From panel: <code>{stats.get('candidates', 0)}</code>\n"
         f"• After local filters: <code>{stats.get('prefiltered', 0)}</code>\n\n"
         "<b>Per-user lookups:</b>\n"
         f"• OK: <code>{stats.get('fetched_ok', 0)}</code>\n"
         f"• Failed: <code>{stats.get('fetched_failed', 0)}</code>\n"
+        f"• Timeouts (in failed): <code>{stats.get('fetched_timeouts', 0)}</code>\n"
+        f"• Unsent/deferred: <code>{stats.get('fetched_deferred', 0)}</code>\n"
         f"• Not found (404): <code>{stats.get('not_found', 0)}</code>\n"
         f"• Forbidden (403): <code>{stats.get('forbidden', 0)}</code>\n"
-        f"• Coverage: <code>{float(stats.get('coverage') or 0):.1%}</code>\n\n"
+        f"• HTTP coverage: <code>{float(stats.get('http_coverage') or 0):.1%}</code>\n"
+        f"• Usable user coverage: <code>{float(stats.get('coverage') or 0):.1%}</code>\n\n"
+        "<b>Evidence:</b>\n"
+        f"{format_api_evidence_summary(stats)}\n"
+        "HTTP success does not confirm complete node evidence for each user.\n\n"
         "<b>Result:</b>\n"
         f"• Users with IPs: <code>{stats.get('users_with_ips', 0)}</code>\n"
         f"• Accepted IPs: <code>{stats.get('total_ips', 0)}</code>\n"
         f"• IPs dropped: <code>{', '.join(dropped)}</code>\n"
-        f"• Nodes reporting: <code>{nodes_label}</code>\n"
         f"• Geo lookups: <code>{stats.get('geo_lookups', 0)}</code>"
     )
 

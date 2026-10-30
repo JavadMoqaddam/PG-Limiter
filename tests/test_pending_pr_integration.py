@@ -71,7 +71,7 @@ async def test_persisted_api_inbound_pause_preserves_both_snapshots_and_failure_
 
 
 @pytest.mark.parametrize("path", ["scan", "persistent"])
-async def test_first_disable_enrichment_expires_second_api_user(api_cycle, monkeypatch, path):
+async def test_first_disable_delay_requires_rechecking_second_api_user(api_cycle, monkeypatch, path):
     import utils.warning_system as warning_package
     import utils.warning_system.enhanced_system as warnings
     import utils.warning_system.helpers as helpers
@@ -114,8 +114,9 @@ async def test_first_disable_enrichment_expires_second_api_user(api_cycle, monke
     assert await api_cycle.run()
     assert punished == ["alice"]
     assert enrichment.await_count == 1
-    assert "bob" not in [call.args[0] for call in add_warning.await_args_list]
-    assert api_cycle.warning.warnings == {}
+    assert ("bob" in [call.args[0] for call in add_warning.await_args_list]) is (path == "scan")
+    assert set(api_cycle.warning.warnings) == {"bob"}
+    assert api_cycle.warning.warnings["bob"].consecutive_violations == 3
 
 
 @pytest.mark.parametrize("mode", ["device", "ip"])
@@ -167,7 +168,7 @@ async def test_cdn_api_overlap_controls_warning_normalization_and_persistent_pat
         assert punished == []
 
 
-async def test_expiring_direct_copy_retains_fresh_cdn_observation_after_preparation(api_cycle, monkeypatch):
+async def test_request_snapshot_retains_direct_and_cdn_observations_after_preparation(api_cycle, monkeypatch):
     import utils.check_usage as usage
     import utils.panel_api.nodes as nodes
     from utils.types import NodeType
@@ -208,7 +209,7 @@ async def test_expiring_direct_copy_retains_fresh_cdn_observation_after_preparat
 
     monkeypatch.setattr(usage, "count_devices", capture)
     assert await api_cycle.run()
-    assert (1, [(5, api_cycle.now + 50)]) in counts
+    assert (1, [(1, api_cycle.now), (5, api_cycle.now + 50)]) in counts
     assert api_cycle.warning.warnings == {}
 
 
@@ -231,7 +232,8 @@ async def test_unknown_logs_evidence_preserves_history_without_warning_ban_clear
     await parse_logs("", 1, "node", api_cycle.config)
     LOG_OBSERVATIONS.register_fleet([NodeType(1, "node", "192.0.2.1", "connected")])
     note_node_event(1)
-    clock[0] += 60
+    # Shared Last seen is 90s in this fixture, longer than its 60s cadence.
+    clock[0] += 90
     assert LOG_OBSERVATIONS.is_current(LOG_OBSERVATIONS.evidence())
     LOG_OBSERVATIONS.register_fleet(None)
     mutation_names = ("add_warning", "check_persistent_violations", "clear_user_trust_data", "cleanup_expired_warnings")

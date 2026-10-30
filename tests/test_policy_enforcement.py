@@ -59,7 +59,7 @@ async def policy_cycle(settings_db, monkeypatch, completed_logs_evidence):
                 monkeypatch.setattr(module, name, AsyncMock())
     sync.USER_METADATA_CACHE.clear()
     ACTIVE_USERS.clear()
-    panel = PanelType("admin", "test", "panel.local")
+    panel = PanelType(panel_domain="panel.local", panel_api_key="pg_key_test")
 
     def warning(*, expired=False, count=2):
         now = time.time()

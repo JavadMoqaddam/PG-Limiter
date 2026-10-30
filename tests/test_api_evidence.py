@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from utils.panel_api.request_helper import panel_request as real_panel_request
+
 
 @pytest.fixture
 async def api_cycle(tmp_path, monkeypatch, operational_topics):
@@ -57,7 +59,6 @@ async def api_cycle(tmp_path, monkeypatch, operational_topics):
     # Only external I/O is replaced; collection, metadata, counting and warnings run.
     monkeypatch.setattr(usage, "send_logs", AsyncMock())
     monkeypatch.setattr(usage, "send_user_message", AsyncMock())
-    monkeypatch.setattr(auth, "get_token", AsyncMock(return_value=SimpleNamespace(panel_token="test")))
     monkeypatch.setattr(nodes, "get_nodes", AsyncMock(return_value=[NodeType(1, "node", "192.0.2.1", "connected")]))
     monkeypatch.setattr(requests, "is_panel_available", lambda: True)
     monkeypatch.setattr(api, "_notify", AsyncMock())
@@ -68,12 +69,37 @@ async def api_cycle(tmp_path, monkeypatch, operational_topics):
     }
 
     async def get(_panel, path, **kwargs):
+        if path.startswith("/api/user/"):
+            name = path.removeprefix("/api/user/")
+            body = {"id": list(bodies).index(name) + 1, "username": name, "group_ids": [1], "status": "active"}
+            return SimpleNamespace(status_code=200, json=lambda: body)
+        if path == "/api/groups":
+            body = {"groups": [{"id": 1, "name": "test", "inbound_tags": ["test"], "is_disabled": False}], "total": 1}
+            return SimpleNamespace(status_code=200, json=lambda: body)
+        if path == "/api/cores":
+            body = {
+                "cores": [
+                    {
+                        "id": 1,
+                        "type": "xray",
+                        "config": {"inbounds": [{"tag": "test", "protocol": "vless"}]},
+                        "exclude_inbound_tags": [],
+                        "fallbacks_inbound_tags": [],
+                    }
+                ],
+                "count": 1,
+            }
+            return SimpleNamespace(status_code=200, json=lambda: body)
         assert path == "/api/users"
         return SimpleNamespace(
-            json=lambda: {"users": [{"id": i, "username": n} for i, n in enumerate(bodies, 1)], "total": len(bodies)}
+            status_code=200,
+            json=lambda: {
+                "users": [{"id": i, "username": n, "group_ids": [1]} for i, n in enumerate(bodies, 1)],
+                "total": len(bodies),
+            },
         )
 
-    async def request(_panel, _method, path, _token, **kwargs):
+    async def request(_panel, _method, path, **kwargs):
         name = list(bodies)[int(path.split("/")[-2]) - 1]
         body = bodies[name]
         if body is None:
@@ -93,7 +119,7 @@ async def api_cycle(tmp_path, monkeypatch, operational_topics):
         "country_code": "",
         "except_users": [],
     }
-    panel = PanelType("admin", "test", "panel.local")
+    panel = PanelType(panel_domain="panel.local", panel_api_key="pg_key_test")
 
     async def run():
         ready = await api.collect_active_users_from_api(panel, config)
@@ -109,9 +135,7 @@ async def api_cycle(tmp_path, monkeypatch, operational_topics):
     await engine.dispose()
 
 
-@pytest.mark.parametrize(
-    "unknown", [None, {}, {"nodes": {"1": None}}, {"nodes": {}}, {"nodes": {"1": {"ips": {"5.6.7.8": 1}}}}]
-)
+@pytest.mark.parametrize("unknown", [None, {}, {"nodes": {"1": None}}, {"nodes": {"1": {"ips": {"5.6.7.8": 1}}}}])
 async def test_unknown_user_keeps_counter_while_complete_user_advances(api_cycle, unknown, monkeypatch):
     await api_cycle.run()
     alice = api_cycle.warning.warnings["alice"]
@@ -122,6 +146,41 @@ async def test_unknown_user_keeps_counter_while_complete_user_advances(api_cycle
     assert api_cycle.warning.warnings["alice"] is alice
     assert alice.consecutive_violations == before
     assert api_cycle.warning.warnings["bob"].consecutive_violations == 2
+
+
+async def test_collection_recovers_when_cooldown_exceeds_evidence_freshness(api_cycle, monkeypatch):
+    import httpx
+
+    import utils.ip_source_api as api
+    import utils.panel_api.request_helper as requests
+
+    api_cycle.config.update(api_ip_freshness=1, api_ip_concurrency=1)
+    monkeypatch.setattr(requests, "panel_request", real_panel_request)
+    monkeypatch.setattr(
+        requests,
+        "online_stats_circuit_breaker",
+        requests.PanelCircuitBreaker(failure_threshold=1, recovery_timeout=1.1, single_probe=True),
+    )
+    calls = 0
+    observed_timeouts = []
+
+    async def respond(request):
+        nonlocal calls
+        calls += 1
+        observed_timeouts.append(request.extensions["timeout"]["read"])
+        if calls == 1:
+            raise httpx.ReadTimeout("synthetic private transport detail")
+        return httpx.Response(200, json={"nodes": {"1": {"ips": {"5.6.7.8": int(time.time())}}}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(requests, "_panel_client", client)
+        assert await api.collect_active_users_from_api(api_cycle.panel, api_cycle.config)
+    assert api.LAST_CYCLE_STATS["fetched_ok"] == 1
+    assert api.LAST_CYCLE_STATS["fetched_timeouts"] == 1
+    assert api.LAST_CYCLE_STATS["fetched_read_timeouts"] == 1
+    assert api.LAST_CYCLE_STATS["fetched_deferred"] == 0
+    assert api_cycle.config["api_ip_freshness"] == 1
+    assert observed_timeouts == [20.0, 20.0]
 
 
 async def test_all_valid_expired_observations_clear_pending_warnings(api_cycle):
@@ -177,7 +236,7 @@ async def test_setting_change_during_collection_discards_batch(api_cycle, monkey
     assert api_cycle.warning.warnings == {}
 
 
-async def test_freshness_is_rechecked_after_async_preparation(api_cycle, monkeypatch):
+async def test_request_snapshot_survives_async_preparation(api_cycle, monkeypatch):
     import utils.check_usage as usage
 
     await api_cycle.run()
@@ -193,7 +252,7 @@ async def test_freshness_is_rechecked_after_async_preparation(api_cycle, monkeyp
 
     monkeypatch.setattr(usage, "read_config_snapshot", delayed_metadata)
     assert await api_cycle.run()
-    assert api_cycle.warning.warnings == {}
+    assert set(api_cycle.warning.warnings) == {"alice", "bob"}
 
 
 async def test_config_change_during_preparation_keeps_counters(api_cycle, monkeypatch):
@@ -230,7 +289,7 @@ async def test_late_log_updates_cannot_contaminate_api_enforcement(api_cycle):
     assert api_cycle.warning.warnings == {}
 
 
-async def test_slow_warning_persistence_does_not_warn_later_users_on_expired_ips(api_cycle, monkeypatch):
+async def test_slow_warning_persistence_keeps_later_users_request_snapshot(api_cycle, monkeypatch):
     import utils.warning_system.enhanced_system as warnings
 
     await api_cycle.run()
@@ -244,7 +303,7 @@ async def test_slow_warning_persistence_does_not_warn_later_users_on_expired_ips
 
     monkeypatch.setattr(warnings, "atomic_write_json", delayed_write)
     assert await api_cycle.run()
-    assert "bob" not in api_cycle.warning.warnings
+    assert api_cycle.warning.warnings["bob"].consecutive_violations == 2
 
 
 async def test_missing_node_list_skips_enforcement(api_cycle, monkeypatch):
@@ -257,7 +316,9 @@ async def test_missing_node_list_skips_enforcement(api_cycle, monkeypatch):
 
 @pytest.mark.parametrize("status", ["error", "connecting"])
 @pytest.mark.parametrize("sample", ["empty_ips", "nonempty_ips", "no_candidates", "omitted_warning_user"])
-async def test_unavailable_enabled_node_preserves_entire_warning_cycle(api_cycle, monkeypatch, status, sample):
+async def test_unavailable_node_preserves_absent_warnings_but_allows_healthy_scope(
+    api_cycle, monkeypatch, status, sample
+):
     import utils.ip_source_api as api
     import utils.panel_api.nodes as nodes
     from utils.types import NodeType
@@ -284,12 +345,15 @@ async def test_unavailable_enabled_node_preserves_entire_warning_cycle(api_cycle
     elif sample == "omitted_warning_user":
         api_cycle.bodies.pop("alice")
 
-    ready = await api_cycle.run()
-    assert api_cycle.warning.warnings == warnings
-    assert {name: record.consecutive_violations for name, record in warnings.items()} == before
-    assert ready is False
-    assert api.get_last_cycle_stats()["collection_outcome"] == "failure"
-    assert api.get_last_cycle_stats()["skipped_reason"] == "node availability unknown"
+    assert await api_cycle.run() is True
+    if sample == "empty_ips":
+        assert api_cycle.warning.warnings == warnings
+        assert {name: record.consecutive_violations for name, record in warnings.items()} == before
+    else:
+        assert api_cycle.warning.warnings == warnings
+        expected = {name: count + int(name in api_cycle.bodies) for name, count in before.items()}
+        assert {name: record.consecutive_violations for name, record in warnings.items()} == expected
+    assert api.get_last_cycle_stats()["consecutive_unsuccessful_cycles"] == 0
 
 
 @pytest.mark.parametrize("status", ["error", "connecting"])
@@ -385,6 +449,99 @@ async def test_partial_cycle_reports_completeness_separately_from_enforcement(ap
     assert get_last_cycle_stats().get("collection_outcome") == "success"
 
 
+@pytest.mark.parametrize(
+    ("body", "reason_key"),
+    [
+        ({"nodes": {"1": None}}, "null_node_users"),
+        ({"nodes": {"1": {"ips": {"5.6.7.8": 1}}}}, "unknown_age_users"),
+        ("future", "future_timestamp_users"),
+    ],
+)
+async def test_successful_api_responses_explain_unusable_evidence(api_cycle, monkeypatch, caplog, body, reason_key):
+    from utils.ip_source_api import get_last_cycle_stats
+
+    assert await api_cycle.run()
+    warnings = dict(api_cycle.warning.warnings)
+    before = {name: record.consecutive_violations for name, record in warnings.items()}
+    monkeypatch.setattr(time, "time", lambda: api_cycle.now + 60)
+    if body == "future":
+        body = {"nodes": {"1": {"ips": {"5.6.7.8": api_cycle.now + 120}}}}
+    for name in api_cycle.bodies:
+        api_cycle.bodies[name] = body
+    caplog.clear()
+
+    assert await api_cycle.run() is False
+    stats = get_last_cycle_stats()
+    assert stats["http_coverage"] == 1.0
+    assert stats["coverage"] == 0.0
+    assert stats["fetched_ok"] == 2
+    assert stats["unknown_users"] == 2
+    assert stats[reason_key] == 2
+    assert api_cycle.warning.warnings == warnings
+    assert {name: record.consecutive_violations for name, record in warnings.items()} == before
+    diagnostics = [
+        record.getMessage() for record in caplog.records if "API user evidence unavailable:" in record.getMessage()
+    ]
+    assert len(diagnostics) == 1
+    assert all(value not in diagnostics[0] for value in ("alice", "bob", "5.6.7.8", "9.9.9.9", "panel.local"))
+
+
+async def test_api_evidence_diagnostics_count_users_and_reset_after_recovery(api_cycle, monkeypatch):
+    import utils.panel_api.nodes as nodes
+    from utils.ip_source_api import get_last_cycle_stats
+    from utils.types import NodeType
+
+    monkeypatch.setattr(
+        nodes,
+        "get_nodes",
+        AsyncMock(return_value=[NodeType(n, "node", f"192.0.2.{n}", "connected") for n in (1, 2, 3)]),
+    )
+    api_cycle.bodies["alice"] = {"nodes": {"1": None}}
+    api_cycle.bodies["bob"] = {
+        "nodes": {
+            "1": {"ips": {"5.6.7.8": 1, "9.9.9.9": 2}},
+            "2": {"ips": {"5.6.7.8": api_cycle.now + 120}},
+            "3": {"ips": {}},
+        }
+    }
+    assert await api_cycle.run() is False
+    stats = get_last_cycle_stats()
+    assert stats["unknown_users"] == 2
+    assert stats["null_node_users"] == 1
+    assert stats["unknown_age_users"] == 1
+    assert stats["future_timestamp_users"] == 1
+    assert stats["unknown_age_ips"] == 2
+
+    for name in api_cycle.bodies:
+        api_cycle.bodies[name] = {"nodes": {str(n): {"ips": {}} for n in (1, 2, 3)}}
+    assert await api_cycle.run() is True
+    stats = get_last_cycle_stats()
+    assert stats["unknown_users"] == 0
+    assert stats["null_node_users"] == 0
+    assert stats["unknown_age_users"] == 0
+    assert stats["future_timestamp_users"] == 0
+
+
+async def test_superseded_api_evidence_does_not_publish_unusable_payload_diagnostics(api_cycle, monkeypatch, caplog):
+    import utils.ip_source_api as api
+    from utils.read_config import save_config_value
+
+    for name in api_cycle.bodies:
+        api_cycle.bodies[name] = {"nodes": {}}
+    original = api._validate_ips
+
+    async def change_settings(ips, config):
+        result = await original(ips, config)
+        await save_config_value("api_ip_freshness", "10")
+        return result
+
+    monkeypatch.setattr(api, "_validate_ips", change_settings)
+    assert await api_cycle.run() is False
+    stats = api.get_last_cycle_stats()
+    assert stats["collection_outcome"] == "superseded"
+    assert not any("API user evidence unavailable:" in record.getMessage() for record in caplog.records)
+
+
 def _not_found_response(body):
     if body == "bare":
         return SimpleNamespace(status_code=404)
@@ -407,10 +564,10 @@ async def test_unconfirmed_404_preserves_warning_while_known_user_advances(api_c
     monkeypatch.setattr(time, "time", lambda: api_cycle.now + 60)
     original = requests.panel_request
 
-    async def request(panel, method, path, token, **kwargs):
+    async def request(panel, method, path, **kwargs):
         if path == "/api/node/online_stats/1/ip":
             return _not_found_response(body), None
-        return await original(panel, method, path, token, **kwargs)
+        return await original(panel, method, path, **kwargs)
 
     monkeypatch.setattr(requests, "panel_request", request)
     assert await api_cycle.run()

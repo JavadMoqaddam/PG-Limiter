@@ -8,6 +8,8 @@ Two independent group choices live here:
     can no longer be resolved on re-enable, so nobody ends up group-less.
 """
 
+from html import escape
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
@@ -23,12 +25,7 @@ async def _get_groups_from_panel():
         from utils.types import PanelType
 
         config_data = await read_config()
-        panel_config = config_data.get("panel", {})
-        panel_data = PanelType(
-            panel_config.get("username", ""),
-            panel_config.get("password", ""),
-            panel_config.get("domain", "")
-        )
+        panel_data = PanelType.from_config(config_data)
 
         groups = await get_all_groups(panel_data)
         return groups, config_data
@@ -46,12 +43,9 @@ def create_disable_group_keyboard(groups: list, current_group_id: int = None):
         is_selected = gid == current_group_id
         prefix = "✅" if is_selected else "⬜"
 
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{prefix} {name} (ID: {gid})",
-                callback_data=f"select_disabled_group:{gid}"
-            )
-        ])
+        keyboard.append(
+            [InlineKeyboardButton(f"{prefix} {name} (ID: {gid})", callback_data=f"select_disabled_group:{gid}")]
+        )
 
     keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.DISABLE_BY_GROUP)])
     keyboard.append([InlineKeyboardButton("« Back to Disable Method", callback_data=CallbackData.DISABLE_METHOD_MENU)])
@@ -67,13 +61,15 @@ async def handle_disable_by_group_callback(query, _context: ContextTypes.DEFAULT
         try:
             await query.edit_message_text(
                 text="📁 <b>Disable by Group</b>\n\n"
-                     "❌ Could not load groups from panel.\n"
-                     "Please check your panel connection.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Retry", callback_data=CallbackData.DISABLE_BY_GROUP)],
-                    [InlineKeyboardButton("« Back", callback_data=CallbackData.DISABLE_METHOD_MENU)]
-                ]),
-                parse_mode="HTML"
+                "❌ Could not load groups from panel.\n"
+                "Please check your panel connection.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("🔄 Retry", callback_data=CallbackData.DISABLE_BY_GROUP)],
+                        [InlineKeyboardButton("« Back", callback_data=CallbackData.DISABLE_METHOD_MENU)],
+                    ]
+                ),
+                parse_mode="HTML",
             )
         except BadRequest as e:
             if "message is not modified" not in str(e).lower():
@@ -93,10 +89,10 @@ async def handle_disable_by_group_callback(query, _context: ContextTypes.DEFAULT
     try:
         await query.edit_message_text(
             text="📁 <b>Disable by Group</b>\n\n"
-                 "Select the group where disabled users will be moved:\n\n"
-                 "<i>When a user exceeds their IP limit, they will be moved to this group.</i>",
+            "Select the group where disabled users will be moved:\n\n"
+            "<i>When a user exceeds their IP limit, they will be moved to this group.</i>",
             reply_markup=keyboard,
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     except BadRequest as e:
         if "message is not modified" not in str(e).lower():
@@ -121,21 +117,21 @@ async def handle_select_disabled_group_callback(query, _context: ContextTypes.DE
 
         await query.edit_message_text(
             text="🚫 <b>Disable Method</b>\n\n"
-                 f"✅ Method set to <b>By Group</b>\n"
-                 f"Group: <b>{group_name}</b> (ID: {group_id})\n\n"
-                 "• <b>By Status</b>: Set user status to 'disabled'\n"
-                 "• <b>By Group</b>: Move user to a disabled group",
+            f"✅ Method set to <b>By Group</b>\n"
+            f"Group: <b>{escape(str(group_name))}</b> (ID: {group_id})\n\n"
+            "• <b>By Status</b>: Set user status to 'disabled'\n"
+            "• <b>By Group</b>: Move user to a disabled group",
             reply_markup=create_disable_method_keyboard("group", group_name),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
     except Exception as e:
         await query.edit_message_text(
-            text=f"❌ Error: {str(e)}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("« Back", callback_data=CallbackData.DISABLE_BY_GROUP)]
-            ]),
-            parse_mode="HTML"
+            text=f"❌ Error: {escape(str(e))}",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« Back", callback_data=CallbackData.DISABLE_BY_GROUP)]]
+            ),
+            parse_mode="HTML",
         )
 
 
@@ -149,16 +145,15 @@ def create_fallback_group_keyboard(groups: list, current_group_id: int = None):
         is_selected = gid == current_group_id
         prefix = "✅" if is_selected else "⬜"
 
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{prefix} {name} (ID: {gid})",
-                callback_data=f"select_fallback_group:{gid}"
-            )
-        ])
+        keyboard.append(
+            [InlineKeyboardButton(f"{prefix} {name} (ID: {gid})", callback_data=f"select_fallback_group:{gid}")]
+        )
 
     # Add option to clear fallback group
     if current_group_id:
-        keyboard.append([InlineKeyboardButton("❌ Clear Fallback Group", callback_data=CallbackData.CLEAR_FALLBACK_GROUP)])
+        keyboard.append(
+            [InlineKeyboardButton("❌ Clear Fallback Group", callback_data=CallbackData.CLEAR_FALLBACK_GROUP)]
+        )
 
     keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data=CallbackData.FALLBACK_GROUP_MENU)])
     keyboard.append([InlineKeyboardButton("« Back to Disable Method", callback_data=CallbackData.DISABLE_METHOD_MENU)])
@@ -174,13 +169,15 @@ async def handle_fallback_group_menu_callback(query, _context: ContextTypes.DEFA
         try:
             await query.edit_message_text(
                 text="🔄 <b>Fallback Group</b>\n\n"
-                     "❌ Could not load groups from panel.\n"
-                     "Please check your panel connection.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Retry", callback_data=CallbackData.FALLBACK_GROUP_MENU)],
-                    [InlineKeyboardButton("« Back", callback_data=CallbackData.DISABLE_METHOD_MENU)]
-                ]),
-                parse_mode="HTML"
+                "❌ Could not load groups from panel.\n"
+                "Please check your panel connection.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("🔄 Retry", callback_data=CallbackData.FALLBACK_GROUP_MENU)],
+                        [InlineKeyboardButton("« Back", callback_data=CallbackData.DISABLE_METHOD_MENU)],
+                    ]
+                ),
+                parse_mode="HTML",
             )
         except BadRequest as e:
             if "message is not modified" not in str(e).lower():
@@ -207,13 +204,13 @@ async def handle_fallback_group_menu_callback(query, _context: ContextTypes.DEFA
     try:
         await query.edit_message_text(
             text="🔄 <b>Fallback Group</b>\n\n"
-                 f"Current: <b>{current_name}</b>\n\n"
-                 "Select the group that will be assigned to users when:\n"
-                 "• Their original groups cannot be found when re-enabling\n"
-                 "• All active users should have this group\n\n"
-                 "<i>This ensures all enabled users have at least one valid group.</i>",
+            f"Current: <b>{escape(str(current_name))}</b>\n\n"
+            "Select the group that will be assigned to users when:\n"
+            "• Their original groups cannot be found when re-enabling\n"
+            "• All active users should have this group\n\n"
+            "<i>This ensures all enabled users have at least one valid group.</i>",
             reply_markup=keyboard,
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     except BadRequest as e:
         if "message is not modified" not in str(e).lower():
@@ -242,21 +239,21 @@ async def handle_select_fallback_group_callback(query, _context: ContextTypes.DE
 
         await query.edit_message_text(
             text="🚫 <b>Disable Method</b>\n\n"
-                 f"✅ Fallback group set to <b>{group_name}</b> (ID: {group_id})\n\n"
-                 "• <b>By Status</b>: Set user status to 'disabled'\n"
-                 "• <b>By Group</b>: Move user to a disabled group\n"
-                 "• <b>Fallback Group</b>: Default group for re-enabled users",
+            f"✅ Fallback group set to <b>{escape(str(group_name))}</b> (ID: {group_id})\n\n"
+            "• <b>By Status</b>: Set user status to 'disabled'\n"
+            "• <b>By Group</b>: Move user to a disabled group\n"
+            "• <b>Fallback Group</b>: Default group for re-enabled users",
             reply_markup=create_disable_method_keyboard(current_method, disabled_group_name, group_name),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
     except Exception as e:
         await query.edit_message_text(
-            text=f"❌ Error: {str(e)}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("« Back", callback_data=CallbackData.FALLBACK_GROUP_MENU)]
-            ]),
-            parse_mode="HTML"
+            text=f"❌ Error: {escape(str(e))}",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« Back", callback_data=CallbackData.FALLBACK_GROUP_MENU)]]
+            ),
+            parse_mode="HTML",
         )
 
 
@@ -279,19 +276,19 @@ async def handle_clear_fallback_group_callback(query, _context: ContextTypes.DEF
 
         await query.edit_message_text(
             text="🚫 <b>Disable Method</b>\n\n"
-                 "✅ Fallback group has been cleared.\n\n"
-                 "• <b>By Status</b>: Set user status to 'disabled'\n"
-                 "• <b>By Group</b>: Move user to a disabled group\n"
-                 "• <b>Fallback Group</b>: Default group for re-enabled users",
+            "✅ Fallback group has been cleared.\n\n"
+            "• <b>By Status</b>: Set user status to 'disabled'\n"
+            "• <b>By Group</b>: Move user to a disabled group\n"
+            "• <b>Fallback Group</b>: Default group for re-enabled users",
             reply_markup=create_disable_method_keyboard(current_method, disabled_group_name, None),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
     except Exception as e:
         await query.edit_message_text(
-            text=f"❌ Error: {str(e)}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("« Back", callback_data=CallbackData.FALLBACK_GROUP_MENU)]
-            ]),
-            parse_mode="HTML"
+            text=f"❌ Error: {escape(str(e))}",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« Back", callback_data=CallbackData.FALLBACK_GROUP_MENU)]]
+            ),
+            parse_mode="HTML",
         )

@@ -119,7 +119,13 @@ async def test_cancel_button_clears_freshness_waiting_state(monkeypatch):
     await settings.handle_ip_source_menu_callback(query, context)
     assert not context.user_data.get("waiting_for")
     keyboard = query.edit_message_text.call_args.kwargs["reply_markup"]
-    assert any(button.text == "🕒 Last seen: 10s" for row in keyboard.inline_keyboard for button in row)
+    freshness_button = next(
+        button
+        for row in keyboard.inline_keyboard
+        for button in row
+        if button.callback_data == "ip_source_set_freshness"
+    )
+    assert "10s" in freshness_button.text
 
 
 @pytest.mark.parametrize("target", ["api", "logs"])

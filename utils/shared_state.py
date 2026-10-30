@@ -5,11 +5,13 @@ Decouples state ownership to eliminate circular dependencies between check_usage
 
 import asyncio
 import copy
+import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from utils.types import UserType
 from utils.log_observations import LOG_OBSERVATIONS, LogSampleEvidence
+from utils.api_observations import APIObservationWindow, APIUserContext
 
 # Global state of currently active connected users
 ACTIVE_USERS: dict[str, UserType] = {}
@@ -20,13 +22,22 @@ ACTIVE_USERS_LOCK = asyncio.Lock()
 
 @dataclass(frozen=True)
 class APISampleEvidence:
-    """The settings and unknown users belonging to one completed API collection."""
+    """Settings, per-request timing and user scopes of one API collection."""
 
     generation: int
     config_revision: int
     freshness_seconds: int
     unknown_users: frozenset[str] = frozenset()
     eligible_node_ids: frozenset[int] | None = None
+    # During fleet outages, absence from the online list cannot clear a warning.
+    # Successfully evaluated users (including valid empty maps) remain actionable.
+    known_users: frozenset[str] | None = None
+    observation_windows: dict[str, APIObservationWindow] = field(default_factory=dict)
+    user_contexts: dict[str, APIUserContext] = field(default_factory=dict)
+    live_node_ids: frozenset[int] = frozenset()
+    # Positive observations may prove a violation; missing nodes cannot prove
+    # normalization, even for a user with some valid observations.
+    partial_users: frozenset[str] = frozenset()
 
 
 class ActiveUsersSnapshot(dict[str, UserType]):
@@ -68,14 +79,21 @@ def api_evidence_is_current(evidence: APISampleEvidence) -> bool:
     return evidence.generation == _api_generation and evidence.config_revision == get_config_revision()
 
 
-def refresh_api_user(user: UserType, freshness_seconds: int) -> bool:
-    """Evaluate source timestamps locally, including after asynchronous preparation."""
-    evaluated_at = time.time()
+def refresh_api_user(user: UserType, freshness_seconds: int, *, evidence: APISampleEvidence | None = None) -> bool:
+    """Recount the same request-owned observation throughout its one API cycle."""
+    window = evidence.observation_windows.get(user.name) if evidence else None
+    if evidence is not None and (window is None or not window.clock_is_current()):
+        return False
+    evaluated_at = window.started_at if window else time.time()
+    latest_at = window.received_at if window else evaluated_at
+    live_nodes = evidence.live_node_ids if evidence else frozenset()
     connections = user.device_info.connections
-    if any(connection.last_seen > evaluated_at for connection in connections):
+    if any(connection.last_seen > latest_at for connection in connections):
         return False
     connections = [
-        connection for connection in connections if 0 <= evaluated_at - connection.last_seen < freshness_seconds
+        connection
+        for connection in connections
+        if connection.node_id in live_nodes or max(0, evaluated_at - connection.last_seen) < freshness_seconds
     ]
     user.device_info.connections = connections
     user.ip = sorted({connection.ip for connection in connections})
@@ -83,6 +101,51 @@ def refresh_api_user(user: UserType, freshness_seconds: int) -> bool:
     user.device_info.unique_nodes = {connection.node_id for connection in connections}
     user.device_info.inbound_protocols = {connection.inbound_protocol for connection in connections}
     user.device_info.is_multi_device = len(user.ip) > 1
+    return True
+
+
+def refresh_log_user(user: UserType, evidence: LogSampleEvidence | None) -> bool:
+    """Recount original-time observations using a current, frozen Logs scope.
+
+    Valid expired observations are known empty evidence. A retired witness or
+    an invalid/future source timestamp cannot authorize a warning or clearing.
+    """
+    if not LOG_OBSERVATIONS.is_current(evidence, allow_partial=True):
+        return False
+    evaluated_at = time.time()
+    if evaluated_at < evidence.interval_end:
+        return False
+    eligible = evidence.eligible_node_ids or frozenset()
+    versions = dict(evidence.node_versions)
+    connections = [
+        connection
+        for connection in user.device_info.connections
+        if type(connection.node_id) is int
+        and connection.node_id in eligible
+        and LOG_OBSERVATIONS.monitors(connection.node_id)
+        and LOG_OBSERVATIONS.node_epoch(connection.node_id) == versions.get(connection.node_id)
+    ]
+    if any(
+        not isinstance(connection.last_seen, (int, float))
+        or not math.isfinite(connection.last_seen)
+        or connection.last_seen > evaluated_at
+        for connection in connections
+    ):
+        return False
+    connections = [
+        connection
+        for connection in connections
+        if connection.last_seen <= evidence.interval_end
+        and 0 <= evaluated_at - connection.last_seen < evidence.freshness_seconds
+    ]
+    user.device_info.connections = connections
+    user.ip = sorted({connection.ip for connection in connections})
+    user.device_info.unique_ips = set(user.ip)
+    user.device_info.unique_nodes = {connection.node_id for connection in connections}
+    user.device_info.inbound_protocols = {connection.inbound_protocol for connection in connections}
+    user.device_info.is_multi_device = (
+        len(user.ip) > 2 or len(user.device_info.unique_nodes) > 1 or len(user.device_info.inbound_protocols) > 1
+    )
     return True
 
 
@@ -155,22 +218,24 @@ def note_node_event(node_id: int | None, when: float | None = None) -> None:
     if previous is None or now - previous > node_silence_window(LOG_OBSERVATIONS.interval) or now < previous:
         # Detect the gap on receipt too: no enforcement/status poll need have
         # observed the stale heartbeat before it was replaced by this one.
-        LOG_OBSERVATIONS.note_transport_gap(now)
+        LOG_OBSERVATIONS.note_transport_gap(now, node_id=node_id)
     NODE_LAST_EVENT[node_id] = now
 
 
 def forget_node_event(node_id: int | None) -> None:
     """Drop a node's heartbeat when its task is cancelled or the node disappears."""
-    if node_id is None:
+    if type(node_id) is not int:
         return
     if NODE_LAST_EVENT.pop(node_id, None) is not None and LOG_OBSERVATIONS.monitors(node_id):
-        LOG_OBSERVATIONS.note_transport_gap(time.time())
+        LOG_OBSERVATIONS.note_transport_gap(time.time(), node_id=node_id)
 
 
 def clear_node_events() -> None:
     """Forget every heartbeat, for the periodic full rebuild of the node tasks."""
-    if any(LOG_OBSERVATIONS.monitors(node_id) for node_id in NODE_LAST_EVENT):
-        LOG_OBSERVATIONS.note_transport_gap(time.time())
+    now = time.time()
+    for node_id in NODE_LAST_EVENT:
+        if LOG_OBSERVATIONS.monitors(node_id):
+            LOG_OBSERVATIONS.note_transport_gap(now, node_id=node_id)
     NODE_LAST_EVENT.clear()
 
 
@@ -233,16 +298,19 @@ async def get_active_users_snapshot() -> dict[str, UserType]:
             if not api_evidence_is_current(_api_snapshot.api_evidence):
                 return ActiveUsersSnapshot()
             return _clone_user_map(_api_snapshot)
+        now = time.time()
+        _validate_live_log_times(now)
         snapshot = _clone_user_map(ACTIVE_USERS)
-        snapshot.log_evidence = LOG_OBSERVATIONS.evidence()
+        snapshot.log_evidence = LOG_OBSERVATIONS.evidence(end=now)
+        retain_log_interval(snapshot, snapshot.log_evidence.interval_start, snapshot.log_evidence.interval_end)
         return snapshot
 
 
 async def pop_active_users_snapshot(config_data: dict | None = None) -> ActiveUsersSnapshot:
     """
-    Atomically take an isolated point-in-time snapshot of ACTIVE_USERS and clear the collection.
-    Guarantees that new connections arriving during cycle analysis are preserved for the next cycle
-    and never orphaned or dropped by a delayed clear.
+    Atomically take an isolated snapshot while retaining fresh Logs observations.
+    Original source times bound the rolling store, including when Last seen is
+    longer than the scan interval. Concurrent ingestion never aliases the snapshot.
     """
     global _api_snapshot
     from utils.read_config import get_config_revision
@@ -256,21 +324,24 @@ async def pop_active_users_snapshot(config_data: dict | None = None) -> ActiveUs
             return ActiveUsersSnapshot()
         if config_data is not None and LOG_OBSERVATIONS.configure(config_data):
             ACTIVE_USERS.clear()
+        now = time.time()
+        _validate_live_log_times(now)
+        evidence = LOG_OBSERVATIONS.evidence(end=now)
+        # Prune the live store without the snapshot's ready-node filter. Records
+        # from monitored nodes still warming up must remain available to later scans.
+        retain_log_interval(ACTIVE_USERS, max(LOG_OBSERVATIONS.floor, evidence.interval_start), evidence.interval_end)
         snapshot = _clone_user_map(ACTIVE_USERS)
-        snapshot.log_evidence = LOG_OBSERVATIONS.evidence()
+        snapshot.log_evidence = evidence
         retain_log_interval(snapshot, snapshot.log_evidence.interval_start, snapshot.log_evidence.interval_end)
-        ACTIVE_USERS.clear()
         return snapshot
 
 
 async def merge_active_users_snapshot(batch: dict[str, UserType]) -> int:
     """Requeue a consumed batch when the cycle failed before it could be evaluated.
 
-    A ``pop_active_users_snapshot()`` clears ACTIVE_USERS, so a failure later in the
-    cycle would lose the batch: the next cycle would see those still-connected users as
-    absent and clear their warnings. This restores each user from the batch, but merges
-    by connection identity - a newer event that arrived during the cycle is kept, never
-    overwritten by the stale sample.
+    Rolling Logs observations normally remain in ACTIVE_USERS. Preserve the
+    restoration contract for callers holding an unevaluated batch, without
+    overwriting newer observations or crossing source generations.
 
     Returns the number of users actually restored (those without a newer observation).
     """
@@ -286,7 +357,9 @@ async def merge_active_users_snapshot(batch: dict[str, UserType]) -> int:
             getattr(batch, "log_evidence", None)
         ):
             return 0
-        retain_log_interval(batch, max(LOG_OBSERVATIONS.floor, time.time() - LOG_OBSERVATIONS.interval), time.time())
+        retain_log_interval(
+            batch, max(LOG_OBSERVATIONS.floor, time.time() - LOG_OBSERVATIONS.freshness_seconds), time.time()
+        )
         for email, user in batch.items():
             if not email or not user:
                 continue
@@ -298,13 +371,27 @@ async def merge_active_users_snapshot(batch: dict[str, UserType]) -> int:
     return restored
 
 
+def _validate_live_log_times(now: float) -> None:
+    """Retire invalid monitored-node evidence before snapshot pruning removes it."""
+    for user in ACTIVE_USERS.values():
+        for connection in user.device_info.connections:
+            if LOG_OBSERVATIONS.monitors(connection.node_id):
+                LOG_OBSERVATIONS.validate_source_time(connection.node_id, connection.last_seen, now=now)
+
+
 def retain_log_interval(users: dict[str, UserType], start: float, end: float) -> None:
-    """Retain original-time observations only from the current monitoring scope."""
+    """Retain original-time observations from a snapshot's frozen ready scope."""
+    evidence = getattr(users, "log_evidence", None)
+    eligible = evidence.eligible_node_ids if evidence is not None else None
     for name, user in list(users.items()):
         connections = [
             c
             for c in user.device_info.connections
-            if start < c.last_seen <= end and LOG_OBSERVATIONS.monitors(c.node_id)
+            if type(c.last_seen) in (int, float)
+            and math.isfinite(c.last_seen)
+            and start < c.last_seen <= end
+            and LOG_OBSERVATIONS.monitors(c.node_id)
+            and (evidence is None or (type(c.node_id) is int and eligible is not None and c.node_id in eligible))
         ]
         user.device_info.connections = connections
         user.ip = sorted({c.ip for c in connections})

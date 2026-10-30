@@ -30,7 +30,6 @@ async def test_api_source_switch_retires_observed_samples(monkeypatch, mode, ope
     monkeypatch.setattr(parser, "_PARSER_CONFIG_CACHE_TIME", time.time())
     monkeypatch.setattr(parser, "_PARSER_CONFIG_REVISION", configuration.get_config_revision())
     monkeypatch.setattr(collector, "_IP_SOURCE_RECHECK_SECONDS", 0)
-    monkeypatch.setattr(collector, "get_token", AsyncMock(return_value=SimpleNamespace(panel_token="test-token")))
     monkeypatch.setattr(collector, "_update_node_status", AsyncMock())
     monkeypatch.setattr(parser, "CURRENT_NODE_INFO", {"node_id": None, "node_name": None})
     saved_heartbeats = dict(NODE_LAST_EVENT)
@@ -89,7 +88,8 @@ async def test_api_source_switch_retires_observed_samples(monkeypatch, mode, ope
     try:
         with pytest.raises(asyncio.CancelledError):
             await collector.get_nodes_logs(
-                PanelType("admin", "secret", "panel.local"), NodeType(7, "node-7", "1.2.3.4", "connected")
+                PanelType(panel_domain="panel.local", panel_api_key="pg_key_test"),
+                NodeType(7, "node-7", "1.2.3.4", "connected"),
             )
         assert state == {"opened": 1, "closed": True, "parked": True}
         assert len(observed_generation) == 1

@@ -8,10 +8,10 @@ router's ``_lazy("telegram_bot.handlers.settings", "X")`` lookups keep working
 unchanged.
 
     settings_common.py        root menu + shared keyboard
-    settings_panel.py         panel domain / username / password
+    settings_panel.py         ENV-only panel setup guidance
     settings_display.py       country filter, ipinfo token, report detail
     settings_groups.py        disabled group, fallback group
-    settings_sync.py          user sync interval, pending deletions
+    settings_sync.py          automatic panel mirror and sync interval
     settings_subnet.py        subnet grouping, high trust grouping
     settings_trust.py         trust data reset
     settings_cdn.py           CDN inbounds
@@ -26,9 +26,6 @@ from telegram_bot.handlers.settings_common import (
 )
 from telegram_bot.handlers.settings_panel import (
     set_panel_domain,
-    get_domain,
-    get_username,
-    get_password,
 )
 from telegram_bot.handlers.settings_display import (
     create_enhanced_details_keyboard,

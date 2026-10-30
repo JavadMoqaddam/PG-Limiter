@@ -21,7 +21,7 @@ from utils.shared_state import (
 )
 from utils.types import ConnectionInfo, NodeType, PanelType, UserType
 
-PANEL = PanelType("admin", "secret", "panel.local")
+PANEL = PanelType(panel_domain="panel.local", panel_api_key="pg_key_test")
 
 
 @pytest.fixture
@@ -38,6 +38,8 @@ async def node_cycle(enforcement_cycle, completed_logs_evidence):
         LOG_OBSERVATIONS.zones[str(node_id)] = LOG_OBSERVATIONS._zone("UTC")
         note_node_event(node_id)
     LOG_OBSERVATIONS.fleet_floor = LOG_OBSERVATIONS.floor
+    for node_id in LOG_OBSERVATIONS.required_nodes:
+        LOG_OBSERVATIONS.node_states[node_id].floor = LOG_OBSERVATIONS.floor
     LOG_OBSERVATIONS.transport_floor = LOG_OBSERVATIONS.floor
     return system, get_db, messages, config
 
@@ -55,7 +57,17 @@ async def publish_user(config, user, source, *, eligible=frozenset({0, 2}), unkn
         assert await save_config_value("ip_source", "api")
         await read_config()
         config.update(ip_source="api", _revision=get_config_revision())
-        evidence = APISampleEvidence(begin_api_collection(), get_config_revision(), 60, unknown, eligible)
+        from utils.api_observations import APIObservationWindow, monotonic_time
+
+        now, mono = time.time(), monotonic_time()
+        evidence = APISampleEvidence(
+            begin_api_collection(),
+            get_config_revision(),
+            60,
+            unknown,
+            eligible,
+            observation_windows={user.name: APIObservationWindow(now, now, mono, mono)},
+        )
         assert await publish_api_snapshot({"alice": user}, evidence)
     else:
         ACTIVE_USERS["alice"] = user

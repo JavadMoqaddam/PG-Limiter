@@ -29,8 +29,16 @@ COPY --from=builder /install /usr/local
 
 WORKDIR /app
 
-# Copy application code
-COPY . .
+# Copy only runtime source; local state and investigation files are not inputs.
+COPY requirements.txt alembic.ini limiter.py api_server.py cli_main.py run_telegram.py start.sh cli_wrapper.sh ./
+COPY utils/ ./utils/
+COPY db/ ./db/
+COPY telegram_bot/ ./telegram_bot/
+COPY cli/ ./cli/
+COPY api/ ./api/
+COPY tools/ ./tools/
+# Distribute the license and attribution with the runtime image.
+COPY LICENSE README.md ./
 
 # Create data directory for persistent storage
 RUN mkdir -p /var/lib/pg-limiter/data /var/lib/pg-limiter/logs

@@ -1,13 +1,26 @@
 """Snapshots of ACTIVE_USERS must be deep so a report reading one is not mutated by
 ongoing ingestion into the live map."""
 
+import time
+
 import utils.shared_state as shared_state
-from utils.types import DeviceInfo, UserType
+from utils.log_observations import LOG_OBSERVATIONS
+from utils.types import ConnectionInfo, DeviceInfo, NodeType, UserType
 
 
-async def test_snapshot_deep_clones_nested_state():
+async def test_snapshot_deep_clones_nested_state(monkeypatch, operational_topics):
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    LOG_OBSERVATIONS.configure({"log_timezone": "UTC", "check_interval": 60, "api_ip_freshness": 60})
+    LOG_OBSERVATIONS.register_fleet([NodeType(1, "node", "192.0.2.1", "connected")])
+    shared_state.note_node_event(1)
+    clock[0] += 60
     shared_state.ACTIVE_USERS.clear()
-    device_info = DeviceInfo(unique_ips={"1.1.1.1"}, is_multi_device=False)
+    device_info = DeviceInfo(
+        connections=[ConnectionInfo("1.1.1.1", 1, "node", "Vless", 1059.0)],
+        unique_ips={"1.1.1.1"},
+        is_multi_device=False,
+    )
     shared_state.ACTIVE_USERS["u"] = UserType(
         name="u",
         ip=["1.1.1.1"],

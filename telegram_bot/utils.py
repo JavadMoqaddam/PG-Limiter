@@ -8,7 +8,6 @@ import json
 import os
 import sys
 
-from utils.types import PanelType
 from utils.atomic_io import atomic_write_json
 from utils.logs import get_logger
 from utils import settings_service
@@ -22,13 +21,6 @@ except ImportError:
     sys.exit()
 
 _config_write_lock = asyncio.Lock()
-
-
-async def get_token(panel_data: PanelType) -> PanelType:
-    """Canonical token fetcher delegating to panel_api.auth module."""
-    from utils.panel_api.auth import get_token as auth_get_token
-
-    return await auth_get_token(panel_data)
 
 
 async def send_response(update, text: str, reply_markup=None, parse_mode: str = "HTML"):
@@ -291,31 +283,6 @@ async def remove_admin_from_config(admin_id: int) -> bool:
         await write_json_file(data)
         return True
     return False
-
-
-async def add_base_information(domain: str, password: str, username: str):
-    """
-    Adds base information including domain, password, and username.
-
-    Args:
-        domain (str): The domain for the panel.
-        password (str): The password for the panel.
-        username (str): The username for the panel.
-
-    Returns:
-        None
-    """
-    await get_token(PanelType(panel_domain=domain, panel_password=password, panel_username=username))
-    if os.path.exists("config.json"):
-        data = await read_json_file()
-    else:
-        data = {}
-    if "panel" not in data:
-        data["panel"] = {}
-    data["panel"]["domain"] = domain
-    data["panel"]["username"] = username
-    data["panel"]["password"] = password
-    await write_json_file(data)
 
 
 async def get_special_limits_dict() -> dict:

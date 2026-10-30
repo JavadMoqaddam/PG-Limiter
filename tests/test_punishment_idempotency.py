@@ -19,7 +19,7 @@ _CONFIG = {"punishment": {"enabled": True, "steps": [{"type": "disable", "durati
 
 
 def _panel():
-    return PanelType(panel_username="u", panel_password="p", panel_domain="d")
+    return PanelType(panel_domain="d", panel_api_key="pg_key_test")
 
 
 async def test_db_failure_reconciles_without_reapplying(tmp_path, monkeypatch):

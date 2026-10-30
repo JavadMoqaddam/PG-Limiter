@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from utils.device_count import COUNT_MODE_INBOUND
 from utils.parse_logs import INVALID_IPS
 from utils.log_observations import LOG_OBSERVATIONS
+from utils import node_health_notifications
 from utils.monitoring_gate import (
     MonitoringAdmission,
     monitoring_is_current,
@@ -27,7 +28,7 @@ except ImportError as exc:
     raise ImportError("Module 'httpx' is not installed. Use: 'pip install httpx'") from exc
 from telegram_bot.send_message import send_logs, edit_message
 from utils.logs import logger  # pylint: disable=ungrouped-imports
-from utils.panel_api import get_nodes, get_token
+from utils.panel_api import get_nodes, get_panel_headers
 from utils.parse_logs import clear_node_active_connections, parse_logs, set_current_node_info
 from utils.shared_state import (
     clear_node_events,
@@ -79,8 +80,14 @@ async def _build_node_status_message() -> str:
 
     lines.append(f"\n📊 Connected: {connected} | Connecting: {connecting} | Failed: {failed}")
 
-    reason = LOG_OBSERVATIONS.unavailable_reason()
+    evidence = LOG_OBSERVATIONS.evidence()
+    reason = evidence.unavailable_reason
     lines.append("\nLogs evidence: " + (html.escape(reason) if reason else "ready"))
+    if evidence.required_node_ids is not None and evidence.eligible_node_ids is not None:
+        coverage = "complete" if evidence.coverage_complete else "partial"
+        lines.append(
+            f"Ready nodes: {len(evidence.eligible_node_ids)}/{len(evidence.required_node_ids)} | Coverage: {coverage}"
+        )
     return "\n".join(lines)
 
 
@@ -155,6 +162,28 @@ _status_lock = asyncio.Lock()
 _status_initializing: bool = False
 
 
+async def _report_node_health(admission, *, nodes=None, observed_node_ids=None) -> None:
+    """Keep diagnostic admission failures outside transport error handling."""
+    try:
+        await node_health_notifications.report_node_health(admission, nodes=nodes, observed_node_ids=observed_node_ids)
+    except Exception:
+        logger.warning("Could not evaluate node health for General; transport monitoring continues")
+
+
+async def _report_polled_node_health(nodes, admission) -> None:
+    """Do not label a node's first pending connection as a transport incident."""
+    observed = {
+        node.node_id
+        for node in nodes or ()
+        if node.status != "connected"
+        or (
+            node.node_id in _node_connection_status
+            and _node_connection_status[node.node_id]["status"] != "⏳ Connecting..."
+        )
+    }
+    await _report_node_health(admission, nodes=nodes, observed_node_ids=observed)
+
+
 async def _update_node_status(
     node_id: int, node_name: str, status: str, admission: MonitoringAdmission | None = None
 ) -> None:
@@ -172,6 +201,12 @@ async def _update_node_status(
     if not monitoring_is_current(admission):
         return
     _node_connection_status[node_id] = {"name": node_name, "status": status}
+    if "❌" in status or "⚫" in status:
+        await _report_node_health(
+            admission,
+            nodes=[NodeType(node_id, node_name, "", "connected")],
+            observed_node_ids={node_id},
+        )
 
     # Throttle edits: sync with check_interval (default 60s)
     now = time.time()
@@ -245,6 +280,13 @@ async def init_node_status_message(nodes: list, admission: MonitoringAdmission |
     if not monitoring_is_current(admission):
         return
     LOG_OBSERVATIONS.register_fleet(nodes)
+    await _report_node_health(
+        admission,
+        nodes=nodes,
+        observed_node_ids={node.node_id for node in nodes if node.status != "connected"},
+    )
+    if not monitoring_is_current(admission):
+        return
     _node_connection_status = {}
     _node_status_message_id = None
 
@@ -266,8 +308,10 @@ async def init_node_status_message(nodes: list, admission: MonitoringAdmission |
 
 
 @asynccontextmanager
-async def _track_log_transport(node_id: int):
+async def _track_log_transport(node_id: int, admission: MonitoringAdmission | None = None):
     """A new stream and its closure delimit complete transport observation."""
+    if admission is None:
+        admission = monitoring_snapshot()
     forget_node_event(node_id)
     try:
         yield
@@ -275,6 +319,7 @@ async def _track_log_transport(node_id: int):
         # Runs on EOF, parser/HTTP failures and task cancellation before retries
         # or periodic rebuilding can make the old heartbeat look healthy.
         forget_node_event(node_id)
+        await _report_node_health(admission, observed_node_ids={node_id})
 
 
 async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: MonitoringAdmission | None = None) -> None:
@@ -287,8 +332,6 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
         node (NodeType): The specific node to connect to.
         admission: Original owner's Topics admission, when scheduled by a node poll.
 
-    Raises:
-        ValueError: If there is an issue with getting the panel token.
     """
     from utils.panel_api.request_helper import wait_for_panel, is_panel_available
     from utils.read_config import get_config_revision
@@ -351,20 +394,6 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
         if not monitoring_is_current(admission):
             return
 
-        # get_token raises on failure. This call sat outside the try below, so a panel
-        # that refused to authenticate killed this node's task - and with it, being a
-        # TaskGroup child, the whole process. Retry in place instead: the loop already
-        # handles panel unavailability a few lines up.
-        try:
-            get_panel_token = await get_token(panel_data)
-        except Exception as token_error:  # pylint: disable=broad-except
-            logger.error(f"Could not obtain a panel token for node {node.node_id}: {token_error}. Retrying in 30s.")
-            await asyncio.sleep(30)
-            continue
-        token = get_panel_token.panel_token
-        if not monitoring_is_current(admission):
-            return
-
         # Determine the scheme based on the domain
         scheme = "http" if panel_data.panel_domain.startswith("http://") else "https"
         base_url = panel_data.panel_domain.replace("https://", "").replace("http://", "")
@@ -372,7 +401,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
         try:
             url = f"{scheme}://{base_url}/api/node/{node.node_id}/logs"
             headers = {
-                "Authorization": f"Bearer {token}",
+                **get_panel_headers(panel_data),
                 "Accept": "text/event-stream",
                 "Cache-Control": "no-cache",
             }
@@ -392,11 +421,14 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
             # Match the API client instead of hardcoding False, so PANEL_VERIFY_SSL
             # covers the log streams too. Same host as the API calls, so a setting that
             # works there works here; the default stays off.
-            verify_ssl = os.getenv("PANEL_VERIFY_SSL", "false").lower() in ("true", "1", "yes")
+            verify_ssl = os.getenv("PANEL_VERIFY_SSL", "true").strip().lower() not in ("false", "0", "no", "off")
             async with httpx.AsyncClient(verify=verify_ssl, timeout=sse_timeout) as client:
                 logger.info(f"Establishing SSE connection for node {node.node_id}: {node.node_name}")
 
-                async with client.stream("GET", url, headers=headers) as response, _track_log_transport(node.node_id):
+                async with (
+                    client.stream("GET", url, headers=headers) as response,
+                    _track_log_transport(node.node_id, admission),
+                ):
                     if response.status_code != 200:
                         raise httpx.HTTPStatusError(
                             f"HTTP {response.status_code}", request=response.request, response=response
@@ -416,6 +448,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
                     # warmup. HTTP 200 cannot certify the missing preceding logs.
                     # Every line below refreshes liveness independently of parsing.
                     note_node_event(node.node_id)
+                    await _report_node_health(admission, nodes=[node], observed_node_ids={node.node_id})
 
                     # Keep unconsumed observations across reconnects. Replayed
                     # records are rejected and could not replace a cleared sample.
@@ -427,6 +460,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
                         # Honour a runtime switch to API mode: the stream is
                         # abandoned so the outer loop can park the task.
                         now = time.time()
+                        received_monotonic = time.monotonic()
                         # Any line at all counts, including the keep-alives that
                         # carry no "data:" payload: this answers "is the stream
                         # alive", not "did a user connect". Counting only parsed
@@ -466,12 +500,30 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
                         if line.startswith("data: "):
                             log_data = line[6:]  # Remove "data: " prefix
                             if log_data.strip():  # Only process non-empty log data
-                                await parse_logs(log_data, node.node_id, node.node_name)
+                                await parse_logs(
+                                    log_data,
+                                    node.node_id,
+                                    node.node_name,
+                                    received_wall=now,
+                                    received_monotonic=received_monotonic,
+                                )
+                    else:
+                        # HTTP 200 followed by EOF is still a closed transport.
+                        # Use the retry path instead of immediately reopening it;
+                        # explicit breaks and retired monitoring remain intentional.
+                        if not await _ip_source_is_api():
+                            if monitoring_is_current(admission) and LOG_OBSERVATIONS.monitors(node.node_id):
+                                raise httpx.ReadError("SSE stream ended")
 
         except httpx.HTTPStatusError as error:
+            status = error.response.status_code
+            if status in (401, 403):
+                await _update_node_status(node.node_id, node.node_name, "❌ Authentication Error", admission)
+                logger.error(f"Panel API key rejected for node {node.node_id}: HTTP {status}")
+                return
             consecutive_failures += 1
             await _update_node_status(node.node_id, node.node_name, "❌ HTTP Error", admission)
-            logger.error(f"HTTP error connecting to node {node.node_id}: {error}")
+            logger.error(f"HTTP error connecting to node {node.node_id}: HTTP {status}")
             retry_delay = min(60, 5 * (2 ** min(consecutive_failures - 1, 4)))
             await asyncio.sleep(retry_delay)
             await _update_node_status(node.node_id, node.node_name, "⏳ Reconnecting...", admission)
@@ -480,7 +532,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
         except httpx.ConnectError as error:
             consecutive_failures += 1
             await _update_node_status(node.node_id, node.node_name, "❌ Connection Error", admission)
-            logger.error(f"Connection error for node {node.node_id}: {error}")
+            logger.error(f"Connection error for node {node.node_id}: {type(error).__name__}")
             # Shorter sleep if panel might be restarting
             retry_delay = (
                 min(30, 3 * (2 ** min(consecutive_failures - 1, 3)))
@@ -494,7 +546,7 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
         except Exception as error:  # pylint: disable=broad-except
             consecutive_failures += 1
             await _update_node_status(node.node_id, node.node_name, "❌ Failed", admission)
-            logger.error(f"Failed to connect to node {node.node_id}: {error}")
+            logger.error(f"Failed to connect to node {node.node_id}: {type(error).__name__}")
             retry_delay = min(60, 5 * (2 ** min(consecutive_failures - 1, 4)))
             await asyncio.sleep(retry_delay)
             await _update_node_status(node.node_id, node.node_name, "⏳ Reconnecting...", admission)
@@ -568,6 +620,7 @@ async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
             if not monitoring_is_current(admission):
                 continue
             LOG_OBSERVATIONS.register_fleet(nodes_list)
+            await _report_polled_node_health(nodes_list, admission)
         except Exception as error:  # pylint: disable=broad-except
             LOG_OBSERVATIONS.register_fleet(None)
             logger.warning(
@@ -680,52 +733,49 @@ async def handle_cancel_all(tasks: list[Task], panel_data: PanelType, tg: asynci
         if not monitoring_is_current(admission):
             continue
 
-        # Cancel all existing node tasks
-        for task in list(tasks):
-            if task.get_name().startswith("Task-"):
-                task.cancel()
-                tasks.remove(task)
-                if task in task_node_mapping:
-                    task_node_mapping.pop(task)
-                task_monitoring_admissions.pop(task, None)
+        # Planned maintenance already has its own General message. Its deliberate
+        # stream closures and ordinary fresh-interval warmup are not incidents.
+        with node_health_notifications.NODE_HEALTH_NOTIFICATIONS.planned_refresh(LOG_OBSERVATIONS.required_nodes or ()):
+            # Cancel all existing node tasks
+            for task in list(tasks):
+                if task.get_name().startswith("Task-"):
+                    task.cancel()
+                    tasks.remove(task)
+                    if task in task_node_mapping:
+                        task_node_mapping.pop(task)
+                    task_monitoring_admissions.pop(task, None)
 
-        # Reset status tracking
-        _node_status_message_id = None
-        _node_connection_status = {}
+            # Reset status tracking
+            _node_status_message_id = None
+            _node_connection_status = {}
 
-        # Every stream is about to be rebuilt, so the old heartbeats describe
-        # tasks that no longer exist. Leaving them would make the next cycle read
-        # the whole fleet as stale during the rebuild and skip enforcement.
-        clear_node_events()
-        LOG_OBSERVATIONS.register_fleet(None)
+            # The old heartbeats belong to transports that are being closed.
+            clear_node_events()
+            LOG_OBSERVATIONS.register_fleet(None)
 
-        # Small delay to let tasks clean up
-        await asyncio.sleep(2)
-        if not monitoring_is_current(admission):
-            continue
+            # Small delay to let tasks clean up
+            await asyncio.sleep(2)
+            if not monitoring_is_current(admission):
+                continue
 
-        # Fetch fresh node list. get_nodes raises on failure rather than returning a
-        # ValueError, so an unguarded call here could take the whole TaskGroup - and
-        # therefore the process - down while rebuilding the streams.
-        try:
-            nodes_list = await get_nodes(panel_data)
-        except Exception as error:  # pylint: disable=broad-except
-            logger.error(
-                f"Could not fetch the node list while rebuilding SSE streams: {error}. "
-                f"No streams were recreated on this pass."
-            )
-            nodes_list = None
-        if nodes_list and monitoring_is_current(admission):
-            # Initialize status message for all nodes
-            await init_node_status_message(nodes_list, admission)
+            # A failed fetch must not take the TaskGroup down during maintenance.
+            try:
+                nodes_list = await get_nodes(panel_data)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.error(
+                    f"Could not fetch the node list while rebuilding SSE streams: {error}. "
+                    f"No streams were recreated on this pass."
+                )
+                nodes_list = None
+            if nodes_list and monitoring_is_current(admission):
+                await init_node_status_message(nodes_list, admission)
 
-            # Create new tasks for all connected nodes
-            for node in nodes_list:
-                if not monitoring_is_current(admission):
-                    break
-                if node.status == "connected":
-                    await create_node_task(panel_data, tg, node, admission)
-                    await asyncio.sleep(1)  # Small delay between node connections
+                for node in nodes_list:
+                    if not monitoring_is_current(admission):
+                        break
+                    if node.status == "connected":
+                        await create_node_task(panel_data, tg, node, admission)
+                        await asyncio.sleep(1)
 
         logger.info(f"SSE connections restarted. Active tasks: {len(tasks)}")
 
@@ -767,6 +817,7 @@ async def check_and_add_new_nodes(panel_data: PanelType, tg: asyncio.TaskGroup) 
             if not monitoring_is_current(admission):
                 continue
             LOG_OBSERVATIONS.register_fleet(all_nodes)
+            await _report_polled_node_health(all_nodes, admission)
             if all_nodes and not isinstance(all_nodes, ValueError):
                 for node in all_nodes:
                     if not monitoring_is_current(admission):
