@@ -19,7 +19,6 @@ def create_main_menu_keyboard():
         ],
         [
             InlineKeyboardButton("👑 Admins", callback_data=CallbackData.ADMIN_MENU),
-            InlineKeyboardButton("💾 Backup", callback_data=CallbackData.BACKUP),
         ],
         [
             InlineKeyboardButton("📥 Restore", callback_data=CallbackData.RESTORE),
