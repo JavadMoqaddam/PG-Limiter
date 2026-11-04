@@ -80,7 +80,6 @@ from telegram_bot.handlers.reports import (
 )
 
 from telegram_bot.handlers.backup import (
-    send_backup,
     restore_config,
     restore_config_handler,
 )
@@ -200,8 +199,7 @@ __all__ = [
     "users_by_protocol_command",
     "ip_history_12h_command",
     "ip_history_48h_command",
-    # Backup handlers
-    "send_backup",
+    # Restore handlers
     "restore_config",
     "restore_config_handler",
     # Punishment handlers

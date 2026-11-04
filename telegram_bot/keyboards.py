@@ -19,10 +19,6 @@ def create_main_menu_keyboard():
         ],
         [
             InlineKeyboardButton("👑 Admins", callback_data=CallbackData.ADMIN_MENU),
-            InlineKeyboardButton("💾 Backup", callback_data=CallbackData.BACKUP),
-        ],
-        [
-            InlineKeyboardButton("📥 Restore", callback_data=CallbackData.RESTORE),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -57,7 +53,7 @@ def create_settings_menu_keyboard():
         ],
         [
             InlineKeyboardButton("🖥️ Node Settings", callback_data=CallbackData.NODE_SETTINGS_MENU),
-            InlineKeyboardButton("💾 Auto-Backup", callback_data=CallbackData.AUTO_BACKUP_MENU),
+            InlineKeyboardButton("💾 Backup & Restore", callback_data=CallbackData.AUTO_BACKUP_MENU),
         ],
         [
             InlineKeyboardButton("🛰️ IP Source", callback_data=CallbackData.IP_SOURCE_MENU),

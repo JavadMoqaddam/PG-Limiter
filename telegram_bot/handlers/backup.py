@@ -1,6 +1,6 @@
 """
-Backup and restore handlers for the Telegram bot.
-Includes functions for creating and restoring backups.
+Automatic backup and restore handlers for the Telegram bot.
+Includes scheduled/topic backups and offline restore preparation.
 """
 
 import asyncio
@@ -23,7 +23,7 @@ from utils.backup import create_backup, runtime_layout, stage_backup
 from utils.backup_paths import AUTO_BACKUP_CONFIG_FILE
 
 from telegram_bot.input_owner import reply_input_prompt
-from telegram_bot.constants import RESTORE_CONFIG
+from telegram_bot.constants import CallbackData, RESTORE_CONFIG
 from telegram_bot.handlers.admin import check_admin_privilege
 from utils.logs import get_logger
 
@@ -74,44 +74,6 @@ def _sync_create_backup_zip() -> tuple[str, str, str]:
         shutil.rmtree(temp_dir)
         raise
     return zip_path, zip_name, temp_dir
-
-
-async def send_backup(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    """Send a comprehensive backup zip file to the user."""
-    check = await check_admin_privilege(update)
-    if check is not None:
-        return check
-
-    temp_dir = None
-    try:
-        await update.message.reply_text("📦 Creating backup... Please wait.")
-
-        zip_path, zip_name, temp_dir = await asyncio.to_thread(_sync_create_backup_zip)
-
-        # Send the zip file
-        with open(zip_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=zip_name,
-                caption=(
-                    "✅ <b>Backup created successfully!</b>\n\n"
-                    "📁 This backup includes:\n"
-                    "• Configuration files\n"
-                    "• Database-consistent SQLite snapshot\n"
-                    "• Persisted JSON state, captured independently\n\n"
-                    "💡 /restore validates and stages this file for offline restoration."
-                ),
-                parse_mode="HTML",
-            )
-
-        # Cleanup
-        shutil.rmtree(temp_dir)
-
-    except Exception as e:
-        await update.message.reply_html(f"❌ <b>Error creating backup:</b>\n<code>{html.escape(str(e))}</code>")
-    finally:
-        if temp_dir is not None:
-            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 async def restore_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -632,7 +594,7 @@ def save_auto_backup_config(config: dict):
 
 
 def create_auto_backup_keyboard(config: dict) -> InlineKeyboardMarkup:
-    """Create the auto-backup settings menu keyboard."""
+    """Create the backup and restore menu, keeping restore available when scheduling is off."""
     enabled = config.get("enabled", True)
     interval = config.get("interval_hours", 1)
 
@@ -663,13 +625,14 @@ def create_auto_backup_keyboard(config: dict) -> InlineKeyboardMarkup:
         # Backup now button
         keyboard.append([InlineKeyboardButton("📦 Backup Now", callback_data="auto_backup_now")])
 
+    keyboard.append([InlineKeyboardButton("📥 Restore", callback_data=CallbackData.RESTORE)])
     keyboard.append([InlineKeyboardButton("« Back to Settings", callback_data="settings_menu")])
 
     return InlineKeyboardMarkup(keyboard)
 
 
 async def auto_backup_menu(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    """Show the auto-backup settings menu."""
+    """Show backup scheduling, immediate backup, and restore navigation."""
     check = await check_admin_privilege(update)
     if check is not None:
         return check
@@ -683,11 +646,11 @@ async def auto_backup_menu(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     status_text = "Enabled" if enabled else "Disabled"
 
     message = (
-        f"💾 <b>Auto-Backup Settings</b>\n\n"
-        f"Status: {status_icon} <code>{status_text}</code>\n"
+        "💾 <b>Backup &amp; Restore</b>\n\n"
+        f"Auto-Backup: {status_icon} <code>{status_text}</code>\n"
         f"Interval: <code>{interval} hour(s)</code>\n\n"
-        f"💡 <i>Automatic backups are sent to all admins\n"
-        f"containing config, database, and legacy files.</i>"
+        "💡 <i>Backups are sent to the configured backup topic, "
+        "with administrator delivery as a fallback.</i>"
     )
 
     if update.callback_query:
