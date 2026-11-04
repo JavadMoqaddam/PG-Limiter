@@ -143,7 +143,6 @@ from telegram_bot.handlers.reports import (
 )
 from telegram_bot.handlers.status_reports import health_report_command, status_command
 from telegram_bot.handlers.backup import (
-    send_backup,
     restore_config,
     restore_config_handler,
     migrate_backup_start,
@@ -313,9 +312,9 @@ MENU_TEXTS = {
     ),
     "restore": (
         "📥 <b>Restore from Backup</b>\n\n"
-        "Please send your backup file (zip or json format).\n\n"
-        "<b>⚠️ Warning:</b> This will replace your current data!\n\n"
-        "Use /restore command to upload your backup file."
+        "Use /restore to upload your backup file (zip or json format).\n\n"
+        "The bot validates and stages the file for offline restoration. "
+        "Apply it from the host using the command shown after validation."
     ),
     "create_config": ("⚙️ <b>Create Config</b>\n\nUse the command:\n<code>/create_config</code>"),
     "add_admin": (
@@ -412,20 +411,6 @@ async def _set_disable_by_status(update, query, context) -> None:
     )
 
 
-async def _send_backup_from_button(update, query, context) -> None:
-    """Backup expects an Update-like object carrying the message."""
-
-    class _FakeUpdate:
-        def __init__(self, message, effective_user, effective_chat):
-            self.message = message
-            self.effective_user = effective_user
-            self.effective_chat = effective_chat
-
-    fake_update = _FakeUpdate(query.message, update.effective_user, update.effective_chat)
-    await query.message.reply_text("📦 Creating backup... Please wait.")
-    await send_backup(fake_update, context)
-
-
 async def _cdn_mode_add(update, query, context) -> None:
     """Adding a CDN inbound continues as a text prompt when the handler asks for it."""
     from telegram_bot.handlers.settings import cdn_mode_add_callback
@@ -471,12 +456,17 @@ CALLBACK_ROUTES = {
     CallbackData.REMOVE_EXCEPT_USER: lambda u, q, c: handle_remove_except_user_callback(q, c),
     CallbackData.SHOW_SPECIAL_LIMIT: lambda u, q, c: handle_show_special_limit_callback(q, c),
     CallbackData.SET_SPECIAL_LIMIT: lambda u, q, c: handle_set_special_limit_callback(q, c),
-    # --- Admins & backup ----------------------------------------------------
+    # --- Admins & restore ---------------------------------------------------
     CallbackData.LIST_ADMINS: lambda u, q, c: handle_admins_list_callback(q, c),
     CallbackData.ADD_ADMIN: lambda u, q, c: _show_screen(q, MENU_TEXTS["add_admin"], _admin_screen_keyboard()),
     CallbackData.REMOVE_ADMIN: lambda u, q, c: _show_screen(q, MENU_TEXTS["remove_admin"], _admin_screen_keyboard()),
-    CallbackData.BACKUP: _send_backup_from_button,
-    CallbackData.RESTORE: lambda u, q, c: _show_screen(q, MENU_TEXTS["restore"], create_back_to_main_keyboard()),
+    CallbackData.RESTORE: lambda u, q, c: _show_screen(
+        q,
+        MENU_TEXTS["restore"],
+        InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Back to Backup & Restore", callback_data=CallbackData.AUTO_BACKUP_MENU)]]
+        ),
+    ),
     # --- Monitoring & reports ------------------------------------------------
     CallbackData.MONITORING_STATUS: lambda u, q, c: monitoring_status(u, c),
     CallbackData.MONITORING_DETAILS: lambda u, q, c: monitoring_details(u, c),
@@ -1245,8 +1235,7 @@ application.add_handler(CommandHandler("users_by_protocol", users_by_protocol_co
 application.add_handler(CommandHandler("ip_history_12h", ip_history_12h_command))
 application.add_handler(CommandHandler("ip_history_48h", ip_history_48h_command))
 
-# Backup
-application.add_handler(CommandHandler("backup", send_backup))
+# Restore
 application.add_handler(
     ScopedConversationHandler(
         application,

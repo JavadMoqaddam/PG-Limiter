@@ -6,6 +6,14 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Consolidate Telegram backup scheduling, Backup Now, and Restore under Settings → Backup & Restore. Move Restore out of the main menu and keep it available when automatic backups are disabled.
+
+### Removed
+
+- Remove the direct-chat Telegram `/backup` command and main-menu Backup shortcut. Immediate backups remain available through Settings → Backup & Restore → Backup Now, alongside scheduled backups and the host backup command.
+
 ## [1.7.2] - 2026-10-30
 
 ### Added

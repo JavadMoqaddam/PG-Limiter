@@ -130,7 +130,6 @@ class CallbackData:
     REMOVE_ADMIN = "remove_admin"
 
     # Backup/Restore
-    BACKUP = "backup"
     RESTORE = "restore"
 
     # Config
@@ -343,8 +342,8 @@ Inspect individual connection activity in Topics.
 /remove_admin - Remove admin
 /admins_list - List all admins
 
-<b>💾 Backup:</b>
-/backup - Create config backup
+<b>💾 Backup and Restore:</b>
+Settings → Backup &amp; Restore - Backup scheduling, Backup Now, and restore
 /restore - Restore from backup
 /migrate_backup - Migrate JSON backup to database
 

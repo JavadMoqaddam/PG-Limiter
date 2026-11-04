@@ -1,6 +1,8 @@
 # Backup and offline restore
 
-Use `/backup`, the automatic backup schedule, or the host command:
+In Telegram, open **Settings → Backup & Restore** for backup scheduling, **Backup Now** (available when Auto-Backup is enabled), and **Restore**. Restore remains available when Auto-Backup is disabled. Immediate and scheduled backups use the same delivery path: the configured backup topic, with administrator delivery as a fallback.
+
+To create a backup on the host:
 
 ```bash
 pg-limiter backup /root/pg-limiter-backup.zip
