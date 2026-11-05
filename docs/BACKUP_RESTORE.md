@@ -44,8 +44,11 @@ management script. The updater's limited copies do not replace this archive,
 especially for a custom database path and persisted state sidecars. Apply the
 archive with the current offline restore helper and decline its restart prompt;
 then restore the matching previous image, Compose file and script before starting.
-An older image cannot resolve newer Alembic revisions. See the
-[1.7.3 rollback procedure](releases/v1.7.3.md#rollback) for migration `012`.
+An older image cannot resolve newer Alembic revisions. Revision `013` also
+refuses every in-place downgrade because 1.7.3 cannot read grouped notification
+contexts in the database and punishment-fact journal. See the
+[1.7.4 rollback procedure](releases/v1.7.4.md#rollback) for returning to 1.7.3,
+or the [1.7.3 rollback procedure](releases/v1.7.3.md#rollback) for migration `012`.
 
 ## Legacy compatibility
 
