@@ -9,6 +9,13 @@ All notable changes to PG-Limiter are recorded here. Format follows
 ### Changed
 
 - Consolidate Telegram backup scheduling, Backup Now, and Restore under Settings → Backup & Restore. Move Restore out of the main menu and keep it available when automatic backups are disabled.
+- Stop blind retries of uncertain noncritical Telegram sends and supersede older unsent warning reports with the latest completed scan. Critical notifications retain durable at-least-once retries, with possible duplicates after lost responses. See [delivery policy](docs/TELEGRAM_DELIVERY.md).
+
+### Fixed
+
+- Keep node-summary delivery receipts through slow sends, coalesce later updates, and retire producer work on monitoring resets, periodic SSE refresh and shutdown. Telegram waits no longer block node-status ingestion.
+- Replace node summaries, menus and status cards only after confirmed message unavailability. Preserve confirmed backup delivery through local cleanup failures and avoid administrator fallback after an uncertain group send.
+- These delivery changes require no schema migration; existing critical pending JSON state remains included in backups.
 
 ### Removed
 

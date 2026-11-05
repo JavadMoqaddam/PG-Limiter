@@ -383,8 +383,9 @@ async def test_failed_connection_notice_does_not_alarm_other_starting_nodes(actu
     actual_nodes.shared.forget_node_event(28)
     monkeypatch.setattr(streams, "monitoring_is_current", lambda admission: admission is health.admission)
     monkeypatch.setattr(streams, "_get_status_throttle_interval", AsyncMock(return_value=60))
-    monkeypatch.setattr(streams, "_status_initializing", True)
+    monkeypatch.setattr(streams, "enqueue_log_delivery", AsyncMock(return_value=None))
     await streams._update_node_status(28, "relay 28", "❌ HTTP Error", health.admission)
+    await streams.retire_node_status_message()
     assert len(health.messages) == 1
     assert "28" in health.messages[0][0] and "Node 1:" not in health.messages[0][0]
 

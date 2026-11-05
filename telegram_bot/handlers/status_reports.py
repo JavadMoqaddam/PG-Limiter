@@ -11,6 +11,7 @@ from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes, ConversationHandler
 
+from telegram_bot.delivery_errors import is_message_unavailable
 from telegram_bot.handlers.admin import check_admin_privilege
 from telegram_bot.keyboards import create_status_reports_keyboard
 from utils.logs import get_logger
@@ -267,8 +268,8 @@ async def deliver_card(update: Update, text: str, keyboard) -> None:
             except BadRequest as error:
                 if "message is not modified" in str(error).lower():
                     return
-            except Exception:
-                pass
+                if not is_message_unavailable(error):
+                    raise
             await query.message.reply_text(**kwargs)
         else:
             await update.message.reply_text(**kwargs)

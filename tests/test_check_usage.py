@@ -29,6 +29,10 @@ async def test_unknown_active_users_are_queued_once_without_default_enforcement(
     queued: list[str] = []
     resolved: list[str] = []
     warned: list[str] = []
+    reports: list[list[dict]] = []
+
+    async def report(warnings, *_args, **_kwargs):
+        reports.append(warnings)
 
     async def fake_pop_snapshot(_config):
         return users
@@ -78,6 +82,7 @@ async def test_unknown_active_users_are_queued_once_without_default_enforcement(
     monkeypatch.setattr(check_usage.warning_system, "warnings", {})
     monkeypatch.setattr(user_sync, "queue_unknown_user_fetch", fake_queue)
     monkeypatch.setattr(check_usage, "resolve_effective_limit", fail_resolve)
+    monkeypatch.setattr(check_usage, "dispatch_chunked_warnings", report)
 
     await check_usage.check_users_usage(
         PanelType(panel_domain="panel.example", panel_api_key="pg_key_test"),
@@ -87,3 +92,4 @@ async def test_unknown_active_users_are_queued_once_without_default_enforcement(
     assert sorted(queued) == ["alice", "bob"]
     assert resolved == []
     assert warned == []
+    assert reports == [[]]

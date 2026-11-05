@@ -508,9 +508,10 @@ async def test_node_registration_precedes_status_notification_and_access(logs, m
     async def notify(*args, **kwargs):
         observed.append(LOG_OBSERVATIONS.required_nodes)
 
-    monkeypatch.setattr(streams, "send_logs", notify)
+    monkeypatch.setattr(streams, "enqueue_log_delivery", notify)
     monkeypatch.setattr("utils.read_config.read_config", AsyncMock(return_value=logs.config))
     await streams.init_node_status_message([NodeType(1, "node", "192.0.2.1", "connected")])
+    await asyncio.sleep(0)
     assert observed == [{1: True}]
 
 

@@ -2,6 +2,8 @@
 
 In Telegram, open **Settings → Backup & Restore** for backup scheduling, **Backup Now** (available when Auto-Backup is enabled), and **Restore**. Restore remains available when Auto-Backup is disabled. Immediate and scheduled backups use the same delivery path: the configured backup topic, with administrator delivery as a fallback.
 
+A confirmed Telegram document receipt remains successful even if local cleanup fails. Administrator fallback is allowed for a definite group destination rejection; an uncertain group send does not trigger another copy or claim success. With Topics disabled or no group configured, the existing administrator delivery path still applies. See [Telegram delivery and retries](TELEGRAM_DELIVERY.md).
+
 To create a backup on the host:
 
 ```bash
@@ -11,6 +13,8 @@ pg-limiter backup /root/pg-limiter-backup.zip
 New archives contain a **database-consistent SQLite backup API snapshot** of the configured `DATABASE_URL`. Committed WAL records are included in that snapshot; live `-wal` and `-shm` files are never archived. Missing or uninitialized databases fail the backup rather than producing a successful database-backup message. External databases and SQLite `file:` URI URLs require a database-specific backup procedure.
 
 The archive also includes the environment file once and the actual persisted warning/trust history, punishment compatibility history, original groups, Telegram topics/message caches, pending notifications, disable-message receipts, automatic-backup settings and existing legacy import inputs. JSON and environment files are captured independently of SQLite: the archive does **not** promise a transaction spanning those stores. A versioned manifest records checksums and explicitly absent JSON files.
+
+The delivery policy introduces no schema migration or new backup format. Critical pending notifications retain their existing JSON backup inclusion. Replaying restored pending state can duplicate a critical notification whose Telegram acknowledgement was lost; noncritical pending sends and node-summary state are not durable recovery records.
 
 The original-group compatibility file now defaults to `$PG_LIMITER_DATA_DIR/user_groups_backup.json` (`/var/lib/pg-limiter/user_groups_backup.json` by default). Until that file exists, the old working-directory or `/app/.user_groups_backup.json` is read without being removed. Subsequent saves persist on the volume.
 
