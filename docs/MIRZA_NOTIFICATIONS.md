@@ -167,18 +167,21 @@ external punishment-fact journal, even when a bot has only one admin. Rollback
 requires restoring a full pre-upgrade backup of the database and state files
 offline before starting the older version.
 
-Migration `012_mirza_notifications` adds route and delivery tables and extends
-punishment evidence; existing facts are not backfilled. Container startup applies
-the migration. For a local Python installation, run `python -m alembic upgrade
-head` against the configured `DATABASE_URL` before starting the updated daemon.
+The earlier migration `012_mirza_notifications` adds route and delivery tables
+and extends punishment evidence; existing facts are not backfilled. Container
+startup applies all pending migrations, including `013`. For a local Python
+installation, run `python -m alembic upgrade head` against the configured
+`DATABASE_URL` before starting the updated daemon.
 
 Routes, API keys and notification delivery state are included in the existing
 SQLite backup. The existing punishment-fact journal retains pending evidence
 during a temporary database failure and is also included in backups. Treat
 backup archives as credentials. See [Backup & Restore](BACKUP_RESTORE.md).
 
-Before upgrading, retain a full private backup and the previous image identity.
-Rollback to 1.7.2 requires restoring compatible database and state files offline
-before starting the older image. An explicit downgrade of revision `012` deletes
-Mirza Bot routes, API keys and delivery history; it is not a lossless rollback. See
-the [release rollback procedure](releases/v1.7.3.md#rollback).
+Before upgrading, retain a full private backup and the previous image identity,
+Compose file and management script. Follow the
+[1.7.4 rollback procedure](releases/v1.7.4.md#rollback) to restore the complete
+pre-upgrade database and state offline before returning to 1.7.3. For older
+upgrades, the [1.7.3 rollback procedure](releases/v1.7.3.md#rollback) describes
+returning to 1.7.2; downgrading revision `012` deletes Mirza Bot settings, API keys
+and delivery history and does not restore a complete snapshot.
