@@ -8,6 +8,8 @@ import pytest
 from sqlalchemy import event, select
 
 from test_mirza_persistence import mirza_database  # noqa: F401
+from test_mirza_settings import configure_route, edit_message
+from utils import mirza_settings as settings
 from utils.types import PanelType, UserType
 
 PANEL = PanelType(panel_domain="panel.example", panel_api_key="pg_key_test")
@@ -24,7 +26,6 @@ LADDER = [
 async def punishment_env(mirza_database, tmp_path, monkeypatch):
     import utils.panel_api.users as users
     import utils.punishment_system as punishment
-    from utils.mirza_settings import create_route, update_route
     from db.crud.config import ConfigCRUD
     from db.crud.users import UserCRUD
     import utils.read_config as configuration
@@ -51,16 +52,8 @@ async def punishment_env(mirza_database, tmp_path, monkeypatch):
     monkeypatch.setattr(users, "disable_user_by_status", AsyncMock(return_value=True))
     monkeypatch.setattr(users, "revoke_user_subscription", AsyncMock(return_value=False))
     monkeypatch.setattr(users, "reset_user_uuid", AsyncMock(return_value=False))
-    route = await create_route("owner")
-    route = await update_route(
-        route["id"],
-        {
-            "admin_usernames": ["owner"],
-            "base_url": "https://one.example/api",
-            "api_key": "key-one",
-            "message_text": "[Username]: [Limit]",
-            "enabled": True,
-        },
+    route = await configure_route(
+        settings, "owner", "https://one.example/api", "key-one", "[Username]: [Limit]", steps=[0, 1]
     )
     return system, config, route
 
@@ -72,15 +65,12 @@ async def events(sessions):
         return list(await db.scalars(select(MirzaNotification).order_by(MirzaNotification.applied_at)))
 
 
-@pytest.mark.parametrize("mode,selected,want", [("last", [], [4, 4]), ("selected", [0, 2], [0, 2])])
-async def test_actual_ladder_positions_and_repeated_final_incidents(
-    punishment_env, mirza_database, mode, selected, want
-):
-    from utils.mirza_settings import update_route
+@pytest.mark.parametrize("selected,want", [([4], [4, 4]), ([0, 2], [0, 2])])
+async def test_actual_ladder_positions_and_repeated_final_incidents(punishment_env, mirza_database, selected, want):
     from utils.panel_api.users import disable_user_with_punishment
 
     _, _, route = punishment_env
-    await update_route(route["id"], {"trigger_mode": mode, "selected_steps": selected})
+    await edit_message(settings, route, {"selected_steps": selected})
     for _ in range(6):
         await disable_user_with_punishment(PANEL, UserType("customer", group_ids=[7]))
     rows = await events(mirza_database)
@@ -88,13 +78,18 @@ async def test_actual_ladder_positions_and_repeated_final_incidents(
     assert all(row.context["step_count"] == 5 and row.context["effective_limit"] == 4 for row in rows)
 
 
-async def test_shorter_ladder_final_is_dynamic(punishment_env, mirza_database):
+async def test_shorter_ladder_requires_explicit_reselection_without_remapping(punishment_env, mirza_database):
     from utils.panel_api.users import disable_user_with_punishment
 
-    _, config, _ = punishment_env
+    _, config, route = punishment_env
+    route = await edit_message(settings, route, {"selected_steps": [4]})
     config["punishment"]["steps"] = deepcopy(LADDER[:3])
     for _ in range(3):
         await disable_user_with_punishment(PANEL, UserType("customer"))
+    assert await events(mirza_database) == []
+    assert (await settings.get_route(route["id"]))["messages"][0]["selected_steps"] == [4]
+    await edit_message(settings, route, {"selected_steps": [2]})
+    await disable_user_with_punishment(PANEL, UserType("customer"))
     rows = await events(mirza_database)
     assert len(rows) == 1 and rows[0].context["step_index"] == 2 and rows[0].context["step_count"] == 3
 

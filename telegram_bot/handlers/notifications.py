@@ -95,27 +95,22 @@ async def _list(update: Update, notice: str = ""):
 
 
 async def _route(update: Update, route: dict, notice: str = ""):
-    mode = (
-        "Last step (dynamic)"
-        if route["trigger_mode"] == "last"
-        else ("Selected steps: " + (", ".join(str(step + 1) for step in route["selected_steps"]) or "none"))
-    )
+    ready = sum(_ready(message) for message in route["messages"])
     text = (
         f"🤖 <b>{_preview(route['name'], 80)}</b>\n\n{notice}"
         f"Status: {'Enabled' if route['enabled'] else 'Disabled'}\n"
         f"Included admins: {len(route['admin_usernames'])}\n"
         f"URL: <code>{_preview(route['base_url'], 160) or 'Missing'}</code>\n"
         f"API key: {'Configured' if route['key_configured'] else 'Missing'}\n"
-        f"Triggers: {mode}\n\n"
-        "Test Connection sends <code>test</code> to your own account through this Mirza Bot. Start it first.\n\n"
-        f"<b>Message preview</b>\n{_preview(route['message_text']) or 'Missing'}"
+        f"Messages: {len(route['messages'])} · ready: {ready}\n\n"
+        "Test Connection sends <code>test</code> to your own account through this Mirza Bot. Start it first."
     )
     rows = [
         [_button("⏸ Disable" if route["enabled"] else "✅ Enable", "e", route)],
         [_button("👤 Admins", "g", route), _button("✏️ Rename", "n", route)],
         [_button("🌐 URL", "u", route), _button("🔑 Replace API Key", "k", route)],
         [_button("🔌 Test Connection", "c", route)],
-        [_button("✏️ Message", "m", route), _button("⚖️ Triggers", "t", route)],
+        [_button("💬 Messages", "h", route)],
         [_button("🗑 Delete", "d", route)],
         [InlineKeyboardButton("« Back to Notifications", callback_data=CallbackData.NOTIFICATIONS_MENU)],
     ]
@@ -317,39 +312,216 @@ async def _select_admin(update: Update, parts: list[str]):
     return await _admins(update, route)
 
 
-async def _triggers(update: Update, route: dict, notice: str = ""):
-    config = await read_settings()
-    steps = config.get("punishment", {}).get("steps", [])[:10]
-    selected = set(route["selected_steps"]) if route["trigger_mode"] == "selected" else set()
-    rows = [[_button(f"{'✅ ' if route['trigger_mode'] == 'last' else ''}Last step (dynamic)", "l", route)]]
-    for index, step in enumerate(steps):
-        label = {"warning": "Warning", "disable": "Disable", "revoke": "Revoke + Disable"}.get(
-            step.get("type"), "Unknown"
-        )
-        if step.get("duration"):
-            label += f" · {step['duration']} min"
-        rows.append([_button(f"{'✅' if index in selected else '▫️'} Step {index + 1}: {label}", "s", route, index)])
-    for index in sorted(selected - set(range(len(steps)))):
-        rows.append([_button(f"✅ Step {index + 1}: inactive (remove)", "s", route, index)])
-    rows.append([_button("« Back to Bot", "r", route)])
-    text = (
-        f"⚖️ <b>Notification triggers</b>\n\n{notice}"
-        "Last step is dynamic and follows the ladder for each incident.\n"
-        "Choose selected steps below; each checked position toggles independently.\n"
-        "Inactive positions remain saved until you remove them.\n"
-        "An enabled configuration must keep at least one selected step."
+def _message_token(message_id: str) -> str:
+    """Use compact UUID identity, resolved unambiguously against saved entries."""
+    return _compact_id(uuid.UUID(message_id).bytes[:12])
+
+
+def _message_button(label: str, action: str, route: dict, message: dict) -> InlineKeyboardButton:
+    payload = (
+        f"mn:{action}:{_compact_id(uuid.UUID(route['id']).bytes)}:{route['revision']}:{_message_token(message['id'])}"
     )
-    return await _respond(update, text, InlineKeyboardMarkup(rows))
+    return InlineKeyboardButton(label, callback_data=payload)
 
 
-async def _prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, route: dict | None, notice: str = ""):
+def _message_back(route: dict, message: dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[_message_button("« Back to Message", "O", route, message)], [_button("« Back to Bot", "r", route)]]
+    )
+
+
+def _step_summary(message: dict) -> str:
+    return ", ".join(str(index + 1) for index in message["selected_steps"]) or "none"
+
+
+def _ready(message: dict) -> bool:
+    return bool(message["message_text"].strip() and message["selected_steps"])
+
+
+async def _messages(update: Update, route: dict, notice: str = ""):
+    rows = [
+        [
+            _message_button(
+                f"{'✅' if _ready(message) else '📝'} {message['name'][:80]} · steps: {_step_summary(message)}",
+                "O",
+                route,
+                message,
+            )
+        ]
+        for message in route["messages"]
+    ]
+    rows.extend([[_button("➕ Add Message", "a", route)], [_button("« Back to Bot", "r", route)]])
+    return await _respond(
+        update,
+        f"💬 <b>Messages · {_preview(route['name'], 80)}</b>\n\n{notice}"
+        "Choose a named message or add one. Each step belongs to at most one message.\n"
+        "Messages with empty text or no selected steps are drafts. Unassigned stages send no notification.",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def _message(update: Update, route: dict, message: dict, notice: str = ""):
+    return await _respond(
+        update,
+        f"💬 <b>{_preview(message['name'], 80)}</b>\n\n{notice}"
+        f"Status: {'Ready' if _ready(message) else 'Draft'}\n"
+        f"Steps: {_step_summary(message)}\n\n"
+        f"<b>Text preview</b>\n{_preview(message['message_text']) or 'Empty'}",
+        InlineKeyboardMarkup(
+            [
+                [_message_button("✏️ Text", "T", route, message), _message_button("⚖️ Steps", "S", route, message)],
+                [_message_button("✏️ Rename", "N", route, message), _message_button("🗑 Delete", "D", route, message)],
+                [_button("« Back to Messages", "h", route)],
+                [_button("« Back to Bot", "r", route)],
+            ]
+        ),
+    )
+
+
+async def _effective_steps() -> list:
+    """Read the normalized enforcement ladder without constructing its state."""
+    from utils.punishment_system import PunishmentSystem, _parse_step
+
+    config = await read_settings()
+    punishment = config.get("punishment", {})
+    raw = punishment.get("steps", []) if isinstance(punishment, dict) else []
+    parsed = [_parse_step(index + 1, step) for index, step in enumerate(raw)] if isinstance(raw, list) else []
+    return [step for step in parsed if step is not None] or PunishmentSystem.DEFAULT_STEPS.copy()
+
+
+async def _steps(update: Update, route: dict, message: dict, notice: str = ""):
+    steps = (await _effective_steps())[:10]
+    selected = set(message["selected_steps"])
+    owners = {
+        index: entry for entry in route["messages"] if entry["id"] != message["id"] for index in entry["selected_steps"]
+    }
+    rows = []
+    for index, step in enumerate(steps):
+        owner = owners.get(index)
+        prefix = "✅" if index in selected else "🔒" if owner else "▫️"
+        suffix = f" · {owner['name'][:60]}" if owner else ""
+        rows.append(
+            [
+                _message_button(
+                    f"{prefix} Step {index + 1}: {step.get_display_text()}{suffix}",
+                    str(index),
+                    route,
+                    message,
+                )
+            ]
+        )
+    for index in sorted(selected - set(range(len(steps)))):
+        rows.append([_message_button(f"✅ Step {index + 1}: inactive (remove)", str(index), route, message)])
+    rows.extend(_message_back(route, message).inline_keyboard)
+    return await _respond(
+        update,
+        f"⚖️ <b>Steps · {_preview(message['name'], 80)}</b>\n\n{notice}"
+        "Tap numbered stages to include or remove them. Locked stages belong to another message.\n"
+        "Review assignments after reordering or replacing the punishment ladder.\n"
+        "Inactive saved positions remain removable; they never move automatically.",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def _message_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list[str]):
+    if len(parts) != 5 or not re.fullmatch(r"[A-Za-z0-9_-]{22}", parts[2]):
+        raise ValueError
+    route_id = uuid.UUID(bytes=base64.urlsafe_b64decode(parts[2] + "=="))
+    if _compact_id(route_id.bytes) != parts[2]:
+        raise ValueError
+    if not re.fullmatch(r"[0-9]{1,19}", parts[3]) or not re.fullmatch(r"[A-Za-z0-9_-]{16}", parts[4]):
+        raise ValueError
+    route = await settings.get_route(str(route_id))
+    if route is None or route["revision"] != int(parts[3]):
+        return await _list(update, "⚠️ Configuration changed or was deleted. Open it again.\n\n")
+    matches = [message for message in route["messages"] if _message_token(message["id"]) == parts[4]]
+    if len(matches) != 1:
+        return await _messages(update, route, "⚠️ Message list changed. Select a message again.\n\n")
+    message = matches[0]
+    action = parts[1]
+    if action == "O":
+        return await _message(update, route, message)
+    if action == "S":
+        return await _steps(update, route, message)
+    if action in {"T", "N"}:
+        return await _prompt(
+            update,
+            context,
+            "message_text" if action == "T" else "message_name",
+            route,
+            message=message,
+        )
+    if action == "D":
+        return await _respond(
+            update,
+            f"🗑 Delete message <b>{_preview(message['name'], 80)}</b>?\n"
+            "Its steps will become unassigned and older unsent bot notifications will be cancelled.",
+            InlineKeyboardMarkup(
+                [
+                    [_message_button("Confirm Delete", "X", route, message)],
+                    [_message_button("« Back to Message", "O", route, message)],
+                ]
+            ),
+        )
+    try:
+        if action == "X":
+            route = await settings.delete_message(route["id"], message["id"], expected_revision=route["revision"])
+            return await _messages(update, route, "✅ Message deleted.\n\n")
+        index = int(action)
+        selected = set(message["selected_steps"])
+        steps = (await _effective_steps())[:10]
+        if index >= len(steps) and index not in selected:
+            raise ValueError
+        owner = next(
+            (entry for entry in route["messages"] if entry["id"] != message["id"] and index in entry["selected_steps"]),
+            None,
+        )
+        if owner:
+            return await _steps(
+                update,
+                route,
+                message,
+                f"⚠️ This step belongs to another message: <b>{_preview(owner['name'], 80)}</b>. "
+                "Remove it there first.\n\n",
+            )
+        selected.symmetric_difference_update({index})
+        route = await settings.update_message(
+            route["id"],
+            message["id"],
+            {"selected_steps": sorted(selected)},
+            expected_revision=route["revision"],
+        )
+    except MirzaRouteError as error:
+        current = await settings.get_route(route["id"])
+        if current is None or current["revision"] != route["revision"]:
+            return await _list(update, "⚠️ Configuration changed or was deleted. Open it again.\n\n")
+        notice = f"⚠️ {html.escape(str(error))}\n\n"
+        if action == "X":
+            return await _message(update, route, message, notice)
+        return await _steps(update, route, message, notice)
+    message = next(entry for entry in route["messages"] if entry["id"] == message["id"])
+    return await _steps(update, route, message)
+
+
+async def _prompt(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    field: str,
+    route: dict | None,
+    notice: str = "",
+    *,
+    message: dict | None = None,
+):
     context.user_data.update(
         waiting_for=INPUT_FLOW,
         mirza_field=field,
         mirza_route_id=route["id"] if route else None,
         mirza_revision=route["revision"] if route else None,
+        mirza_message_id=message["id"] if message else None,
     )
     prompts = {
+        "new_message_name": "Enter a unique name for the new message, e.g. <code>First warning</code>. It starts as a draft with no text or steps.",
+        "message_name": "Enter a unique name for this message, e.g. <code>Final disable</code>.",
         "name": "Enter a name for this Mirza Bot, e.g. <code>Sales Bot</code>.\n"
         "Choose its admins from the panel list after saving.",
         "base_url": "Enter the HTTPS Mirza Bot API base URL, e.g. <code>https://bot.example.com/api/</code>.\n"
@@ -359,13 +531,13 @@ async def _prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str
         "message_text": "Enter the fixed HTML message. Use literal <code>[Username]</code> for the punished "
         "configuration username and <code>[Limit]</code> for its effective allowed concurrent "
         "connection count. Both tokens are case-sensitive.\n"
-        "Example: کانفیگ [Username] به‌دلیل تخلف غیرفعال شد.\n"
+        "Example: کانفیگ [Username] به‌دلیل استفاده از بیش از [Limit] دستگاه غیرفعال شد.\n"
         "The expanded message must fit 4096 UTF-16 units.",
     }
     text = f"✏️ <b>Notifications</b>\n\n{notice}{prompts[field]}\n\n/cancel to cancel."
-    if field == "message_text" and route:
-        text += f"\n\n<b>Current preview</b>\n{_preview(route['message_text'], 350)}"
-    return await _respond(update, text, _back(route))
+    if field == "message_text" and message:
+        text += f"\n\n<b>Current preview</b>\n{_preview(message['message_text'], 350)}"
+    return await _respond(update, text, _message_back(route, message) if message else _back(route))
 
 
 async def notifications_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -390,11 +562,15 @@ async def notification_callback(update: Update, context: ContextTypes.DEFAULT_TY
         action = parts[1]
         if parts == ["mn", "b"]:
             return await _prompt(update, context, "name", None)
+        if parts[0] != "mn":
+            raise ValueError
         if action == "i":
             return await _select_admin(update, parts)
+        if action in {"O", "T", "S", "N", "D", "X", *"0123456789"}:
+            return await _message_callback(update, context, parts)
         if action == "p" and len(parts) == 3 and parts[2].isascii() and parts[2].isdigit() and len(parts[2]) <= 9:
             return await _list(update)
-        if action not in {"r", "e", "u", "k", "m", "n", "g", "f", "t", "l", "s", "d", "x", "c"}:
+        if action not in {"r", "e", "u", "k", "m", "n", "g", "f", "t", "l", "s", "d", "x", "c", "h", "a"}:
             raise ValueError
         if len(parts) != (5 if action == "s" else 4) or str(uuid.UUID(parts[2])) != parts[2]:
             raise ValueError
@@ -410,11 +586,15 @@ async def notification_callback(update: Update, context: ContextTypes.DEFAULT_TY
             return await _test_connection(update, context, route)
         if action in {"g", "f"}:
             return await _admins(update, route, force_refresh=action == "f")
-        if action in {"u", "k", "m", "n"}:
-            field = {"u": "base_url", "k": "api_key", "m": "message_text", "n": "name"}[action]
+        if action in {"u", "k", "n"}:
+            field = {"u": "base_url", "k": "api_key", "n": "name"}[action]
             return await _prompt(update, context, field, route)
-        if action == "t":
-            return await _triggers(update, route)
+        if action == "a":
+            return await _prompt(update, context, "new_message_name", route)
+        if action in {"h", "m", "t", "l", "s"}:
+            if action == "s" and not re.fullmatch(r"[0-9]", parts[4]):
+                raise ValueError
+            return await _messages(update, route)
         if action == "d":
             return await _respond(
                 update,
@@ -425,23 +605,8 @@ async def notification_callback(update: Update, context: ContextTypes.DEFAULT_TY
         if action == "x":
             await settings.delete_route(route["id"], expected_revision=revision)
             return await _list(update, notice="✅ Configuration deleted.\n\n")
-        changes = {"enabled": not route["enabled"]} if action == "e" else {"trigger_mode": "last", "selected_steps": []}
-        if action == "s":
-            if not parts[4].isascii() or not parts[4].isdigit() or len(parts[4]) != 1:
-                raise ValueError
-            index = int(parts[4])
-            selected = set(route["selected_steps"]) if route["trigger_mode"] == "selected" else set()
-            steps = (await read_settings()).get("punishment", {}).get("steps", [])[:10]
-            if index >= len(steps) and index not in selected:
-                raise ValueError
-            selected.symmetric_difference_update({index})
-            if route["enabled"] and not selected:
-                return await _triggers(
-                    update, route, "⚠️ Keep at least one selected step, choose Last step, or disable first.\n\n"
-                )
-            changes = {"trigger_mode": "selected", "selected_steps": sorted(selected)}
-        route = await settings.update_route(route["id"], changes, expected_revision=revision)
-        return await (_triggers(update, route) if action in {"l", "s"} else _route(update, route))
+        route = await settings.update_route(route["id"], {"enabled": not route["enabled"]}, expected_revision=revision)
+        return await _route(update, route)
     except MirzaRouteError as error:
         # Settings validation errors contain fixed safe descriptions, never values.
         return await _respond(
@@ -462,8 +627,9 @@ async def notification_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     field = context.user_data.get("mirza_field")
     route = None
+    message = None
     try:
-        if field not in {"name", "base_url", "api_key", "message_text"}:
+        if field not in {"name", "base_url", "api_key", "message_text", "message_name", "new_message_name"}:
             raise ValueError
         if field == "name" and context.user_data.get("mirza_route_id") is None:
             route = await settings.create_route(update.message.text)
@@ -473,16 +639,36 @@ async def notification_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if route is None or route["revision"] != revision:
                 end_input(context)
                 return await _list(update, notice="⚠️ Configuration changed or was deleted. Open it again.\n\n")
-            route = await settings.update_route(route["id"], {field: update.message.text}, expected_revision=revision)
+            if field == "new_message_name":
+                route = await settings.create_message(route["id"], update.message.text, expected_revision=revision)
+                message = route["messages"][-1]
+            elif field in {"message_text", "message_name"}:
+                message_id = context.user_data.get("mirza_message_id")
+                message = next((entry for entry in route["messages"] if entry["id"] == message_id), None)
+                if message is None:
+                    raise ValueError
+                route = await settings.update_message(
+                    route["id"],
+                    message_id,
+                    {"name" if field == "message_name" else field: update.message.text},
+                    expected_revision=revision,
+                )
+                message = next(entry for entry in route["messages"] if entry["id"] == message_id)
+            else:
+                route = await settings.update_route(
+                    route["id"], {field: update.message.text}, expected_revision=revision
+                )
         if field == "api_key":
             try:
                 await update.message.delete()
             except Exception:
                 pass
         end_input(context)
-        return await _route(update, route, "✅ Saved.\n\n")
+        return await (
+            _message(update, route, message, "✅ Saved.\n\n") if message else _route(update, route, "✅ Saved.\n\n")
+        )
     except MirzaRouteError as error:
-        return await _prompt(update, context, field, route, f"⚠️ {html.escape(str(error))}\n\n")
+        return await _prompt(update, context, field, route, f"⚠️ {html.escape(str(error))}\n\n", message=message)
     except Exception:
         end_input(context)
         return await _respond(update, "⚠️ Could not save Notifications. Open the configuration and try again.", _back())

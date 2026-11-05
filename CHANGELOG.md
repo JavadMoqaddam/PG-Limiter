@@ -8,12 +8,19 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ### Added
 
+- Manage named messages inside each Mirza Bot with Text, Steps, Rename and confirmed Delete. A message may cover multiple explicit numbered punishment stages; each stage belongs to at most one message in that bot. Empty-text or unassigned messages remain drafts.
 - Add **Test Connection** to each Mirza Bot configuration. Send `test` to the administrator pressing the button using that bot's saved credentials, with safe result messages, repeated-click protection and no automatic retries or punishment-history changes.
 
 ### Changed
 
+- Replace the bot-wide template and trigger controls with a Messages list. Unassigned stages send no notification, and all message edits share the bot revision and cancel its older unsent events.
+- Preserve existing text and explicit assignments through migration `014_notification_messages`; convert the former dynamic last stage to its explicit position once. In-place downgrade is refused; rollback requires the full pre-upgrade database and state backup.
 - Show a robot icon beside each configured Mirza Bot name, retaining its enabled/disabled indicator.
 - Clarify the minimum Mirza Bot API permission (`users`) and its section-wide scope.
+
+### Removed
+
+- Remove dynamic Last step selection and automatic stage remapping. Review message assignments after reordering or replacing punishment stages; removed saved positions remain visible and removable.
 
 ## [1.7.4] - 2026-11-05
 

@@ -118,8 +118,21 @@ class MirzaNotificationService:
             ):
                 await Notifications.transition(db, event.incident_id, "pending", "skipped", last_error="route_changed")
             else:
+                # Legacy snapshots refer specifically to the message migrated
+                # with the bot's UUID. A replacement never inherits its receipt.
+                message_id = candidate.get("message_id", route.id)
+                entries = route.messages if isinstance(route.messages, list) else []
+                matches = [entry for entry in entries if isinstance(entry, dict) and entry.get("id") == message_id]
+                if len(matches) != 1:
+                    await Notifications.transition(
+                        db, event.incident_id, "pending", "skipped", last_error="message_missing"
+                    )
+                    await db.commit()
+                    return
                 try:
-                    message = render_message(route.message_text, event.username, event.context.get("effective_limit"))
+                    message = render_message(
+                        matches[0].get("message_text"), event.username, event.context.get("effective_limit")
+                    )
                 except ValueError:
                     await Notifications.transition(
                         db, event.incident_id, "pending", "failed", last_error="message_invalid"

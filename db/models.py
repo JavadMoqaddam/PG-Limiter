@@ -275,6 +275,7 @@ class MirzaRoute(Base):
     enabled = Column(Boolean, nullable=False, default=False, server_default="0")
     trigger_mode = Column(String(20), nullable=False, default="last", server_default="last")
     selected_steps = Column(JSON, nullable=False, default=list, server_default="[]")
+    messages = Column(JSON, nullable=False, default=list, server_default="[]")
     revision = Column(Integer, nullable=False, default=1, server_default="1")
 
     admins = relationship("MirzaRouteAdmin", lazy="selectin", cascade="all, delete-orphan", passive_deletes=True)

@@ -10,21 +10,18 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from test_mirza_settings import route_database  # noqa: F401
+from test_mirza_settings import configure_route, route_database  # noqa: F401
 from test_mirza_persistence import alembic, confirmed
 
 
 async def configured(settings, name="Sales", admins=None):
-    route = await settings.create_route(name)
-    return await settings.update_route(
-        route["id"],
-        {
-            "admin_usernames": ["alice", "bob"] if admins is None else admins,
-            "base_url": "https://bot.example/api",
-            "api_key": "synthetic-key",
-            "message_text": "<b>[Username]</b>",
-            "enabled": True,
-        },
+    return await configure_route(
+        settings,
+        name,
+        "https://bot.example/api",
+        "synthetic-key",
+        "<b>[Username]</b>",
+        admins=["alice", "bob"] if admins is None else admins,
     )
 
 
@@ -37,7 +34,7 @@ async def test_new_bot_has_no_members_and_enable_requires_one(route_database):
     with pytest.raises(ValueError):
         await settings.update_route(
             bot["id"],
-            {"base_url": "https://bot.example", "api_key": "key", "message_text": "hello", "enabled": True},
+            {"base_url": "https://bot.example", "api_key": "key", "enabled": True},
         )
     assert await settings.get_route(bot["id"]) == bot
 
@@ -50,14 +47,20 @@ async def test_shared_snapshot_is_one_secret_free_group_and_defensive(route_data
     assert rules == [
         {
             "route_id": bot["id"],
-            "revision": 2,
+            "revision": bot["revision"],
             "admin_usernames": ["alice", "bob"],
-            "trigger_mode": "last",
-            "selected_steps": [],
+            "messages": [{"id": bot["messages"][0]["id"], "selected_steps": [0]}],
         }
     ]
     context = settings.notification_context(rules, 0, 1, "disable", 3)
-    assert context["candidates"] == [{"route_id": bot["id"], "revision": 2, "admin_usernames": ["alice", "bob"]}]
+    assert context["candidates"] == [
+        {
+            "route_id": bot["id"],
+            "revision": bot["revision"],
+            "admin_usernames": ["alice", "bob"],
+            "message_id": bot["messages"][0]["id"],
+        }
+    ]
     assert settings.validate_notification_context(context) == context
     context["candidates"][0]["admin_usernames"].append("mallory")
     assert "mallory" not in repr(rules)
@@ -90,7 +93,7 @@ async def test_concurrent_member_assignment_has_one_winner_and_no_partial_edit(r
     async def assign(bot):
         return await settings.update_route(
             bot["id"],
-            {"admin_usernames": ["owner"], "message_text": "new", "api_key": "synthetic-secret"},
+            {"admin_usernames": ["owner"], "name": bot["name"] + " changed", "api_key": "synthetic-secret"},
             expected_revision=1,
         )
 
@@ -99,9 +102,9 @@ async def test_concurrent_member_assignment_has_one_winner_and_no_partial_edit(r
     failure = next(outcome for outcome in outcomes if isinstance(outcome, Exception))
     assert isinstance(failure, MirzaRouteError) and "synthetic-secret" not in str(failure)
     saved = await settings.list_routes()
-    assert sorted((bot["revision"], bot["message_text"], bot["admin_usernames"]) for bot in saved) == [
-        (1, "", []),
-        (2, "new", ["owner"]),
+    assert sorted((bot["revision"], bot["name"].endswith(" changed"), bot["admin_usernames"]) for bot in saved) == [
+        (1, False, []),
+        (2, True, ["owner"]),
     ]
 
 
@@ -120,25 +123,26 @@ async def test_membership_edit_and_cancellation_share_caller_rollback(route_data
                 context={},
                 state="ready",
                 route_id=bot["id"],
-                route_revision=2,
+                route_revision=bot["revision"],
             )
         )
         await db.commit()
     async with route_database() as db:
         await MirzaRoutesCRUD.update(
-            db, bot["id"], {"admin_usernames": ["alice"], "name": "Changed"}, expected_revision=2
+            db, bot["id"], {"admin_usernames": ["alice"], "name": "Changed"}, expected_revision=bot["revision"]
         )
         await db.rollback()
     assert await settings.get_route(bot["id"]) == bot
     async with route_database() as db:
         assert (await db.get(MirzaNotification, "ready")).state == "ready"
-    bot = await settings.update_route(bot["id"], {"admin_usernames": ["alice"]}, expected_revision=2)
-    assert bot["revision"] == 3
+    revision = bot["revision"]
+    bot = await settings.update_route(bot["id"], {"admin_usernames": ["alice"]}, expected_revision=revision)
+    assert bot["revision"] == revision + 1
     async with route_database() as db:
         assert (await db.get(MirzaNotification, "ready")).state == "skipped"
     with pytest.raises(ValueError):
         await settings.update_route(bot["id"], {"admin_usernames": []})
-    assert (await settings.get_route(bot["id"]))["revision"] == 3
+    assert (await settings.get_route(bot["id"]))["revision"] == revision + 1
     await settings.update_route(bot["id"], {"enabled": False, "admin_usernames": []})
 
 
@@ -155,9 +159,20 @@ async def test_two_owners_share_delivery_and_legacy_context_still_resolves(
     from test_mirza_delivery import service_with_transport
 
     bot = await configured(settings)
+    if legacy:
+        # Simulate the migration's identity preservation, without a production compatibility API.
+        from sqlalchemy import update
+        from db.models import MirzaRoute
+
+        messages = deepcopy(bot["messages"])
+        messages[0]["id"] = bot["id"]
+        async with route_database() as db:
+            await db.execute(update(MirzaRoute).where(MirzaRoute.id == bot["id"]).values(messages=messages))
+            await db.commit()
+        bot = await settings.get_route(bot["id"])
     context = settings.notification_context(await settings.capture_rules(), 0, 1, "disable", 3)
     if legacy:
-        context["candidates"] = [{"route_id": bot["id"], "revision": 2, "admin_username": "alice"}]
+        context["candidates"] = [{"route_id": bot["id"], "revision": bot["revision"], "admin_username": "alice"}]
     monkeypatch.setattr(facts, "_journal", PunishmentFactJournal(str(tmp_path / "outbox.json")))
     async with route_database() as db:
         for owner in ("alice", "bob", "other"):
@@ -241,7 +256,9 @@ async def test_populated_012_upgrade_preserves_settings_memberships_and_receipts
     with sqlite3.connect(path) as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(mirza_routes)")}
         assert "name" in columns and "admin_username" not in columns
-        assert db.execute("SELECT * FROM mirza_routes").fetchone() == (
+        assert db.execute(
+            "SELECT id, name, base_url, api_key, message_text, enabled, trigger_mode, selected_steps, revision FROM mirza_routes"
+        ).fetchone() == (
             context["candidates"][0]["route_id"],
             "alice",
             "https://bot.example/api",
@@ -252,6 +269,14 @@ async def test_populated_012_upgrade_preserves_settings_memberships_and_receipts
             "[0, 3]",
             7,
         )
+        assert json.loads(db.execute("SELECT messages FROM mirza_routes").fetchone()[0]) == [
+            {
+                "id": context["candidates"][0]["route_id"],
+                "name": "Default message",
+                "message_text": "Hello",
+                "selected_steps": [0, 3],
+            }
+        ]
         assert db.execute("SELECT admin_username, route_id FROM mirza_route_admins").fetchall() == [
             ("alice", context["candidates"][0]["route_id"])
         ]
@@ -280,14 +305,14 @@ def test_failed_013_upgrade_rolls_back_rename_and_memberships(tmp_path):
             "CREATE TRIGGER reject_owner BEFORE INSERT ON mirza_route_admins BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END"
         )
     with pytest.raises(subprocess.CalledProcessError):
-        alembic(path, "upgrade", "head")
+        alembic(path, "upgrade", "013_notification_bots")
     with sqlite3.connect(path) as db:
         assert "admin_username" in {row[1] for row in db.execute("PRAGMA table_info(mirza_routes)")}
         assert db.execute("SELECT id, admin_username FROM mirza_routes").fetchall() == [("route", "alice")]
         assert db.execute("SELECT version_num FROM alembic_version").fetchone() == ("012_mirza_notifications",)
         assert db.execute("SELECT count(*) FROM mirza_route_admins").fetchone() == (0,)
         db.execute("DROP TRIGGER reject_owner")
-    alembic(path, "upgrade", "head")
+    alembic(path, "upgrade", "013_notification_bots")
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT * FROM mirza_route_admins").fetchall() == [("alice", "route")]
 
@@ -305,7 +330,7 @@ def test_013_downgrade_requires_full_backup_without_changing_schema_or_notificat
                 "INSERT INTO mirza_routes (id, admin_username, api_key, revision) VALUES (?, 'alice', 'synthetic-key', 7)",
                 (route_id,),
             )
-    alembic(path, "upgrade", "head")
+    alembic(path, "upgrade", "013_notification_bots")
     context = json.dumps(
         {
             "candidates": [{"route_id": route_id, "revision": 7, "admin_usernames": ["alice"]}],
@@ -336,7 +361,7 @@ def test_013_downgrade_requires_full_backup_without_changing_schema_or_notificat
     assert "pre-upgrade backup" in error.value.stderr
     with sqlite3.connect(path) as db:
         assert list(db.iterdump()) == before
-    alembic(path, "upgrade", "head")
+    alembic(path, "upgrade", "013_notification_bots")
 
 
 async def test_membership_conflict_rolls_back_removed_owners_and_secret(route_database):
@@ -355,7 +380,7 @@ async def test_membership_conflict_rolls_back_removed_owners_and_secret(route_da
                 context={},
                 state="ready",
                 route_id=first["id"],
-                route_revision=2,
+                route_revision=first["revision"],
             )
         )
         await db.commit()
@@ -363,14 +388,14 @@ async def test_membership_conflict_rolls_back_removed_owners_and_secret(route_da
         await settings.update_route(
             first["id"],
             {"name": "Changed", "admin_usernames": ["carol"], "api_key": "replacement"},
-            expected_revision=2,
+            expected_revision=first["revision"],
         )
     assert await settings.get_route(first["id"]) == first
     assert await settings.get_route(second["id"]) == second
     async with route_database() as db:
         from db.crud.mirza_routes import MirzaRoutesCRUD
 
-        assert await MirzaRoutesCRUD.read_secret(db, first["id"], 2) == "synthetic-key"
+        assert await MirzaRoutesCRUD.read_secret(db, first["id"], first["revision"]) == "synthetic-key"
         assert (await db.get(MirzaNotification, "ready")).state == "ready"
 
 

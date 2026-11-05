@@ -9,6 +9,8 @@ import httpx
 import pytest
 
 from test_mirza_persistence import mirza_database  # noqa: F401
+from test_mirza_settings import configure_route, edit_message
+from utils import mirza_settings as settings
 
 
 @pytest.mark.parametrize(
@@ -82,20 +84,9 @@ async def test_only_definite_pretransmission_errors_retry(error, want):
 
 @pytest.fixture
 async def delivery_env(mirza_database, monkeypatch):
-    from utils.mirza_settings import create_route, update_route
     import utils.panel_api.users as users
 
-    route = await create_route("owner")
-    route = await update_route(
-        route["id"],
-        {
-            "admin_usernames": ["owner"],
-            "base_url": "https://one.example/api",
-            "api_key": "key-one",
-            "message_text": "<b>[Username]</b>: [Limit]",
-            "enabled": True,
-        },
-    )
+    route = await configure_route(settings, "owner", "https://one.example/api", "key-one", "<b>[Username]</b>: [Limit]")
     metadata = {
         "username": "config<&",
         "admin": {"id": 7, "username": "owner"},
@@ -132,6 +123,7 @@ async def admit(sessions, route, incident="incident", *, username="config<&", li
                             "route_id": route["id"],
                             "revision": route["revision"],
                             "admin_usernames": route["admin_usernames"],
+                            "message_id": route["messages"][0]["id"],
                         }
                     ],
                     "step_index": 0,
@@ -198,7 +190,10 @@ async def test_invalid_metadata_or_old_unpinned_route_never_sends(delivery_env, 
     elif change == "delete":
         await delete_route(route["id"])
     else:
-        await update_route(route["id"], {"enabled": False} if change == "disable" else {"message_text": "new message"})
+        if change == "disable":
+            await update_route(route["id"], {"enabled": False})
+        else:
+            await edit_message(settings, route, {"message_text": "new message"})
     requests = []
     service = service_with_transport(
         lambda request: requests.append(request) or httpx.Response(200, json={"status": True})
@@ -212,20 +207,9 @@ async def test_invalid_metadata_or_old_unpinned_route_never_sends(delivery_env, 
 
 async def test_retry_backoff_allows_other_owner_then_stops_at_three_attempts(delivery_env, mirza_database, monkeypatch):
     import utils.panel_api.users as users
-    from utils.mirza_settings import create_route, update_route
 
     route, _ = delivery_env
-    second = await create_route("other-owner")
-    second = await update_route(
-        second["id"],
-        {
-            "admin_usernames": ["other-owner"],
-            "base_url": "https://two.example/api",
-            "api_key": "key-two",
-            "message_text": "other text",
-            "enabled": True,
-        },
-    )
+    second = await configure_route(settings, "other-owner", "https://two.example/api", "key-two", "other text")
     await admit(mirza_database, route, "one", username="one")
     await admit(mirza_database, second, "two", username="two")
 
@@ -328,10 +312,8 @@ async def test_metadata_failures_are_bounded_without_remote_delivery(delivery_en
 
 @pytest.mark.parametrize("template,limit", [("[Limit]", None), ("x" * 4086 + "[Username]", 4)])
 async def test_unrenderable_payload_fails_without_http(delivery_env, mirza_database, template, limit):
-    from utils.mirza_settings import update_route
-
     route, _ = delivery_env
-    route = await update_route(route["id"], {"message_text": template})
+    route = await edit_message(settings, route, {"message_text": template})
     await admit(mirza_database, route, limit=limit)
     requests = []
     service = service_with_transport(lambda r: requests.append(r))

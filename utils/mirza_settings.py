@@ -101,6 +101,48 @@ def render_message(template: str, username: str, limit: int | None = None) -> st
     return rendered
 
 
+def _validate_messages(messages: list[dict]) -> list[dict]:
+    if not isinstance(messages, list):
+        raise MirzaRouteError("Invalid message list")
+    messages = deepcopy(messages)
+    names, identities, assigned = set(), set(), set()
+    for message in messages:
+        if not isinstance(message, dict) or set(message) != {"id", "name", "message_text", "selected_steps"}:
+            raise MirzaRouteError("Invalid message fields")
+        try:
+            if not isinstance(message["id"], str) or str(uuid.UUID(message["id"])) != message["id"]:
+                raise ValueError
+        except (ValueError, AttributeError, TypeError):
+            raise MirzaRouteError("Invalid message identity") from None
+        message["name"] = _bot_name(message["name"])
+        if message["name"] in names or message["id"] in identities:
+            raise MirzaRouteError("A message with this name or identity already exists")
+        names.add(message["name"])
+        identities.add(message["id"])
+        text = message["message_text"]
+        try:
+            if not isinstance(text, str) or len(text.encode("utf-16-le")) // 2 > 4096:
+                raise ValueError
+        except (ValueError, UnicodeError):
+            raise MirzaRouteError("Message must be at most 4096 UTF-16 units") from None
+        steps = message["selected_steps"]
+        if not isinstance(steps, list) or any(type(step) is not int or not 0 <= step <= 9 for step in steps):
+            raise MirzaRouteError("Selected steps must be zero-based integers from 0 to 9")
+        message["selected_steps"] = sorted(set(steps))
+        if assigned.intersection(steps):
+            raise MirzaRouteError("A selected step is already assigned to another message")
+        assigned.update(steps)
+    return messages
+
+
+def _message_ready(message: dict) -> bool:
+    return bool(message["message_text"].strip() and message["selected_steps"])
+
+
+def _route_values(row) -> dict:
+    return {key: getattr(row, key) for key in ("name", "admin_usernames", "base_url", "api_key", "enabled", "messages")}
+
+
 def _validate_route(values: dict) -> dict:
     values = deepcopy(values)
     values["name"] = _bot_name(values["name"])
@@ -112,31 +154,18 @@ def _validate_route(values: dict) -> dict:
     key = values["api_key"]
     if not isinstance(key, str) or len(key) > 512 or any(not 33 <= ord(c) <= 126 for c in key):
         raise MirzaRouteError("API key must be at most 512 printable non-whitespace ASCII characters")
-    text = values["message_text"]
-    try:
-        if not isinstance(text, str) or len(text.encode("utf-16-le")) // 2 > 4096:
-            raise ValueError
-    except (ValueError, UnicodeError):
-        raise MirzaRouteError("Message must be at most 4096 UTF-16 units") from None
-    if (
-        type(values["enabled"]) is not bool
-        or not isinstance(values["trigger_mode"], str)
-        or values["trigger_mode"] not in {"last", "selected"}
-    ):
-        raise MirzaRouteError("Invalid enabled flag or trigger mode")
-    steps = values["selected_steps"]
-    if not isinstance(steps, list) or any(type(step) is not int or not 0 <= step <= 9 for step in steps):
-        raise MirzaRouteError("Selected steps must be zero-based integers from 0 to 9")
-    values["selected_steps"] = sorted(set(steps))
+    if type(values["enabled"]) is not bool:
+        raise MirzaRouteError("Invalid enabled flag")
+    values["messages"] = _validate_messages(values["messages"])
     if values["enabled"] and (
         not values["admin_usernames"]
         or not values["base_url"]
         or not key
-        or not text.strip()
-        or (values["trigger_mode"] == "selected" and not values["selected_steps"])
+        or not any(_message_ready(message) for message in values["messages"])
     ):
         raise MirzaRouteError(
-            "Assign at least one admin and complete the URL, key, message and step selection before enabling"
+            "Assign at least one admin and complete the URL, key and a message with selected steps; "
+            "disable the bot before removing its last ready message"
         )
     return values
 
@@ -192,10 +221,7 @@ async def update_route(route_id: str, changes: dict, *, expected_revision: int |
         "admin_usernames",
         "base_url",
         "api_key",
-        "message_text",
         "enabled",
-        "trigger_mode",
-        "selected_steps",
     }
     if not isinstance(changes, dict) or not set(changes).issubset(allowed):
         raise MirzaRouteError("Unknown route setting")
@@ -203,11 +229,52 @@ async def update_route(route_id: str, changes: dict, *, expected_revision: int |
         row = await MirzaRoutesCRUD.get(db, route_id)
         if row is None:
             raise MirzaRouteError("Route no longer exists")
-        values = {key: getattr(row, key) for key in allowed}
+        values = _route_values(row)
         values.update(deepcopy(changes))
         values = _validate_route(values)
         revision = row.revision if expected_revision is None else expected_revision
         return MirzaRoutesCRUD.public(await MirzaRoutesCRUD.update(db, route_id, values, expected_revision=revision))
+
+
+async def _edit_message(route_id: str, message_id: str | None, changes: dict | None, expected_revision: int) -> dict:
+    async with _transaction() as db:
+        row = await MirzaRoutesCRUD.get(db, route_id)
+        if row is None or row.revision != expected_revision:
+            raise MirzaRouteError("Bot changed or was deleted. Open it again")
+        values = _route_values(row)
+        messages = deepcopy(values["messages"])
+        if message_id is None:
+            messages.append(
+                {"id": str(uuid.uuid4()), "name": changes["name"], "message_text": "", "selected_steps": []}
+            )
+        else:
+            matches = [message for message in messages if message["id"] == message_id]
+            if len(matches) != 1:
+                raise MirzaRouteError("Message changed or was deleted. Open it again")
+            if changes is None:
+                messages.remove(matches[0])
+            else:
+                matches[0].update(deepcopy(changes))
+        values["messages"] = messages
+        values = _validate_route(values)
+        return MirzaRoutesCRUD.public(
+            await MirzaRoutesCRUD.update(db, route_id, values, expected_revision=expected_revision)
+        )
+
+
+async def create_message(route_id: str, name: str, *, expected_revision: int) -> dict:
+    """Append an unassigned draft under the bot's revision and cancellation boundary."""
+    return await _edit_message(route_id, None, {"name": name}, expected_revision)
+
+
+async def update_message(route_id: str, message_id: str, changes: dict, *, expected_revision: int) -> dict:
+    if not isinstance(changes, dict) or not set(changes).issubset({"name", "message_text", "selected_steps"}):
+        raise MirzaRouteError("Unknown message setting")
+    return await _edit_message(route_id, message_id, changes, expected_revision)
+
+
+async def delete_message(route_id: str, message_id: str, *, expected_revision: int) -> dict:
+    return await _edit_message(route_id, message_id, None, expected_revision)
 
 
 async def delete_route(route_id: str, *, expected_revision: int | None = None) -> None:
@@ -219,21 +286,9 @@ async def capture_rules() -> list[dict]:
     async with _transaction() as db:
         rules = []
         for row in await MirzaRoutesCRUD.list(db):
-            values = {
-                key: getattr(row, key)
-                for key in (
-                    "name",
-                    "admin_usernames",
-                    "base_url",
-                    "api_key",
-                    "message_text",
-                    "enabled",
-                    "trigger_mode",
-                    "selected_steps",
-                )
-            }
+            values = _route_values(row)
             try:
-                _validate_route(values)
+                values = _validate_route(values)
             except MirzaRouteError:
                 continue
             if row.enabled:
@@ -242,8 +297,11 @@ async def capture_rules() -> list[dict]:
                         "route_id": row.id,
                         "revision": row.revision,
                         "admin_usernames": row.admin_usernames,
-                        "trigger_mode": row.trigger_mode,
-                        "selected_steps": deepcopy(row.selected_steps),
+                        "messages": [
+                            {"id": message["id"], "selected_steps": message["selected_steps"]}
+                            for message in values["messages"]
+                            if _message_ready(message)
+                        ],
                     }
                 )
         return rules
@@ -262,20 +320,19 @@ def notification_context(
         or step_type not in {"warning", "disable", "revoke"}
     ):
         return None
-    candidates = [
-        {
-            "route_id": rule["route_id"],
-            "revision": rule["revision"],
-            **(
-                {"admin_usernames": rule["admin_usernames"]}
-                if "admin_usernames" in rule
-                else {"admin_username": rule["admin_username"]}
-            ),
-        }
-        for rule in rules
-        if (rule["trigger_mode"] == "last" and step_index == step_count - 1)
-        or (rule["trigger_mode"] == "selected" and step_index in rule["selected_steps"])
-    ]
+    candidates = []
+    for rule in rules:
+        matches = [message for message in rule["messages"] if step_index in message["selected_steps"]]
+        if len(matches) != 1:
+            continue
+        candidates.append(
+            {
+                "route_id": rule["route_id"],
+                "revision": rule["revision"],
+                "admin_usernames": rule["admin_usernames"],
+                "message_id": matches[0]["id"],
+            }
+        )
     return (
         deepcopy(
             {
@@ -322,12 +379,19 @@ def validate_notification_context(context: dict | None) -> dict | None:
         if not isinstance(candidate, dict) or set(candidate) not in (
             {"route_id", "revision", "admin_username"},
             {"route_id", "revision", "admin_usernames"},
+            {"route_id", "revision", "admin_usernames", "message_id"},
         ):
             raise ValueError("Invalid notification context")
         try:
             if not isinstance(candidate["route_id"], str):
                 raise ValueError
             uuid.UUID(candidate["route_id"])
+            if "message_id" in candidate:
+                if (
+                    not isinstance(candidate["message_id"], str)
+                    or str(uuid.UUID(candidate["message_id"])) != candidate["message_id"]
+                ):
+                    raise ValueError
             if "admin_usernames" in candidate:
                 names = candidate["admin_usernames"]
                 if (
