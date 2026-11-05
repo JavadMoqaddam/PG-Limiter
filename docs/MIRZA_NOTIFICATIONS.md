@@ -1,7 +1,7 @@
-# Mirza customer notifications
+# Mirza Bot customer notifications
 
 Open **Settings → 🔔 Notifications** in a private chat with the PG-Limiter bot.
-Existing authorized bot administrators can configure a separate Mirza sales bot
+Existing authorized bot administrators can configure a separate Mirza Bot instance
 for each PasarGuard admin. New configurations are disabled until completed and
 explicitly enabled.
 
@@ -9,11 +9,11 @@ explicitly enabled.
 
 1. Choose **Add Admin** and enter the exact **PasarGuard admin username** that
    owns the customer's configuration. This does not create a panel admin.
-2. Set that admin's Mirza API base URL, for example
+2. Set that admin's Mirza Bot API base URL, for example
    `https://bot.example.com/api/`. An HTTPS domain without a path is normalized
    to `/api`. Enter the API base, not its documentation page or `/users` endpoint.
-3. Set a Mirza API key authorized to use the **users API**, including its
-   `send_message` action. Use the key generated in Mirza's API-key settings.
+3. Set a Mirza Bot API key authorized to use the **users API**, including its
+   `send_message` action. Use the key generated in Mirza Bot's API-key settings.
    The menu shows only whether a key is configured; replacing it does not reveal
    the previous value.
 4. Set the message and select the punishment stages that should notify.
@@ -60,7 +60,7 @@ template needs `[Limit]` and no valid limit is available, the notification fails
 without guessing a number. A template without variables is sent unchanged.
 Other bracketed text remains literal.
 
-Mirza supports HTML messages, so a template can contain
+Mirza Bot supports HTML messages, so a template can contain
 `<code>[Username]</code>`. The substituted username is HTML-escaped. The final
 message must fit within 4096 UTF-16 units; an oversized result fails without
 being truncated or sent in parts.
@@ -106,14 +106,14 @@ that lookup affect the resolution.
 
 The request is `POST <API base>/users`, with the admin's key in the `Token`
 header and JSON containing `actions: "send_message"`, `chat_id` as a string,
-and the rendered `text`. Delivery is acknowledged only when Mirza returns a
-successful HTTP response with the JSON boolean `status: true`. This is Mirza's
+and the rendered `text`. Delivery is acknowledged only when Mirza Bot returns a
+successful HTTP response with the JSON boolean `status: true`. This is Mirza Bot's
 acknowledgment, not proof that the customer read the Telegram message.
 
 ## Delivery status and changes
 
 The menu shows delivery status counts. Sending runs independently of the
-limiter, so a slow or unavailable Mirza endpoint does not delay punishment.
+limiter, so a slow or unavailable Mirza Bot endpoint does not delay punishment.
 
 | Status | Meaning |
 | --- | --- |
@@ -121,7 +121,7 @@ limiter, so a slow or unavailable Mirza endpoint does not delay punishment.
 | Ready | Recipient and message are saved, waiting for transmission |
 | Sending | A transmission is in progress; interruption can leave an uncertain outcome |
 | Retry | A definite temporary failure is waiting for a bounded retry |
-| Delivered | Mirza acknowledged the request |
+| Delivered | Mirza Bot acknowledged the request |
 | Skipped | No valid recipient/owner or the applicable settings changed |
 | Failed | Invalid configuration/payload, rejected request or retries exhausted |
 | Uncertain | The remote request may have succeeded; it is not resent automatically |
@@ -129,7 +129,7 @@ limiter, so a slow or unavailable Mirza endpoint does not delay punishment.
 Temporary failures known to occur before sending and explicit rate-limit
 responses can be retried, with at most three attempts for metadata resolution
 and three transmission attempts for definite temporary failures. A timeout after
-sending, interrupted request or ambiguous server response can follow successful delivery. Mirza documents no
+sending, interrupted request or ambiguous server response can follow successful delivery. Mirza Bot documents no
 idempotency key, so such requests remain uncertain instead of being blindly
 repeated. This avoids that source of duplicate messages at the cost of some
 uncertain messages potentially not arriving.
@@ -155,5 +155,5 @@ backup archives as credentials. See [Backup & Restore](BACKUP_RESTORE.md).
 Before upgrading, retain a full private backup and the previous image identity.
 Rollback to 1.7.2 requires restoring compatible database and state files offline
 before starting the older image. An explicit downgrade of revision `012` deletes
-Mirza routes, API keys and delivery history; it is not a lossless rollback. See
+Mirza Bot routes, API keys and delivery history; it is not a lossless rollback. See
 the [release rollback procedure](releases/v1.7.3.md#rollback).

@@ -66,7 +66,7 @@ class MirzaNotificationService:
                 except Exception:
                     # A failed commit leaves the conditional state as its owner.
                     # In particular, sending can never re-enter the due queue.
-                    logger.warning("Mirza notification processing deferred after local failure")
+                    logger.warning("Mirza Bot notification processing deferred after local failure")
 
     async def _resolve(self, event) -> None:
         from db.database import AsyncSessionLocal
@@ -161,7 +161,7 @@ class MirzaNotificationService:
                 # The durable sending row still owns the uncertain request.
                 # A database outage must not turn shutdown cancellation into
                 # an ordinary per-event failure and restart the worker loop.
-                logger.warning("Interrupted Mirza delivery remains owned by its sending record")
+                logger.warning("Interrupted Mirza Bot delivery remains owned by its sending record")
             raise
         except Exception:
             result = MirzaResult("uncertain", "transport_interrupted")
@@ -190,7 +190,7 @@ class MirzaNotificationService:
             try:
                 await self.run_once()
             except Exception:
-                logger.warning("Mirza notification worker deferred after local failure")
+                logger.warning("Mirza Bot notification worker deferred after local failure")
             await asyncio.sleep(1)
 
     async def close(self) -> None:

@@ -1,4 +1,4 @@
-"""Small Mirza transport with conservative, sanitized delivery outcomes."""
+"""Small Mirza Bot transport with conservative, sanitized delivery outcomes."""
 
 from dataclasses import dataclass
 

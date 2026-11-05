@@ -1,4 +1,4 @@
-"""Add versioned Mirza routes and incident-owned notifications without backfill.
+"""Add versioned Mirza Bot routes and incident-owned notifications without backfill.
 
 Revision ID: 012_mirza_notifications
 Revises: 011_daily_reports

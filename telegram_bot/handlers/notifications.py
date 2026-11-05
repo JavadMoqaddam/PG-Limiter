@@ -1,4 +1,4 @@
-"""Private, revision-guarded management of per-owner Mirza notifications."""
+"""Private, revision-guarded management of per-owner Mirza Bot notifications."""
 
 import html
 import uuid
@@ -157,9 +157,9 @@ async def _prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str
     )
     prompts = {
         "admin_username": "Enter the exact PasarGuard admin username. This does not create a panel admin.",
-        "base_url": "Enter the HTTPS Mirza API base URL, e.g. <code>https://bot.example.com/api/</code>.\n"
+        "base_url": "Enter the HTTPS Mirza Bot API base URL, e.g. <code>https://bot.example.com/api/</code>.\n"
         "Enter the base, not its /users endpoint.",
-        "api_key": "Enter the replacement Mirza API key with users/send_message permission.\n"
+        "api_key": "Enter the replacement Mirza Bot API key with users/send_message permission.\n"
         "The key is never displayed. Its incoming message will be deleted best-effort after saving.",
         "message_text": "Enter the fixed HTML message. Use literal <code>[Username]</code> for the punished "
         "configuration username and <code>[Limit]</code> for its effective allowed concurrent "

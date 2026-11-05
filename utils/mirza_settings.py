@@ -1,4 +1,4 @@
-"""Independent Mirza route settings and pure secret-free admission snapshots."""
+"""Independent Mirza Bot route settings and pure secret-free admission snapshots."""
 
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -137,7 +137,7 @@ async def _transaction():
     except MirzaRouteError:
         raise
     except Exception:
-        raise RuntimeError("Mirza settings database operation failed") from None
+        raise RuntimeError("Mirza Bot settings database operation failed") from None
 
 
 async def list_routes() -> list[dict]:

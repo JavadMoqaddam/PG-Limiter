@@ -1,4 +1,4 @@
-"""Idempotent admission and atomic state ownership for Mirza notifications."""
+"""Idempotent admission and atomic state ownership for Mirza Bot notifications."""
 
 from copy import deepcopy
 import re
