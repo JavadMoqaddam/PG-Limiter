@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/Python-3.12+-blue?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/Python-3.15-blue?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/License-AGPL--3.0-green" alt="License">
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white" alt="Docker">
-  <img src="https://img.shields.io/badge/Version-1.7.2-blue" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.7.3-blue" alt="Version">
 </p>
 
 <h1 align="center">🛡️ PG-Limiter</h1>
@@ -17,7 +17,7 @@
 
 ---
 
-**PG-Limiter 1.7.2** keeps API enforcement ahead of waiting user synchronization and adds aggregate API lookup timings. Read the [release notes](docs/releases/v1.7.2.md) and credential migration instructions before upgrading from 1.7.0.
+**PG-Limiter 1.7.3** adds per-admin Mirza punishment notifications, improves Telegram delivery handling, and brings Backup & Restore into one menu. The release image and CI use Python 3.15. Read the [release notes](docs/releases/v1.7.3.md) and credential migration instructions before upgrading from 1.7.0.
 
 ## 📑 Table of Contents
 
@@ -37,6 +37,7 @@
 - [CLI Interface](#-cli-interface)
 - [REST API](#-rest-api)
 - [Disable Methods](#-disable-methods)
+- [Mirza Notifications](#-mirza-notifications)
 - [Caching](#-caching)
 - [Project Architecture](#-project-architecture)
 - [FAQ](#-faq)
@@ -68,6 +69,8 @@
 | 📝 **Audit Logging** | Preserves violation and disable message history for accounting |
 | 💾 **Automated Backups** | Scheduled periodic backups sent directly to your Telegram backup topic |
 
+Critical notifications retain durable retries and can duplicate after a lost Telegram response. Periodic warnings and system messages stop blind resend after uncertain delivery; newer warning scans replace older unsent work. Node summaries retain pending receipts and coalesce updates. See [Telegram delivery and retries](docs/TELEGRAM_DELIVERY.md) for the tradeoffs and menu/backup behavior.
+
 ### ⚡ Performance & Data Management
 | Feature | Description |
 |---------|-------------|
@@ -91,21 +94,21 @@
 
 ### Quick Install with Docker (Recommended)
 
-Version 1.7.2 requires `PANEL_API_KEY`. Before upgrading from 1.7.0, prepare
+Version 1.7.3 requires `PANEL_API_KEY`. Before upgrading from 1.7.0, prepare
 the key and permission scopes described in the
 [panel API-key guide](docs/PANEL_API_KEY.md).
 
-Run the versioned 1.7.2 installer. Existing installations must configure their panel API key and intended TLS verification setting before upgrading:
+Run the versioned 1.7.3 installer. Existing installations must configure their panel API key and intended TLS verification setting before upgrading:
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.2/pg-limiter.sh) install
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.3/pg-limiter.sh) install
 ```
 
 Or download and run step-by-step:
 
 ```bash
 # Download the installer
-curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.2/pg-limiter.sh -o /tmp/pg-limiter.sh
+curl -fsSL https://raw.githubusercontent.com/JavadMoqaddam/PG-Limiter/v1.7.3/pg-limiter.sh -o /tmp/pg-limiter.sh
 
 # Run installation
 sudo bash /tmp/pg-limiter.sh install
@@ -300,13 +303,13 @@ COUNTRY_CODE=IR
 TZ=UTC
 ```
 
-The panel API key is the sole panel credential in version 1.7.2.
+The panel API key is the sole panel credential in version 1.7.3.
 REST requests, SSE log streams and startup probes send it in `X-Api-Key`.
 Panel username/password login is unsupported. Changing `PANEL_DOMAIN` or
 `PANEL_API_KEY` requires restarting the process or recreating its container.
 See the [panel API-key guide](docs/PANEL_API_KEY.md) for permission scopes,
 upgrading an existing `.env` and TLS settings. Version 1.7.0 used panel
-username/password credentials; configure the key before upgrading to 1.7.2.
+username/password credentials; configure the key before upgrading to 1.7.3.
 The optional management API keeps its separate
 `API_USERNAME` and `API_PASSWORD` authentication.
 
@@ -351,6 +354,21 @@ Runs on port `8080` by default. Swagger documentation available at `http://local
 
 1. **Status-based (Default):** Sets user status to `disabled` in PasarGuard panel.
 2. **Group-based:** Preserves original user groups and temporarily moves user to a restricted fallback group ID until re-enabled.
+
+---
+
+## 🔔 Mirza Notifications
+
+In a private bot chat, open **Settings → Notifications** to configure a separate
+Mirza API URL, key and message for each PasarGuard admin. Choose the dynamic last
+punishment step or select specific stages. Every newly applied matching incident
+can notify the customer identified in the configuration's note. `[Username]`
+inserts the punished configuration's username; `[Limit]` inserts its effective
+allowed connection count.
+
+Configurations start disabled. Delivery uses a persistent queue independently of
+enforcement. See [Mirza customer notifications](docs/MIRZA_NOTIFICATIONS.md) for
+setup, permissions, templates and delivery statuses.
 
 ---
 

@@ -19,6 +19,8 @@ Thank you for your interest in contributing to Limiter!
 
 ## Development
 
+The release image and CI use **Python 3.15**. Use the same interpreter in your development virtual environment.
+
 ### Running Locally
 
 ```bash

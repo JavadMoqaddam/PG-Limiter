@@ -59,6 +59,7 @@ def create_settings_menu_keyboard():
             InlineKeyboardButton("🛰️ IP Source", callback_data=CallbackData.IP_SOURCE_MENU),
             InlineKeyboardButton("🧮 Device Counting", callback_data=CallbackData.DEVICE_COUNT_MENU),
         ],
+        [InlineKeyboardButton("🔔 Notifications", callback_data=CallbackData.NOTIFICATIONS_MENU)],
         [
             InlineKeyboardButton("🔙 Back", callback_data=CallbackData.BACK_MAIN),
         ],

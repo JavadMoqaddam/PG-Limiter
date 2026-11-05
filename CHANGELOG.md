@@ -6,9 +6,27 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
+## [1.7.3] - 2026-11-05
+
+### Added
+
+- Add Settings → Notifications for per-PasarGuard-admin Mirza API URLs, keys, message templates and selectable punishment stages. `[Username]` and `[Limit]` insert the punished configuration's username and effective connection limit; each new matching punishment can notify its customer.
+- Persist notification events independently of enforcement, deduplicate incident replay, and retain uncertain delivery outcomes without blind resending. Migration `012_mirza_notifications` preserves existing punishment evidence without historical backfill.
+
 ### Changed
 
+- Upgrade the container runtime to Python 3.15.0 and run CI tests, lint and SQLite migration checks on Python 3.15.
+- Validate candidate images on amd64 and arm64 before publishing the stable version and latest tags.
+- Refresh cachetools, FastAPI, Ruff, pytest, pytest-asyncio and the Docker registry login action.
 - Consolidate Telegram backup scheduling, Backup Now, and Restore under Settings → Backup & Restore. Move Restore out of the main menu and keep it available when automatic backups are disabled.
+- Stop blind retries of uncertain noncritical Telegram sends and supersede older unsent warning reports with the latest completed scan. Critical notifications retain durable at-least-once retries, with possible duplicates after lost responses. See [delivery policy](docs/TELEGRAM_DELIVERY.md).
+
+### Fixed
+
+- Keep node-summary delivery receipts through slow sends, coalesce later updates, and retire producer work on monitoring resets, periodic SSE refresh and shutdown. Telegram waits no longer block node-status ingestion.
+- Replace node summaries, menus and status cards only after confirmed message unavailability. Preserve confirmed backup delivery through local cleanup failures and avoid administrator fallback after an uncertain group send.
+- The Telegram delivery changes require no additional migration beyond the Mirza schema revision; existing critical pending JSON state remains included in backups.
+- Replace image-only rollback hints with offline restoration guidance for database and state compatibility across schema changes.
 
 ### Removed
 

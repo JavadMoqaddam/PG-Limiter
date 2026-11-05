@@ -2,6 +2,8 @@
 
 In Telegram, open **Settings → Backup & Restore** for backup scheduling, **Backup Now** (available when Auto-Backup is enabled), and **Restore**. Restore remains available when Auto-Backup is disabled. Immediate and scheduled backups use the same delivery path: the configured backup topic, with administrator delivery as a fallback.
 
+A confirmed Telegram document receipt remains successful even if local cleanup fails. Administrator fallback is allowed for a definite group destination rejection; an uncertain group send does not trigger another copy or claim success. With Topics disabled or no group configured, the existing administrator delivery path still applies. See [Telegram delivery and retries](TELEGRAM_DELIVERY.md).
+
 To create a backup on the host:
 
 ```bash
@@ -11,6 +13,10 @@ pg-limiter backup /root/pg-limiter-backup.zip
 New archives contain a **database-consistent SQLite backup API snapshot** of the configured `DATABASE_URL`. Committed WAL records are included in that snapshot; live `-wal` and `-shm` files are never archived. Missing or uninitialized databases fail the backup rather than producing a successful database-backup message. External databases and SQLite `file:` URI URLs require a database-specific backup procedure.
 
 The archive also includes the environment file once and the actual persisted warning/trust history, punishment compatibility history, original groups, Telegram topics/message caches, pending notifications, disable-message receipts, automatic-backup settings and existing legacy import inputs. JSON and environment files are captured independently of SQLite: the archive does **not** promise a transaction spanning those stores. A versioned manifest records checksums and explicitly absent JSON files.
+
+[Mirza notification](MIRZA_NOTIFICATIONS.md) routes, API keys and delivery states are part of the SQLite snapshot. Pending punishment evidence is retained in the existing fact-journal sidecar. Backup archives therefore contain credentials and should be kept private.
+
+The Telegram delivery policy introduces no additional schema migration or new backup format. Critical pending notifications retain their existing JSON backup inclusion. Replaying restored pending state can duplicate a critical notification whose Telegram acknowledgement was lost; noncritical pending sends and node-summary state are not durable recovery records.
 
 The original-group compatibility file now defaults to `$PG_LIMITER_DATA_DIR/user_groups_backup.json` (`/var/lib/pg-limiter/user_groups_backup.json` by default). Until that file exists, the old working-directory or `/app/.user_groups_backup.json` is read without being removed. Subsequent saves persist on the volume.
 
@@ -29,6 +35,17 @@ The management command validates the archive and destination before asking to ap
 Restored `.env`'s explicit SQLite `DATABASE_URL` selects the database location for the next lifecycle. Without an archived URL, the current effective URL selects the destination. An archived `PG_LIMITER_DATA_DIR` also selects the original-group and legacy-config destinations using the same path rules as their runtime owners, including explicit absence. The helper checks that database and JSON state destinations are on real persistent mounts; an ephemeral image path cannot produce a successful restore. Directory mounts and file bind mounts for the configured database or owned state files are supported. `DATABASE_URL` and `PG_LIMITER_DATA_DIR` using environment interpolation must be resolved to explicit values before restoration. Configuration is writable only in the offline apply helper; the daemon's configuration mount stays read-only.
 
 After applying, the command asks whether to start the service. Declining leaves it stopped. Starting uses a fresh process and configuration; the bot never swaps files underneath a running database engine. The management script and application image must both contain this backup format/helper; an older image fails before shutdown because it cannot run the validator.
+
+## Rollback across migrations
+
+For rollback across a database migration, keep a complete private archive made
+before the upgrade, together with the previous image identity, Compose file and
+management script. The updater's limited copies do not replace this archive,
+especially for a custom database path and persisted state sidecars. Apply the
+archive with the current offline restore helper and decline its restart prompt;
+then restore the matching previous image, Compose file and script before starting.
+An older image cannot resolve newer Alembic revisions. See the
+[1.7.3 rollback procedure](releases/v1.7.3.md#rollback) for migration `012`.
 
 ## Legacy compatibility
 

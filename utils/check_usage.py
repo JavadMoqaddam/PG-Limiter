@@ -621,10 +621,10 @@ async def dispatch_chunked_warnings(
         max_warnings: Configurable max warning cycles before disable
     """
     admission = monitoring_snapshot()
-    if not new_warnings or not monitoring_is_current(admission):
+    if not monitoring_is_current(admission):
         return
 
-    from telegram_bot.send_message import send_warning_log
+    from telegram_bot.send_message import send_warning_report
     from datetime import datetime
     import html
 
@@ -632,9 +632,10 @@ async def dispatch_chunked_warnings(
     total_violators = len(new_warnings)
     total_chunks = (total_violators + chunk_size - 1) // chunk_size
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    logger.info(f"📨 Enqueueing {total_chunks} warning report batches ({total_violators} users) to Warnings topic")
+    logger.info(f"📨 Enqueueing warning scan with {total_chunks} chunks ({total_violators} users) to Warnings topic")
 
     period_min = max(1, round(check_interval * max_warnings / 60))
+    messages = []
     for idx in range(0, total_violators, chunk_size):
         if not monitoring_is_current(admission):
             return
@@ -678,9 +679,10 @@ async def dispatch_chunked_warnings(
         )
 
         batch_msg = f"{header}\n\n" + "\n\n".join(user_blocks) + f"\n\n{footer}"
-        # Enqueue with safe TTL (10 minutes) so reports are not prematurely dropped
-        warning_ttl = max(600.0, check_interval * 10)
-        await send_warning_log(batch_msg, ttl=warning_ttl)
+        messages.append(batch_msg)
+    if monitoring_is_current(admission):
+        # A complete current scan supersedes older queued chunks, including when empty.
+        await send_warning_report(messages, ttl=max(600.0, check_interval * 10))
 
 
 def _sample_is_trustworthy(all_users_actual_ips: dict, check_interval: int) -> bool:
@@ -1420,10 +1422,9 @@ async def check_users_usage(panel_data: PanelType, config_data: dict | None = No
     total_monitored = len(warning_system.get_monitoring_users())
     if not cycle_is_current():
         return
-    if cycle_new_warnings:
-        await dispatch_chunked_warnings(
-            cycle_new_warnings, check_interval, total_monitored, max_warnings=int(max_warning_count)
-        )
+    await dispatch_chunked_warnings(
+        cycle_new_warnings, check_interval, total_monitored, max_warnings=int(max_warning_count)
+    )
 
     # Clean up expired warnings. Gated on the same trustworthiness verdict as
     # check_persistent_violations: unconditional cleanup deleted exactly the records

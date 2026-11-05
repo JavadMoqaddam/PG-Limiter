@@ -179,7 +179,7 @@ def pytest_addoption(parser):
 
 
 @pytest.fixture
-def operational_topics(monkeypatch, tmp_path):
+async def operational_topics(monkeypatch, tmp_path):
     """Use a real, isolated Topics destination for tests exercising monitoring."""
     import telegram_bot.topics as topics
 
@@ -207,9 +207,11 @@ def operational_topics(monkeypatch, tmp_path):
     monkeypatch.setattr(logs, "TASKS", [])
     monkeypatch.setattr(logs, "task_node_mapping", {})
     monkeypatch.setattr(logs, "task_monitoring_admissions", {})
-    monkeypatch.setattr(logs, "_pending_status_update_task", None)
+    monkeypatch.setattr(logs, "_node_status_delivery", None)
+    monkeypatch.setattr(logs, "_node_connection_status", {})
     monkeypatch.setattr(logs, "_status_lock", asyncio.Lock())
     yield manager
+    await logs.retire_node_status_message()
 
 
 @pytest.fixture

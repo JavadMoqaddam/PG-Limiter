@@ -8,6 +8,7 @@ success. The panel and local disk cannot participate in one atomic transaction.
 import asyncio
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass, field
 import json
 import math
@@ -55,14 +56,17 @@ class ActionFact:
     disable_succeeded: bool = False
     revoke_succeeded: bool = False
     uuid_reset_succeeded: bool = False
+    warning_succeeded: bool = False
+    notification_context: dict | None = None
     state: str = "prepared"
     journal: "PunishmentFactJournal" = field(default=None, repr=False)
     on_disabled: Callable | None = field(default=None, repr=False)
     known_not_disabled: bool = field(default=False, repr=False)
+    step_type: str | None = field(default=None, repr=False)
 
     def snapshot(self) -> dict:
         return {
-            key: getattr(self, key)
+            key: deepcopy(getattr(self, key))
             for key in (
                 "incident_id",
                 "username",
@@ -72,6 +76,8 @@ class ActionFact:
                 "disable_succeeded",
                 "revoke_succeeded",
                 "uuid_reset_succeeded",
+                "warning_succeeded",
+                "notification_context",
                 "state",
             )
         }
@@ -91,6 +97,14 @@ class ActionFact:
             setattr(self, field_name, True)
             if self.applied_at is None:
                 self.applied_at = self.journal.clock()
+            self.journal.pending[self.incident_id] = self.snapshot()
+
+    def mark_warning(self) -> None:
+        """Capture confirmed warning history ownership before any await."""
+        if not self.warning_succeeded:
+            self.warning_succeeded = True
+            self.state = "completed"
+            self.applied_at = self.journal.clock()
             self.journal.pending[self.incident_id] = self.snapshot()
 
     async def save(self) -> None:
@@ -120,6 +134,11 @@ class PunishmentFactJournal:
                 if not isinstance(loaded, dict):
                     raise ValueError("Fact outbox must contain an object")
                 for incident_id, snapshot in loaded.items():
+                    from db.crud.punishment_facts import normalize_fact
+
+                    if isinstance(snapshot, dict):
+                        snapshot = normalize_fact(snapshot)
+                        loaded[incident_id] = snapshot
                     if (
                         not isinstance(snapshot, dict)
                         or set(snapshot) != expected
@@ -132,7 +151,12 @@ class PunishmentFactJournal:
                         )
                         or any(
                             type(snapshot[key]) is not bool
-                            for key in ("disable_succeeded", "revoke_succeeded", "uuid_reset_succeeded")
+                            for key in (
+                                "disable_succeeded",
+                                "revoke_succeeded",
+                                "uuid_reset_succeeded",
+                                "warning_succeeded",
+                            )
                         )
                         or any(
                             type(value) not in (int, float) or not math.isfinite(value)
@@ -186,8 +210,28 @@ class PunishmentFactJournal:
                 logger.error("Punishment fact outbox write failed; pending evidence remains owned: %s", error)
 
     @asynccontextmanager
-    async def action(self, username: str, step_index: int | None, on_disabled: Callable | None = None):
-        fact = ActionFact(uuid.uuid4().hex, username, step_index, self.clock(), journal=self, on_disabled=on_disabled)
+    async def action(
+        self,
+        username: str,
+        step_index: int | None,
+        on_disabled: Callable | None = None,
+        *,
+        notification_context: dict | None = None,
+        step_type: str | None = None,
+    ):
+        from utils.mirza_settings import validate_notification_context
+
+        context = validate_notification_context(notification_context)
+        fact = ActionFact(
+            uuid.uuid4().hex,
+            username,
+            step_index,
+            self.clock(),
+            journal=self,
+            on_disabled=on_disabled,
+            notification_context=context,
+            step_type=step_type,
+        )
         self.pending[fact.incident_id] = fact.snapshot()
         try:
             await fact.save()
@@ -203,7 +247,7 @@ class PunishmentFactJournal:
             normal = True
         finally:
             _current_action.reset(token)
-            fact.state = "completed" if normal or fact.disable_succeeded else "uncertain"
+            fact.state = "completed" if normal or fact.disable_succeeded or fact.warning_succeeded else "uncertain"
             await fact.save()
 
     async def ready_before(self, end: float) -> bool:

@@ -34,7 +34,7 @@ jobs:
         uses: docker/setup-buildx-action@v4.4.1
 
       - name: Log in to Container Registry (GHCR)
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@v4.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -50,13 +50,58 @@ jobs:
             type=raw,value=${{ inputs.release_version }},priority=1000
             type=sha,prefix=
 
-      - name: Build and push Docker image
+      - name: Name the candidate image
+        id: candidate
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: type=sha,prefix=candidate-,format=long
+
+      - name: Build and push candidate image
+        id: build
         uses: docker/build-push-action@v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.candidate.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Check both candidate architectures before stable publication
+        shell: bash
+        env:
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.tags }}
+          CANDIDATE_DIGEST: ${{ steps.build.outputs.digest }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          image="${CANDIDATE_TAG%:*}@${CANDIDATE_DIGEST}"
+          for platform in linux/amd64 linux/arm64; do
+            docker run --rm --platform "$platform" --network none \
+              --tmpfs /var/lib/pg-limiter:rw,mode=1777 \
+              -e RELEASE_VERSION \
+              --entrypoint /bin/sh "$image" -ec '
+                mkdir -p /var/lib/pg-limiter/data /var/lib/pg-limiter/logs
+                python -c "import ast, os, pathlib, sys; import telegram, httpx, sqlalchemy, fastapi, alembic; assert sys.version_info[:2] == (3, 15); source = ast.parse(pathlib.Path(\"limiter.py\").read_text()); version = next(ast.literal_eval(n.value) for n in source.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == \"VERSION\" for t in n.targets)); assert version == os.environ[\"RELEASE_VERSION\"]; assert pathlib.Path(\"LICENSE\").stat().st_size > 0"
+                python -m alembic upgrade head
+                python cli_main.py --help >/dev/null
+              '
+          done
+
+      - name: Publish verified image tags
+        shell: bash
+        env:
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.tags }}
+          CANDIDATE_DIGEST: ${{ steps.build.outputs.digest }}
+          PUBLISH_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          image="${CANDIDATE_TAG%:*}@${CANDIDATE_DIGEST}"
+          tags=()
+          while IFS= read -r tag; do
+            test -n "$tag"
+            tags+=(--tag "$tag")
+          done <<< "$PUBLISH_TAGS"
+          docker buildx imagetools create "${tags[@]}" "$image"
