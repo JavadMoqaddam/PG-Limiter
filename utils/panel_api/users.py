@@ -1122,7 +1122,7 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
         if policy is not None:
             effective_limit = policy.limit
     except Exception:
-        users_logger.warning("Mirza notification limit snapshot unavailable; continuing punishment")
+        users_logger.warning("Mirza Bot notification limit snapshot unavailable; continuing punishment")
     selection = {}
     punishment, step_index, violation_count = await get_punishment_for_user(
         username.name, data, selection_snapshot=selection
@@ -1136,7 +1136,7 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
                 rules, step_index, selection.get("step_count", 0), punishment.step_type, effective_limit
             )
         except Exception:
-            users_logger.warning("Mirza notification rules unavailable; continuing punishment")
+            users_logger.warning("Mirza Bot notification rules unavailable; continuing punishment")
 
     users_logger.debug(
         f"⚖️ Punishment for {username.name}: step={step_index}, violations={violation_count}, type={punishment.step_type if punishment else 'none'}"

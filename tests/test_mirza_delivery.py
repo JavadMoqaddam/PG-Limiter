@@ -89,6 +89,7 @@ async def delivery_env(mirza_database, monkeypatch):
     route = await update_route(
         route["id"],
         {
+            "admin_usernames": ["owner"],
             "base_url": "https://one.example/api",
             "api_key": "key-one",
             "message_text": "<b>[Username]</b>: [Limit]",
@@ -130,7 +131,7 @@ async def admit(sessions, route, incident="incident", *, username="config<&", li
                         {
                             "route_id": route["id"],
                             "revision": route["revision"],
-                            "admin_username": route["admin_username"],
+                            "admin_usernames": route["admin_usernames"],
                         }
                     ],
                     "step_index": 0,
@@ -217,7 +218,13 @@ async def test_retry_backoff_allows_other_owner_then_stops_at_three_attempts(del
     second = await create_route("other-owner")
     second = await update_route(
         second["id"],
-        {"base_url": "https://two.example/api", "api_key": "key-two", "message_text": "other text", "enabled": True},
+        {
+            "admin_usernames": ["other-owner"],
+            "base_url": "https://two.example/api",
+            "api_key": "key-two",
+            "message_text": "other text",
+            "enabled": True,
+        },
     )
     await admit(mirza_database, route, "one", username="one")
     await admit(mirza_database, second, "two", username="two")

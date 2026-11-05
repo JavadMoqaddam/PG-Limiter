@@ -84,7 +84,8 @@ def test_url_rejects_unsafe_or_endpoint_inputs(value):
 async def configure_route(settings, admin, url="https://bot.example.com", key="synthetic-key", text="Hello"):
     route = await settings.create_route(admin)
     return await settings.update_route(
-        route["id"], {"base_url": url, "api_key": key, "message_text": text, "enabled": True}
+        route["id"],
+        {"admin_usernames": [admin], "base_url": url, "api_key": key, "message_text": text, "enabled": True},
     )
 
 
@@ -93,7 +94,8 @@ async def test_routes_hide_keys_and_versions_follow_actual_edits(route_database)
     from db.crud.mirza_routes import MirzaRoutesCRUD
 
     route = await settings.create_route(" alice ")
-    assert route["admin_username"] == "alice"
+    assert route["name"] == "alice"
+    assert route["admin_usernames"] == []
     assert (route["enabled"], route["trigger_mode"], route["selected_steps"], route["revision"]) == (
         False,
         "last",
@@ -105,7 +107,13 @@ async def test_routes_hide_keys_and_versions_follow_actual_edits(route_database)
         await settings.update_route(route["id"], {"enabled": True})
     updated = await settings.update_route(
         route["id"],
-        {"base_url": "https://bot.example.com", "api_key": "synthetic-key", "message_text": "Hello", "enabled": True},
+        {
+            "admin_usernames": ["alice"],
+            "base_url": "https://bot.example.com",
+            "api_key": "synthetic-key",
+            "message_text": "Hello",
+            "enabled": True,
+        },
     )
     assert updated["revision"] == 2
     assert updated["key_configured"] is True
@@ -121,7 +129,7 @@ async def test_routes_hide_keys_and_versions_follow_actual_edits(route_database)
         assert await MirzaRoutesCRUD.read_secret(db, route["id"], 3) is None
 
 
-async def test_duplicate_admin_rejected_and_recreation_has_new_identity(route_database):
+async def test_duplicate_bot_name_rejected_and_recreation_has_new_identity(route_database):
     from utils import mirza_settings as settings
 
     route = await settings.create_route("alice")
@@ -135,7 +143,7 @@ async def test_duplicate_admin_rejected_and_recreation_has_new_identity(route_da
 
 
 @pytest.mark.parametrize("admin", ["", " ", "a\nname", "a\x00name", "a" * 256])
-async def test_admin_name_rejects_empty_controls_and_oversized_input(route_database, admin):
+async def test_bot_name_rejects_empty_controls_and_oversized_input(route_database, admin):
     from utils import mirza_settings as settings
 
     with pytest.raises(ValueError):
@@ -189,18 +197,20 @@ async def test_independent_routes_capture_defensive_dynamic_and_selected_rules(r
     await settings.update_route(bob["id"], {"trigger_mode": "selected", "selected_steps": [0, 3]})
     await settings.create_route("disabled")
     rules = await settings.capture_rules()
-    assert {r["admin_username"] for r in rules} == {"alice", "bob"}
+    assert {r["admin_usernames"][0] for r in rules} == {"alice", "bob"}
     assert "api_key" not in repr(rules) and "Alice text" not in repr(rules)
     context = settings.notification_context(rules, 3, 4, "revoke")
     assert context["step_index"] == 3 and context["step_count"] == 4
-    assert {r["admin_username"] for r in context["candidates"]} == {"alice", "bob"}
-    assert [r["admin_username"] for r in settings.notification_context(rules, 0, 4, "warning")["candidates"]] == ["bob"]
-    assert [r["admin_username"] for r in settings.notification_context(rules, 1, 2, "disable")["candidates"]] == [
+    assert {r["admin_usernames"][0] for r in context["candidates"]} == {"alice", "bob"}
+    assert [r["admin_usernames"][0] for r in settings.notification_context(rules, 0, 4, "warning")["candidates"]] == [
+        "bob"
+    ]
+    assert [r["admin_usernames"][0] for r in settings.notification_context(rules, 1, 2, "disable")["candidates"]] == [
         "alice"
     ]
     assert settings.notification_context(rules, 1, 4, "disable") is None
     rules[0]["selected_steps"].append(9)
-    context["candidates"][0]["admin_username"] = "mutated"
+    context["candidates"][0]["admin_usernames"][0] = "mutated"
     assert "mutated" not in repr(await settings.capture_rules())
     async with route_database() as db:
         assert await MirzaRoutesCRUD.read_secret(db, alice["id"], 2) == "alice-key"

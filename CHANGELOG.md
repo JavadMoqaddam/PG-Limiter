@@ -6,11 +6,17 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Organize Notifications by named Mirza Bot instances. Each bot shares its endpoint, key, message and triggers across included panel admins; select or remove admins directly from the full panel list. Each admin belongs to at most one bot, and manual admin entry is removed.
+- Preserve existing per-admin settings and delivery history through migration `013_notification_bots`, converting each existing configuration into one bot with its original admin. Rollback to 1.7.3 requires restoring the full pre-upgrade database and state backup; revision 013 refuses in-place downgrade because the old version cannot read grouped notification contexts.
+- Use the full Mirza Bot product name in documentation, notification prompts and diagnostics.
+
 ## [1.7.3] - 2026-11-05
 
 ### Added
 
-- Add Settings → Notifications for per-PasarGuard-admin Mirza API URLs, keys, message templates and selectable punishment stages. `[Username]` and `[Limit]` insert the punished configuration's username and effective connection limit; each new matching punishment can notify its customer.
+- Add Settings → Notifications for per-PasarGuard-admin Mirza Bot API URLs, keys, message templates and selectable punishment stages. `[Username]` and `[Limit]` insert the punished configuration's username and effective connection limit; each new matching punishment can notify its customer.
 - Persist notification events independently of enforcement, deduplicate incident replay, and retain uncertain delivery outcomes without blind resending. Migration `012_mirza_notifications` preserves existing punishment evidence without historical backfill.
 
 ### Changed
@@ -25,7 +31,7 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 - Keep node-summary delivery receipts through slow sends, coalesce later updates, and retire producer work on monitoring resets, periodic SSE refresh and shutdown. Telegram waits no longer block node-status ingestion.
 - Replace node summaries, menus and status cards only after confirmed message unavailability. Preserve confirmed backup delivery through local cleanup failures and avoid administrator fallback after an uncertain group send.
-- The Telegram delivery changes require no additional migration beyond the Mirza schema revision; existing critical pending JSON state remains included in backups.
+- The Telegram delivery changes require no additional migration beyond the Mirza Bot schema revision; existing critical pending JSON state remains included in backups.
 - Replace image-only rollback hints with offline restoration guidance for database and state compatibility across schema changes.
 
 ### Removed

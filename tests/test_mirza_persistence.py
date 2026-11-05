@@ -261,7 +261,8 @@ def test_upgrade_populated_011_and_roundtrip_preserve_facts_without_backfill(tmp
     alembic(path, "upgrade", "011_daily_reports")
     with sqlite3.connect(path) as db:
         db.execute("INSERT INTO punishment_facts VALUES ('legacy','customer',3,99,100,1,0,0,'completed')")
-    alembic(path, "upgrade", "head")
+    # Round-trip revision 012 before advancing to the current schema for parity.
+    alembic(path, "upgrade", "012_mirza_notifications")
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT notification_context, warning_succeeded FROM punishment_facts").fetchone() == (
             None,
@@ -269,9 +270,10 @@ def test_upgrade_populated_011_and_roundtrip_preserve_facts_without_backfill(tmp
         )
         assert db.execute("SELECT count(*) FROM mirza_notifications").fetchone() == (0,)
     alembic(path, "downgrade", "011_daily_reports")
-    alembic(path, "upgrade", "head")
+    alembic(path, "upgrade", "012_mirza_notifications")
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT incident_id FROM punishment_facts").fetchone() == ("legacy",)
+    alembic(path, "upgrade", "head")
     subprocess.run(
         [sys.executable, "tools/ci_migration_checks.py", "parity", str(path)],
         check=True,

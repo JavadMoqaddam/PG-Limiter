@@ -1,10 +1,12 @@
 """Notifications management through real PTB routing, SQLite and offline Telegram."""
 
+import asyncio
 import importlib
 import json
 from itertools import count
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from telegram import Update
 from telegram.ext import ApplicationBuilder
@@ -34,6 +36,21 @@ class MenuTransport(TelegramTransport):
 async def menu(settings_db, monkeypatch):
     import telegram_bot.handlers.admin as admin_handlers
     import telegram_bot.main as main
+    import utils.panel_api.admins as panel_api
+
+    panel = SimpleNamespace(admins=[], unavailable=False)
+
+    async def panel_get(panel_data, path):
+        assert path == "/api/admins"
+        assert panel_data.panel_domain == "https://panel.example.com"
+        if panel.unavailable:
+            return None
+        return httpx.Response(200, json={"admins": panel.admins})
+
+    monkeypatch.setenv("PANEL_DOMAIN", "https://panel.example.com")
+    monkeypatch.setenv("PANEL_API_KEY", "synthetic-panel-key")
+    monkeypatch.setattr(panel_api, "panel_get", panel_get)
+    monkeypatch.setattr(panel_api, "_admins_cache", {"admins": None, "expires_at": 0.0, "panel_domain": None})
 
     transport = MenuTransport()
     build = ApplicationBuilder.build
@@ -139,6 +156,8 @@ async def menu(settings_db, monkeypatch):
         requests=transport.requests,
         app=app,
         main=main,
+        panel=panel,
+        refresh_panel=panel_api.invalidate_admins_cache,
     )
     await app.shutdown()
     assert not errors
@@ -149,6 +168,7 @@ async def complete_route(admin="alice", **changes):
     return await settings.update_route(
         route["id"],
         {
+            "admin_usernames": [admin],
             "base_url": "https://bot.example.com/api",
             "api_key": "private-test-key",
             "message_text": "[Username] [Limit]",
@@ -159,16 +179,16 @@ async def complete_route(admin="alice", **changes):
 
 async def open_route(menu, route):
     await menu.click("notifications_menu")
-    await menu.click(menu.button(route["admin_username"]))
+    await menu.click(menu.button(route["name"]))
 
 
-async def test_private_admin_can_add_and_edit_own_route_without_a_test_send(menu, caplog):
+async def test_private_admin_can_add_bot_select_members_and_edit_without_a_test_send(menu, caplog):
     bob = await complete_route("bob", message_text="Bob unchanged")
     await menu.click("settings_menu")
     await menu.click(menu.button("Notifications"))
-    await menu.click(menu.button("Add Admin"))
+    await menu.click(menu.button("Add Bot"))
     await menu.text("alice")
-    route = next(route for route in await settings.list_routes() if route["admin_username"] == "alice")
+    route = next(route for route in await settings.list_routes() if route["name"] == "alice")
     assert not route["enabled"]
     for label, value in [
         ("URL", "https://alice.example.com/"),
@@ -177,9 +197,15 @@ async def test_private_admin_can_add_and_edit_own_route_without_a_test_send(menu
     ]:
         await menu.click(menu.button(label))
         await menu.text(value)
+    menu.panel.admins = [{"username": "alice"}, {"username": "second-owner"}]
+    await menu.click(menu.button("Admins"))
+    await menu.click(menu.button("alice"))
+    await menu.click(menu.button("second-owner"))
+    await menu.click(menu.button("Back to Bot"))
     await menu.click(menu.button("Enable"))
     saved = await settings.get_route(route["id"])
     assert saved["enabled"] and saved["key_configured"]
+    assert saved["admin_usernames"] == ["alice", "second-owner"]
     assert saved["base_url"] == "https://alice.example.com/api"
     assert saved["message_text"] == "<b>[Username]</b> allowed [Limit]"
     assert await settings.get_route(bob["id"]) == bob
@@ -191,7 +217,7 @@ async def test_private_admin_can_add_and_edit_own_route_without_a_test_send(menu
 @pytest.mark.parametrize("kwargs", [{"user": 99}, {"private": False, "chat": -100}])
 async def test_menu_rejects_unauthorized_or_public_chat(menu, kwargs):
     await menu.click("notifications_menu", **kwargs)
-    assert "Add Admin" not in repr(menu.buttons())
+    assert "Add Bot" not in repr(menu.buttons())
     assert await settings.list_routes() == []
 
 
@@ -310,7 +336,7 @@ async def test_stale_text_and_delete_confirmation_cannot_overwrite_settings(menu
     await menu.click(menu.button("Delete"))
     await menu.click(menu.button("Confirm"))
     assert await settings.get_route(route["id"]) is None
-    assert "Add Admin" in repr(menu.buttons())
+    assert "Add Bot" in repr(menu.buttons())
 
 
 @pytest.mark.parametrize(
@@ -332,15 +358,10 @@ async def test_invalid_or_deleted_route_callbacks_offer_safe_navigation(menu, da
     assert data not in menu.messages[-1]
 
 
-async def test_routes_paginate_ten_at_a_time_with_short_secret_free_callbacks(menu):
+async def test_bots_are_accessible_with_short_secret_free_callbacks(menu):
     routes = [await settings.create_route(f"admin-{index:02}") for index in range(23)]
     await menu.click("notifications_menu")
-    assert sum("admin-" in b["text"] for b in menu.buttons()) == 10
-    await menu.click(menu.button("Next"))
-    assert sum("admin-" in b["text"] for b in menu.buttons()) == 10
-    assert "admin-10" in repr(menu.buttons()) and "admin-00" not in repr(menu.buttons())
-    await menu.click(menu.button("Next"))
-    assert sum("admin-" in b["text"] for b in menu.buttons()) == 3
+    assert sum("admin-" in b["text"] for b in menu.buttons()) == 23
     await open_route(menu, routes[0])
     await menu.click(menu.button("Triggers"))
     for endpoint, params in menu.requests:
@@ -442,7 +463,7 @@ async def test_key_entry_database_failure_is_localized_and_does_not_echo_key(men
     assert "never-display-this-key" not in repr(menu.requests) + caplog.text
     assert not menu.app.user_data[7]
     await menu.click("notifications_menu")
-    assert "Add Admin" in repr(menu.buttons())
+    assert "Add Bot" in repr(menu.buttons())
 
 
 async def test_valid_routes_at_largest_sqlite_revision_keep_callbacks_within_64_bytes(menu):
@@ -453,6 +474,148 @@ async def test_valid_routes_at_largest_sqlite_revision_keep_callbacks_within_64_
     async with database.get_db() as db:
         await db.execute(update(MirzaRoute).where(MirzaRoute.id == route["id"]).values(revision=2**63 - 1))
     await open_route(menu, route)
-    for label in ["Triggers", "Back to Admin", "Message", "Back to Admin", "Delete"]:
+    for label in ["Triggers", "Back to Bot", "Message", "Back to Bot", "Delete"]:
         await menu.click(menu.button(label))
         assert all(len(button["callback_data"].encode()) <= 64 for button in menu.buttons())
+
+
+async def test_new_bot_opens_full_panel_admin_list_without_manual_add_or_automatic_membership(menu):
+    menu.panel.admins = [{"username": f"seller-{i:02}", "is_sudo": i == 0} for i in range(23)]
+    await menu.click("notifications_menu")
+    await menu.click(menu.button("Add Bot"))
+    await menu.text("Sales Bot")
+    await menu.click(menu.button("Admins"))
+    assert sum("seller-" in b["text"] for b in menu.buttons()) == 23
+    assert not any(word in repr(menu.buttons()) for word in ["Add Admin", "More options", "Exclude"])
+    routes = await settings.list_routes()
+    assert len(routes) == 1 and routes[0]["admin_usernames"] == [] and not routes[0]["enabled"]
+    markup = menu.requests[-1][1]["reply_markup"]
+    if isinstance(markup, str):
+        markup = json.loads(markup)
+    assert all(len(row) == 1 for row in markup["inline_keyboard"])
+    await menu.click(menu.button("seller-22"))
+    assert (await settings.get_route(routes[0]["id"]))["admin_usernames"] == ["seller-22"]
+    assert "✅" in next(b["text"] for b in menu.buttons() if "seller-22" in b["text"])
+    await menu.click(menu.button("seller-22"))
+    assert (await settings.get_route(routes[0]["id"]))["admin_usernames"] == []
+
+
+async def test_admin_assigned_to_other_bot_is_visible_but_cannot_be_included(menu):
+    menu.panel.admins = [{"username": "owner"}]
+    first = await complete_route("owner")
+    second = await settings.create_route("Second bot")
+    await open_route(menu, second)
+    await menu.click(menu.button("Admins"))
+    assert "🔒" in next(b["text"] for b in menu.buttons() if "owner" in b["text"])
+    await menu.click(menu.button("owner"))
+    assert (await settings.get_route(second["id"]))["admin_usernames"] == []
+    assert await settings.get_route(first["id"]) == first
+    assert "another bot" in menu.messages[-1].lower()
+
+
+async def test_admin_selection_uses_exact_unicode_name_and_short_revision_guarded_payload(menu):
+    from sqlalchemy import update
+    from db.models import MirzaRoute
+
+    route = await settings.create_route("Unicode bot")
+    async with database.get_db() as db:
+        await db.execute(update(MirzaRoute).where(MirzaRoute.id == route["id"]).values(revision=2**63 - 2))
+    owner = "فروشنده<&>" + "آ" * 180
+    menu.panel.admins = [{"username": owner}, {"username": owner + "ب"}]
+    await open_route(menu, route)
+    await menu.click(menu.button("Admins"))
+    callbacks = [b["callback_data"] for b in menu.buttons() if b["text"].startswith("▫️")]
+    assert len(set(callbacks)) == 2
+    assert all(len(b["callback_data"].encode()) <= 64 for b in menu.buttons())
+    menu.panel.admins.reverse()
+    await menu.refresh_panel()
+    await menu.click(callbacks[0])
+    assert (await settings.get_route(route["id"]))["admin_usernames"] == [owner]
+    assert all(len(b["callback_data"].encode()) <= 64 for b in menu.buttons())
+    await menu.click(callbacks[1])
+    assert (await settings.get_route(route["id"]))["admin_usernames"] == [owner]
+    assert "changed" in menu.messages[-1].lower()
+
+
+async def test_removed_panel_selection_cannot_assign_replacement_owner(menu):
+    route = await settings.create_route("Bot")
+    menu.panel.admins = [{"username": "old-owner"}]
+    await open_route(menu, route)
+    await menu.click(menu.button("Admins"))
+    old = menu.button("old-owner")
+    menu.panel.admins = [{"username": "new-owner"}]
+    await menu.refresh_panel()
+    await menu.click(old)
+    assert (await settings.get_route(route["id"]))["admin_usernames"] == []
+    assert "new-owner" in repr(menu.buttons()) and "changed" in menu.messages[-1].lower()
+
+
+async def test_panel_outage_keeps_members_removable_and_refresh_recovers(menu):
+    route = await complete_route("saved-owner")
+    menu.panel.unavailable = True
+    await open_route(menu, route)
+    await menu.click(menu.button("Admins"))
+    assert "could not" in menu.messages[-1].lower() and "panel" in menu.messages[-1].lower()
+    await menu.click(menu.button("saved-owner"))
+    assert (await settings.get_route(route["id"]))["admin_usernames"] == []
+    menu.panel.unavailable = False
+    menu.panel.admins = [{"username": "recovered-owner"}]
+    await menu.click(menu.button("Refresh"))
+    assert "recovered-owner" in repr(menu.buttons())
+
+
+async def test_refresh_updates_shared_panel_admin_cache(menu):
+    route = await settings.create_route("Bot")
+    menu.panel.admins = [{"username": "first-owner"}]
+    await open_route(menu, route)
+    await menu.click(menu.button("Admins"))
+    menu.panel.admins = [{"username": "second-owner"}]
+    await menu.click(menu.button("Refresh"))
+    assert "second-owner" in repr(menu.buttons()) and "first-owner" not in repr(menu.buttons())
+
+
+@pytest.mark.parametrize("kwargs", [{"user": 99}, {"chat": -100, "private": False}])
+async def test_admin_selection_preserves_private_chat_authorization(menu, kwargs):
+    route = await settings.create_route("Bot")
+    menu.panel.admins = [{"username": "owner"}]
+    await open_route(menu, route)
+    await menu.click(menu.button("Admins"))
+    await menu.click(menu.button("owner"), **kwargs)
+    assert await settings.get_route(route["id"]) == route
+
+
+async def test_repeated_membership_clicks_apply_only_once(menu):
+    route = await settings.create_route("Bot")
+    menu.panel.admins = [{"username": "owner"}]
+    await open_route(menu, route)
+    await menu.click(menu.button("Admins"))
+    payload = menu.button("owner")
+    await asyncio.gather(menu.click(payload), menu.click(payload, user=8, chat=8))
+    saved = await settings.get_route(route["id"])
+    assert saved["admin_usernames"] == ["owner"] and saved["revision"] == route["revision"] + 1
+
+
+async def test_malformed_panel_names_are_not_selectable(menu):
+    route = await settings.create_route("Bot")
+    menu.panel.admins = [{"username": " owner "}, {"username": None}, {"username": "bad\x00name"}]
+    await open_route(menu, route)
+    await menu.click(menu.button("Admins"))
+    assert not any("owner" in b["text"] or "bad" in b["text"] for b in menu.buttons())
+    assert await settings.get_route(route["id"]) == route
+
+
+async def test_old_manual_admin_callback_cannot_start_input(menu):
+    await menu.click("mn:a")
+    await menu.text("owner")
+    assert await settings.list_routes() == []
+    assert not menu.app.user_data[7].get("waiting_for")
+
+
+async def test_rename_bot_does_not_change_membership_or_other_bot_settings(menu):
+    route = await complete_route()
+    await open_route(menu, route)
+    await menu.click(menu.button("Rename"))
+    await menu.text("Sales <East>")
+    saved = await settings.get_route(route["id"])
+    assert saved["name"] == "Sales <East>" and saved["admin_usernames"] == ["alice"]
+    assert "Sales &lt;East&gt;" in menu.messages[-1]

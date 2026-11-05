@@ -5,8 +5,9 @@ import uuid
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 
-from db.models import MirzaRoute
+from db.models import MirzaRoute, MirzaRouteAdmin
 
 
 class MirzaRouteError(ValueError):
@@ -20,7 +21,8 @@ class MirzaRoutesCRUD:
     def public(row: MirzaRoute) -> dict:
         return {
             "id": row.id,
-            "admin_username": row.admin_username,
+            "name": row.name,
+            "admin_usernames": row.admin_usernames,
             "base_url": row.base_url,
             "message_text": row.message_text,
             "enabled": row.enabled,
@@ -32,19 +34,22 @@ class MirzaRoutesCRUD:
 
     @staticmethod
     async def list(db: AsyncSession) -> list[MirzaRoute]:
-        return list((await db.scalars(select(MirzaRoute).order_by(MirzaRoute.admin_username))).all())
+        return list((await db.scalars(select(MirzaRoute).order_by(MirzaRoute.name))).all())
 
     @staticmethod
     async def get(db: AsyncSession, route_id: str) -> MirzaRoute | None:
         return await db.get(MirzaRoute, route_id, populate_existing=True)
 
     @staticmethod
-    async def create(db: AsyncSession, admin_username: str) -> MirzaRoute:
-        if await db.scalar(select(MirzaRoute.id).where(MirzaRoute.admin_username == admin_username)):
-            raise MirzaRouteError("A route for this admin already exists")
-        row = MirzaRoute(id=str(uuid.uuid4()), admin_username=admin_username)
+    async def create(db: AsyncSession, name: str) -> MirzaRoute:
+        if await db.scalar(select(MirzaRoute.id).where(MirzaRoute.name == name)):
+            raise MirzaRouteError("A bot with this name already exists")
+        row = MirzaRoute(id=str(uuid.uuid4()), name=name, admins=[])
         db.add(row)
-        await db.flush()
+        try:
+            await db.flush()
+        except IntegrityError:
+            raise MirzaRouteError("A bot with this name already exists") from None
         return row
 
     @staticmethod
@@ -61,15 +66,35 @@ class MirzaRoutesCRUD:
             from db.crud.mirza_notifications import MirzaNotificationsCRUD
 
             revision = row.revision
-            result = await db.execute(
-                update(MirzaRoute)
-                .where(MirzaRoute.id == route_id, MirzaRoute.revision == revision)
-                .values(**changed, revision=revision + 1)
-                .execution_options(synchronize_session=False)
-            )
-            if result.rowcount != 1:
-                raise MirzaRouteError("Route changed; reload before editing")
-            await MirzaNotificationsCRUD.cancel_unsent_for_route(db, route_id, revision)
+            members = changed.pop("admin_usernames", None)
+            try:
+                result = await db.execute(
+                    update(MirzaRoute)
+                    .where(MirzaRoute.id == route_id, MirzaRoute.revision == revision)
+                    .values(**changed, revision=revision + 1)
+                    .execution_options(synchronize_session=False)
+                )
+                if result.rowcount != 1:
+                    raise MirzaRouteError("Route changed; reload before editing")
+                if members is not None:
+                    removed = set(row.admin_usernames) - set(members)
+                    added = set(members) - set(row.admin_usernames)
+                    if removed:
+                        await db.execute(
+                            delete(MirzaRouteAdmin).where(
+                                MirzaRouteAdmin.route_id == route_id,
+                                MirzaRouteAdmin.admin_username.in_(removed),
+                            )
+                        )
+                    db.add_all(MirzaRouteAdmin(admin_username=name, route_id=route_id) for name in sorted(added))
+                    # The PK enforces exclusivity even if two sessions both read
+                    # the owner as unassigned. A failed flush rolls back all writes.
+                    await db.flush()
+                await MirzaNotificationsCRUD.cancel_unsent_for_route(db, route_id, revision)
+            except IntegrityError:
+                raise MirzaRouteError(
+                    "Bot name already exists or an admin is already assigned to another bot"
+                ) from None
             row = await MirzaRoutesCRUD.get(db, route_id)
         return row
 
@@ -83,6 +108,7 @@ class MirzaRoutesCRUD:
         result = await db.execute(query)
         if expected_revision is not None and result.rowcount != 1:
             raise MirzaRouteError("Route changed or no longer exists")
+        await db.execute(delete(MirzaRouteAdmin).where(MirzaRouteAdmin.route_id == route_id))
         await MirzaNotificationsCRUD.cancel_unsent_for_route(db, route_id)
 
     @staticmethod

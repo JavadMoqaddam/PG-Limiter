@@ -268,7 +268,7 @@ class MirzaRoute(Base):
     __tablename__ = "mirza_routes"
 
     id = Column(String(36), primary_key=True)
-    admin_username = Column(String(255), nullable=False, unique=True)
+    name = Column(String(255), nullable=False, unique=True)
     base_url = Column(Text, nullable=False, default="", server_default="")
     api_key = Column(String(512), nullable=False, default="", server_default="")
     message_text = Column(Text, nullable=False, default="", server_default="")
@@ -276,6 +276,22 @@ class MirzaRoute(Base):
     trigger_mode = Column(String(20), nullable=False, default="last", server_default="last")
     selected_steps = Column(JSON, nullable=False, default=list, server_default="[]")
     revision = Column(Integer, nullable=False, default=1, server_default="1")
+
+    admins = relationship("MirzaRouteAdmin", lazy="selectin", cascade="all, delete-orphan", passive_deletes=True)
+
+    @property
+    def admin_usernames(self) -> list[str]:
+        """Exact panel identities assigned to this bot, in stable order."""
+        return sorted(admin.admin_username for admin in self.admins)
+
+
+class MirzaRouteAdmin(Base):
+    """A panel owner belongs to at most one bot, including disabled bots."""
+
+    __tablename__ = "mirza_route_admins"
+
+    admin_username = Column(String(255), primary_key=True)
+    route_id = Column(String(36), ForeignKey("mirza_routes.id", ondelete="CASCADE"), nullable=False, index=True)
 
 
 class PunishmentFact(Base):

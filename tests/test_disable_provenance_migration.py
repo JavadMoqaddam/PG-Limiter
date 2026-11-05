@@ -57,7 +57,8 @@ def test_provenance_has_one_head_and_keeps_retired_isp_cache_absent(tmp_path):
 
 def test_replay_preserves_provenance_and_downgrade_keeps_other_disable_fields(tmp_path):
     database = tmp_path / "replay.db"
-    migrate(database, "upgrade", "head")
+    # Scope replay and rollback to the provenance migration.
+    migrate(database, "upgrade", "010_disable_provenance")
     with sqlite3.connect(database) as connection:
         connection.execute(
             "INSERT INTO users (username, is_disabled_by_limiter, disabled_at, enable_at, disable_provenance) "
@@ -65,7 +66,7 @@ def test_replay_preserves_provenance_and_downgrade_keeps_other_disable_fields(tm
             ("alice", 1, 100.0, -1.0, json.dumps(PROVENANCE)),
         )
     migrate(database, "stamp", "006_drop_patterns")
-    migrate(database, "upgrade", "head")
+    migrate(database, "upgrade", "010_disable_provenance")
     with sqlite3.connect(database) as connection:
         stored = connection.execute("SELECT disable_provenance FROM users WHERE username = 'alice'").fetchone()[0]
     assert json.loads(stored) == PROVENANCE
@@ -77,6 +78,6 @@ def test_replay_preserves_provenance_and_downgrade_keeps_other_disable_fields(tm
         assert connection.execute(
             "SELECT is_disabled_by_limiter, disabled_at, enable_at FROM users WHERE username = 'alice'"
         ).fetchone() == (1, 100.0, -1.0)
-    migrate(database, "upgrade", "head")
+    migrate(database, "upgrade", "010_disable_provenance")
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT disable_provenance FROM users WHERE username = 'alice'").fetchone() == (None,)

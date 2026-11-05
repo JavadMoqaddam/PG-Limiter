@@ -17,7 +17,7 @@
 
 ---
 
-**PG-Limiter 1.7.3** adds per-admin Mirza punishment notifications, improves Telegram delivery handling, and brings Backup & Restore into one menu. The release image and CI use Python 3.15. Read the [release notes](docs/releases/v1.7.3.md) and credential migration instructions before upgrading from 1.7.0.
+**PG-Limiter 1.7.3** adds per-admin Mirza Bot punishment notifications, improves Telegram delivery handling, and brings Backup & Restore into one menu. The release image and CI use Python 3.15. Read the [release notes](docs/releases/v1.7.3.md) and credential migration instructions before upgrading from 1.7.0.
 
 ## 📑 Table of Contents
 
@@ -37,7 +37,7 @@
 - [CLI Interface](#-cli-interface)
 - [REST API](#-rest-api)
 - [Disable Methods](#-disable-methods)
-- [Mirza Notifications](#-mirza-notifications)
+- [Mirza Bot Notifications](#-mirza-bot-notifications)
 - [Caching](#-caching)
 - [Project Architecture](#-project-architecture)
 - [FAQ](#-faq)
@@ -357,17 +357,19 @@ Runs on port `8080` by default. Swagger documentation available at `http://local
 
 ---
 
-## 🔔 Mirza Notifications
+## 🔔 Mirza Bot Notifications
 
-In a private bot chat, open **Settings → Notifications** to configure a separate
-Mirza API URL, key and message for each PasarGuard admin. Choose the dynamic last
+In a private bot chat, open **Settings → Notifications → Add Bot** to configure a
+named Mirza Bot with its own API URL, key, message and punishment stages. Open
+**Admins** and tap panel admins to include them. Several admins can share one bot's
+settings; each admin can belong to only one bot. Choose the dynamic last
 punishment step or select specific stages. Every newly applied matching incident
 can notify the customer identified in the configuration's note. `[Username]`
 inserts the punished configuration's username; `[Limit]` inserts its effective
 allowed connection count.
 
 Configurations start disabled. Delivery uses a persistent queue independently of
-enforcement. See [Mirza customer notifications](docs/MIRZA_NOTIFICATIONS.md) for
+enforcement. See [Mirza Bot customer notifications](docs/MIRZA_NOTIFICATIONS.md) for
 setup, permissions, templates and delivery statuses.
 
 ---

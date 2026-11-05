@@ -48,7 +48,7 @@ resource and action as `resource.action`.
 | Disable/re-enable users or change their groups/proxy settings | `users.update` |
 | Revoke a user's subscription when the punishment policy requests it | `users.revoke_sub` |
 | Read groups for filters, group limits and group-based disable settings | `groups.read` |
-| List administrators for administrator filters | `admins.read` |
+| List administrators for filters and notification bot membership | `admins.read` |
 
 Panel user permissions have a scope: Own (`1`) covers the key's administrator's
 users; All (`2`) covers users across administrators. Choose scopes for

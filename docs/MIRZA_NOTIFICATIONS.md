@@ -1,36 +1,49 @@
-# Mirza customer notifications
+# Mirza Bot customer notifications
 
 Open **Settings → 🔔 Notifications** in a private chat with the PG-Limiter bot.
-Existing authorized bot administrators can configure a separate Mirza sales bot
-for each PasarGuard admin. New configurations are disabled until completed and
-explicitly enabled.
+Existing authorized bot administrators can configure multiple Mirza Bot instances.
+Each named bot has its own API URL, key, message and punishment stages, shared by
+all PasarGuard admins included in that bot. New bots start disabled with no admins.
 
-## Set up an admin
+## Set up a bot
 
-1. Choose **Add Admin** and enter the exact **PasarGuard admin username** that
-   owns the customer's configuration. This does not create a panel admin.
-2. Set that admin's Mirza API base URL, for example
+1. Choose **Add Bot** and give it a recognizable name, such as `Sales Bot`.
+2. Open **Admins**. All panel admins appear in a single column, like Admin Filter.
+   Tap an admin to include them; tap a checked admin to remove them. Selection
+   uses the exact PasarGuard owner username, not a Telegram handle. There is no
+   manual admin entry or Exclude mode.
+3. Set the bot's Mirza Bot API base URL, for example
    `https://bot.example.com/api/`. An HTTPS domain without a path is normalized
    to `/api`. Enter the API base, not its documentation page or `/users` endpoint.
-3. Set a Mirza API key authorized to use the **users API**, including its
-   `send_message` action. Use the key generated in Mirza's API-key settings.
+4. Set a Mirza Bot API key authorized to use the **users API**, including its
+   `send_message` action. Use the key generated in Mirza Bot's API-key settings.
    The menu shows only whether a key is configured; replacing it does not reveal
    the previous value.
-4. Set the message and select the punishment stages that should notify.
-5. Enable the configuration.
+5. Set the shared message and select the punishment stages that should notify.
+6. Enable the bot after selecting at least one admin and completing its settings.
 
-Repeat these steps for each sales admin. Each configuration has its own URL,
-key, message and trigger selection; another admin's bot is never used as a
-fallback. The panel key used by PG-Limiter needs appropriately scoped
-`users.read` permission to read users across the configured admins. Keep the
-existing enforcement permissions described in [Panel API keys](PANEL_API_KEY.md).
+Repeat these steps for each sales bot. An admin can belong to only one bot,
+including disabled bots. Admins assigned elsewhere show a lock and that bot's
+name; remove them from the other bot before assigning them here. To remove the
+last member of an enabled bot, disable the bot first. Unselected admins and new
+panel admins receive no notifications until included.
+
+**Refresh** reloads the panel list. If the panel is unavailable, existing members
+remain visible and removable. Members missing from the current panel list are
+marked accordingly. The menu shares the existing panel-admin cache.
+
+Another bot is never used as a fallback. The panel key used by PG-Limiter needs
+`admins.read` to list admins and appropriately scoped `users.read` permission to
+read users across the included admins. Keep the existing enforcement permissions
+described in [Panel API keys](PANEL_API_KEY.md).
 
 Enter keys only in the private bot chat. PG-Limiter deletes an incoming key
 message best-effort after saving, but cannot guarantee deletion. Use `/cancel`
 to cancel a pending edit. A new command or menu also clears that edit.
 
-Configured admins are listed ten per page. **Delete** requires confirmation;
-it removes the notification configuration, not the PasarGuard admin.
+**Rename** changes the bot's display name. **Delete** requires confirmation;
+it removes the bot configuration and frees its admin assignments. It does not
+delete PasarGuard admins or the external sales bot.
 
 ## Message template
 
@@ -60,7 +73,7 @@ template needs `[Limit]` and no valid limit is available, the notification fails
 without guessing a number. A template without variables is sent unchanged.
 Other bracketed text remains literal.
 
-Mirza supports HTML messages, so a template can contain
+Mirza Bot supports HTML messages, so a template can contain
 `<code>[Username]</code>`. The substituted username is HTML-escaped. The final
 message must fit within 4096 UTF-16 units; an oversized result fails without
 being truncated or sent in parts.
@@ -91,7 +104,7 @@ off do not trigger this feature.
 ## Find the customer and send
 
 The notification worker reads the current full user response from PasarGuard.
-It reads `admin.username` and `note` together, matches the admin's configuration,
+It reads `admin.username` and `note` together, finds the bot including that admin,
 and extracts the customer's numeric Telegram ID from a note such as:
 
 ```text
@@ -104,16 +117,16 @@ are skipped; the bot does not guess a recipient. Owner and note are resolved
 when the queued notification is processed, so changes made on the panel before
 that lookup affect the resolution.
 
-The request is `POST <API base>/users`, with the admin's key in the `Token`
+The request is `POST <API base>/users`, with the selected bot's key in the `Token`
 header and JSON containing `actions: "send_message"`, `chat_id` as a string,
-and the rendered `text`. Delivery is acknowledged only when Mirza returns a
-successful HTTP response with the JSON boolean `status: true`. This is Mirza's
+and the rendered `text`. Delivery is acknowledged only when Mirza Bot returns a
+successful HTTP response with the JSON boolean `status: true`. This is Mirza Bot's
 acknowledgment, not proof that the customer read the Telegram message.
 
 ## Delivery status and changes
 
 The menu shows delivery status counts. Sending runs independently of the
-limiter, so a slow or unavailable Mirza endpoint does not delay punishment.
+limiter, so a slow or unavailable Mirza Bot endpoint does not delay punishment.
 
 | Status | Meaning |
 | --- | --- |
@@ -121,7 +134,7 @@ limiter, so a slow or unavailable Mirza endpoint does not delay punishment.
 | Ready | Recipient and message are saved, waiting for transmission |
 | Sending | A transmission is in progress; interruption can leave an uncertain outcome |
 | Retry | A definite temporary failure is waiting for a bounded retry |
-| Delivered | Mirza acknowledged the request |
+| Delivered | Mirza Bot acknowledged the request |
 | Skipped | No valid recipient/owner or the applicable settings changed |
 | Failed | Invalid configuration/payload, rejected request or retries exhausted |
 | Uncertain | The remote request may have succeeded; it is not resent automatically |
@@ -129,18 +142,30 @@ limiter, so a slow or unavailable Mirza endpoint does not delay punishment.
 Temporary failures known to occur before sending and explicit rate-limit
 responses can be retried, with at most three attempts for metadata resolution
 and three transmission attempts for definite temporary failures. A timeout after
-sending, interrupted request or ambiguous server response can follow successful delivery. Mirza documents no
+sending, interrupted request or ambiguous server response can follow successful delivery. Mirza Bot documents no
 idempotency key, so such requests remain uncertain instead of being blindly
 repeated. This avoids that source of duplicate messages at the cost of some
 uncertain messages potentially not arriving.
 
-Editing, disabling or deleting an admin configuration invalidates its older
-unsent events. Each edit changes the configuration revision; an old button or
+Editing a bot's settings or membership, disabling it, or deleting it invalidates
+its older unsent events. Each edit changes the configuration revision; an old button or
 pending text edit cannot overwrite a newer revision. A request already in
 flight may complete. New incidents use the updated settings. A restart retains pending events and does not automatically
 repeat an interrupted in-flight request.
 
 ## Storage and upgrades
+
+Migration `013_notification_bots` converts each pre-existing admin configuration
+into one named bot containing that same admin. IDs, revisions, keys, settings,
+enabled states and notification receipts are preserved. Bots are not automatically
+merged when URLs match. Previously queued single-admin events remain supported;
+upgrading does not replay past punishments. Bot membership is included in backups.
+
+Revision `013` refuses in-place downgrade before changing the database. Version
+1.7.3 cannot read the grouped notification contexts stored in SQLite and the
+external punishment-fact journal, even when a bot has only one admin. Rollback
+requires restoring a full pre-upgrade backup of the database and state files
+offline before starting the older version.
 
 Migration `012_mirza_notifications` adds route and delivery tables and extends
 punishment evidence; existing facts are not backfilled. Container startup applies
@@ -155,5 +180,5 @@ backup archives as credentials. See [Backup & Restore](BACKUP_RESTORE.md).
 Before upgrading, retain a full private backup and the previous image identity.
 Rollback to 1.7.2 requires restoring compatible database and state files offline
 before starting the older image. An explicit downgrade of revision `012` deletes
-Mirza routes, API keys and delivery history; it is not a lossless rollback. See
+Mirza Bot routes, API keys and delivery history; it is not a lossless rollback. See
 the [release rollback procedure](releases/v1.7.3.md#rollback).
