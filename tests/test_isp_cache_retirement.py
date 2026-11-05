@@ -74,7 +74,8 @@ def test_fresh_and_create_all_databases_do_not_create_isp_cache(tmp_path):
 
 def test_downgrade_recreates_cache_schema_and_reupgrade_removes_it(tmp_path):
     path = tmp_path / "downgrade.db"
-    migrate(path, "upgrade", "head")
+    # Exercise revision 009's reversible cache schema transition.
+    migrate(path, "upgrade", "009_drop_isp_cache")
     migrate(path, "downgrade", "008_missing_indexes")
     assert "subnet_isp" in tables(path)
     with closing(sqlite3.connect(path)) as connection:
@@ -86,5 +87,5 @@ def test_downgrade_recreates_cache_schema_and_reupgrade_removes_it(tmp_path):
             "ix_subnet_isp_isp",
             "ix_subnet_isp_cached_at",
         } <= indexes
-    migrate(path, "upgrade", "head")
+    migrate(path, "upgrade", "009_drop_isp_cache")
     assert "subnet_isp" not in tables(path)
