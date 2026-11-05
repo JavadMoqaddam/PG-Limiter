@@ -55,6 +55,7 @@ async def punishment_env(mirza_database, tmp_path, monkeypatch):
     route = await update_route(
         route["id"],
         {
+            "admin_usernames": ["owner"],
             "base_url": "https://one.example/api",
             "api_key": "key-one",
             "message_text": "[Username]: [Limit]",

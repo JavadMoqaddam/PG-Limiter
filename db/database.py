@@ -270,6 +270,18 @@ def _ensure_mirza_fact_columns_sync(sync_conn: Connection) -> None:
         )
 
 
+def _ensure_mirza_bot_schema_sync(sync_conn: Connection) -> None:
+    """Bootstrap old routes once; existing group membership is authoritative."""
+    from sqlalchemy import inspect, text
+
+    columns = {column["name"] for column in inspect(sync_conn).get_columns("mirza_routes")}
+    if "admin_username" in columns:
+        sync_conn.execute(text("ALTER TABLE mirza_routes RENAME COLUMN admin_username TO name"))
+        sync_conn.execute(
+            text("INSERT INTO mirza_route_admins (admin_username, route_id) SELECT name, id FROM mirza_routes")
+        )
+
+
 async def init_db():
     """
     Initialize the database - creates all tables and schema based on SQLAlchemy models.
@@ -300,6 +312,7 @@ async def init_db():
                 await conn.exec_driver_sql("BEGIN IMMEDIATE")
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(_ensure_mirza_fact_columns_sync)
+            await conn.run_sync(_ensure_mirza_bot_schema_sync)
             await conn.run_sync(_sync_deprecated_legacy_tables_sync)
 
         _DB_INITIALIZED = True

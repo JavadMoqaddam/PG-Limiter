@@ -6,6 +6,12 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Organize Notifications by named Mirza Bot instances. Each bot shares its endpoint, key, message and triggers across included panel admins; select or remove admins directly from the full panel list. Each admin belongs to at most one bot, and manual admin entry is removed.
+- Preserve existing per-admin settings and delivery history through migration `013_notification_bots`, converting each existing configuration into one bot with its original admin. Rollback to 1.7.3 requires restoring the full pre-upgrade database and state backup; revision 013 refuses in-place downgrade because the old version cannot read grouped notification contexts.
+- Use the full Mirza Bot product name in documentation, notification prompts and diagnostics.
+
 ## [1.7.3] - 2026-11-05
 
 ### Added

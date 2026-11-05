@@ -359,8 +359,10 @@ Runs on port `8080` by default. Swagger documentation available at `http://local
 
 ## 🔔 Mirza Bot Notifications
 
-In a private bot chat, open **Settings → Notifications** to configure a separate
-Mirza Bot API URL, key and message for each PasarGuard admin. Choose the dynamic last
+In a private bot chat, open **Settings → Notifications → Add Bot** to configure a
+named Mirza Bot with its own API URL, key, message and punishment stages. Open
+**Admins** and tap panel admins to include them. Several admins can share one bot's
+settings; each admin can belong to only one bot. Choose the dynamic last
 punishment step or select specific stages. Every newly applied matching incident
 can notify the customer identified in the configuration's note. `[Username]`
 inserts the punished configuration's username; `[Limit]` inserts its effective

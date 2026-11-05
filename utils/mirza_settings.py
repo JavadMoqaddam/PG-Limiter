@@ -15,10 +15,24 @@ from db.crud.mirza_routes import MirzaRouteError, MirzaRoutesCRUD
 def _admin_name(value: str) -> str:
     if not isinstance(value, str) or any(unicodedata.category(char).startswith("C") for char in value):
         raise MirzaRouteError("Admin username must not contain control characters")
-    value = value.strip()
-    if not value or len(value) > 255:
+    if not value.strip() or len(value) > 255:
         raise MirzaRouteError("Admin username must contain 1–255 characters")
     return value
+
+
+def _bot_name(value: str) -> str:
+    if not isinstance(value, str) or any(unicodedata.category(char).startswith("C") for char in value):
+        raise MirzaRouteError("Bot name must not contain control characters")
+    value = value.strip()
+    if not value or len(value) > 255:
+        raise MirzaRouteError("Bot name must contain 1–255 characters")
+    return value
+
+
+def _admin_names(values: list[str]) -> list[str]:
+    if not isinstance(values, list):
+        raise MirzaRouteError("Admin usernames must be a list")
+    return sorted({_admin_name(value) for value in values})
 
 
 def normalize_base_url(value: str) -> str:
@@ -89,7 +103,8 @@ def render_message(template: str, username: str, limit: int | None = None) -> st
 
 def _validate_route(values: dict) -> dict:
     values = deepcopy(values)
-    values["admin_username"] = _admin_name(values["admin_username"])
+    values["name"] = _bot_name(values["name"])
+    values["admin_usernames"] = _admin_names(values["admin_usernames"])
     if values["base_url"]:
         values["base_url"] = normalize_base_url(values["base_url"])
     elif not isinstance(values["base_url"], str):
@@ -114,12 +129,15 @@ def _validate_route(values: dict) -> dict:
         raise MirzaRouteError("Selected steps must be zero-based integers from 0 to 9")
     values["selected_steps"] = sorted(set(steps))
     if values["enabled"] and (
-        not values["base_url"]
+        not values["admin_usernames"]
+        or not values["base_url"]
         or not key
         or not text.strip()
         or (values["trigger_mode"] == "selected" and not values["selected_steps"])
     ):
-        raise MirzaRouteError("Complete the URL, key, message and step selection before enabling")
+        raise MirzaRouteError(
+            "Assign at least one admin and complete the URL, key, message and step selection before enabling"
+        )
     return values
 
 
@@ -151,14 +169,23 @@ async def get_route(route_id: str) -> dict | None:
         return MirzaRoutesCRUD.public(row) if row is not None else None
 
 
-async def create_route(admin_username: str) -> dict:
-    admin_username = _admin_name(admin_username)
+async def create_route(name: str) -> dict:
+    name = _bot_name(name)
     async with _transaction() as db:
-        return MirzaRoutesCRUD.public(await MirzaRoutesCRUD.create(db, admin_username))
+        return MirzaRoutesCRUD.public(await MirzaRoutesCRUD.create(db, name))
 
 
 async def update_route(route_id: str, changes: dict, *, expected_revision: int | None = None) -> dict:
-    allowed = {"admin_username", "base_url", "api_key", "message_text", "enabled", "trigger_mode", "selected_steps"}
+    allowed = {
+        "name",
+        "admin_usernames",
+        "base_url",
+        "api_key",
+        "message_text",
+        "enabled",
+        "trigger_mode",
+        "selected_steps",
+    }
     if not isinstance(changes, dict) or not set(changes).issubset(allowed):
         raise MirzaRouteError("Unknown route setting")
     async with _transaction() as db:
@@ -184,7 +211,8 @@ async def capture_rules() -> list[dict]:
             values = {
                 key: getattr(row, key)
                 for key in (
-                    "admin_username",
+                    "name",
+                    "admin_usernames",
                     "base_url",
                     "api_key",
                     "message_text",
@@ -202,7 +230,7 @@ async def capture_rules() -> list[dict]:
                     {
                         "route_id": row.id,
                         "revision": row.revision,
-                        "admin_username": row.admin_username,
+                        "admin_usernames": row.admin_usernames,
                         "trigger_mode": row.trigger_mode,
                         "selected_steps": deepcopy(row.selected_steps),
                     }
@@ -224,7 +252,15 @@ def notification_context(
     ):
         return None
     candidates = [
-        {key: rule[key] for key in ("route_id", "revision", "admin_username")}
+        {
+            "route_id": rule["route_id"],
+            "revision": rule["revision"],
+            **(
+                {"admin_usernames": rule["admin_usernames"]}
+                if "admin_usernames" in rule
+                else {"admin_username": rule["admin_username"]}
+            ),
+        }
         for rule in rules
         if (rule["trigger_mode"] == "last" and step_index == step_count - 1)
         or (rule["trigger_mode"] == "selected" and step_index in rule["selected_steps"])
@@ -272,18 +308,27 @@ def validate_notification_context(context: dict | None) -> dict | None:
         raise ValueError("Invalid notification context")
     seen = set()
     for candidate in context["candidates"]:
-        if not isinstance(candidate, dict) or set(candidate) != {"route_id", "revision", "admin_username"}:
+        if not isinstance(candidate, dict) or set(candidate) not in (
+            {"route_id", "revision", "admin_username"},
+            {"route_id", "revision", "admin_usernames"},
+        ):
             raise ValueError("Invalid notification context")
         try:
             if not isinstance(candidate["route_id"], str):
                 raise ValueError
             uuid.UUID(candidate["route_id"])
-            if (
-                type(candidate["revision"]) is not int
-                or candidate["revision"] < 1
-                or _admin_name(candidate["admin_username"]) != candidate["admin_username"]
-                or candidate["route_id"] in seen
-            ):
+            if "admin_usernames" in candidate:
+                names = candidate["admin_usernames"]
+                if (
+                    not names
+                    or not isinstance(names, list)
+                    or any(_admin_name(name) != name for name in names)
+                    or len(set(names)) != len(names)
+                ):
+                    raise ValueError
+            elif _admin_name(candidate["admin_username"]) != candidate["admin_username"]:
+                raise ValueError
+            if type(candidate["revision"]) is not int or candidate["revision"] < 1 or candidate["route_id"] in seen:
                 raise ValueError
         except (ValueError, TypeError, AttributeError):
             raise ValueError("Invalid notification context") from None

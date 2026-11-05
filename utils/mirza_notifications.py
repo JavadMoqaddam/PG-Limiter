@@ -95,8 +95,12 @@ class MirzaNotificationService:
         owner = admin.get("username") if isinstance(admin, dict) else admin if isinstance(admin, str) else None
         if not owner:
             owner = details.get("created_by")
-        candidates = [candidate for candidate in event.context["candidates"] if candidate["admin_username"] == owner]
-        if not candidates:
+        candidates = [
+            candidate
+            for candidate in event.context["candidates"]
+            if isinstance(owner, str) and owner in candidate.get("admin_usernames", [candidate.get("admin_username")])
+        ]
+        if len(candidates) != 1:
             await self._transition(event.incident_id, "pending", "skipped", last_error="owner_unmatched")
             return
         recipient = parse_recipient(details.get("note"))
@@ -110,7 +114,7 @@ class MirzaNotificationService:
                 route is None
                 or not route.enabled
                 or route.revision != candidate["revision"]
-                or route.admin_username != owner
+                or owner not in route.admin_usernames
             ):
                 await Notifications.transition(db, event.incident_id, "pending", "skipped", last_error="route_changed")
             else:

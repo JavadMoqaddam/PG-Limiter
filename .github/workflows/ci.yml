@@ -218,13 +218,21 @@ jobs:
           python tools/ci_migration_checks.py assert-upsert ./data/populated.db
           python tools/ci_migration_checks.py parity ./data/populated.db
 
-      - name: Scenario 5 - the chain is linear and downgrades cleanly
+      - name: Scenario 5 - the chain is linear and unsafe rollback is refused
         env:
           DATABASE_URL: sqlite+aiosqlite:///./data/fresh.db
         run: |
           python -m alembic heads 2>&1 | tee heads.txt
           test "$(grep -c '(head)' heads.txt)" -eq 1
-          python -m alembic downgrade -1
+          python -m alembic current > before.txt
+          if python -m alembic downgrade -1 > downgrade.txt 2>&1; then
+            echo "::error::grouped notification contexts require a full backup rollback"
+            exit 1
+          fi
+          grep -q 'full pre-upgrade backup' downgrade.txt
+          python -m alembic current > after.txt
+          cmp before.txt after.txt
+          python tools/ci_migration_checks.py parity ./data/fresh.db
           python -m alembic upgrade head
 
   tests:

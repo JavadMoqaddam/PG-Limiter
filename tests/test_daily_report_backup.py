@@ -77,7 +77,7 @@ def test_offline_restore_preserves_mirza_credentials_and_incident_delivery(layou
     from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
 
-    from db.models import Base, MirzaNotification, MirzaRoute, PunishmentFact
+    from db.models import Base, MirzaNotification, MirzaRoute, MirzaRouteAdmin, PunishmentFact
     from utils.backup import apply_backup, create_backup
 
     database = Path(layout.database_url.split("///", 1)[1])
@@ -85,7 +85,15 @@ def test_offline_restore_preserves_mirza_credentials_and_incident_delivery(layou
     Base.metadata.create_all(engine)
     context = {"candidates": [{"route_id": "route", "revision": 2, "admin_username": "seller"}], "effective_limit": 3}
     with Session(engine) as session:
-        session.add(MirzaRoute(id="route", admin_username="seller", api_key="synthetic-key", revision=2))
+        session.add(
+            MirzaRoute(
+                id="route",
+                name="Sales",
+                api_key="synthetic-key",
+                revision=2,
+                admins=[MirzaRouteAdmin(admin_username="seller"), MirzaRouteAdmin(admin_username="other-seller")],
+            )
+        )
         session.add(
             PunishmentFact(
                 incident_id="warning",
@@ -116,16 +124,20 @@ def test_offline_restore_preserves_mirza_credentials_and_incident_delivery(layou
     archive = tmp_path / "mirza.zip"
     create_backup(archive, layout)
     with sqlite3.connect(database) as db:
+        db.execute("DELETE FROM mirza_route_admins")
         db.execute("DELETE FROM mirza_routes")
         db.execute("DELETE FROM mirza_notifications")
         db.execute("DELETE FROM punishment_facts")
     apply_backup(archive, layout, service_stopped=True)
     with sqlite3.connect(database) as db:
-        assert db.execute("SELECT admin_username, api_key, revision FROM mirza_routes").fetchone() == (
-            "seller",
+        assert db.execute("SELECT name, api_key, revision FROM mirza_routes").fetchone() == (
+            "Sales",
             "synthetic-key",
             2,
         )
+        assert db.execute(
+            "SELECT admin_username, route_id FROM mirza_route_admins ORDER BY admin_username"
+        ).fetchall() == [("other-seller", "route"), ("seller", "route")]
         warning_succeeded, saved_context = db.execute(
             "SELECT warning_succeeded, notification_context FROM punishment_facts"
         ).fetchone()
