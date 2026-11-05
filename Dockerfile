@@ -1,4 +1,4 @@
-FROM python:3.14.9-slim-bookworm AS base
+FROM python:3.15.0-slim-bookworm AS base
 
 FROM base AS builder
 
