@@ -19,6 +19,9 @@ PENDING_KEYS = (
     "limit_group_id",
     "limit_group_name",
     "cdn_mode_action",
+    "mirza_field",
+    "mirza_route_id",
+    "mirza_revision",
 )
 
 

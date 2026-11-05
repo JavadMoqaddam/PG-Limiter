@@ -6,6 +6,11 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- Add Settings → Notifications for per-PasarGuard-admin Mirza API URLs, keys, message templates and selectable punishment stages. `[Username]` and `[Limit]` insert the punished configuration's username and effective connection limit; each new matching punishment can notify its customer.
+- Persist notification events independently of enforcement, deduplicate incident replay, and retain uncertain delivery outcomes without blind resending. Migration `012_mirza_notifications` preserves existing punishment evidence without historical backfill.
+
 ### Changed
 
 - Consolidate Telegram backup scheduling, Backup Now, and Restore under Settings → Backup & Restore. Move Restore out of the main menu and keep it available when automatic backups are disabled.

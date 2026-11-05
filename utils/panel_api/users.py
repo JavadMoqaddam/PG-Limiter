@@ -1111,9 +1111,32 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
     punishment system's unrecorded ledger on failure, so the side effect is never repeated.
     """
     from utils.punishment_system import get_punishment_for_user
+    from utils.mirza_settings import capture_rules, notification_context
+    from utils.settings_service import read_user_policy
+    from copy import deepcopy
 
-    data = await read_config()
-    punishment, step_index, violation_count = await get_punishment_for_user(username.name, data)
+    data = deepcopy(await read_config())
+    effective_limit = None
+    try:
+        policy = await read_user_policy(username.name)
+        if policy is not None:
+            effective_limit = policy.limit
+    except Exception:
+        users_logger.warning("Mirza notification limit snapshot unavailable; continuing punishment")
+    selection = {}
+    punishment, step_index, violation_count = await get_punishment_for_user(
+        username.name, data, selection_snapshot=selection
+    )
+    context = None
+    enabled = selection.get("enabled", data.get("punishment", {}).get("enabled", True))
+    if enabled:
+        try:
+            rules = await capture_rules()
+            context = notification_context(
+                rules, step_index, selection.get("step_count", 0), punishment.step_type, effective_limit
+            )
+        except Exception:
+            users_logger.warning("Mirza notification rules unavailable; continuing punishment")
 
     users_logger.debug(
         f"⚖️ Punishment for {username.name}: step={step_index}, violations={violation_count}, type={punishment.step_type if punishment else 'none'}"
@@ -1132,18 +1155,18 @@ async def _apply_punishment_locked(panel_data: PanelType, username: UserType, sy
             "message": str(error),
         }
 
-    enabled = data.get("punishment", {}).get("enabled", True)
-    if enabled and punishment.is_warning():
-        try:
-            return await _apply_selected_punishment(
-                panel_data, username, system, data, punishment, step_index, violation_count
-            )
-        except EnforcementProtected as error:
-            return protected_result(error)
     callback = (
-        (lambda: system.mark_unrecorded(username.name, step_index, punishment.duration_minutes)) if enabled else None
+        (lambda: system.mark_unrecorded(username.name, step_index, punishment.duration_minutes))
+        if enabled and not punishment.is_warning()
+        else None
     )
-    async with get_punishment_fact_journal().action(username.name, step_index if enabled else None, callback):
+    async with get_punishment_fact_journal().action(
+        username.name,
+        step_index if enabled else None,
+        callback,
+        notification_context=context,
+        step_type=punishment.step_type if enabled else None,
+    ):
         try:
             return await _apply_selected_punishment(
                 panel_data, username, system, data, punishment, step_index, violation_count

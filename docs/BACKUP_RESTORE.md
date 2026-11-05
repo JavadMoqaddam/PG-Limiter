@@ -12,6 +12,8 @@ New archives contain a **database-consistent SQLite backup API snapshot** of the
 
 The archive also includes the environment file once and the actual persisted warning/trust history, punishment compatibility history, original groups, Telegram topics/message caches, pending notifications, disable-message receipts, automatic-backup settings and existing legacy import inputs. JSON and environment files are captured independently of SQLite: the archive does **not** promise a transaction spanning those stores. A versioned manifest records checksums and explicitly absent JSON files.
 
+[Mirza notification](MIRZA_NOTIFICATIONS.md) routes, API keys and delivery states are part of the SQLite snapshot. Pending punishment evidence is retained in the existing fact-journal sidecar. Backup archives therefore contain credentials and should be kept private.
+
 The original-group compatibility file now defaults to `$PG_LIMITER_DATA_DIR/user_groups_backup.json` (`/var/lib/pg-limiter/user_groups_backup.json` by default). Until that file exists, the old working-directory or `/app/.user_groups_backup.json` is read without being removed. Subsequent saves persist on the volume.
 
 ## Stage and apply

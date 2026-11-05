@@ -106,8 +106,7 @@ def _coerce_window_hours(raw, default: int) -> int:
         value = 0
     if value < 1:
         punishment_logger.error(
-            f"⚠️ Punishment window {raw!r} is not a positive number of hours - "
-            f"using the default of {default}h"
+            f"⚠️ Punishment window {raw!r} is not a positive number of hours - using the default of {default}h"
         )
         return default
     return value
@@ -116,6 +115,7 @@ def _coerce_window_hours(raw, default: int) -> int:
 @dataclass
 class PunishmentStep:
     """Represents a single punishment step"""
+
     step_type: str  # "warning", "disable", or "revoke"
     duration_minutes: int  # 0 = unlimited/permanent for disable, ignored for warning/revoke
 
@@ -128,23 +128,23 @@ class PunishmentStep:
         """
         self.step_type = str(self.step_type or "").strip().lower()
         self.duration_minutes = _coerce_duration_minutes(self.duration_minutes, self.step_type)
-    
+
     def is_warning(self) -> bool:
         """Check if this step is a warning only"""
         return self.step_type == "warning"
-    
+
     def is_unlimited_disable(self) -> bool:
         """Check if this step is an unlimited/permanent disable"""
         return self.step_type == "disable" and self.duration_minutes == 0
-    
+
     def is_revoke(self) -> bool:
         """Check if this step revokes the subscription (changes UUID)"""
         return self.step_type == "revoke"
-    
+
     def get_duration_seconds(self) -> int:
         """Get duration in seconds"""
         return self.duration_minutes * 60
-    
+
     def get_display_text(self) -> str:
         """Get human-readable text for this step"""
         if self.is_warning():
@@ -172,10 +172,7 @@ def _parse_step(position: int, step) -> Optional[PunishmentStep]:
     which entry of their steps list is wrong.
     """
     if not isinstance(step, dict):
-        punishment_logger.error(
-            f"⚠️ Punishment step {position} is {type(step).__name__}, not an object - "
-            f"skipping it"
-        )
+        punishment_logger.error(f"⚠️ Punishment step {position} is {type(step).__name__}, not an object - skipping it")
         return None
 
     step_type = str(step.get("type") or "disable").strip().lower()
@@ -208,6 +205,7 @@ def _parse_step(position: int, step) -> Optional[PunishmentStep]:
 @dataclass
 class ViolationRecord:
     """Represents a single violation record"""
+
     username: str
     timestamp: float
     step_applied: int  # Which step was applied (0-indexed)
@@ -226,11 +224,11 @@ class ViolationRecordError(Exception):
 class PunishmentSystem:
     """
     Smart punishment system with escalating penalties.
-    
+
     Tracks user violations within a configurable time window and applies
     progressively harsher punishments based on violation count.
     """
-    
+
     DEFAULT_STEPS = [
         PunishmentStep("warning", 0),
         PunishmentStep("disable", 10),
@@ -238,9 +236,9 @@ class PunishmentSystem:
         PunishmentStep("disable", 60),
         PunishmentStep("disable", 0),  # Unlimited
     ]
-    
+
     DEFAULT_WINDOW_HOURS = 168  # 7 days
-    
+
     def __init__(self, filename: str = "/var/lib/pg-limiter/violation_history.json"):
         self.filename = filename
         self.violations: dict[str, list[ViolationRecord]] = {}  # username -> list of violations
@@ -287,7 +285,7 @@ class PunishmentSystem:
             f"{reason}. That copy can be stale, so the escalation step may be wrong. "
             f"Further occurrences are suppressed for 60s."
         )
-    
+
     def load_violations(self):
         """Load violation history from file"""
         try:
@@ -295,59 +293,65 @@ class PunishmentSystem:
                 punishment_logger.debug(f"📂 Loading violation history from {self.filename}")
                 with open(self.filename, "r", encoding="utf-8") as file:
                     data = json.load(file)
-                    
+
                     for username, records in data.get("violations", {}).items():
                         self.violations[username] = []
                         for record in records:
-                            self.violations[username].append(ViolationRecord(
-                                username=record["username"],
-                                timestamp=record["timestamp"],
-                                step_applied=record["step_applied"],
-                                disable_duration=record["disable_duration"],
-                                enabled_at=record.get("enabled_at")
-                            ))
-                    
+                            self.violations[username].append(
+                                ViolationRecord(
+                                    username=record["username"],
+                                    timestamp=record["timestamp"],
+                                    step_applied=record["step_applied"],
+                                    disable_duration=record["disable_duration"],
+                                    enabled_at=record.get("enabled_at"),
+                                )
+                            )
+
                     # Clean up old violations
                     self.cleanup_old_violations()
-                    
+
                     punishment_logger.info(f"✅ Loaded violation history for {len(self.violations)} users")
         except Exception as e:
             punishment_logger.error(f"❌ Error loading violation history: {e}")
             self.violations = {}
-    
+
     def _sync_save_violations(self):
         """Synchronous file write for violation history data."""
         data = {"violations": {}}
         for username, records in self.violations.items():
             data["violations"][username] = []
             for record in records:
-                data["violations"][username].append({
-                    "username": record.username,
-                    "timestamp": record.timestamp,
-                    "step_applied": record.step_applied,
-                    "disable_duration": record.disable_duration,
-                    "enabled_at": record.enabled_at
-                })
+                data["violations"][username].append(
+                    {
+                        "username": record.username,
+                        "timestamp": record.timestamp,
+                        "step_applied": record.step_applied,
+                        "disable_duration": record.disable_duration,
+                        "enabled_at": record.enabled_at,
+                    }
+                )
         atomic_write_json(self.filename, data)
 
-    async def save_violations(self):
+    async def save_violations(self) -> bool:
         """Save violation history to file using asyncio.Lock and atomic write for safety."""
         try:
             async with self._write_lock:
                 await asyncio.to_thread(self._sync_save_violations)
             punishment_logger.debug(f"💾 Saved violation history for {len(self.violations)} users")
+            return True
         except Exception as e:
             punishment_logger.error(f"❌ Error saving violation history: {e}")
-    
+            return False
+
     def load_config(self, config_data: dict):
         """
         Load punishment configuration from config data.
-        
+
         Args:
             config_data: Configuration dictionary with optional 'punishment' key
         """
         punishment_config = config_data.get("punishment", {})
-        
+
         self.enabled = bool(punishment_config.get("enabled", True))
         self.window_hours = _coerce_window_hours(
             punishment_config.get("window_hours", self.DEFAULT_WINDOW_HOURS),
@@ -366,28 +370,26 @@ class PunishmentSystem:
             if not self.steps:
                 self.steps = self.DEFAULT_STEPS.copy()
                 punishment_logger.error(
-                    "⚠️ No usable punishment step in the configuration - falling back "
-                    "to the built-in steps"
+                    "⚠️ No usable punishment step in the configuration - falling back to the built-in steps"
                 )
             else:
-                punishment_logger.info(f"📋 Loaded {len(self.steps)} punishment steps from config (window: {self.window_hours}h)")
+                punishment_logger.info(
+                    f"📋 Loaded {len(self.steps)} punishment steps from config (window: {self.window_hours}h)"
+                )
         else:
             self.steps = self.DEFAULT_STEPS.copy()
             punishment_logger.debug("📋 Using default punishment steps")
-    
+
     def cleanup_old_violations(self):
         """Remove violations older than the time window"""
         current_time = time.time()
         self._last_cleanup = current_time
         window_seconds = self.window_hours * 60 * 60
         cutoff_time = current_time - window_seconds
-        
+
         for username in list(self.violations.keys()):
             # Filter out old violations
-            self.violations[username] = [
-                v for v in self.violations[username]
-                if v.timestamp > cutoff_time
-            ]
+            self.violations[username] = [v for v in self.violations[username] if v.timestamp > cutoff_time]
             # Remove user if no recent violations
             if not self.violations[username]:
                 del self.violations[username]
@@ -401,7 +403,7 @@ class PunishmentSystem:
         if force or (current_time - self._last_cleanup > 300):
             self.cleanup_old_violations()
 
-    async def get_violation_count_async(self, username: str) -> int:
+    async def get_violation_count_async(self, username: str, *, window_hours: int | None = None) -> int:
         """
         Violation count inside the window, read from SQLite.
 
@@ -409,59 +411,61 @@ class PunishmentSystem:
         is the number that matters. The JSON copy is a fallback of last resort and
         is now announced when it is used - see ``_warn_json_fallback``.
         """
+        window_hours = self.window_hours if window_hours is None else window_hours
         try:
             from db.database import get_db, DB_AVAILABLE
             from db.crud.violations import ViolationHistoryCRUD
+
             if DB_AVAILABLE:
                 async with get_db() as db:
-                    return await ViolationHistoryCRUD.get_violation_count(db, username, window_hours=self.window_hours)
+                    return await ViolationHistoryCRUD.get_violation_count(db, username, window_hours=window_hours)
             self._warn_json_fallback("db.database reports DB_AVAILABLE is False")
         except Exception as e:
             self._warn_json_fallback(f"the query failed ({e})")
 
-        self._ensure_cleanup()
-        return len(self.violations.get(username, []))
-    
+        cutoff = time.time() - window_hours * 3600
+        return sum(record.timestamp > cutoff for record in self.violations.get(username, []))
+
     def get_violation_count(self, username: str) -> int:
         """
         Get the number of violations for a user within the time window.
-        
+
         Args:
             username: The username to check
-            
+
         Returns:
             Number of violations in the time window
         """
         self._ensure_cleanup()
         return len(self.violations.get(username, []))
-    
+
     def get_next_step_index(self, username: str) -> int:
         """
         Get the index of the next punishment step for a user.
-        
+
         Args:
             username: The username to check
-            
+
         Returns:
             Step index (0-indexed), capped at max step
         """
         violation_count = self.get_violation_count(username)
         # Cap at the last step
         return min(violation_count, len(self.steps) - 1)
-    
+
     def get_next_punishment(self, username: str) -> PunishmentStep:
         """
         Get the next punishment step for a user.
-        
+
         Args:
             username: The username to check
-            
+
         Returns:
             The PunishmentStep to apply
         """
         step_index = self.get_next_step_index(username)
         return self.steps[step_index]
-    
+
     async def record_violation(self, username: str, step_applied: int, duration_minutes: int):
         """
         Record a new violation for a user in SQLite and in-memory cache.
@@ -521,7 +525,16 @@ class PunishmentSystem:
 
         if not db_available:
             self._remember_recorded_violation(record)
-        await self.save_violations()
+            from utils.punishment_facts import settle_owned
+
+            async def save_and_acknowledge():
+                if not await self.save_violations():
+                    raise ViolationRecordError("Could not save violation history")
+                self._acknowledge_warning(record)
+
+            await settle_owned(save_and_acknowledge())
+        else:
+            await self.save_violations()
 
         punishment_logger.info(
             f"📝 Recorded violation #{len(self.violations[username])} for {username} (step {step_applied}, duration: {duration_minutes}min)"
@@ -548,6 +561,7 @@ class PunishmentSystem:
                     punishment_logger.error(f"Could not confirm violation commit for {record.username}: {error}")
                 raise
             self._remember_recorded_violation(record)
+            self._acknowledge_warning(record)
 
         commit = asyncio.create_task(commit_and_acknowledge())
         interrupted = None
@@ -585,6 +599,7 @@ class PunishmentSystem:
             # Capture the query result before session cleanup can raise or yield.
             if persisted:
                 self._remember_recorded_violation(record)
+                self._acknowledge_warning(record)
             self._unconfirmed_incidents.pop(record.username, None)
             return persisted
 
@@ -594,6 +609,21 @@ class PunishmentSystem:
         if self.get_unrecorded_incident(record.username) == (record.step_applied, record.disable_duration):
             self._recorded_incidents.add(record.username)
             self._unconfirmed_incidents.pop(record.username, None)
+
+    @staticmethod
+    def _acknowledge_warning(record: ViolationRecord) -> None:
+        """Mark only the matching warning after its authoritative store succeeds."""
+        from utils.punishment_facts import current_action
+
+        fact = current_action()
+        if (
+            fact is not None
+            and fact.username == record.username
+            and fact.step_index == record.step_applied
+            and record.disable_duration == 0
+            and fact.step_type == "warning"
+        ):
+            fact.mark_warning()
 
     def begin_incident(self, username: str) -> bool:
         """Claim a punishment incident for a user.
@@ -633,6 +663,7 @@ class PunishmentSystem:
         try:
             from db.database import get_db, DB_AVAILABLE
             from db.crud.violations import ViolationHistoryCRUD
+
             if DB_AVAILABLE:
                 async with get_db() as db:
                     await ViolationHistoryCRUD.clear_user(db, username)
@@ -644,12 +675,13 @@ class PunishmentSystem:
             del self.violations[username]
             await self.save_violations()
             punishment_logger.info(f"🗑️ Cleared violation history for {username}")
-    
+
     async def clear_all_history(self):
         """Clear all violation history"""
         try:
             from db.database import get_db, DB_AVAILABLE
             from db.crud.violations import ViolationHistoryCRUD
+
             if DB_AVAILABLE:
                 async with get_db() as db:
                     await ViolationHistoryCRUD.clear_all(db)
@@ -660,7 +692,7 @@ class PunishmentSystem:
         self.violations = {}
         await self.save_violations()
         punishment_logger.info("🗑️ Cleared all violation history")
-    
+
     def _build_status(self, username: str, entries: list[tuple[int, int, float]]) -> dict:
         """
         Shape the status dict from (step_applied, disable_duration, timestamp) rows.
@@ -706,11 +738,10 @@ class PunishmentSystem:
         try:
             from db.database import get_db, DB_AVAILABLE
             from db.crud.violations import ViolationHistoryCRUD
+
             if DB_AVAILABLE:
                 async with get_db() as db:
-                    rows = await ViolationHistoryCRUD.get_user_violations(
-                        db, username, window_hours=self.window_hours
-                    )
+                    rows = await ViolationHistoryCRUD.get_user_violations(db, username, window_hours=self.window_hours)
                 return self._build_status(
                     username,
                     [(row.step_applied, row.disable_duration, row.timestamp) for row in rows],
@@ -736,7 +767,7 @@ class PunishmentSystem:
             username,
             [(v.step_applied, v.disable_duration, v.timestamp) for v in violations],
         )
-    
+
     def _format_time_ago(self, timestamp: float) -> str:
         """Format timestamp as 'X ago' string"""
         diff = time.time() - timestamp
@@ -747,7 +778,7 @@ class PunishmentSystem:
         if diff < 86400:
             return f"{int(diff / 3600)}h ago"
         return f"{int(diff / 86400)}d ago"
-    
+
     def get_steps_summary(self) -> str:
         """Get a formatted summary of all punishment steps"""
         lines = [f"📋 <b>Punishment Steps</b> (window: {self.window_hours}h):\n"]
@@ -772,28 +803,35 @@ def get_punishment_system() -> PunishmentSystem:
 punishment_system = get_punishment_system()
 
 
-async def get_punishment_for_user(username: str, config_data: dict) -> tuple[PunishmentStep, int, int]:
+async def get_punishment_for_user(
+    username: str, config_data: dict, *, selection_snapshot: dict | None = None
+) -> tuple[PunishmentStep, int, int]:
     """
     Get the punishment to apply for a user.
-    
+
     Args:
         username: The username
         config_data: Configuration data with punishment settings
-        
+
     Returns:
         Tuple of (PunishmentStep, step_index, violation_count)
     """
     system = get_punishment_system()
     system.load_config(config_data)
-    
-    if not system.enabled:
+    steps = tuple(system.steps)
+    enabled = system.enabled
+    window_hours = system.window_hours
+    if selection_snapshot is not None:
+        selection_snapshot.update(enabled=enabled, step_count=len(steps), window_hours=window_hours)
+
+    if not enabled:
         # Punishment system disabled - use unlimited disable as default
         return PunishmentStep("disable", 0), 0, 0
-    
-    violation_count = await system.get_violation_count_async(username)
-    step_index = min(violation_count, len(system.steps) - 1)
-    punishment = system.steps[step_index]
-    
+
+    violation_count = await system.get_violation_count_async(username, window_hours=window_hours)
+    step_index = min(violation_count, len(steps) - 1)
+    punishment = steps[step_index]
+
     return punishment, step_index, violation_count
 
 

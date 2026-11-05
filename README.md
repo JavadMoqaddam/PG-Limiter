@@ -37,6 +37,7 @@
 - [CLI Interface](#-cli-interface)
 - [REST API](#-rest-api)
 - [Disable Methods](#-disable-methods)
+- [Mirza Notifications](#-mirza-notifications)
 - [Caching](#-caching)
 - [Project Architecture](#-project-architecture)
 - [FAQ](#-faq)
@@ -351,6 +352,21 @@ Runs on port `8080` by default. Swagger documentation available at `http://local
 
 1. **Status-based (Default):** Sets user status to `disabled` in PasarGuard panel.
 2. **Group-based:** Preserves original user groups and temporarily moves user to a restricted fallback group ID until re-enabled.
+
+---
+
+## 🔔 Mirza Notifications
+
+In a private bot chat, open **Settings → Notifications** to configure a separate
+Mirza API URL, key and message for each PasarGuard admin. Choose the dynamic last
+punishment step or select specific stages. Every newly applied matching incident
+can notify the customer identified in the configuration's note. `[Username]`
+inserts the punished configuration's username; `[Limit]` inserts its effective
+allowed connection count.
+
+Configurations start disabled. Delivery uses a persistent queue independently of
+enforcement. See [Mirza customer notifications](docs/MIRZA_NOTIFICATIONS.md) for
+setup, permissions, templates and delivery statuses.
 
 ---
 

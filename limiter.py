@@ -32,6 +32,42 @@ main_logger = get_logger("limiter.main")
 
 # Strong references container for root background tasks
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
+_MIRZA_SERVICE = None
+_MIRZA_TASK: asyncio.Task | None = None
+
+
+def start_mirza_notifications(panel_data: PanelType) -> None:
+    """Keep delivery supervision outside the monitoring TaskGroup."""
+    from utils.mirza_notifications import MirzaNotificationService
+
+    global _MIRZA_SERVICE, _MIRZA_TASK
+    if _MIRZA_TASK is not None and not _MIRZA_TASK.done():
+        return
+    _MIRZA_SERVICE = MirzaNotificationService(panel_data)
+    _MIRZA_TASK = asyncio.create_task(
+        _supervise("mirza_notifications", _MIRZA_SERVICE.run_forever), name="mirza_notifications"
+    )
+    _BACKGROUND_TASKS.add(_MIRZA_TASK)
+    _MIRZA_TASK.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def stop_mirza_notifications() -> None:
+    """Settle the in-flight delivery owner and close HTTP before DB disposal."""
+    from utils.punishment_facts import settle_owned
+
+    global _MIRZA_SERVICE, _MIRZA_TASK
+    service, task = _MIRZA_SERVICE, _MIRZA_TASK
+
+    async def stop():
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if service is not None:
+            await service.close()
+
+    await settle_owned(stop())
+    _MIRZA_SERVICE = None
+    _MIRZA_TASK = None
 
 
 def parse_args(argv=None):
@@ -215,6 +251,7 @@ async def main():
         # Initialize panel connection
         panel_data = PanelType.from_config(config_file)
         main_logger.info(f"✓ Panel configured: {config_file['panel']['domain']}")
+        start_mirza_notifications(panel_data)
 
         # Preserve disabled users across restarts (enable_dis_user background loop handles expired bans)
         main_logger.info("✓ Disabled users state preserved across restarts")
@@ -294,6 +331,7 @@ async def main():
 
 async def cleanup_resources():
     """Gracefully close all shared network clients and database connections."""
+    await stop_mirza_notifications()
     # 1. Close GeoIP client
     try:
         await close_geo_client()

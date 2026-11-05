@@ -179,7 +179,8 @@ async def test_selected_step_captures_actual_flags(fact_database, tmp_path, monk
     async with fact_database() as db:
         rows = (await db.scalars(select(PunishmentFact))).all()
         if flags is None:
-            assert rows == []
+            assert len(rows) == 1
+            assert rows[0].state == "completed" and not rows[0].disable_succeeded
         else:
             assert len(rows) == 1
             assert rows[0].step_index == 4
