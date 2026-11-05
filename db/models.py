@@ -262,6 +262,22 @@ class IPHistory(Base):
         return f"<IPHistory(username='{self.username}', ip='{self.ip}')>"
 
 
+class MirzaRoute(Base):
+    """One independently versioned destination; secrets never leave this table."""
+
+    __tablename__ = "mirza_routes"
+
+    id = Column(String(36), primary_key=True)
+    admin_username = Column(String(255), nullable=False, unique=True)
+    base_url = Column(Text, nullable=False, default="", server_default="")
+    api_key = Column(String(512), nullable=False, default="", server_default="")
+    message_text = Column(Text, nullable=False, default="", server_default="")
+    enabled = Column(Boolean, nullable=False, default=False, server_default="0")
+    trigger_mode = Column(String(20), nullable=False, default="last", server_default="last")
+    selected_steps = Column(JSON, nullable=False, default=list, server_default="[]")
+    revision = Column(Integer, nullable=False, default=1, server_default="1")
+
+
 class PunishmentFact(Base):
     """Independent evidence of actual effects; never cleared with violation history."""
 
@@ -275,9 +291,37 @@ class PunishmentFact(Base):
     disable_succeeded = Column(Boolean, nullable=False, default=False)
     revoke_succeeded = Column(Boolean, nullable=False, default=False)
     uuid_reset_succeeded = Column(Boolean, nullable=False, default=False)
+    warning_succeeded = Column(Boolean, nullable=False, default=False, server_default="0")
+    notification_context = Column(JSON, nullable=True)
     state = Column(String(20), nullable=False)
 
     __table_args__ = (Index("ix_punishment_facts_applied_at", "applied_at"),)
+
+
+class MirzaNotification(Base):
+    """Durable incident identity and pinned delivery data without API credentials."""
+
+    __tablename__ = "mirza_notifications"
+
+    incident_id = Column(String(64), primary_key=True)
+    username = Column(String(255), nullable=False)
+    applied_at = Column(Float, nullable=False)
+    context = Column(JSON, nullable=False)
+    state = Column(String(20), nullable=False, default="pending", server_default="pending")
+    route_id = Column(String(36), nullable=True)
+    route_revision = Column(Integer, nullable=True)
+    recipient = Column(String(255), nullable=True)
+    base_url = Column(Text, nullable=True)
+    message_text = Column(Text, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    resolve_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    next_attempt_at = Column(Float, nullable=False, default=0, server_default="0")
+    last_error = Column(String(64), nullable=True)
+
+    __table_args__ = (
+        Index("ix_mirza_notifications_state_next_attempt", "state", "next_attempt_at"),
+        Index("ix_mirza_notifications_route_revision", "route_id", "route_revision"),
+    )
 
 
 class DailyReportRun(Base):

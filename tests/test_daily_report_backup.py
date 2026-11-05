@@ -47,7 +47,10 @@ def test_snapshot_stage_and_offline_restore_keep_pending_time_and_known_receipt(
     engine.dispose()
     with sqlite3.connect(database) as db:
         db.execute(
-            "INSERT INTO punishment_facts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO punishment_facts "
+            "(incident_id, username, step_index, started_at, applied_at, "
+            "disable_succeeded, revoke_succeeded, uuid_reset_succeeded, state) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ("known", "bob", 2, 90.0, 91.0, True, False, False, "completed"),
         )
         db.execute(
@@ -68,6 +71,69 @@ def test_snapshot_stage_and_offline_restore_keep_pending_time_and_known_receipt(
     with sqlite3.connect(database) as db:
         assert db.execute("SELECT applied_at FROM punishment_facts").fetchone() == (91.0,)
         assert db.execute("SELECT state, message_id FROM daily_report_runs").fetchone() == ("delivered", 77)
+
+
+def test_offline_restore_preserves_mirza_credentials_and_incident_delivery(layout, tmp_path):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from db.models import Base, MirzaNotification, MirzaRoute, PunishmentFact
+    from utils.backup import apply_backup, create_backup
+
+    database = Path(layout.database_url.split("///", 1)[1])
+    engine = create_engine(f"sqlite:///{database}")
+    Base.metadata.create_all(engine)
+    context = {"candidates": [{"route_id": "route", "revision": 2, "admin_username": "seller"}], "effective_limit": 3}
+    with Session(engine) as session:
+        session.add(MirzaRoute(id="route", admin_username="seller", api_key="synthetic-key", revision=2))
+        session.add(
+            PunishmentFact(
+                incident_id="warning",
+                username="alice",
+                started_at=99,
+                applied_at=100,
+                warning_succeeded=True,
+                notification_context=context,
+                state="completed",
+            )
+        )
+        session.add(
+            MirzaNotification(
+                incident_id="warning",
+                username="alice",
+                applied_at=100,
+                context=context,
+                route_id="route",
+                route_revision=2,
+                state="delivered",
+                recipient="5123456789",
+                message_text="alice: 3",
+                attempts=1,
+            )
+        )
+        session.commit()
+    engine.dispose()
+    archive = tmp_path / "mirza.zip"
+    create_backup(archive, layout)
+    with sqlite3.connect(database) as db:
+        db.execute("DELETE FROM mirza_routes")
+        db.execute("DELETE FROM mirza_notifications")
+        db.execute("DELETE FROM punishment_facts")
+    apply_backup(archive, layout, service_stopped=True)
+    with sqlite3.connect(database) as db:
+        assert db.execute("SELECT admin_username, api_key, revision FROM mirza_routes").fetchone() == (
+            "seller",
+            "synthetic-key",
+            2,
+        )
+        warning_succeeded, saved_context = db.execute(
+            "SELECT warning_succeeded, notification_context FROM punishment_facts"
+        ).fetchone()
+        assert warning_succeeded == 1
+        assert json.loads(saved_context) == context
+        assert db.execute(
+            "SELECT incident_id, state, recipient, message_text, attempts FROM mirza_notifications"
+        ).fetchone() == ("warning", "delivered", "5123456789", "alice: 3", 1)
 
 
 def test_v1_backup_remains_valid_and_removes_stale_new_outbox(layout, tmp_path):

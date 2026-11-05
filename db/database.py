@@ -257,6 +257,19 @@ def _sync_deprecated_legacy_tables_sync(sync_conn: Connection) -> None:
     LegacyTableImportCRUD.complete_connection(sync_conn)
 
 
+def _ensure_mirza_fact_columns_sync(sync_conn: Connection) -> None:
+    """create_all cannot extend a populated 011 fact table before Alembic runs."""
+    from sqlalchemy import inspect, text
+
+    columns = {column["name"] for column in inspect(sync_conn).get_columns("punishment_facts")}
+    if "notification_context" not in columns:
+        sync_conn.execute(text("ALTER TABLE punishment_facts ADD COLUMN notification_context JSON"))
+    if "warning_succeeded" not in columns:
+        sync_conn.execute(
+            text("ALTER TABLE punishment_facts ADD COLUMN warning_succeeded BOOLEAN NOT NULL DEFAULT FALSE")
+        )
+
+
 async def init_db():
     """
     Initialize the database - creates all tables and schema based on SQLAlchemy models.
@@ -286,6 +299,7 @@ async def init_db():
                 # reads; independent fresh startups must not race create_all.
                 await conn.exec_driver_sql("BEGIN IMMEDIATE")
             await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(_ensure_mirza_fact_columns_sync)
             await conn.run_sync(_sync_deprecated_legacy_tables_sync)
 
         _DB_INITIALIZED = True

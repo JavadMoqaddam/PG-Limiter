@@ -223,6 +223,9 @@ class CallbackData:
     USER_SYNC_PENDING = "user_sync_pending"  # Legacy button redirects to sync settings
     USER_SYNC_FORCE_DELETE = "user_sync_force_delete"  # Legacy button redirects to sync settings
 
+    # Mirza customer notification settings
+    NOTIFICATIONS_MENU = "notifications_menu"
+
     # Topics settings
     TOPICS_MENU = "topics_menu"
     TOPICS_TOGGLE = "topics_toggle"

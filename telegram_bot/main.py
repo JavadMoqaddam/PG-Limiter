@@ -492,6 +492,9 @@ CALLBACK_ROUTES = {
     CallbackData.ENHANCED_MENU: lambda u, q, c: handle_enhanced_menu_callback(q, c),
     CallbackData.ENHANCED_ON: lambda u, q, c: handle_enhanced_toggle_callback(q, c, True),
     CallbackData.ENHANCED_OFF: lambda u, q, c: handle_enhanced_toggle_callback(q, c, False),
+    CallbackData.NOTIFICATIONS_MENU: _lazy(
+        "telegram_bot.handlers.notifications", "notifications_menu", pass_update=True
+    ),
     # --- Disable method -----------------------------------------------------
     CallbackData.DISABLE_METHOD_MENU: _show_disable_method_menu,
     CallbackData.DISABLE_BY_STATUS: _set_disable_by_status,
@@ -699,6 +702,12 @@ async def _dispatch_callback_query(update: Update, context: ContextTypes.DEFAULT
     route = CALLBACK_ROUTES.get(data)
     if route is not None:
         await route(update, query, context)
+        return
+
+    if data.startswith("mn:"):
+        from telegram_bot.handlers.notifications import notification_callback
+
+        await notification_callback(update, context)
         return
 
     if data.startswith("disabled_group_page:"):
@@ -981,6 +990,11 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _dispatch_inline_text(update: Update, context: ContextTypes.DEFAULT_TYPE, waiting_for: str):
     """Route input accepted by the active inline interaction."""
+
+    if waiting_for == "mirza_notification":
+        from telegram_bot.handlers.notifications import notification_input
+
+        return await notification_input(update, context)
 
     # Handle different input types based on waiting_for state
     if waiting_for == "general_limit":
