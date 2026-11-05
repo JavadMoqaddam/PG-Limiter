@@ -151,3 +151,9 @@ Routes, API keys and notification delivery state are included in the existing
 SQLite backup. The existing punishment-fact journal retains pending evidence
 during a temporary database failure and is also included in backups. Treat
 backup archives as credentials. See [Backup & Restore](BACKUP_RESTORE.md).
+
+Before upgrading, retain a full private backup and the previous image identity.
+Rollback to 1.7.2 requires restoring compatible database and state files offline
+before starting the older image. An explicit downgrade of revision `012` deletes
+Mirza routes, API keys and delivery history; it is not a lossless rollback. See
+the [release rollback procedure](releases/v1.7.3.md#rollback).

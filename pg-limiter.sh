@@ -4,7 +4,7 @@ set -e
 # PG-Limiter Management Script
 # https://github.com/JavadMoqaddam/PG-Limiter
 
-VERSION="1.7.2"
+VERSION="1.7.3"
 
 # Configuration
 REPO_OWNER="JavadMoqaddam"
@@ -834,7 +834,8 @@ cmd_update_verify() {
     colorized_echo green "✓ PG-Limiter v$VERSION updated and running"
     echo ""
     echo "  Backup:   $backup_dir"
-    echo "  Rollback: docker tag $rollback_tag $DOCKER_IMAGE && pg-limiter restart"
+    echo "  Rollback guide: https://github.com/$REPO_OWNER/$REPO_NAME/blob/v$VERSION/docs/releases/v$VERSION.md#rollback"
+    echo "  Restore compatible pre-upgrade data offline before starting an older image."
     echo ""
     colorized_echo blue "Worth a look after any update:"
     echo "  pg-limiter logs | grep -iE 'migration|alembic|Counting mode'"
@@ -845,18 +846,20 @@ cmd_update_rollback_hint() {
     local rollback_tag="$2"
 
     echo ""
-    colorized_echo yellow "To go back:"
+    colorized_echo yellow "To go back after a schema migration, keep the service stopped:"
+    echo "  Use the current CLI to restore a complete pre-upgrade archive offline:"
+    echo "  pg-limiter restore /path/to/full-pre-upgrade-backup.zip"
+    echo "  Decline the restart prompt, then restore the previous Compose file and CLI."
     if docker image inspect "$rollback_tag" >/dev/null 2>&1; then
-        echo "  docker tag $rollback_tag $DOCKER_IMAGE"
-        echo "  cp -a $backup_dir/pg-limiter.old /usr/local/bin/pg-limiter"
-        echo "  pg-limiter restart"
+        echo "  Retained image candidate: $rollback_tag (verify its original version)."
     else
         colorized_echo yellow "  No rollback image was tagged; pull the previous release manually."
     fi
     echo ""
-    colorized_echo yellow "Your data before this update is in: $backup_dir"
-    echo "  Restore the database with the container stopped:"
-    echo "  cp -a $backup_dir/pg_limiter.db $DATA_DIR/data/pg_limiter.db"
+    colorized_echo yellow "Partial updater copies are in: $backup_dir"
+    echo "  They do not replace a full backup of a custom database and all state sidecars."
+    echo "  Start only after the database, state files, image and CLI match the previous release."
+    echo "  https://github.com/$REPO_OWNER/$REPO_NAME/blob/v$VERSION/docs/releases/v$VERSION.md#rollback"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -36,6 +36,17 @@ Restored `.env`'s explicit SQLite `DATABASE_URL` selects the database location f
 
 After applying, the command asks whether to start the service. Declining leaves it stopped. Starting uses a fresh process and configuration; the bot never swaps files underneath a running database engine. The management script and application image must both contain this backup format/helper; an older image fails before shutdown because it cannot run the validator.
 
+## Rollback across migrations
+
+For rollback across a database migration, keep a complete private archive made
+before the upgrade, together with the previous image identity, Compose file and
+management script. The updater's limited copies do not replace this archive,
+especially for a custom database path and persisted state sidecars. Apply the
+archive with the current offline restore helper and decline its restart prompt;
+then restore the matching previous image, Compose file and script before starting.
+An older image cannot resolve newer Alembic revisions. See the
+[1.7.3 rollback procedure](releases/v1.7.3.md#rollback) for migration `012`.
+
 ## Legacy compatibility
 
 Old bot ZIPs with `data/pg_limiter.db` and host ZIPs with `data/data/pg_limiter.db` are recognized. A unique custom SQLite filename under `data/` is also recognized. If an old archive contains an associated WAL, it is materialized into a standalone checked temporary snapshot before application. Its original cross-file consistency cannot be certified. An old archive with no database, multiple database candidates or corrupt data is refused. Legacy JSON files that were never included in that archive remain unchanged, and this limitation is reported; undeclared deployment/log files are not restored.
