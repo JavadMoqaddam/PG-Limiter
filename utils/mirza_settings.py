@@ -169,6 +169,17 @@ async def get_route(route_id: str) -> dict | None:
         return MirzaRoutesCRUD.public(row) if row is not None else None
 
 
+async def get_test_credentials(route_id: str, *, expected_revision: int) -> tuple[str, str]:
+    """Read a matching bot's URL/key for an explicit test, including disabled bots."""
+    async with _transaction() as db:
+        row = await MirzaRoutesCRUD.get(db, route_id)
+        if row is None or row.revision != expected_revision:
+            raise MirzaRouteError("Bot changed or was deleted. Open it again before testing")
+        if not row.base_url or not row.api_key:
+            raise MirzaRouteError("Configure the URL and API key before testing")
+        return row.base_url, row.api_key
+
+
 async def create_route(name: str) -> dict:
     name = _bot_name(name)
     async with _transaction() as db:
