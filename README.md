@@ -69,6 +69,8 @@
 | 📝 **Audit Logging** | Preserves violation and disable message history for accounting |
 | 💾 **Automated Backups** | Scheduled periodic backups sent directly to your Telegram backup topic |
 
+Critical notifications retain durable retries and can duplicate after a lost Telegram response. Periodic warnings and system messages stop blind resend after uncertain delivery; newer warning scans replace older unsent work. Node summaries retain pending receipts and coalesce updates. See [Telegram delivery and retries](docs/TELEGRAM_DELIVERY.md) for the tradeoffs and menu/backup behavior.
+
 ### ⚡ Performance & Data Management
 | Feature | Description |
 |---------|-------------|

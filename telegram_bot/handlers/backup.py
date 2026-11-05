@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     ContextTypes,
     ConversationHandler,
@@ -487,22 +488,30 @@ def _sync_create_auto_backup_zip(interval_hours: int) -> tuple[str, str, str]:
 async def send_automatic_backup() -> bool:
     """
     Send an automatic backup to the forum group (if topics enabled) or all admins.
+    Only a definite group destination rejection permits fallback to admins.
     Called by scheduler based on auto-backup config.
     """
     from telegram_bot.main import application
     from telegram_bot.utils import check_admin
     from telegram_bot.topics import TopicType, get_topics_manager
+    from utils.punishment_facts import settle_owned
 
     backup_logger.info("📦 Creating automatic backup...")
 
     temp_dir = None
+    delivered = 0
     try:
         # Get auto-backup config for interval info
         config = await asyncio.to_thread(get_auto_backup_config)
         interval_hours = config.get("interval_hours", 1)
 
-        # Create temp directory for backup
-        zip_path, zip_name, temp_dir = await asyncio.to_thread(_sync_create_auto_backup_zip, interval_hours)
+        async def create_owned_backup() -> tuple[str, str]:
+            # Publish the directory before repeated caller cancellation can propagate.
+            nonlocal temp_dir
+            zip_path, zip_name, temp_dir = await asyncio.to_thread(_sync_create_auto_backup_zip, interval_hours)
+            return zip_path, zip_name
+
+        zip_path, zip_name = await settle_owned(create_owned_backup())
 
         # Get topics manager
         topics_manager = get_topics_manager()
@@ -515,27 +524,39 @@ async def send_automatic_backup() -> bool:
         )
 
         # Try sending to forum group first if topics are enabled
-        if topics_manager.enabled and topics_manager.group_id:
+        group_id = topics_manager.group_id if topics_manager.enabled else None
+        if group_id:
             thread_id = topics_manager.get_topic_id(TopicType.BACKUPS)
-            try:
-                with open(zip_path, "rb") as f:
+            with open(zip_path, "rb") as f:
+                try:
                     await application.bot.send_document(
-                        chat_id=topics_manager.group_id,
+                        chat_id=group_id,
                         document=f,
                         filename=zip_name,
                         caption=caption,
                         parse_mode="HTML",
                         message_thread_id=thread_id,
                     )
+                except (BadRequest, Forbidden) as error:
+                    destination_rejected = isinstance(error, Forbidden) or any(
+                        phrase in str(error).lower()
+                        for phrase in ("chat not found", "message thread not found", "topic_closed")
+                    )
+                    if not destination_rejected:
+                        raise
+                    backup_logger.warning(
+                        "Automatic backup action=send_group result=destination_rejected fallback=admins error=%s",
+                        type(error).__name__,
+                    )
+                else:
+                    # Record the receipt before file close, logging, or cleanup can fail.
+                    delivered = 1
+            if delivered:
                 backup_logger.info(f"✅ Automatic backup sent to forum group (thread={thread_id})")
-                shutil.rmtree(temp_dir)
                 return True
-            except Exception as e:
-                backup_logger.warning(f"⚠️ Failed to send backup to forum group: {e}, falling back to admins")
 
         # Fallback: send to all admins
         admins = await check_admin()
-        delivered = 0
 
         for admin in admins:
             try:
@@ -547,22 +568,27 @@ async def send_automatic_backup() -> bool:
                         caption=caption,
                         parse_mode="HTML",
                     )
+                    delivered += 1
                 backup_logger.info(f"✅ Automatic backup sent to admin {admin}")
-                delivered += 1
             except Exception as e:
-                backup_logger.error(f"❌ Failed to send backup to admin {admin}: {e}")
+                backup_logger.error("Automatic backup action=send_admin result=failed error=%s", type(e).__name__)
 
-        # Cleanup
-        shutil.rmtree(temp_dir)
-        backup_logger.info("✅ Automatic backup completed successfully")
+        backup_logger.info(f"Automatic backup completed with {delivered} confirmed admin deliveries")
         return delivered > 0
 
     except Exception as e:
-        backup_logger.error(f"❌ Automatic backup failed: {e}")
-        return False
+        backup_logger.error(
+            "Automatic backup action=send result=interrupted confirmed_deliveries=%s error=%s",
+            delivered,
+            type(e).__name__,
+        )
+        return delivered > 0
     finally:
         if temp_dir is not None:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            try:
+                await settle_owned(asyncio.to_thread(shutil.rmtree, temp_dir))
+            except Exception as error:
+                backup_logger.warning("Automatic backup action=cleanup result=failed error=%s", type(error).__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

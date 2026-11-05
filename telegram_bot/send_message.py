@@ -9,7 +9,7 @@ import os
 import time
 from typing import Any, Optional, Tuple
 
-from telegram_bot.dispatcher import Priority, get_dispatcher
+from telegram_bot.dispatcher import DeliveryHandle, Priority, get_dispatcher
 from telegram_bot.topics import TopicType, get_topics_manager
 from utils.atomic_io import atomic_write_json
 from utils.logs import get_logger
@@ -202,6 +202,58 @@ async def send_logs(
         except Exception as error:
             tg_send_logger.error(f"Error waiting for outbound delivery: {error}")
     return None
+
+
+async def enqueue_log_delivery(
+    msg: str,
+    *,
+    topic_type: TopicType = TopicType.GENERAL,
+    message_key: Optional[str] = None,
+    priority: int = Priority.SYSTEM,
+    ttl: Optional[float] = None,
+    cancel_key: Optional[str] = None,
+) -> DeliveryHandle | None:
+    """Return a delivery handle while preserving the existing logging wrapper's result."""
+    manager = get_topics_manager()
+    if not manager.enabled or not manager.group_id:
+        return None
+    if message_key and manager.is_message_sent(topic_type, message_key):
+        return None
+    return await get_dispatcher().enqueue_send_delivery(
+        _split_message(_sanitize_html_message(msg), 3900),
+        topic_type=topic_type,
+        priority=priority,
+        ttl=ttl,
+        cancel_key=cancel_key,
+        chat_id=manager.group_id,
+        message_thread_id=manager.get_topic_id(topic_type) or manager.get_topic_id(TopicType.GENERAL),
+        message_key=message_key,
+    )
+
+
+async def enqueue_edit_delivery(message_info: Optional[Tuple[int, int]], new_text: str) -> DeliveryHandle | None:
+    """Return the outcome owner for an edit to a known receipt."""
+    if not message_info:
+        return None
+    message_id, chat_id = message_info
+    return await get_dispatcher().enqueue_edit_delivery(chat_id, message_id, _sanitize_html_message(new_text))
+
+
+async def send_warning_report(messages: list[str], *, ttl: float) -> DeliveryHandle | None:
+    """Admit a complete scan atomically; an empty current scan retires queued warnings."""
+    manager = get_topics_manager()
+    if not manager.enabled or not manager.group_id:
+        return None
+    texts = [chunk for message in messages for chunk in _split_message(_sanitize_html_message(message), 3900)]
+    return await get_dispatcher().enqueue_send_delivery(
+        texts,
+        topic_type=TopicType.WARNINGS,
+        priority=Priority.WARNINGS,
+        ttl=ttl,
+        chat_id=manager.group_id,
+        message_thread_id=manager.get_topic_id(TopicType.WARNINGS) or manager.get_topic_id(TopicType.GENERAL),
+        warning_report=True,
+    )
 
 
 async def send_warning_log(

@@ -27,9 +27,8 @@ async def streams(api_cycle, logs, monkeypatch):
     monkeypatch.setattr(collector, "TASKS", [])
     monkeypatch.setattr(collector, "task_node_mapping", {})
     monkeypatch.setattr(collector, "_node_connection_status", {})
-    monkeypatch.setattr(collector, "_pending_status_update_task", None)
     monkeypatch.setattr(collector, "send_logs", AsyncMock(return_value=77))
-    monkeypatch.setattr(collector, "edit_message", AsyncMock(return_value=True))
+    monkeypatch.setattr(collector, "enqueue_log_delivery", AsyncMock(return_value=None))
     opened = []
     started = {i: asyncio.Event() for i in (1, 9)}
     closed = {i: asyncio.Event() for i in (1, 9)}
@@ -69,10 +68,7 @@ async def streams(api_cycle, logs, monkeypatch):
 
     monkeypatch.setattr(collector.httpx, "AsyncClient", Client)
     yield SimpleNamespace(module=collector, opened=opened, started=started, closed=closed)
-    pending = collector._pending_status_update_task
-    if pending is not None:
-        pending.cancel()
-        await asyncio.gather(pending, return_exceptions=True)
+    await collector.retire_node_status_message()
 
 
 @pytest.mark.parametrize(

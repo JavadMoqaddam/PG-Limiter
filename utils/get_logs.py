@@ -8,6 +8,7 @@ import os
 import time
 from asyncio import Task
 from datetime import datetime
+from dataclasses import dataclass
 from contextlib import asynccontextmanager
 
 from utils.device_count import COUNT_MODE_INBOUND
@@ -26,7 +27,8 @@ try:
     import httpx
 except ImportError as exc:
     raise ImportError("Module 'httpx' is not installed. Use: 'pip install httpx'") from exc
-from telegram_bot.send_message import send_logs, edit_message
+from telegram_bot.dispatcher import DeliveryHandle
+from telegram_bot.send_message import send_logs, enqueue_log_delivery, enqueue_edit_delivery
 from utils.logs import logger  # pylint: disable=ungrouped-imports
 from utils.panel_api import get_nodes, get_panel_headers
 from utils.parse_logs import clear_node_active_connections, parse_logs, set_current_node_info
@@ -44,8 +46,7 @@ TASKS = []
 task_node_mapping = {}
 task_monitoring_admissions = {}
 
-# Track the status message for node connections
-_node_status_message_id = None
+# Track observed connection state separately from Telegram delivery receipts.
 _node_connection_status = {}  # node_id -> {"name": str, "status": str}
 
 
@@ -91,9 +92,125 @@ async def _build_node_status_message() -> str:
     return "\n".join(lines)
 
 
-_last_status_edit_time = 0.0
-_last_status_text = ""
-_pending_status_update_task: asyncio.Task | None = None
+@dataclass(eq=False)
+class _NodeStatusDelivery:
+    """One summary scope owns a single pending operation and coalesces newer text."""
+
+    admission: MonitoringAdmission
+    desired_text: str = ""
+    confirmed_text: str = ""
+    message_info: tuple[int, int] | None = None
+    handle: DeliveryHandle | None = None
+    task: asyncio.Task | None = None
+    throttle: float = 0.0
+    last_attempt: float = 0.0
+    blocked: bool = False
+    retired: bool = False
+
+    def current(self) -> bool:
+        return not self.retired and self is _node_status_delivery and monitoring_is_current(self.admission)
+
+    def request(self, text: str, throttle: float) -> None:
+        self.desired_text, self.throttle = text, throttle
+        if self.current() and not self.blocked and (self.task is None or self.task.done()):
+            self.task = asyncio.create_task(self._deliver(), name="node-status-delivery")
+
+    async def close(self) -> None:
+        """Retire this producer waiter while the dispatcher retains delivery ownership."""
+        self.retired = True
+        if self.task is not None:
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+            self.task = None
+
+    async def _deliver(self) -> None:
+        try:
+            while self.current() and not self.blocked and self.desired_text != self.confirmed_text:
+                if self.message_info is not None:
+                    delay = self.throttle - (time.monotonic() - self.last_attempt)
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                if not self.current():
+                    return
+                text = self.desired_text
+                if text == self.confirmed_text:
+                    return
+                self.last_attempt = time.monotonic()
+                editing = self.message_info is not None
+                self.handle = (
+                    await enqueue_edit_delivery(self.message_info, text)
+                    if editing
+                    else await enqueue_log_delivery(text)
+                )
+                if self.handle is None:
+                    return
+                # No caller timeout converts a pending delivery into permission to append.
+                result = await self.handle.wait()
+                while result.status == "pending" and self.current():
+                    await asyncio.sleep(0.1)
+                    result = await self.handle.wait()
+                if not self.current():
+                    return
+                self.handle = None
+                if result.status == "delivered":
+                    if not editing:
+                        if not isinstance(result.receipt, tuple):
+                            self.blocked = True
+                            return
+                        self.message_info = result.receipt
+                    self.confirmed_text = text
+                elif editing and result.replacement_allowed:
+                    self.message_info = None
+                    self.confirmed_text = ""
+                elif not editing:
+                    # An unconfirmed append must never create another append in this scope.
+                    self.blocked = True
+                else:
+                    # The edit may have applied. Even the formerly confirmed text
+                    # must be written again if it becomes the desired state.
+                    self.confirmed_text = ""
+                    if self.desired_text == text:
+                        return
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if self.message_info is None:
+                self.blocked = True
+            logger.debug("Node status delivery stopped: %s", type(error).__name__)
+        finally:
+            self.task = None
+
+
+_node_status_delivery: _NodeStatusDelivery | None = None
+_status_lock = asyncio.Lock()
+
+
+async def retire_node_status_message(admission: MonitoringAdmission | None = None) -> None:
+    """Settle the old summary producer before a source reset or dispatcher shutdown."""
+    global _node_status_delivery
+    async with _status_lock:
+        owner = _node_status_delivery
+        if owner is not None and (admission is None or owner.admission != admission or not admission.allowed):
+            _node_status_delivery = None
+            await owner.close()
+
+
+async def _status_owner(admission: MonitoringAdmission, *, reset: bool = False) -> _NodeStatusDelivery | None:
+    global _node_status_delivery
+    async with _status_lock:
+        if not monitoring_is_current(admission):
+            return None
+        owner = _node_status_delivery
+        if owner is not None and (reset or owner.admission != admission):
+            _node_status_delivery = None
+            await owner.close()
+            owner = None
+        if not monitoring_is_current(admission):
+            return None
+        if owner is None:
+            owner = _node_status_delivery = _NodeStatusDelivery(admission)
+        return owner
+
 
 # How often a live SSE stream re-checks whether the IP source was switched
 # to API mode from the Telegram bot.
@@ -140,28 +257,6 @@ async def _get_node_poll_interval() -> float:
     return node_silence_window(await _get_status_throttle_interval())
 
 
-async def _delayed_status_update(delay: float, admission: MonitoringAdmission) -> None:
-    """Flush the latest node connection status to Telegram after the throttle window ends."""
-    global _last_status_edit_time, _last_status_text, _node_status_message_id
-    try:
-        await asyncio.sleep(delay)
-        if not monitoring_is_current(admission):
-            return
-        message = await _build_node_status_message()
-        if monitoring_is_current(admission) and message != _last_status_text and _node_status_message_id:
-            _last_status_edit_time = time.time()
-            _last_status_text = message
-            await edit_message(_node_status_message_id, message)
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        logger.debug(f"Delayed node status update note: {e}")
-
-
-_status_lock = asyncio.Lock()
-_status_initializing: bool = False
-
-
 async def _report_node_health(admission, *, nodes=None, observed_node_ids=None) -> None:
     """Keep diagnostic admission failures outside transport error handling."""
     try:
@@ -187,18 +282,11 @@ async def _report_polled_node_health(nodes, admission) -> None:
 async def _update_node_status(
     node_id: int, node_name: str, status: str, admission: MonitoringAdmission | None = None
 ) -> None:
-    """Update the status of a node in memory and refresh the message with rate throttling and trailing flush."""
-    global \
-        _node_connection_status, \
-        _node_status_message_id, \
-        _last_status_edit_time, \
-        _last_status_text, \
-        _pending_status_update_task, \
-        _status_initializing
-
+    """Observe node health and request a summary without waiting on Telegram."""
     if admission is None:
         admission = monitoring_snapshot()
-    if not monitoring_is_current(admission):
+    owner = await _status_owner(admission)
+    if owner is None:
         return
     _node_connection_status[node_id] = {"name": node_name, "status": status}
     if "❌" in status or "⚫" in status:
@@ -207,47 +295,10 @@ async def _update_node_status(
             nodes=[NodeType(node_id, node_name, "", "connected")],
             observed_node_ids={node_id},
         )
-
-    # Throttle edits: sync with check_interval (default 60s)
-    now = time.time()
-    throttle_interval = await _get_status_throttle_interval()
-    if not monitoring_is_current(admission):
-        return
-    elapsed = now - _last_status_edit_time
-
-    if _status_initializing:
-        # Initial status message is in flight; trailing update will flush latest states
-        return
-
-    if _node_status_message_id and elapsed < throttle_interval:
-        # Schedule trailing update so latest states are flushed at the end of the throttle window
-        if _pending_status_update_task is None or _pending_status_update_task.done():
-            _pending_status_update_task = asyncio.create_task(
-                _delayed_status_update(throttle_interval - elapsed, admission)
-            )
-        return
-
-    async with _status_lock:
-        message = await _build_node_status_message()
-        if not monitoring_is_current(admission) or message == _last_status_text:
-            return
-
-        _last_status_edit_time = now
-        _last_status_text = message
-
-        if _node_status_message_id:
-            # Try to edit the existing message
-            result = await edit_message(_node_status_message_id, message)
-            if not result and monitoring_is_current(admission):
-                # If edit fails, send a new message
-                _node_status_message_id = await send_logs(message, return_message_id=True)
-        else:
-            # Send initial message (guarded against concurrent duplicate sends)
-            _status_initializing = True
-            try:
-                _node_status_message_id = await send_logs(message, return_message_id=True)
-            finally:
-                _status_initializing = False
+    throttle = await _get_status_throttle_interval()
+    message = await _build_node_status_message()
+    if owner.current():
+        owner.request(message, throttle)
 
 
 async def _refresh_log_config() -> None:
@@ -264,12 +315,7 @@ async def _refresh_log_config() -> None:
 
 async def init_node_status_message(nodes: list, admission: MonitoringAdmission | None = None) -> None:
     """Initialize the status message with monitored nodes showing as connecting."""
-    global \
-        _node_connection_status, \
-        _node_status_message_id, \
-        _status_initializing, \
-        _last_status_edit_time, \
-        _last_status_text
+    global _node_connection_status
 
     if admission is None:
         admission = monitoring_snapshot()
@@ -287,24 +333,20 @@ async def init_node_status_message(nodes: list, admission: MonitoringAdmission |
     )
     if not monitoring_is_current(admission):
         return
+    owner = await _status_owner(admission, reset=True)
+    if owner is None:
+        return
     _node_connection_status = {}
-    _node_status_message_id = None
 
     for node in nodes:
         if node.status == "connected" and LOG_OBSERVATIONS.monitors(node.node_id):
             _node_connection_status[node.node_id] = {"name": node.node_name, "status": "⏳ Connecting..."}
 
     if _node_connection_status:
+        throttle = await _get_status_throttle_interval()
         message = await _build_node_status_message()
-        if not monitoring_is_current(admission):
-            return
-        _last_status_edit_time = time.time()
-        _last_status_text = message
-        _status_initializing = True
-        try:
-            _node_status_message_id = await send_logs(message, return_message_id=True)
-        finally:
-            _status_initializing = False
+        if owner.current():
+            owner.request(message, throttle)
 
 
 @asynccontextmanager
@@ -555,15 +597,12 @@ async def get_nodes_logs(panel_data: PanelType, node: NodeType, admission: Monit
 
 async def retire_log_streams(admission=None) -> None:
     """Close all owned SSE transports and abandon their pending status report."""
-    global _pending_status_update_task, _node_status_message_id, _last_status_text, _last_status_edit_time
+    await retire_node_status_message(admission)
     tasks = [
         task
         for task in list(TASKS)
         if admission is None or task_monitoring_admissions.get(task) != admission or not admission.allowed
     ]
-    if _pending_status_update_task is not None:
-        tasks.append(_pending_status_update_task)
-        _pending_status_update_task = None
     for task in tasks:
         task.cancel()
     if tasks:
@@ -576,9 +615,6 @@ async def retire_log_streams(admission=None) -> None:
     surviving_ids = {node.node_id for task, node in task_node_mapping.items() if not task.done()}
     for node_id in set(_node_connection_status) - surviving_ids:
         _node_connection_status.pop(node_id, None)
-    _node_status_message_id = None
-    _last_status_text = ""
-    _last_status_edit_time = 0.0
 
 
 async def handle_cancel(panel_data: PanelType, tasks: list[Task]) -> None:
@@ -711,7 +747,7 @@ async def handle_cancel_all(tasks: list[Task], panel_data: PanelType, tg: asynci
         panel_data (PanelType): The credentials for the panel.
         tg (asyncio.TaskGroup): The TaskGroup to create new tasks in.
     """
-    global _node_status_message_id, _node_connection_status
+    global _node_connection_status
 
     while True:
         # Wait for 2 hours before restarting all SSE connections
@@ -745,8 +781,8 @@ async def handle_cancel_all(tasks: list[Task], panel_data: PanelType, tg: asynci
                         task_node_mapping.pop(task)
                     task_monitoring_admissions.pop(task, None)
 
-            # Reset status tracking
-            _node_status_message_id = None
+            # Retire the producer before opening a fresh summary scope.
+            await retire_node_status_message()
             _node_connection_status = {}
 
             # The old heartbeats belong to transports that are being closed.

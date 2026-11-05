@@ -366,6 +366,14 @@ async def cleanup_resources():
     except Exception as e:
         main_logger.debug(f"Error closing ISP detector: {e}")
 
+    # Retire summary producers before dispatcher drain so late receipts cannot enqueue edits.
+    try:
+        from utils.get_logs import retire_node_status_message
+
+        await retire_node_status_message()
+    except Exception as e:
+        main_logger.debug(f"Error retiring node status producer: {e}")
+
     # 4. Stop Telegram Dispatcher cleanly
     try:
         from telegram_bot.dispatcher import get_dispatcher

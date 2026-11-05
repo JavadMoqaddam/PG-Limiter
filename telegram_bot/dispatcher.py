@@ -21,9 +21,11 @@ import json
 import os
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
+import httpx
 
+from telegram_bot.delivery_errors import is_message_unavailable
 from telegram_bot.topics import TopicType, get_topics_manager
 from utils.atomic_io import atomic_write_json
 from utils.logs import get_logger
@@ -106,6 +108,9 @@ class QueueItem:
     destination_revision: Optional[int] = None
     report_date: Optional[str] = None
     report_timezone: Optional[str] = None
+    replacement_allowed: bool = False
+    transport_started: bool = False
+    superseded: bool = False
 
     @property
     def is_cancelled(self) -> bool:
@@ -124,6 +129,45 @@ class SendBatch:
     completed: bool = False
     completed_at: float = 0.0
     admitted: bool = True
+    warning_scope: Optional[tuple] = None
+
+
+@dataclass(frozen=True)
+class DeliveryResult:
+    """A conservative result for one complete logical delivery."""
+
+    status: Literal["delivered", "pending", "uncertain", "failed", "cancelled"]
+    receipt: tuple[int, int] | bool | None = None
+    replacement_allowed: bool = False
+
+
+@dataclass(frozen=True)
+class DeliveryHandle:
+    """Observe dispatcher-owned events without transferring their cancellation ownership."""
+
+    _items: tuple[QueueItem, ...] = field(repr=False)
+
+    @property
+    def event_ids(self) -> tuple[str, ...]:
+        return tuple(item.event_id for item in self._items)
+
+    async def wait(self, timeout: float | None = None) -> DeliveryResult:
+        """Wait for all chunks; timing out or cancelling this waiter leaves delivery live."""
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(asyncio.shield(item.future) for item in self._items)), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            return DeliveryResult("pending")
+        states = {item.state for item in self._items}
+        if DeliveryState.UNCERTAIN in states:
+            return DeliveryResult("uncertain")
+        if states == {DeliveryState.DELIVERED}:
+            return DeliveryResult("delivered", self._items[-1].receipt)
+        if states & {DeliveryState.QUEUED, DeliveryState.PREPARING, DeliveryState.SENDING}:
+            return DeliveryResult("pending")
+        status = "failed" if DeliveryState.FAILED in states else "cancelled"
+        return DeliveryResult(status, replacement_allowed=all(item.replacement_allowed for item in self._items))
 
 
 class TokenBucket:
@@ -171,6 +215,7 @@ class TelegramDispatcher:
         self._admissions: dict[asyncio.Task, SendBatch] = {}
         self._batches: Dict[str, SendBatch] = {}
         self._dedup_batches: dict[tuple, SendBatch] = {}
+        self._warning_reports: dict[tuple, SendBatch] = {}
         self._paused_until = 0.0
         self._is_running = False
         self._shutting_down = False
@@ -400,9 +445,61 @@ class TelegramDispatcher:
         message_thread_id: Optional[int] = None,
         message_key: Optional[str] = None,
     ) -> list[asyncio.Future]:
+        """Backward-compatible waiter views over a complete owned batch."""
+        batch = await self._admit_send_batch(
+            texts, topic_type, priority, reply_markup, ttl, cancel_key, chat_id, message_thread_id, message_key
+        )
+        return [asyncio.shield(batch.items[index].future) for index in sorted(batch.items)] if batch else []
+
+    async def enqueue_send_delivery(
+        self,
+        texts: list[str],
+        *,
+        topic_type: TopicType = TopicType.GENERAL,
+        priority: int = Priority.SYSTEM,
+        ttl: Optional[float] = None,
+        cancel_key: Optional[str] = None,
+        chat_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+        message_key: Optional[str] = None,
+        warning_report: bool = False,
+    ) -> DeliveryHandle | None:
+        """Admit a batch and return its stable delivery ownership view."""
+        batch = await self._admit_send_batch(
+            texts,
+            topic_type,
+            priority,
+            None,
+            ttl,
+            cancel_key,
+            chat_id,
+            message_thread_id,
+            message_key,
+            warning_report=warning_report,
+        )
+        return (
+            DeliveryHandle(tuple(batch.items[index] for index in sorted(batch.items)))
+            if batch and batch.items
+            else None
+        )
+
+    async def _admit_send_batch(
+        self,
+        texts: list[str],
+        topic_type: TopicType = TopicType.GENERAL,
+        priority: int = Priority.SYSTEM,
+        reply_markup: Any = None,
+        ttl: Optional[float] = None,
+        cancel_key: Optional[str] = None,
+        chat_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+        message_key: Optional[str] = None,
+        *,
+        warning_report: bool = False,
+    ) -> SendBatch | None:
         """Reserve and persist all chunks together, reusing a live dedup batch's futures."""
-        if self._shutting_down or not texts or not get_topics_manager().enabled:
-            return []
+        if self._shutting_down or (not texts and not warning_report) or not get_topics_manager().enabled:
+            return None
         monitoring_revision = get_topics_manager().monitoring_revision
         destination_revision = get_topics_manager().destination_revision
         destination = QueueItem(
@@ -434,12 +531,23 @@ class TelegramDispatcher:
         if namespace:
             existing = self._dedup_batches.get(namespace)
             if existing and (not existing.completed or now - existing.completed_at < 86400):
-                return [asyncio.shield(existing.items[index].future) for index in sorted(existing.items)]
+                return existing
             if existing:
                 self._batches.pop(existing.batch_id, None)
                 self._dedup_batches.pop(namespace, None)
         batch_id = uuid.uuid4().hex
-        batch = SendBatch(batch_id, len(texts), namespace, admitted=False)
+        warning_scope = (
+            (
+                destination.chat_id,
+                destination.message_thread_id,
+                topic_type.value,
+                monitoring_revision,
+                destination_revision,
+            )
+            if warning_report
+            else None
+        )
+        batch = SendBatch(batch_id, len(texts), namespace, admitted=False, warning_scope=warning_scope)
         self._batches[batch_id] = batch
         if namespace:
             self._dedup_batches[namespace] = batch
@@ -472,6 +580,9 @@ class TelegramDispatcher:
             try:
                 if priority == Priority.CRITICAL:
                     await self._save_pending_storage()
+                for item in batch.items.values():
+                    if not item.is_cancelled and (item.destination_pinned or priority != Priority.CRITICAL):
+                        await self._queue(item)
             except BaseException:
                 for item in batch.items.values():
                     self._pending_storage.pop(item.db_id, None)
@@ -484,9 +595,24 @@ class TelegramDispatcher:
                 self._batches.pop(batch_id, None)
                 raise
             batch.admitted = True
-            for item in batch.items.values():
-                if not item.is_cancelled and (item.destination_pinned or priority != Priority.CRITICAL):
-                    await self._queue(item)
+            if warning_scope:
+                previous = self._warning_reports.get(warning_scope)
+                self._warning_reports[warning_scope] = batch
+                if previous:
+                    for item in previous.items.values():
+                        item.superseded = True
+                        if item.state in {DeliveryState.QUEUED, DeliveryState.PREPARING}:
+                            item.state = DeliveryState.CANCELLED
+                            await self._finish(item)
+                if not batch.items:
+                    self._warning_reports.pop(warning_scope, None)
+                    self._batches.pop(batch_id, None)
+
+        # Warning admission has no durable I/O. Commit the complete scan before
+        # superseding its predecessor; cancelled or failed admission leaves it live.
+        if warning_report:
+            await admit()
+            return batch
 
         # Admission belongs to the dispatcher once reserved. A caller disappearing
         # during durable I/O must not leave a persisted row with no live owner.
@@ -504,7 +630,7 @@ class TelegramDispatcher:
         except asyncio.CancelledError:
             await asyncio.shield(admission)
             raise
-        return [asyncio.shield(item.future) for item in batch.items.values()]
+        return batch
 
     async def enqueue_daily_report(self, run: dict) -> bool:
         """Own one durable SYSTEM event with the run's pre-linked stable identity."""
@@ -597,6 +723,15 @@ class TelegramDispatcher:
     async def enqueue_edit(
         self, chat_id: int, message_id: int, new_text: str, priority: int = Priority.SYSTEM, return_future: bool = False
     ) -> Optional[asyncio.Future]:
+        item = await self._admit_edit(chat_id, message_id, new_text, priority)
+        return asyncio.shield(item.future) if return_future and item else None
+
+    async def enqueue_edit_delivery(self, chat_id: int, message_id: int, new_text: str) -> DeliveryHandle | None:
+        """Own an edit to a known message, preserving confirmed rejection details."""
+        item = await self._admit_edit(chat_id, message_id, new_text, Priority.SYSTEM)
+        return DeliveryHandle((item,)) if item else None
+
+    async def _admit_edit(self, chat_id: int, message_id: int, new_text: str, priority: int) -> QueueItem | None:
         if self._shutting_down:
             return None
         item = QueueItem(
@@ -609,7 +744,7 @@ class TelegramDispatcher:
         )
         self._register(item)
         await self._queue(item)
-        return asyncio.shield(item.future) if return_future else None
+        return item
 
     async def enqueue_delete(
         self, chat_id: int, message_id: int, priority: int = Priority.CRITICAL, return_future: bool = False
@@ -655,6 +790,8 @@ class TelegramDispatcher:
         if not batch.completed:
             batch.completed_at = time.time()
             batch.completed = True
+        if batch.warning_scope and self._warning_reports.get(batch.warning_scope) is batch:
+            self._warning_reports.pop(batch.warning_scope, None)
         removed = {}
         for part in batch.items.values():
             if part.db_id and part.state != DeliveryState.FAILED:
@@ -667,7 +804,8 @@ class TelegramDispatcher:
             except BaseException:
                 self._pending_storage.update(removed)
                 raise
-        if not success or not batch.namespace:
+        uncertain = any(part.state == DeliveryState.UNCERTAIN for part in batch.items.values())
+        if not (success or uncertain) or not batch.namespace:
             if batch.namespace and self._dedup_batches.get(batch.namespace) is batch:
                 self._dedup_batches.pop(batch.namespace, None)
             self._batches.pop(batch.batch_id, None)
@@ -686,7 +824,7 @@ class TelegramDispatcher:
         for item in list(self._active_cancel_keys.get(cancel_key, {}).values()):
             if item.state == DeliveryState.SENDING:
                 await asyncio.shield(item.attempt_done.wait())
-            if item.state == DeliveryState.DELIVERED:
+            if item.state in {DeliveryState.DELIVERED, DeliveryState.UNCERTAIN}:
                 await asyncio.shield(item.future)
                 continue
             item.state = DeliveryState.CANCELLED
@@ -713,6 +851,10 @@ class TelegramDispatcher:
         await self._finish(item, item.receipt)
 
     async def _retry(self, item: QueueItem) -> bool:
+        if item.superseded:
+            item.state = DeliveryState.CANCELLED
+            await self._finish(item)
+            return False
         item.retry_count += 1
         if item.priority != Priority.CRITICAL and item.retry_count > item.max_retries:
             item.state = DeliveryState.FAILED
@@ -749,7 +891,7 @@ class TelegramDispatcher:
                     if item.is_cancelled:
                         await self._finish(item)
                         continue
-                    if item.report_date and item.state in {DeliveryState.UNCERTAIN, DeliveryState.FAILED}:
+                    if item.state in {DeliveryState.UNCERTAIN, DeliveryState.FAILED}:
                         await self._finish(item)
                         continue
                     if item.state == DeliveryState.DELIVERED:
@@ -777,6 +919,7 @@ class TelegramDispatcher:
                         await self._finish(item)
                         continue
                     item.state = DeliveryState.SENDING
+                    item.transport_started = False
                     item.attempt_done.clear()
                     try:
                         if item.report_date:
@@ -802,20 +945,38 @@ class TelegramDispatcher:
                             self._pending_storage[item.db_id] = self._record(item)
                             await self._save_pending_storage()
                         await self._finish(item)
+                    elif outcome in {DeliveryOutcome.UNCERTAIN, DeliveryOutcome.CANCELLED}:
+                        item.state = (
+                            DeliveryState.UNCERTAIN if outcome == DeliveryOutcome.UNCERTAIN else DeliveryState.CANCELLED
+                        )
+                        await self._finish(item)
                     else:
                         await self._retry(item)
                 except asyncio.CancelledError:
                     if item is not _SHUTDOWN_SENTINEL and not item.is_cancelled and item.state != DeliveryState.FAILED:
+                        if item.state == DeliveryState.UNCERTAIN and not item.report_date:
+                            await self._finish(item)
+                            break
                         if item.state not in {DeliveryState.DELIVERED, DeliveryState.UNCERTAIN}:
                             item.state = DeliveryState.QUEUED
                         await self._queue(item)
                     break
                 except Exception as error:
-                    dispatcher_logger.error(f"Error processing outbound event: {error}", exc_info=True)
-                    if item.state == DeliveryState.DELIVERED or (
-                        item.report_date
-                        and item.state in {DeliveryState.UNCERTAIN, DeliveryState.CANCELLED, DeliveryState.FAILED}
-                    ):
+                    dispatcher_logger.error(
+                        "Outbound completion error event=%s batch=%s chunk=%s priority=%s attempt=%s outcome=%s",
+                        item.event_id,
+                        item.batch_id,
+                        item.chunk_index,
+                        item.priority,
+                        item.retry_count,
+                        type(error).__name__,
+                    )
+                    if item.state in {
+                        DeliveryState.DELIVERED,
+                        DeliveryState.UNCERTAIN,
+                        DeliveryState.CANCELLED,
+                        DeliveryState.FAILED,
+                    }:
                         try:
                             await asyncio.sleep(2.0)
                         finally:
@@ -833,6 +994,8 @@ class TelegramDispatcher:
         """Discard observations invalidated by a pause, retaining applied critical incidents."""
         if item.action_type != ActionType.SEND or item.priority == Priority.CRITICAL:
             return False
+        if item.superseded:
+            return True
         manager = get_topics_manager()
         if item.report_date:
             from utils.daily_report import configured_zone
@@ -871,8 +1034,9 @@ class TelegramDispatcher:
                     kwargs["message_thread_id"] = item.message_thread_id
                 # Sending-state persistence can finish after Topics/TZ changed.
                 # Recheck at the transport boundary, with no intervening await.
-                if item.report_date and self._observation_obsolete(item):
+                if self._observation_obsolete(item):
                     return DeliveryOutcome.CANCELLED
+                item.transport_started = True
                 message = await bot.send_message(**kwargs)
                 item.receipt = (message.message_id, item.chat_id)
             elif item.action_type == ActionType.EDIT:
@@ -887,6 +1051,10 @@ class TelegramDispatcher:
                 item.last_error = f"Unknown action: {item.action_type}"
                 return DeliveryOutcome.FAILED
             return DeliveryOutcome.DELIVERED
+        except asyncio.CancelledError:
+            if self._noncritical_append(item) and item.transport_started and not item.report_date:
+                item.state = DeliveryState.UNCERTAIN
+            raise
         except Exception as error:
             name = type(error).__name__
             message = str(error).lower()
@@ -902,6 +1070,9 @@ class TelegramDispatcher:
             if item.action_type == ActionType.DELETE and "message to delete not found" in message:
                 item.receipt = True
                 return DeliveryOutcome.DELIVERED
+            if item.action_type == ActionType.EDIT and is_message_unavailable(error):
+                item.replacement_allowed = True
+                return DeliveryOutcome.FAILED
             invalid_payload = (
                 "can't parse entities",
                 "message is too long",
@@ -915,9 +1086,31 @@ class TelegramDispatcher:
                 # Telegram offers no client idempotency token. A transport error
                 # can follow remote acceptance; retain uncertainty without resend.
                 return DeliveryOutcome.UNCERTAIN
+            if (
+                self._noncritical_append(item)
+                and item.transport_started
+                and name not in {"BadRequest", "Forbidden"}
+                and not self._pretransmission_failure(error)
+            ):
+                return DeliveryOutcome.UNCERTAIN
             # Permissions, missing chats/topics and network errors may be repaired.
             # They never become a delivered receipt or discard a critical message.
             return DeliveryOutcome.RETRY
+
+    @staticmethod
+    def _noncritical_append(item: QueueItem) -> bool:
+        return item.action_type == ActionType.SEND and item.priority != Priority.CRITICAL
+
+    @staticmethod
+    def _pretransmission_failure(error: BaseException) -> bool:
+        """Only a known connect/pool failure proves that Telegram received no request."""
+        seen = set()
+        while error is not None and id(error) not in seen:
+            if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+                return True
+            seen.add(id(error))
+            error = error.__cause__
+        return False
 
     def _resolve_remaining_futures(self) -> None:
         while not self.queue.empty():
@@ -930,6 +1123,15 @@ class TelegramDispatcher:
                 continue
             self._queued_db_ids.discard(item.event_id)
             item.enqueued = False
+            if (
+                not item.db_id
+                and not item.report_date
+                and item.state not in {DeliveryState.DELIVERED, DeliveryState.UNCERTAIN, DeliveryState.FAILED}
+            ):
+                # No durable owner can resume this operation after shutdown.
+                # Cancellation does not prove that an interrupted edit was rejected.
+                item.state = DeliveryState.CANCELLED
+                item.replacement_allowed = False
             if item.future and not item.future.done():
                 item.future.set_result(None)
 

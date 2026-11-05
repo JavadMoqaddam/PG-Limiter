@@ -455,13 +455,12 @@ async def test_scheduled_sse_task_keeps_its_admission_before_first_execution(ope
 
 
 async def test_scheduled_node_report_keeps_its_admission_before_first_execution(operational_topics, monkeypatch):
-    import time
     import utils.get_logs as logs
 
     scheduled = []
     delivered = []
 
-    def schedule(coroutine):
+    def schedule(coroutine, **kwargs):
         scheduled.append(coroutine)
         return SimpleNamespace(done=lambda: False)
 
@@ -469,11 +468,8 @@ async def test_scheduled_node_report_keeps_its_admission_before_first_execution(
         delivered.append(args)
         return True
 
-    monkeypatch.setattr(logs, "_node_status_message_id", 123)
-    monkeypatch.setattr(logs, "_last_status_edit_time", time.time())
-    monkeypatch.setattr(logs, "_last_status_text", "")
     monkeypatch.setattr(logs, "_get_status_throttle_interval", AsyncMock(return_value=60))
-    monkeypatch.setattr(logs, "edit_message", edit)
+    monkeypatch.setattr(logs, "enqueue_log_delivery", edit)
     with monkeypatch.context() as scheduling:
         scheduling.setattr(asyncio, "create_task", schedule)
         await logs._update_node_status(1, "old node", "✅ Connected")
@@ -669,7 +665,7 @@ async def test_telegram_unavailability_does_not_pause_enabled_topics(operational
     assert monitoring_is_current(admission) is True
 
 
-async def test_warning_batches_stop_when_topics_disable_during_delivery(operational_topics, monkeypatch):
+async def test_warning_scan_is_admitted_together_before_delivery_can_pause_topics(operational_topics, monkeypatch):
     import utils.check_usage as usage
     import telegram_bot.send_message as messages
 
@@ -679,9 +675,10 @@ async def test_warning_batches_stop_when_topics_disable_during_delivery(operatio
         batches.append(message)
         await operational_topics.set_enabled(False)
 
-    monkeypatch.setattr(messages, "send_warning_log", send)
+    monkeypatch.setattr(messages, "send_warning_report", send)
     await usage.dispatch_chunked_warnings([{"username": f"user{i}"} for i in range(11)], 60, 11)
     assert len(batches) == 1
+    assert len(batches[0]) == 2
 
 
 async def test_usage_loop_rechecks_topics_after_awaited_api_collection(operational_topics, monkeypatch):
@@ -783,9 +780,7 @@ async def test_old_sse_does_not_publish_api_status_after_awaited_pause_resume(op
 
     monkeypatch.setattr(logs, "_ip_source_is_api", mode)
     monkeypatch.setattr(logs, "_get_status_throttle_interval", AsyncMock(return_value=0))
-    monkeypatch.setattr(logs, "_node_status_message_id", None)
-    monkeypatch.setattr(logs, "_last_status_text", "")
-    monkeypatch.setattr(logs, "send_logs", notify)
+    monkeypatch.setattr(logs, "enqueue_log_delivery", notify)
     monkeypatch.setattr(logs.asyncio, "sleep", stop)
     try:
         await logs.get_nodes_logs(PANEL, NODE)
@@ -830,7 +825,7 @@ async def test_sse_refresh_does_not_adopt_nodes_queried_before_pause_resume(oper
     assert scheduled == []
 
 
-async def test_node_discovery_keeps_admission_after_awaited_status_delivery(operational_topics, monkeypatch):
+async def test_node_discovery_keeps_admission_after_awaited_status_preparation(operational_topics, monkeypatch):
     import utils.get_logs as logs
 
     scheduled = []
@@ -841,20 +836,17 @@ async def test_node_discovery_keeps_admission_after_awaited_status_delivery(oper
             scheduled.append(kwargs["name"])
             return object()
 
-    async def notify(message, **kwargs):
+    async def prepare():
         await operational_topics.set_enabled(False)
         await operational_topics.set_enabled(True)
-        return 123
+        return 0
 
     async def stop(*args):
         raise asyncio.CancelledError
 
     monkeypatch.setattr(logs, "get_nodes", AsyncMock(return_value=[NODE]))
-    monkeypatch.setattr(logs, "_get_status_throttle_interval", AsyncMock(return_value=0))
+    monkeypatch.setattr(logs, "_get_status_throttle_interval", prepare)
     monkeypatch.setattr(logs, "_get_node_poll_interval", AsyncMock(return_value=60))
-    monkeypatch.setattr(logs, "_node_status_message_id", None)
-    monkeypatch.setattr(logs, "_last_status_text", "")
-    monkeypatch.setattr(logs, "send_logs", notify)
     monkeypatch.setattr(logs, "wait_for_monitoring_change", stop)
     with pytest.raises(asyncio.CancelledError):
         await logs.check_and_add_new_nodes(PANEL, Group())

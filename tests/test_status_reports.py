@@ -257,7 +257,7 @@ async def test_every_direct_route_authorizes_before_reads(reports, monkeypatch, 
 async def test_delivery_final_failure_is_observable(reports, caplog):
     query = SimpleNamespace(
         answer=AsyncMock(),
-        edit_message_text=AsyncMock(side_effect=TelegramError("edit")),
+        edit_message_text=AsyncMock(side_effect=BadRequest("Message to edit not found")),
         message=SimpleNamespace(reply_text=AsyncMock(side_effect=TelegramError("fallback"))),
     )
     with pytest.raises(TelegramError, match="fallback"):

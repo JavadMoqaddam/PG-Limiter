@@ -152,37 +152,19 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
         sample_warnings.append({"corrupt_data": None})
 
         mock_send = AsyncMock()
-        with patch("telegram_bot.send_message.send_warning_log", mock_send):
+        with patch("telegram_bot.send_message.send_warning_report", mock_send):
             await dispatch_chunked_warnings(sample_warnings, check_interval=60.0, total_monitored=26)
 
         # 26 items with chunk_size 10 = 3 chunks
-        self.assertEqual(mock_send.call_count, 3)
+        self.assertEqual(mock_send.call_count, 1)
 
         # Check that text contains HTML formatted tags and chunk headers
         first_call_args = mock_send.call_args_list[0]
-        msg_text = first_call_args[0][0]
+        self.assertEqual(len(first_call_args[0][0]), 3)
+        msg_text = first_call_args[0][0][0]
         self.assertIn("<b>WARNINGS REPORT</b> (1/3)", msg_text)
         self.assertIn("user_0", msg_text)
         self.assertEqual(first_call_args[1]["ttl"], 600.0)
-
-    async def test_duplicate_text_node_edit_guard(self):
-        """Test that editing node status with identical text is ignored."""
-        from utils.get_logs import _update_node_status
-        import utils.get_logs as gl
-
-        gl._node_status_message_id = (100, -100123456)
-        gl._last_status_edit_time = 0.0
-        gl._last_status_text = "sample text"
-
-        mock_edit = AsyncMock(return_value=True)
-        with (
-            patch("utils.get_logs.edit_message", mock_edit),
-            patch("utils.get_logs._get_status_throttle_interval", AsyncMock(return_value=0.0)),
-            patch("utils.get_logs._build_node_status_message", AsyncMock(return_value="sample text")),
-        ):
-            await _update_node_status(1, "node-1", "✅ Connected")
-            # Since text is unchanged ("sample text" == "sample text"), edit_message should not be called
-            mock_edit.assert_not_called()
 
     async def test_reload_restores_cancel_keys(self):
         """Test that reload_pending_critical_messages restores active cancel keys and builds buttons."""
@@ -202,30 +184,6 @@ class TestTelegramDispatcher(unittest.IsolatedAsyncioTestCase):
         self.assertIn("disable:john_doe", dispatcher._active_cancel_keys)
         cancelled = await dispatcher.cancel_pending("disable:john_doe")
         self.assertTrue(cancelled)
-
-    @pytest.mark.usefixtures("operational_topics")
-    async def test_trailing_node_status_update(self):
-        """Test that delayed trailing task flushes latest status to Telegram."""
-        import utils.get_logs as gl
-        from utils.get_logs import _update_node_status
-
-        gl._node_status_message_id = (100, -100123456)
-        gl._last_status_edit_time = time.time()  # Just updated
-        gl._last_status_text = "old status"
-        gl._pending_status_update_task = None
-
-        mock_edit = AsyncMock(return_value=True)
-        with (
-            patch("utils.get_logs.edit_message", mock_edit),
-            patch("utils.get_logs._get_status_throttle_interval", AsyncMock(return_value=0.05)),
-            patch("utils.get_logs._build_node_status_message", AsyncMock(return_value="new updated status")),
-        ):
-            await _update_node_status(2, "node-2", "✅ Connected")
-            # Immediately within throttle, edit_message is not called directly
-            mock_edit.assert_not_called()
-            # Wait for trailing task to finish
-            await asyncio.sleep(0.08)
-            mock_edit.assert_called_once_with((100, -100123456), "new updated status")
 
 
 async def test_concurrent_critical_enqueue_cancel_persists_exact_snapshot(tmp_path, monkeypatch):

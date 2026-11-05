@@ -8,6 +8,7 @@ import json
 import os
 import sys
 
+from telegram_bot.delivery_errors import is_message_unavailable
 from utils.atomic_io import atomic_write_json
 from utils.logs import get_logger
 from utils import settings_service
@@ -26,7 +27,8 @@ _config_write_lock = asyncio.Lock()
 async def send_response(update, text: str, reply_markup=None, parse_mode: str = "HTML"):
     """
     Unified response helper that works for both callback queries and regular messages.
-    Gracefully handles Telegram 'Message is not modified' error.
+    Allow unchanged edits; replace only confirmed unavailable messages.
+    Other delivery failures propagate so callers do not claim success.
     """
     from telegram.error import BadRequest
 
@@ -44,23 +46,13 @@ async def send_response(update, text: str, reply_markup=None, parse_mode: str = 
         except BadRequest as e:
             if "message is not modified" in str(e).lower():
                 return
-            try:
-                await update.callback_query.message.reply_text(
-                    text=text,
-                    reply_markup=reply_markup,
-                    parse_mode=parse_mode,
-                )
-            except Exception:
-                pass
-        except Exception:
-            try:
-                await update.callback_query.message.reply_text(
-                    text=text,
-                    reply_markup=reply_markup,
-                    parse_mode=parse_mode,
-                )
-            except Exception:
-                pass
+            if not is_message_unavailable(e):
+                raise
+            await update.callback_query.message.reply_text(
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
     elif getattr(update, "message", None):
         await update.message.reply_text(
             text=text,
