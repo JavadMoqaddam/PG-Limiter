@@ -93,8 +93,8 @@ class MirzaNotificationReporter:
                     result = await handle.wait()
                     state = result.status
                     message_id = None
-                    if state == "delivered" and isinstance(result.receipt, tuple) and result.receipt[0] == chat_id:
-                        message_id = result.receipt[1]
+                    if state == "delivered" and isinstance(result.receipt, tuple) and result.receipt[1] == chat_id:
+                        message_id = result.receipt[0]
                     elif state not in ("failed", "cancelled"):
                         state = "uncertain"
                     if state == "cancelled":

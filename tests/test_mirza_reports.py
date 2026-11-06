@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from test_mirza_persistence import mirza_database  # noqa: F401
+from test_outbound_ownership import outbound  # noqa: F401
 from telegram_bot.dispatcher import DeliveryResult
 
 
@@ -43,7 +44,7 @@ def reporter(monkeypatch, outcome="delivered"):
     manager = SimpleNamespace(enabled=True, group_id=-1001, get_topic_id=lambda _: 88)
     monkeypatch.setattr(reports, "get_topics_manager", lambda: manager)
     handle = SimpleNamespace(
-        wait=AsyncMock(return_value=DeliveryResult(outcome, (-1001, 77) if outcome == "delivered" else None))
+        wait=AsyncMock(return_value=DeliveryResult(outcome, (77, -1001) if outcome == "delivered" else None))
     )
     dispatcher = SimpleNamespace(enqueue_send_delivery=AsyncMock(return_value=handle))
     monkeypatch.setattr(reports, "get_dispatcher", lambda: dispatcher)
@@ -196,3 +197,27 @@ async def test_cancelled_report_exits_even_when_database_finish_fails(mirza_data
     with pytest.raises(asyncio.CancelledError):
         await task
     assert (await saved(mirza_database)).report_state == "sending"
+
+
+async def test_real_dispatcher_receipt_is_saved_without_repeating_report(mirza_database, outbound, monkeypatch):
+    import utils.mirza_reports as reports
+    from telegram_bot.topics import TopicType
+
+    await event(mirza_database)
+    outbound.topics.threads[TopicType.MIRZA_NOTIFICATIONS] = 88
+    monkeypatch.setattr(reports, "get_topics_manager", lambda: outbound.topics)
+    monkeypatch.setattr(reports, "get_dispatcher", lambda: outbound.dispatcher)
+    worker = reports.MirzaNotificationReporter()
+    dispatching = asyncio.create_task(outbound.dispatcher.start_worker())
+    try:
+        await asyncio.wait_for(worker.run_once(), 2)
+        result = await saved(mirza_database)
+        assert result.report_state == "delivered"
+        assert (result.report_message_id, result.report_chat_id, result.report_thread_id) == (1, -100111, 88)
+        await worker.run_once()
+        assert len(outbound.sent) == 1
+        assert outbound.sent[0]["message_thread_id"] == 88
+        assert result.state == "delivered" and result.attempts == 1
+    finally:
+        await outbound.dispatcher.stop(wait_seconds=0.05)
+        await asyncio.wait_for(dispatching, 2)
