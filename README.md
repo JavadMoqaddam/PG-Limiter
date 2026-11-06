@@ -170,6 +170,23 @@ PG-Limiter can organize notifications across dedicated Forum topics in a Telegra
 | 💾 **Backups** | Automated and manual database/config backup archives |
 | 📊 **Daily Report** | Previous calendar day’s users actually banned, grouped by applied punishment step |
 | ♾️ **No Limit** | Notifications for unlimited / exempted users |
+| 🔔 **Mirza Bot Notifications** | Final customer notification delivery results, with recipient and punishment context |
+
+**Create Topics** checks saved thread IDs and creates only missing categories. Repeated
+clicks preserve existing topic IDs and message receipts; concurrent setup calls cannot
+duplicate successful creations. Each successful creation is saved immediately, so a
+later failure does not lose it. Setup stops if the forum configuration changes while
+Telegram requests are in progress.
+
+Saved topics are checked without changing their names or icons. Only a confirmed
+missing or deleted thread is replaced. When a check times out or lacks permission,
+the saved ID is preserved and the menu reports that it could not be verified.
+Telegram's Bot API cannot list forum topics or rediscover manually created topics
+whose IDs were never saved. **Clear All Topics** forgets saved mappings; it does not
+delete the actual forum topics, so running creation afterward can create duplicates.
+If a creation response is lost, Telegram may have created the topic without returning
+its ID; check the forum before retrying. Exactly once creation cannot be guaranteed
+for that case or if local saving fails after Telegram creates a topic.
 
 Daily Report sends one brief message at **00:00** for the previous complete calendar
 day, using the current `TZ` environment setting. An unset `TZ` uses UTC; an invalid

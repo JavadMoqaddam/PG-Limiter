@@ -43,7 +43,9 @@ The operator-provided trial procedure must:
 
 Do not run `pg-limiter update` or `pg-limiter restart` during the trial: the installed host commands can recreate the service from the release/base Compose configuration and replace the test image. Use the generated trial and rollback procedures.
 
-Verify a protective effective warning threshold before startup, preserving counters and histories. The trial safeguard should require at least 100 warnings and a margin of ten scans above the highest saved streak. An already safe setting can be verified read-only; changing it requires a private audit of prior settings. Verify the effective database setting because its override can take precedence over ENV. Do not perform Trust Reset or reset counters/history. Review saved warnings before restoring the threshold; existing records can retain their creation threshold.
+For a trial that changes connection counting or enforcement, verify a protective effective warning threshold before startup, preserving counters and histories. That algorithm-trial safeguard should require at least 100 warnings and a margin of ten scans above the highest saved streak. An already safe setting can be verified read-only; changing it requires a private audit of prior settings. Verify the effective database setting because its override can take precedence over ENV. Do not perform Trust Reset or reset counters/history. Review saved warnings before restoring the threshold; existing records can retain their creation threshold.
+
+A notification-only deployment should preserve the existing effective warning threshold and other operational settings, so newly applied punishments can exercise notification admission. If its schema or persisted contexts are incompatible with the previous image, rollback must stop the service and restore the complete pre-upgrade database and state snapshot before starting that image. Make this an explicit restore operation: it discards state changes made after the snapshot. Do not automatically start an old image against the newly migrated live database.
 
 ## Verify the intended source and workload
 

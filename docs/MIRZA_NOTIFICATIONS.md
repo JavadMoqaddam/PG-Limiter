@@ -171,6 +171,38 @@ acknowledgment, not proof that the customer read the Telegram message.
 
 The menu shows delivery status counts. Sending runs independently of the
 limiter, so a slow or unavailable Mirza Bot endpoint does not delay punishment.
+Reopen Notifications to refresh these database counts; an already displayed
+Telegram menu does not update itself.
+
+### Forum delivery reports
+
+Open **Settings → Topics → Create Topics** to add
+**🔔 Mirza Bot Notifications**. Existing saved topics are checked and retained;
+only missing or definitively deleted topics are created. Failed permission
+checks or uncertain existence checks do not replace saved topics.
+
+Each completed notification reports its configuration username, resolved bot
+name, numeric recipient ID, numbered punishment step, time, outcome and safe
+reason code. Delivered means Mirza Bot acknowledged the API request. Failed,
+Skipped and Uncertain results are also reported; unresolved bot/recipient details
+are explicitly marked unknown. API keys, endpoint URLs and customer message text
+are excluded.
+
+Reports wait for this dedicated topic to be configured and enabled; they do not
+fall back to General or private administrator chats. The reporting worker and its
+Telegram receipt are independent of customer delivery and the counters above.
+Report failure never resends a customer notification. A report interrupted while
+sending becomes uncertain on restart and is not automatically appended again.
+Existing terminal notifications at upgrade are treated as historical, avoiding
+a burst of old reports; already pending customer notifications can report their
+eventual result. Test Connection does not create punishment delivery reports.
+
+An incident that never entered the notification queue has no delivery report.
+All-zero counters therefore require checking the saved punishment context and
+queue admission, as well as the active stage and bot configuration. A topic
+receipt alone cannot establish whether the customer received a message.
+
+### Customer notification status
 
 | Status | Meaning |
 | --- | --- |
@@ -202,6 +234,11 @@ retains pending events and does not automatically repeat an interrupted in-fligh
 request.
 
 ## Storage and upgrades
+
+Migration `015_notification_reports` adds the resolved bot name and separate
+report ownership/Telegram receipt fields. These fields are part of the SQLite
+backup. Restarts and restamps do not reset them. Like `014`, every in-place
+downgrade is refused; restore the full pre-upgrade database and state offline.
 
 Migration `014_notification_messages` converts each existing bot's shared text
 into one entry named `Default message`. It preserves explicit stage assignments.
@@ -239,7 +276,7 @@ offline before starting the older version.
 
 The earlier migration `012_mirza_notifications` adds route and delivery tables
 and extends punishment evidence; existing facts are not backfilled. Container
-startup applies all pending migrations, including `014`. For a local Python
+startup applies all pending migrations, including `015`. For a local Python
 installation, run `python -m alembic upgrade head` against the configured
 `DATABASE_URL` before starting the updated daemon.
 

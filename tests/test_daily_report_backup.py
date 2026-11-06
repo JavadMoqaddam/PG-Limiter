@@ -139,6 +139,11 @@ def test_offline_restore_preserves_mirza_credentials_and_incident_delivery(layou
                 context=context,
                 route_id=route_id,
                 route_revision=2,
+                bot_name="Sales",
+                report_state="delivered",
+                report_chat_id=-100123,
+                report_thread_id=42,
+                report_message_id=89,
                 state="delivered",
                 recipient="5123456789",
                 message_text="alice: 3",
@@ -173,6 +178,9 @@ def test_offline_restore_preserves_mirza_credentials_and_incident_delivery(layou
         assert db.execute(
             "SELECT incident_id, state, recipient, message_text, attempts FROM mirza_notifications"
         ).fetchone() == ("warning", "delivered", "5123456789", "alice: 3", 1)
+        assert db.execute(
+            "SELECT bot_name, report_state, report_chat_id, report_thread_id, report_message_id FROM mirza_notifications"
+        ).fetchone() == ("Sales", "delivered", -100123, 42, 89)
 
 
 def test_v1_backup_remains_valid_and_removes_stale_new_outbox(layout, tmp_path):

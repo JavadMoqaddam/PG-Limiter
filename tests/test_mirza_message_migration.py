@@ -74,14 +74,18 @@ async def test_populated_013_conversion_preserves_bots_receipts_and_deleted_all_
         old_columns = [row[1] for row in db.execute("PRAGMA table_info(mirza_routes)")]
         columns_sql = ", ".join(old_columns)
         bots_before = db.execute("SELECT " + columns_sql + " FROM mirza_routes ORDER BY id").fetchall()
-        receipts = db.execute("SELECT * FROM mirza_notifications ORDER BY incident_id").fetchall()
+        receipt_columns = ", ".join(row[1] for row in db.execute("PRAGMA table_info(mirza_notifications)"))
+        receipts = db.execute("SELECT " + receipt_columns + " FROM mirza_notifications ORDER BY incident_id").fetchall()
         owners = db.execute("SELECT * FROM mirza_route_admins ORDER BY admin_username").fetchall()
     if bootstrap_first:
         await bootstrap(path, monkeypatch)
     alembic(path, "upgrade", "head")
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT " + columns_sql + " FROM mirza_routes ORDER BY id").fetchall() == bots_before
-        assert db.execute("SELECT * FROM mirza_notifications ORDER BY incident_id").fetchall() == receipts
+        assert (
+            db.execute("SELECT " + receipt_columns + " FROM mirza_notifications ORDER BY incident_id").fetchall()
+            == receipts
+        )
         assert db.execute("SELECT * FROM mirza_route_admins ORDER BY admin_username").fetchall() == owners
         entries = {key: json.loads(value) for key, value in db.execute("SELECT id, messages FROM mirza_routes")}
         assert entries[BOT] == [
@@ -96,7 +100,10 @@ async def test_populated_013_conversion_preserves_bots_receipts_and_deleted_all_
     await bootstrap(path, monkeypatch)
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT messages FROM mirza_routes").fetchall() == [("[]",), ("[]",)]
-        assert db.execute("SELECT * FROM mirza_notifications ORDER BY incident_id").fetchall() == receipts
+        assert (
+            db.execute("SELECT " + receipt_columns + " FROM mirza_notifications ORDER BY incident_id").fetchall()
+            == receipts
+        )
 
 
 @pytest.mark.parametrize(

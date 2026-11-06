@@ -104,19 +104,28 @@ class MirzaNotificationService:
             await self._transition(event.incident_id, "pending", "skipped", last_error="owner_unmatched")
             return
         recipient = parse_recipient(details.get("note"))
-        if recipient is None:
-            await self._transition(event.incident_id, "pending", "skipped", last_error="recipient_invalid")
-            return
         candidate = candidates[0]
         async with AsyncSessionLocal() as db:
             route = await Routes.get(db, candidate["route_id"])
+            identity = {
+                "route_id": candidate["route_id"],
+                "route_revision": candidate["revision"],
+                "bot_name": route.name if route is not None else None,
+                "recipient": recipient,
+            }
             if (
                 route is None
                 or not route.enabled
                 or route.revision != candidate["revision"]
                 or owner not in route.admin_usernames
             ):
-                await Notifications.transition(db, event.incident_id, "pending", "skipped", last_error="route_changed")
+                await Notifications.transition(
+                    db, event.incident_id, "pending", "skipped", last_error="route_changed", **identity
+                )
+            elif recipient is None:
+                await Notifications.transition(
+                    db, event.incident_id, "pending", "skipped", last_error="recipient_invalid", **identity
+                )
             else:
                 # Legacy snapshots refer specifically to the message migrated
                 # with the bot's UUID. A replacement never inherits its receipt.
@@ -125,7 +134,7 @@ class MirzaNotificationService:
                 matches = [entry for entry in entries if isinstance(entry, dict) and entry.get("id") == message_id]
                 if len(matches) != 1:
                     await Notifications.transition(
-                        db, event.incident_id, "pending", "skipped", last_error="message_missing"
+                        db, event.incident_id, "pending", "skipped", last_error="message_missing", **identity
                     )
                     await db.commit()
                     return
@@ -135,7 +144,7 @@ class MirzaNotificationService:
                     )
                 except ValueError:
                     await Notifications.transition(
-                        db, event.incident_id, "pending", "failed", last_error="message_invalid"
+                        db, event.incident_id, "pending", "failed", last_error="message_invalid", **identity
                     )
                 else:
                     await Notifications.transition(
@@ -143,9 +152,7 @@ class MirzaNotificationService:
                         event.incident_id,
                         "pending",
                         "ready",
-                        route_id=route.id,
-                        route_revision=route.revision,
-                        recipient=recipient,
+                        **identity,
                         base_url=route.base_url,
                         message_text=message,
                         last_error=None,
@@ -203,6 +210,14 @@ class MirzaNotificationService:
         )
 
     async def run_forever(self) -> None:
+        from utils.mirza_reports import MirzaNotificationReporter
+
+        # Forum delivery waits and failures must never delay customer notification.
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(self._delivery_loop(), name="mirza_customer_delivery")
+            tasks.create_task(MirzaNotificationReporter().run_forever(), name="mirza_forum_reports")
+
+    async def _delivery_loop(self) -> None:
         while True:
             try:
                 await self.run_once()

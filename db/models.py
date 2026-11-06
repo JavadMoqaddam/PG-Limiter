@@ -335,9 +335,17 @@ class MirzaNotification(Base):
     next_attempt_at = Column(Float, nullable=False, default=0, server_default="0")
     last_error = Column(String(64), nullable=True)
 
+    # Forum reporting owns a separate receipt; it never changes customer delivery.
+    bot_name = Column(String(255), nullable=True)
+    report_state = Column(String(20), nullable=False, default="pending", server_default="pending")
+    report_chat_id = Column(Integer, nullable=True)
+    report_thread_id = Column(Integer, nullable=True)
+    report_message_id = Column(Integer, nullable=True)
+
     __table_args__ = (
         Index("ix_mirza_notifications_state_next_attempt", "state", "next_attempt_at"),
         Index("ix_mirza_notifications_route_revision", "route_id", "route_revision"),
+        Index("ix_mirza_notifications_report_state", "report_state", "state"),
     )
 
 

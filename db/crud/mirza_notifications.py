@@ -95,6 +95,7 @@ class MirzaNotificationsCRUD:
         allowed = {
             "route_id",
             "route_revision",
+            "bot_name",
             "recipient",
             "base_url",
             "message_text",
