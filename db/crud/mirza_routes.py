@@ -24,10 +24,8 @@ class MirzaRoutesCRUD:
             "name": row.name,
             "admin_usernames": row.admin_usernames,
             "base_url": row.base_url,
-            "message_text": row.message_text,
+            "messages": deepcopy(row.messages),
             "enabled": row.enabled,
-            "trigger_mode": row.trigger_mode,
-            "selected_steps": deepcopy(row.selected_steps),
             "revision": row.revision,
             "key_configured": bool(row.api_key),
         }

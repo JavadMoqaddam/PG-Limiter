@@ -313,6 +313,9 @@ async def init_db():
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(_ensure_mirza_fact_columns_sync)
             await conn.run_sync(_ensure_mirza_bot_schema_sync)
+            from db.notification_message_schema import ensure_message_list_schema
+
+            await conn.run_sync(ensure_message_list_schema)
             await conn.run_sync(_sync_deprecated_legacy_tables_sync)
 
         _DB_INITIALIZED = True

@@ -360,13 +360,15 @@ Runs on port `8080` by default. Swagger documentation available at `http://local
 ## 🔔 Mirza Bot Notifications
 
 In a private bot chat, open **Settings → Notifications → Add Bot** to configure a
-named Mirza Bot with its own API URL, key, message and punishment stages. Open
+named Mirza Bot with its own API URL and key. Open
 **Admins** and tap panel admins to include them. Several admins can share one bot's
-settings; each admin can belong to only one bot. Choose the dynamic last
-punishment step or select specific stages. Every newly applied matching incident
+settings; each admin can belong to only one bot. Under **Messages**, add named
+messages and assign explicit numbered punishment steps to each. A message can
+cover several steps; each step can belong to only one message in that bot.
+Unassigned steps send nothing. Every newly applied matching incident
 can notify the customer identified in the configuration's note. `[Username]`
 inserts the punished configuration's username; `[Limit]` inserts its effective
-allowed connection count.
+device allowance.
 
 Configurations start disabled. Delivery uses a persistent queue independently of
 enforcement. See [Mirza Bot customer notifications](docs/MIRZA_NOTIFICATIONS.md) for

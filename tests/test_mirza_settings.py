@@ -81,11 +81,36 @@ def test_url_rejects_unsafe_or_endpoint_inputs(value):
         normalize_base_url(value)
 
 
-async def configure_route(settings, admin, url="https://bot.example.com", key="synthetic-key", text="Hello"):
-    route = await settings.create_route(admin)
-    return await settings.update_route(
+async def configure_route(
+    settings,
+    admin,
+    url="https://bot.example.com",
+    key="synthetic-key",
+    text="Hello",
+    *,
+    steps=None,
+    admins=None,
+    route=None,
+):
+    route = route or await settings.create_route(admin)
+    route = await settings.update_route(
         route["id"],
-        {"admin_usernames": [admin], "base_url": url, "api_key": key, "message_text": text, "enabled": True},
+        {"admin_usernames": [admin] if admins is None else admins, "base_url": url, "api_key": key},
+        expected_revision=route["revision"],
+    )
+    route = await settings.create_message(route["id"], "Default message", expected_revision=route["revision"])
+    route = await settings.update_message(
+        route["id"],
+        route["messages"][0]["id"],
+        {"message_text": text, "selected_steps": [0] if steps is None else steps},
+        expected_revision=route["revision"],
+    )
+    return await settings.update_route(route["id"], {"enabled": True}, expected_revision=route["revision"])
+
+
+async def edit_message(settings, route, changes):
+    return await settings.update_message(
+        route["id"], route["messages"][0]["id"], changes, expected_revision=route["revision"]
     )
 
 
@@ -96,37 +121,26 @@ async def test_routes_hide_keys_and_versions_follow_actual_edits(route_database)
     route = await settings.create_route(" alice ")
     assert route["name"] == "alice"
     assert route["admin_usernames"] == []
-    assert (route["enabled"], route["trigger_mode"], route["selected_steps"], route["revision"]) == (
-        False,
-        "last",
-        [],
-        1,
-    )
+    assert (route["enabled"], route["messages"], route["revision"]) == (False, [], 1)
+    assert not {"message_text", "trigger_mode", "selected_steps"}.intersection(route)
     assert route["key_configured"] is False
     with pytest.raises(ValueError):
         await settings.update_route(route["id"], {"enabled": True})
-    updated = await settings.update_route(
-        route["id"],
-        {
-            "admin_usernames": ["alice"],
-            "base_url": "https://bot.example.com",
-            "api_key": "synthetic-key",
-            "message_text": "Hello",
-            "enabled": True,
-        },
-    )
-    assert updated["revision"] == 2
+    updated = await configure_route(settings, "alice", route=route)
+    revision = updated["revision"]
+    assert revision > route["revision"]
     assert updated["key_configured"] is True
     assert "api_key" not in updated
     assert "synthetic-key" not in repr(await settings.list_routes())
     assert "api_key" not in await settings.get_route(route["id"])
-    assert (await settings.update_route(route["id"], {"message_text": "Hello"}))["revision"] == 2
+    assert (await edit_message(settings, updated, {"message_text": "Hello"}))["revision"] == revision
     async with route_database() as db:
-        assert await MirzaRoutesCRUD.read_secret(db, route["id"], 1) is None
-        assert await MirzaRoutesCRUD.read_secret(db, route["id"], 2) == "synthetic-key"
-    await settings.update_route(route["id"], {"enabled": False})
+        assert await MirzaRoutesCRUD.read_secret(db, route["id"], route["revision"]) is None
+        assert await MirzaRoutesCRUD.read_secret(db, route["id"], revision) == "synthetic-key"
+    disabled = await settings.update_route(route["id"], {"enabled": False})
+    assert disabled["revision"] == revision + 1
     async with route_database() as db:
-        assert await MirzaRoutesCRUD.read_secret(db, route["id"], 3) is None
+        assert await MirzaRoutesCRUD.read_secret(db, route["id"], disabled["revision"]) is None
 
 
 async def test_duplicate_bot_name_rejected_and_recreation_has_new_identity(route_database):
@@ -171,30 +185,35 @@ async def test_invalid_edit_rolls_back_route(route_database, changes):
     from utils import mirza_settings as settings
 
     route = await settings.create_route("alice")
+    message_changes = set(changes).issubset({"message_text", "selected_steps"})
+    if message_changes:
+        route = await settings.create_message(route["id"], "Default message", expected_revision=route["revision"])
     with pytest.raises(ValueError):
-        await settings.update_route(route["id"], changes)
-    assert (await settings.get_route(route["id"]))["revision"] == 1
+        if message_changes:
+            await edit_message(settings, route, changes)
+        else:
+            await settings.update_route(route["id"], changes)
+    assert await settings.get_route(route["id"]) == route
 
 
-async def test_selected_route_requires_steps_and_text_uses_utf16_limit(route_database):
+async def test_ready_message_requires_steps_and_text_uses_utf16_limit(route_database):
     from utils import mirza_settings as settings
 
     route = await configure_route(settings, "alice", text="😀" * 2048)
     with pytest.raises(ValueError):
-        await settings.update_route(route["id"], {"trigger_mode": "selected"})
+        await edit_message(settings, route, {"selected_steps": []})
     with pytest.raises(ValueError):
-        await settings.update_route(route["id"], {"message_text": "  "})
-    route = await settings.update_route(route["id"], {"trigger_mode": "selected", "selected_steps": [3, 0, 3]})
-    assert route["selected_steps"] == [0, 3]
+        await edit_message(settings, route, {"message_text": "  "})
+    route = await edit_message(settings, route, {"selected_steps": [3, 0, 3]})
+    assert route["messages"][0]["selected_steps"] == [0, 3]
 
 
-async def test_independent_routes_capture_defensive_dynamic_and_selected_rules(route_database):
+async def test_independent_routes_capture_defensive_explicit_rules(route_database):
     from utils import mirza_settings as settings
     from db.crud.mirza_routes import MirzaRoutesCRUD
 
-    alice = await configure_route(settings, "alice", key="alice-key", text="Alice text")
-    bob = await configure_route(settings, "bob", "https://other.example.com/v2", "bob-key", "Bob text")
-    await settings.update_route(bob["id"], {"trigger_mode": "selected", "selected_steps": [0, 3]})
+    alice = await configure_route(settings, "alice", key="alice-key", text="Alice text", steps=[1, 3])
+    bob = await configure_route(settings, "bob", "https://other.example.com/v2", "bob-key", "Bob text", steps=[0, 3])
     await settings.create_route("disabled")
     rules = await settings.capture_rules()
     assert {r["admin_usernames"][0] for r in rules} == {"alice", "bob"}
@@ -208,14 +227,16 @@ async def test_independent_routes_capture_defensive_dynamic_and_selected_rules(r
     assert [r["admin_usernames"][0] for r in settings.notification_context(rules, 1, 2, "disable")["candidates"]] == [
         "alice"
     ]
-    assert settings.notification_context(rules, 1, 4, "disable") is None
-    rules[0]["selected_steps"].append(9)
+    assert settings.notification_context(rules, 2, 4, "disable") is None
+    rules[0]["messages"][0]["selected_steps"].append(9)
     context["candidates"][0]["admin_usernames"][0] = "mutated"
-    assert "mutated" not in repr(await settings.capture_rules())
+    fresh_rules = await settings.capture_rules()
+    assert "mutated" not in repr(fresh_rules)
+    assert all(9 not in message["selected_steps"] for rule in fresh_rules for message in rule["messages"])
     async with route_database() as db:
-        assert await MirzaRoutesCRUD.read_secret(db, alice["id"], 2) == "alice-key"
-        assert await MirzaRoutesCRUD.read_secret(db, bob["id"], 3) == "bob-key"
-    assert (await settings.get_route(bob["id"]))["message_text"] == "Bob text"
+        assert await MirzaRoutesCRUD.read_secret(db, alice["id"], alice["revision"]) == "alice-key"
+        assert await MirzaRoutesCRUD.read_secret(db, bob["id"], bob["revision"]) == "bob-key"
+    assert (await settings.get_route(bob["id"]))["messages"][0]["message_text"] == "Bob text"
 
 
 @pytest.mark.parametrize(
@@ -255,12 +276,12 @@ async def test_stale_revision_cannot_overwrite_or_delete_newer_route(route_datab
     from utils import mirza_settings as settings
 
     route = await settings.create_route("alice")
-    await settings.update_route(route["id"], {"message_text": "new"}, expected_revision=1)
+    await settings.update_route(route["id"], {"name": "new"}, expected_revision=1)
     with pytest.raises(ValueError, match="changed"):
-        await settings.update_route(route["id"], {"message_text": "stale"}, expected_revision=1)
+        await settings.update_route(route["id"], {"name": "stale"}, expected_revision=1)
     with pytest.raises(ValueError, match="changed"):
         await settings.delete_route(route["id"], expected_revision=1)
-    assert (await settings.get_route(route["id"]))["message_text"] == "new"
+    assert (await settings.get_route(route["id"]))["name"] == "new"
 
 
 @pytest.mark.parametrize(
@@ -295,7 +316,7 @@ async def test_edit_or_delete_cancels_pinned_unsent_events_and_retains_terminal_
 
     route = await configure_route(settings, "alice")
     context = {
-        "candidates": [{"route_id": route["id"], "revision": 2, "admin_username": "alice"}],
+        "candidates": [{"route_id": route["id"], "revision": route["revision"], "admin_username": "alice"}],
         "step_index": 0,
         "step_count": 1,
         "step_type": "disable",
@@ -318,13 +339,13 @@ async def test_edit_or_delete_cancels_pinned_unsent_events_and_retains_terminal_
                 },
             )
             await MirzaNotificationsCRUD.transition(
-                db, incident, "pending", state, route_id=route["id"], route_revision=2
+                db, incident, "pending", state, route_id=route["id"], route_revision=route["revision"]
             )
         await db.commit()
     if delete:
         await settings.delete_route(route["id"])
     else:
-        await settings.update_route(route["id"], {"message_text": "replacement"})
+        await edit_message(settings, route, {"message_text": "replacement"})
     async with route_database() as db:
         assert (await db.get(MirzaNotification, "waiting")).state == "skipped"
         assert (await db.get(MirzaNotification, "complete")).state == "delivered"

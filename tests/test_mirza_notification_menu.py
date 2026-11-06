@@ -164,17 +164,41 @@ async def menu(settings_db, monkeypatch):
 
 
 async def complete_route(admin="alice", **changes):
+    message_text = changes.pop("message_text", "[Username] [Limit]")
+    selected_steps = changes.pop("selected_steps", [0])
+    enabled = changes.pop("enabled", False)
     route = await settings.create_route(admin)
-    return await settings.update_route(
+    route = await settings.update_route(
         route["id"],
         {
             "admin_usernames": [admin],
             "base_url": "https://bot.example.com/api",
             "api_key": "private-test-key",
-            "message_text": "[Username] [Limit]",
             **changes,
         },
     )
+    route = await settings.create_message(route["id"], "Default message", expected_revision=route["revision"])
+    route = await settings.update_message(
+        route["id"],
+        route["messages"][0]["id"],
+        {"message_text": message_text, "selected_steps": selected_steps},
+        expected_revision=route["revision"],
+    )
+    if enabled:
+        route = await settings.update_route(route["id"], {"enabled": True}, expected_revision=route["revision"])
+    return route
+
+
+async def edit_default_message(route, text):
+    return await settings.update_message(
+        route["id"], route["messages"][0]["id"], {"message_text": text}, expected_revision=route["revision"]
+    )
+
+
+async def open_default_message(menu, route):
+    await open_route(menu, route)
+    await menu.click(menu.button("Messages"))
+    await menu.click(menu.button("Default message"))
 
 
 async def open_route(menu, route):
@@ -193,10 +217,17 @@ async def test_private_admin_can_add_bot_select_members_and_edit_without_a_test_
     for label, value in [
         ("URL", "https://alice.example.com/"),
         ("API Key", "alice-private-key"),
-        ("Message", "<b>[Username]</b> allowed [Limit]"),
     ]:
         await menu.click(menu.button(label))
         await menu.text(value)
+    await menu.click(menu.button("Messages"))
+    await menu.click(menu.button("Add Message"))
+    await menu.text("Default message")
+    await menu.click(menu.button("Text"))
+    await menu.text("<b>[Username]</b> allowed [Limit]")
+    await menu.click(menu.button("Steps"))
+    await menu.click(menu.button("Step 1"))
+    await menu.click(menu.button("Back to Bot"))
     menu.panel.admins = [{"username": "alice"}, {"username": "second-owner"}]
     await menu.click(menu.button("Admins"))
     await menu.click(menu.button("alice"))
@@ -207,7 +238,7 @@ async def test_private_admin_can_add_bot_select_members_and_edit_without_a_test_
     assert saved["enabled"] and saved["key_configured"]
     assert saved["admin_usernames"] == ["alice", "second-owner"]
     assert saved["base_url"] == "https://alice.example.com/api"
-    assert saved["message_text"] == "<b>[Username]</b> allowed [Limit]"
+    assert saved["messages"][0]["message_text"] == "<b>[Username]</b> allowed [Limit]"
     assert await settings.get_route(bob["id"]) == bob
     assert any(endpoint == "deleteMessage" for endpoint, _ in menu.requests)
     assert "alice-private-key" not in repr(menu.requests) + caplog.text
@@ -244,7 +275,8 @@ async def test_revoked_admin_cannot_finish_key_entry(menu):
 async def test_cancel_command_or_navigation_clears_all_pending_notification_fields(menu, navigation):
     route = await complete_route()
     await open_route(menu, route)
-    await menu.click(menu.button("Message"))
+    await open_default_message(menu, route)
+    await menu.click(menu.button("Text"))
     assert menu.app.user_data[7].get("waiting_for")
     if navigation.startswith("/"):
         await menu.text(navigation)
@@ -277,34 +309,31 @@ async def test_enable_incomplete_route_explains_required_fields(menu):
     assert any("Back" in button["text"] for button in menu.buttons())
 
 
-async def test_multi_selection_changes_independent_steps_and_dynamic_last(menu):
+async def test_multi_selection_changes_independent_explicit_steps(menu):
     route = await complete_route(enabled=True)
-    await open_route(menu, route)
-    await menu.click(menu.button("Triggers"))
-    assert "dynamic" in menu.messages[-1].lower()
+    await open_default_message(menu, route)
+    await menu.click(menu.button("Steps"))
+    assert not any("Last" in button["text"] for button in menu.buttons())
     assert "Warning" in repr(menu.buttons()) and "10" in repr(menu.buttons())
-    assert (await settings.get_route(route["id"]))["trigger_mode"] == "last"
-    await menu.click(menu.button("Step 1"))
     await menu.click(menu.button("Step 3"))
     selected = await settings.get_route(route["id"])
-    assert selected["enabled"] and selected["selected_steps"] == [0, 2]
+    assert selected["enabled"] and selected["messages"][0]["selected_steps"] == [0, 2]
     assert sum("✅" in b["text"] for b in menu.buttons() if "Step" in b["text"]) == 2
     await menu.click(menu.button("Step 1"))
-    assert (await settings.get_route(route["id"]))["selected_steps"] == [2]
+    assert (await settings.get_route(route["id"]))["messages"][0]["selected_steps"] == [2]
     await menu.click(menu.button("Step 3"))
-    assert (await settings.get_route(route["id"]))["selected_steps"] == [2]
-    assert "at least one" in menu.messages[-1].lower()
-    await menu.click(menu.button("Last step"))
-    assert (await settings.get_route(route["id"]))["trigger_mode"] == "last"
+    assert (await settings.get_route(route["id"]))["messages"][0]["selected_steps"] == [2]
+    assert "disable" in menu.messages[-1].lower()
 
 
 async def test_selected_removed_steps_are_visible_and_can_be_removed_without_remapping(menu):
-    route = await complete_route(trigger_mode="selected", selected_steps=[0, 8])
+    route = await complete_route(selected_steps=[0, 8])
     await open_route(menu, route)
-    await menu.click(menu.button("Triggers"))
+    await open_default_message(menu, route)
+    await menu.click(menu.button("Steps"))
     assert "Step 9" in repr(menu.buttons()) and "inactive" in repr(menu.buttons()).lower()
     await menu.click(menu.button("Step 9"))
-    assert (await settings.get_route(route["id"]))["selected_steps"] == [0]
+    assert (await settings.get_route(route["id"]))["messages"][0]["selected_steps"] == [0]
 
 
 @pytest.mark.parametrize("action", ["Enable", "Delete", "URL"])
@@ -312,7 +341,7 @@ async def test_stale_callbacks_do_not_mutate_newer_route_revision(menu, action):
     route = await complete_route()
     await open_route(menu, route)
     payload = menu.button(action)
-    newer = await settings.update_route(route["id"], {"message_text": "Newer settings"})
+    newer = await edit_default_message(route, "Newer settings")
     await menu.click(payload)
     await menu.text("https://stale.example.com")
     assert await settings.get_route(route["id"]) == newer
@@ -322,14 +351,15 @@ async def test_stale_callbacks_do_not_mutate_newer_route_revision(menu, action):
 async def test_stale_text_and_delete_confirmation_cannot_overwrite_settings(menu):
     route = await complete_route()
     await open_route(menu, route)
-    await menu.click(menu.button("Message"))
-    newer = await settings.update_route(route["id"], {"message_text": "Newer settings"})
+    await open_default_message(menu, route)
+    await menu.click(menu.button("Text"))
+    newer = await edit_default_message(route, "Newer settings")
     await menu.text("Stale message")
     assert await settings.get_route(route["id"]) == newer
     await open_route(menu, newer)
     await menu.click(menu.button("Delete"))
     confirm = menu.button("Confirm")
-    newest = await settings.update_route(route["id"], {"message_text": "Newest settings"})
+    newest = await edit_default_message(newer, "Newest settings")
     await menu.click(confirm)
     assert await settings.get_route(route["id"]) == newest
     await open_route(menu, newest)
@@ -363,7 +393,7 @@ async def test_bots_are_accessible_with_short_secret_free_callbacks(menu):
     await menu.click("notifications_menu")
     assert sum("admin-" in b["text"] for b in menu.buttons()) == 23
     await open_route(menu, routes[0])
-    await menu.click(menu.button("Triggers"))
+    await menu.click(menu.button("Messages"))
     for endpoint, params in menu.requests:
         if endpoint in {"sendMessage", "editMessageText"} and params.get("reply_markup"):
             markup = params["reply_markup"]
@@ -378,9 +408,10 @@ async def test_long_html_template_and_url_have_safe_bounded_previews_without_sto
     route = await complete_route("admin<>&", message_text=template, base_url=url)
     await open_route(menu, route)
     assert "admin&lt;&gt;&amp;" in menu.messages[-1]
-    assert "&lt;&gt;&amp;" in menu.messages[-1]
     assert len(menu.messages[-1].encode("utf-16-le")) // 2 <= 4096
-    await menu.click(menu.button("Message"))
+    await open_default_message(menu, route)
+    assert "&lt;&gt;&amp;" in menu.messages[-1]
+    await menu.click(menu.button("Text"))
     assert "[Username]" in menu.messages[-1] and "[Limit]" in menu.messages[-1]
     assert len(menu.messages[-1].encode("utf-16-le")) // 2 <= 4096
     assert await settings.get_route(route["id"]) == route
@@ -440,15 +471,16 @@ async def test_disabling_through_ui_cancels_only_that_route_unsent_events(menu):
 
 
 async def test_current_ladder_changes_leave_selected_positions_visible_as_inactive(menu):
-    route = await complete_route(trigger_mode="selected", selected_steps=[0, 2])
+    route = await complete_route(selected_steps=[0, 2])
     await open_route(menu, route)
     async with database.get_db() as db:
         await ConfigCRUD.set(db, "punishment_steps", json.dumps([{"type": "warning", "duration": 0}]))
-    await menu.click(menu.button("Triggers"))
+    await open_default_message(menu, route)
+    await menu.click(menu.button("Steps"))
     assert "Step 3: inactive" in repr(menu.buttons())
-    assert (await settings.get_route(route["id"]))["selected_steps"] == [0, 2]
+    assert (await settings.get_route(route["id"]))["messages"][0]["selected_steps"] == [0, 2]
     await menu.click(menu.button("Step 3"))
-    assert (await settings.get_route(route["id"]))["selected_steps"] == [0]
+    assert (await settings.get_route(route["id"]))["messages"][0]["selected_steps"] == [0]
 
 
 async def test_key_entry_database_failure_is_localized_and_does_not_echo_key(menu, monkeypatch, caplog):
@@ -474,7 +506,7 @@ async def test_valid_routes_at_largest_sqlite_revision_keep_callbacks_within_64_
     async with database.get_db() as db:
         await db.execute(update(MirzaRoute).where(MirzaRoute.id == route["id"]).values(revision=2**63 - 1))
     await open_route(menu, route)
-    for label in ["Triggers", "Back to Bot", "Message", "Back to Bot", "Delete"]:
+    for label in ["Messages", "Default message", "Steps", "Back to Message", "Text", "Back to Bot", "Delete"]:
         await menu.click(menu.button(label))
         assert all(len(button["callback_data"].encode()) <= 64 for button in menu.buttons())
 

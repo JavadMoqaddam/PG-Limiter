@@ -83,14 +83,40 @@ def test_offline_restore_preserves_mirza_credentials_and_incident_delivery(layou
     database = Path(layout.database_url.split("///", 1)[1])
     engine = create_engine(f"sqlite:///{database}")
     Base.metadata.create_all(engine)
-    context = {"candidates": [{"route_id": "route", "revision": 2, "admin_username": "seller"}], "effective_limit": 3}
+    route_id = "11111111-1111-4111-8111-111111111111"
+    messages = [
+        {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "name": "Warning",
+            "message_text": "[Username]: [Limit] دستگاه",
+            "selected_steps": [0, 1],
+        },
+        {
+            "id": "33333333-3333-4333-8333-333333333333",
+            "name": "Disabled",
+            "message_text": "[Username] disabled",
+            "selected_steps": [4],
+        },
+    ]
+    context = {
+        "candidates": [
+            {
+                "route_id": route_id,
+                "revision": 2,
+                "admin_usernames": ["other-seller", "seller"],
+                "message_id": messages[0]["id"],
+            }
+        ],
+        "effective_limit": 3,
+    }
     with Session(engine) as session:
         session.add(
             MirzaRoute(
-                id="route",
+                id=route_id,
                 name="Sales",
                 api_key="synthetic-key",
                 revision=2,
+                messages=messages,
                 admins=[MirzaRouteAdmin(admin_username="seller"), MirzaRouteAdmin(admin_username="other-seller")],
             )
         )
@@ -111,7 +137,7 @@ def test_offline_restore_preserves_mirza_credentials_and_incident_delivery(layou
                 username="alice",
                 applied_at=100,
                 context=context,
-                route_id="route",
+                route_id=route_id,
                 route_revision=2,
                 state="delivered",
                 recipient="5123456789",
@@ -137,7 +163,8 @@ def test_offline_restore_preserves_mirza_credentials_and_incident_delivery(layou
         )
         assert db.execute(
             "SELECT admin_username, route_id FROM mirza_route_admins ORDER BY admin_username"
-        ).fetchall() == [("other-seller", "route"), ("seller", "route")]
+        ).fetchall() == [("other-seller", route_id), ("seller", route_id)]
+        assert json.loads(db.execute("SELECT messages FROM mirza_routes").fetchone()[0]) == messages
         warning_succeeded, saved_context = db.execute(
             "SELECT warning_succeeded, notification_context FROM punishment_facts"
         ).fetchone()

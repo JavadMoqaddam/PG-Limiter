@@ -2,8 +2,9 @@
 
 Open **Settings → 🔔 Notifications** in a private chat with the PG-Limiter bot.
 Existing authorized bot administrators can configure multiple Mirza Bot instances.
-Each named bot has its own API URL, key, message and punishment stages, shared by
-all PasarGuard admins included in that bot. New bots start disabled with no admins.
+Each named bot has its own API URL, key and named messages, shared by all
+PasarGuard admins included in that bot. Each message covers explicit numbered
+punishment stages. New bots start disabled with no admins or messages.
 
 ## Set up a bot
 
@@ -22,8 +23,10 @@ all PasarGuard admins included in that bot. New bots start disabled with no admi
    its documented key settings have no separate send-message-only permission.
    The menu shows only whether a key is configured; replacing it does not reveal
    the previous value.
-5. Set the shared message and select the punishment stages that should notify.
-6. Enable the bot after selecting at least one admin and completing its settings.
+5. Open **Messages → Add Message**, give it a unique name, enter its **Text**,
+   then select its numbered **Steps**. Add more messages for other stages.
+6. Enable the bot after selecting at least one admin, setting its URL and key,
+   and preparing at least one message with text and selected steps.
 
 Repeat these steps for each sales bot. An admin can belong to only one bot,
 including disabled bots. Admins assigned elsewhere show a lock and that bot's
@@ -68,7 +71,20 @@ administrator. Tests do not enable notifications, change settings, or enter
 punishment history and notification counters. Stale settings buttons cannot
 start a test; a request already in flight may finish after an edit.
 
-## Message template
+## Manage messages
+
+**Messages** lists each named message and its assigned stage numbers. A message
+has **Text**, **Steps**, **Rename** and confirmed **Delete** controls. Names must
+be unique within that bot; another bot may use the same names.
+
+New messages start with empty text and no steps. A message with empty text or no
+assigned steps is a draft. Drafts do not stop other ready messages from sending,
+and there is no separate message enable switch: the bot's enabled state applies
+to all its ready messages. Step assignments remain exclusive even for drafts.
+Disable the bot before deleting or clearing the text/steps of its last ready
+message. Deleting a message frees its assigned stages.
+
+## Message text
 
 Use these literal, case-sensitive placeholders:
 
@@ -84,7 +100,7 @@ Use these literal, case-sensitive placeholders:
 An example using both variables:
 
 ```text
-کانفیگ [Username] حداکثر برای اتصال هم‌زمان [Limit] کاربر مجاز است؛ لطفاً از این تعداد بیشتر نشود.
+کانفیگ [Username] حداکثر برای [Limit] دستگاه مجاز است؛ لطفاً از این تعداد بیشتر نشود.
 ```
 
 Every occurrence is replaced. `[Username]` comes from the punishment incident's
@@ -103,15 +119,20 @@ being truncated or sent in parts.
 
 ## Choose punishment stages
 
-- **Last step** follows the final stage of the punishment ladder in effect for
-  that incident. It does not assume that the final stage is number five.
-- **Selected steps** lets you choose one or more stage positions by toggling
-  their checkmarks independently in **Triggers**. Selecting the first step
-  switches from dynamic last to selected mode. An enabled configuration must
-  retain at least one selected step; choose **Last step** or disable it before
-  clearing the final selection. Review selections if you reorder or remove
-  punishment stages. Removed positions stay visible as inactive and can be
-  removed; they are never silently reassigned to another position.
+Open a message's **Steps** picker. Each numbered stage shows the effective
+punishment description. Checkmarks identify this message's assignments; a lock
+and another message's name identify stages already assigned within this bot.
+Remove a stage from that message before assigning it here.
+
+One message can cover multiple stages. Each numbered stage can belong to only
+one message in the bot. Unassigned stages send no notification. For example,
+assign stages 1 and 2 to `Reminder`, stage 3 to `Temporary disable`, and stage 5
+to `Final disable`; stage 4 sends no message unless explicitly assigned.
+
+Assignments refer to explicit positions. There is no dynamic **Last step**
+selector or automatic remapping when the ladder changes. Review assignments
+after reordering or replacing punishment stages. Removed positions stay visible
+as inactive and can be removed; they are never silently moved to a new position.
 
 Every newly applied matching punishment creates a notification, including each
 new application of the final step to the same configuration. Replaying an
@@ -170,13 +191,39 @@ idempotency key, so such requests remain uncertain instead of being blindly
 repeated. This avoids that source of duplicate messages at the cost of some
 uncertain messages potentially not arriving.
 
-Editing a bot's settings or membership, disabling it, or deleting it invalidates
-its older unsent events. Each edit changes the configuration revision; an old button or
-pending text edit cannot overwrite a newer revision. A request already in
-flight may complete. New incidents use the updated settings. A restart retains pending events and does not automatically
-repeat an interrupted in-flight request.
+Editing a bot's settings or membership, creating/editing/deleting one of its
+messages, disabling it, or deleting it invalidates its older unsent events. All
+messages share the bot's configuration revision; an old button or pending text
+edit cannot overwrite a newer revision. Saving an unchanged value keeps the
+revision. A queued event retains the specific message selected at the punishment
+decision; changing stage assignments never redirects an admitted event. A request
+already in flight may complete. New incidents use the updated settings. A restart
+retains pending events and does not automatically repeat an interrupted in-flight
+request.
 
 ## Storage and upgrades
+
+Migration `014_notification_messages` converts each existing bot's shared text
+into one entry named `Default message`. It preserves explicit stage assignments.
+The former dynamic last selection becomes the final numbered stage of the
+effective configured ladder once during upgrade; the built-in five-stage ladder
+is used if no usable ladder is configured. A former last selection on a ladder
+longer than ten supported stages receives no assignment and requires manual
+selection. Review converted assignments before enabling
+or relying on notifications.
+
+Bot IDs, revisions, credentials, enabled states, membership, punishment facts and
+delivery receipts are preserved. Previously queued events retain their original
+message identity; new messages receive fresh IDs. Deleting all messages and
+restarting or restamping the database does not recreate the migrated message.
+Upgrading does not replay previous punishments.
+
+Revision `014` refuses every in-place downgrade before changing the database.
+Older code cannot read message identities in new notification contexts in SQLite
+and the external punishment-fact journal. Rollback requires stopping the daemon,
+restoring the complete pre-upgrade database and state backup offline, and then
+starting the matching older image. An Alembic downgrade cannot perform that
+rollback.
 
 Migration `013_notification_bots` converts each pre-existing admin configuration
 into one named bot containing that same admin. IDs, revisions, keys, settings,
@@ -192,7 +239,7 @@ offline before starting the older version.
 
 The earlier migration `012_mirza_notifications` adds route and delivery tables
 and extends punishment evidence; existing facts are not backfilled. Container
-startup applies all pending migrations, including `013`. For a local Python
+startup applies all pending migrations, including `014`. For a local Python
 installation, run `python -m alembic upgrade head` against the configured
 `DATABASE_URL` before starting the updated daemon.
 

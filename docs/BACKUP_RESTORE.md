@@ -14,7 +14,7 @@ New archives contain a **database-consistent SQLite backup API snapshot** of the
 
 The archive also includes the environment file once and the actual persisted warning/trust history, punishment compatibility history, original groups, Telegram topics/message caches, pending notifications, disable-message receipts, automatic-backup settings and existing legacy import inputs. JSON and environment files are captured independently of SQLite: the archive does **not** promise a transaction spanning those stores. A versioned manifest records checksums and explicitly absent JSON files.
 
-[Mirza Bot notification](MIRZA_NOTIFICATIONS.md) bot settings, admin memberships, API keys and delivery states are part of the SQLite snapshot. Pending punishment evidence is retained in the existing fact-journal sidecar. Backup archives therefore contain credentials and should be kept private.
+[Mirza Bot notification](MIRZA_NOTIFICATIONS.md) bot settings, named messages and their numbered step assignments, admin memberships, API keys and delivery states are part of the SQLite snapshot. Pending punishment evidence, including the selected message identity, is retained in the existing fact-journal sidecar. Backup archives therefore contain credentials and should be kept private.
 
 The Telegram delivery policy introduces no additional schema migration or new backup format. Critical pending notifications retain their existing JSON backup inclusion. Replaying restored pending state can duplicate a critical notification whose Telegram acknowledgement was lost; noncritical pending sends and node-summary state are not durable recovery records.
 

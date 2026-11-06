@@ -52,6 +52,7 @@ async def test_connection_sends_literal_test_to_pressing_admin_with_selected_bot
             "api_key": "selected-private-key",
         },
     )
+    assert route["messages"] == []
     async with database.get_db() as db:
         counts_before = await MirzaNotificationsCRUD.counts(db)
     await open_route(menu, route)
