@@ -1,9 +1,11 @@
 """Private, revision-guarded management of grouped Mirza Bot notifications."""
 
 import base64
+from contextlib import suppress
 import hashlib
 import html
 import re
+from time import monotonic
 import unicodedata
 import uuid
 
@@ -17,6 +19,7 @@ from telegram_bot.handlers.admin import check_admin_privilege
 from telegram_bot.input_owner import accepts_inline, end_input
 from telegram_bot.utils import send_response
 from utils import mirza_settings as settings
+from utils.mirza_client import MirzaClient, MirzaResult
 from utils.settings_service import read_settings
 
 INPUT_FLOW = "mirza_notification"
@@ -74,7 +77,7 @@ async def _list(update: Update, notice: str = ""):
     routes = await settings.list_routes()
     async with AsyncSessionLocal() as db:
         counts = await MirzaNotificationsCRUD.counts(db)
-    rows = [[_button(f"{'✅' if route['enabled'] else '⏸'} {route['name'][:80]}", "r", route)] for route in routes]
+    rows = [[_button(f"🤖 {route['name'][:80]} {'✅' if route['enabled'] else '⏸'}", "r", route)] for route in routes]
     rows.extend(
         [
             [_button("➕ Add Bot", "b")],
@@ -98,22 +101,107 @@ async def _route(update: Update, route: dict, notice: str = ""):
         else ("Selected steps: " + (", ".join(str(step + 1) for step in route["selected_steps"]) or "none"))
     )
     text = (
-        f"🔔 <b>{_preview(route['name'], 80)}</b>\n\n{notice}"
+        f"🤖 <b>{_preview(route['name'], 80)}</b>\n\n{notice}"
         f"Status: {'Enabled' if route['enabled'] else 'Disabled'}\n"
         f"Included admins: {len(route['admin_usernames'])}\n"
         f"URL: <code>{_preview(route['base_url'], 160) or 'Missing'}</code>\n"
         f"API key: {'Configured' if route['key_configured'] else 'Missing'}\n"
-        f"Triggers: {mode}\n\n<b>Message preview</b>\n{_preview(route['message_text']) or 'Missing'}"
+        f"Triggers: {mode}\n\n"
+        "Test Connection sends <code>test</code> to your own account through this Mirza Bot. Start it first.\n\n"
+        f"<b>Message preview</b>\n{_preview(route['message_text']) or 'Missing'}"
     )
     rows = [
         [_button("⏸ Disable" if route["enabled"] else "✅ Enable", "e", route)],
         [_button("👤 Admins", "g", route), _button("✏️ Rename", "n", route)],
         [_button("🌐 URL", "u", route), _button("🔑 Replace API Key", "k", route)],
+        [_button("🔌 Test Connection", "c", route)],
         [_button("✏️ Message", "m", route), _button("⚖️ Triggers", "t", route)],
         [_button("🗑 Delete", "d", route)],
         [InlineKeyboardButton("« Back to Notifications", callback_data=CallbackData.NOTIFICATIONS_MENU)],
     ]
     return await _respond(update, text, InlineKeyboardMarkup(rows))
+
+
+def _test_notice(result: MirzaResult) -> str:
+    """Present only fixed descriptions, never remote bodies or exception text."""
+    if result.status == "delivered":
+        return "✅ Mirza Bot accepted the test message. Check your chat with that bot.\n\n"
+    return {
+        "message_rejected": "⚠️ Mirza Bot rejected the test. Start or unblock that bot, then try again.\n\n",
+        "request_rejected": "⚠️ Test rejected. Check the API URL, key and users permission.\n\n",
+        "connection_unavailable": "⚠️ Could not connect to Mirza Bot. Check the URL, server and TLS certificate.\n\n",
+        "rate_limited": "⚠️ Mirza Bot is rate limiting requests. Try again later.\n\n",
+    }.get(
+        result.reason,
+        "⚠️ Test result is uncertain. Check your chat with this Mirza Bot before testing again; "
+        "the message may already have arrived.\n\n",
+    )
+
+
+async def _test_alert(update: Update, text: str, *, show_alert: bool = False):
+    # A callback acknowledgement must not replace a test receipt or trigger a new message.
+    with suppress(Exception):
+        return await update.callback_query.answer(text.strip(), show_alert=show_alert)
+
+
+async def _test_result(update: Update, route: dict, notice: str):
+    """Retain the send outcome even when refreshing the configuration fails."""
+    try:
+        current = await settings.get_route(route["id"])
+    except Exception:
+        return await _respond(update, notice + "Could not reload settings. Reopen Notifications.", _back())
+    if current is None or current["revision"] != route["revision"]:
+        return await _list(
+            update,
+            "⚠️ Configuration changed or was deleted during the test. "
+            "This result applies to the previous settings.\n\n" + notice,
+        )
+    return await _route(update, current, notice)
+
+
+async def _test_connection(update: Update, context: ContextTypes.DEFAULT_TYPE, route: dict):
+    """Make one explicit test send to the pressing admin, outside the incident outbox."""
+    user = update.effective_user
+    if user is None or user.id <= 0:
+        raise MirzaRouteError("Could not identify your Telegram account")
+    # One small record per operator, independent of input-flow cleanup and bot count.
+    state = context.user_data.setdefault("notification_test", {"running": False, "next_at": 0.0})
+    if state["running"]:
+        return await _test_alert(update, "A connection test is already in progress.")
+    if monotonic() < state["next_at"]:
+        return await _test_alert(update, "Please wait a few seconds before another test.")
+    if not route["base_url"] or not route["key_configured"]:
+        return await _route(update, route, "⚠️ Configure the URL and API key before testing.\n\n")
+    state["running"] = True
+    attempted = False
+    try:
+        await _route(update, route, "🔄 Testing connection; sending <code>test</code> to your Telegram account…\n\n")
+        if not await _authorized(update, context):
+            return
+        # Read after the progress response so an edit during that await invalidates the test.
+        base_url, key = await settings.get_test_credentials(route["id"], expected_revision=route["revision"])
+        client = MirzaClient()
+        result = MirzaResult("uncertain", "test_interrupted")
+        try:
+            attempted = True
+            result = await client.send_message(base_url, key, str(user.id), "test")
+        except Exception:
+            # Unexpected failures after starting a request cannot justify resending it.
+            pass
+        finally:
+            with suppress(Exception):
+                await client.close()
+        notice = _test_notice(result)
+        try:
+            return await _test_result(update, route, notice)
+        except Exception:
+            # Keep the known result if Telegram cannot edit the screen. Do not send a fallback message.
+            return await _test_alert(update, notice, show_alert=True)
+    finally:
+        state["running"] = False
+        if attempted:
+            # Also suppress queued double-clicks after fast responses or cancellation.
+            state["next_at"] = monotonic() + 5.0
 
 
 def _compact_id(value: bytes) -> str:
@@ -266,7 +354,7 @@ async def _prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str
         "Choose its admins from the panel list after saving.",
         "base_url": "Enter the HTTPS Mirza Bot API base URL, e.g. <code>https://bot.example.com/api/</code>.\n"
         "Enter the base, not its /users endpoint.",
-        "api_key": "Enter the replacement Mirza Bot API key with users/send_message permission.\n"
+        "api_key": "Enter the replacement Mirza Bot API key with the users permission.\n"
         "The key is never displayed. Its incoming message will be deleted best-effort after saving.",
         "message_text": "Enter the fixed HTML message. Use literal <code>[Username]</code> for the punished "
         "configuration username and <code>[Limit]</code> for its effective allowed concurrent "
@@ -306,7 +394,7 @@ async def notification_callback(update: Update, context: ContextTypes.DEFAULT_TY
             return await _select_admin(update, parts)
         if action == "p" and len(parts) == 3 and parts[2].isascii() and parts[2].isdigit() and len(parts[2]) <= 9:
             return await _list(update)
-        if action not in {"r", "e", "u", "k", "m", "n", "g", "f", "t", "l", "s", "d", "x"}:
+        if action not in {"r", "e", "u", "k", "m", "n", "g", "f", "t", "l", "s", "d", "x", "c"}:
             raise ValueError
         if len(parts) != (5 if action == "s" else 4) or str(uuid.UUID(parts[2])) != parts[2]:
             raise ValueError
@@ -318,6 +406,8 @@ async def notification_callback(update: Update, context: ContextTypes.DEFAULT_TY
             return await _list(update, notice="⚠️ Configuration changed or was deleted. Open it again.\n\n")
         if action == "r":
             return await _route(update, route)
+        if action == "c":
+            return await _test_connection(update, context, route)
         if action in {"g", "f"}:
             return await _admins(update, route, force_refresh=action == "f")
         if action in {"u", "k", "m", "n"}:

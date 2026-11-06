@@ -17,6 +17,9 @@ all PasarGuard admins included in that bot. New bots start disabled with no admi
    to `/api`. Enter the API base, not its documentation page or `/users` endpoint.
 4. Set a Mirza Bot API key authorized to use the **users API**, including its
    `send_message` action. Use the key generated in Mirza Bot's API-key settings.
+   Select only **Users (`users`)**; full access and other sections are unnecessary.
+   Mirza Bot grants access by section, so this also permits other users actions;
+   its documented key settings have no separate send-message-only permission.
    The menu shows only whether a key is configured; replacing it does not reveal
    the previous value.
 5. Set the shared message and select the punishment stages that should notify.
@@ -44,6 +47,26 @@ to cancel a pending edit. A new command or menu also clears that edit.
 **Rename** changes the bot's display name. **Delete** requires confirmation;
 it removes the bot configuration and frees its admin assignments. It does not
 delete PasarGuard admins or the external sales bot.
+
+## Test a bot connection
+
+Open the selected bot and choose **🔌 Test Connection**. It sends the literal
+message `test` through that Mirza Bot to the Telegram account of the PG-Limiter
+administrator pressing the button. Start the selected Mirza Bot first and make
+sure you have not blocked it. The test uses the saved API URL and key; it also
+works while notifications are disabled, before selecting admins or a template.
+
+The result appears in PG-Limiter. Success means Mirza Bot acknowledged the API
+request; check your chat with that bot to confirm the test arrived. A rejected
+request points to the URL, key or `users` permission. A rejected message may need
+the recipient to start or unblock the bot. Raw API errors and keys are never
+shown. If the result is uncertain, check your chat before testing again.
+
+Each click makes at most one request, with no automatic retry. Repeated clicks
+while a test is running and for five seconds afterwards are suppressed for that
+administrator. Tests do not enable notifications, change settings, or enter
+punishment history and notification counters. Stale settings buttons cannot
+start a test; a request already in flight may finish after an edit.
 
 ## Message template
 

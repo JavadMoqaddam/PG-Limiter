@@ -6,6 +6,15 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- Add **Test Connection** to each Mirza Bot configuration. Send `test` to the administrator pressing the button using that bot's saved credentials, with safe result messages, repeated-click protection and no automatic retries or punishment-history changes.
+
+### Changed
+
+- Show a robot icon beside each configured Mirza Bot name, retaining its enabled/disabled indicator.
+- Clarify the minimum Mirza Bot API permission (`users`) and its section-wide scope.
+
 ## [1.7.4] - 2026-11-05
 
 ### Changed
