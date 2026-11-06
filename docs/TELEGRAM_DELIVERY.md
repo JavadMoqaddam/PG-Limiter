@@ -21,9 +21,11 @@ PG-Limiter records delivery receipts and keeps each queued operation with its or
 
 **Backup delivery** preserves a positive document receipt even if local cleanup fails. An uncertain group send does not trigger an administrator copy or claim success. A definite destination rejection can use the administrator fallback. See [backup and offline restore](BACKUP_RESTORE.md).
 
+**Mirza Bot result reports** use their dedicated forum topic and a separate persisted report claim/receipt. They follow the noncritical dispatcher policy: known pre-send failures and rate limits can retry, while ambiguous sends stop automatic appends. Restart converts an interrupted report to uncertain. Report delivery never changes customer notification state or retries the customer request. Migration `015_notification_reports` adds this report ownership; the existing SQLite backup includes it. See [Mirza Bot reports](MIRZA_NOTIFICATIONS.md#forum-delivery-reports).
+
 New warning scans, user actions, scheduled reports, reconnect notices and fresh summary scopes are intentional source events. Repeated content from those events is separate from retrying one transport request; this policy does not suppress all messages with identical text. Daily reports retain their existing persisted receipt and uncertainty handling.
 
-No database schema or configuration migration is required for these delivery changes. Critical pending notifications continue to use the existing JSON store, which is already included in backups. Noncritical pending operations and node-summary ownership are process-local; restoring an older backup cannot establish whether Telegram accepted a previously unacknowledged send.
+No database schema or configuration migration is required for the core dispatcher policy. Critical pending notifications continue to use the existing JSON store, which is already included in backups. Noncritical pending operations and node-summary ownership are process-local; restoring an older backup cannot establish whether Telegram accepted a previously unacknowledged send. Mirza Bot reports separately retain their SQLite claim and confirmed receipt.
 
 ## Background
 

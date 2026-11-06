@@ -43,7 +43,7 @@ def create_topics_menu_keyboard(enabled: bool) -> InlineKeyboardMarkup:
 
     if enabled and group_id:
         # Show topic status
-        topics_configured = len(all_topics)
+        topics_configured = sum(bool(all_topics.get(topic_type.value)) for topic_type in TopicType)
         total_topics = len(TopicType)
 
         keyboard.append(
@@ -292,39 +292,52 @@ async def topics_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_response(update, "❌ <b>No Forum Group Configured</b>\n\nPlease set a forum group ID first.")
             return ConversationHandler.END
 
-        # Check permissions first
-        success, message = await manager.check_bot_permissions(application.bot)
+        group_id = manager.group_id
+        destination_revision = manager.destination_revision
+        await _send_response(
+            update, "⏳ <b>Checking topics...</b>\n\nCreating only missing topics. This may take a moment..."
+        )
+        result = await manager.create_topics_for_group(
+            application.bot, group_id=group_id, destination_revision=destination_revision
+        )
 
-        if not success:
-            await _send_response(update, f"❌ <b>Cannot Create Topics</b>\n\n{message}")
-            return ConversationHandler.END
-
-        # Create topics
-        await _send_response(update, "⏳ <b>Creating topics...</b>\n\nThis may take a moment...")
-
-        created_topics = await manager.create_topics_for_group(application.bot)
-
-        if created_topics:
-            topic_list = []
-            for topic_type, thread_id in created_topics.items():
-                config = TOPIC_CONFIG[topic_type]
-                topic_list.append(f"  ✅ {config['name']}")
-
+        if result.cancelled:
             message = (
-                f"✅ <b>Topics Created Successfully!</b>\n\n"
-                f"Created {len(created_topics)} topics:\n"
-                f"{chr(10).join(topic_list)}\n\n"
-                f"Messages will now be organized by category in the forum group."
+                "⚠️ <b>Topic Setup Stopped</b>\n\n"
+                "The forum configuration changed during setup. Review the current settings and try again."
+            )
+        elif result.permission_error:
+            message = f"❌ <b>Cannot Set Up Topics</b>\n\n{html.escape(result.permission_error)}"
+        elif not result and not (result.failed or result.unverified or result.uncertain):
+            message = (
+                f"✅ <b>Topics Already Configured</b>\n\n"
+                f"Verified {len(result.existing)} existing topics. Their saved IDs have been preserved."
             )
         else:
-            message = "⚠️ No topics were created. Please check permissions and try again."
+            incomplete = result.failed or result.unverified or result.uncertain
+            title = "⚠️ <b>Topic Setup Incomplete</b>" if incomplete else "✅ <b>Topics Created Successfully!</b>"
+            lines = [title, "", f"Created {len(result)} topics.", f"Verified {len(result.existing)} existing topics."]
+            for topic_type in result:
+                lines.append(f"  ✅ {TOPIC_CONFIG[topic_type]['name']}")
+            if result.unverified:
+                lines.append(
+                    f"\n{len(result.unverified)} saved topics could not be verified; their IDs have been preserved."
+                )
+            if result.failed:
+                lines.append(f"\nCould not create {len(result.failed)} topics. Successful creations have been saved.")
+            if result.uncertain:
+                lines.append(
+                    f"\nCreation results are uncertain for {len(result.uncertain)} topics. "
+                    "Check the forum before retrying; they may already exist."
+                )
+            message = "\n".join(lines)
 
         # Return to menu
         await _send_response(update, message, create_topics_menu_keyboard(manager.enabled))
 
     except Exception as e:
         topics_handler_logger.error(f"❌ Error setting up topics: {e}")
-        await _send_response(update, f"❌ Error: {str(e)}")
+        await _send_response(update, f"❌ Error: {html.escape(str(e))}")
 
     return ConversationHandler.END
 

@@ -8,11 +8,14 @@ All notable changes to PG-Limiter are recorded here. Format follows
 
 ### Added
 
+- Report terminal Mirza Bot notification results in a dedicated forum topic, including configuration username, resolved bot name, recipient ID, punishment step and safe outcome reason. Independent persisted report ownership keeps Telegram failures from changing or repeating customer delivery.
 - Manage named messages inside each Mirza Bot with Text, Steps, Rename and confirmed Delete. A message may cover multiple explicit numbered punishment stages; each stage belongs to at most one message in that bot. Empty-text or unassigned messages remain drafts.
 - Add **Test Connection** to each Mirza Bot configuration. Send `test` to the administrator pressing the button using that bot's saved credentials, with safe result messages, repeated-click protection and no automatic retries or punishment-history changes.
 
 ### Changed
 
+- Create only missing or definitively deleted forum topics. Preserve existing IDs and message caches, serialize repeated setup clicks, and show partial, unverified or changed-destination results explicitly.
+- Migration `015_notification_reports` preserves customer delivery state and adds separate forum receipts. Existing terminal notifications are not replayed into the new topic; pending customer work can report its eventual result.
 - Replace the bot-wide template and trigger controls with a Messages list. Unassigned stages send no notification, and all message edits share the bot revision and cancel its older unsent events.
 - Preserve existing text and explicit assignments through migration `014_notification_messages`; convert the former dynamic last stage to its explicit position once. In-place downgrade is refused; rollback requires the full pre-upgrade database and state backup.
 - Show a robot icon beside each configured Mirza Bot name, retaining its enabled/disabled indicator.

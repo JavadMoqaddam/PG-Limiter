@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from telegram.error import BadRequest
 
 import telegram_bot.topics as tm
 import telegram_bot.dispatcher as dm
@@ -287,6 +288,7 @@ async def test_created_thread_for_previous_group_is_not_installed_in_new_group(f
         get_chat=AsyncMock(return_value=SimpleNamespace(is_forum=True, title="group")),
         get_chat_member=AsyncMock(return_value=SimpleNamespace(status="creator")),
         create_forum_topic=AsyncMock(side_effect=create_topic),
+        edit_forum_topic=AsyncMock(return_value=True),
     )
     creating = asyncio.create_task(forum.manager.create_topics_for_group(bot))
     try:
@@ -323,6 +325,7 @@ async def test_failed_topic_creation_cannot_resume_after_destination_replacement
         get_chat=AsyncMock(return_value=SimpleNamespace(is_forum=True, title="group")),
         get_chat_member=AsyncMock(return_value=SimpleNamespace(status="creator")),
         create_forum_topic=AsyncMock(side_effect=create_topic),
+        edit_forum_topic=AsyncMock(return_value=True),
     )
     creating = asyncio.create_task(forum.manager.create_topics_for_group(bot))
     try:
@@ -341,8 +344,8 @@ async def test_failed_topic_creation_cannot_resume_after_destination_replacement
 
 async def test_current_destination_creation_continues_after_one_topic_error(forum):
     async def create_topic(**kwargs):
-        if kwargs["name"] == tm.TOPIC_CONFIG[TopicType.GENERAL]["name"]:
-            raise RuntimeError("cannot create General topic")
+        if kwargs["name"] == tm.TOPIC_CONFIG[TopicType.WARNINGS]["name"]:
+            raise BadRequest("cannot create Warnings topic")
         return SimpleNamespace(message_thread_id=71)
 
     bot = SimpleNamespace(
@@ -350,15 +353,20 @@ async def test_current_destination_creation_continues_after_one_topic_error(foru
         get_chat=AsyncMock(return_value=SimpleNamespace(is_forum=True, title="group")),
         get_chat_member=AsyncMock(return_value=SimpleNamespace(status="creator")),
         create_forum_topic=AsyncMock(side_effect=create_topic),
+        edit_forum_topic=AsyncMock(return_value=True),
     )
     created = await forum.manager.create_topics_for_group(bot)
-    expected = {topic: 71 for topic in TopicType if topic != TopicType.GENERAL}
+    expected = {
+        topic: 71 for topic in TopicType if topic not in {TopicType.GENERAL, TopicType.NO_LIMIT, TopicType.WARNINGS}
+    }
     assert created == expected
+    assert created.failed == {TopicType.WARNINGS}
     assert (
         forum.manager.get_all_topics()
         == TopicsManager().get_all_topics()
-        == {"general": 10, **{topic.value: thread for topic, thread in expected.items()}}
+        == {"general": 10, "no_limit": 30, **{topic.value: thread for topic, thread in expected.items()}}
     )
+    assert forum.manager.is_message_sent(TopicType.NO_LIMIT, "no_limit:alice")
 
 
 async def drain_dispatcher(dispatcher):

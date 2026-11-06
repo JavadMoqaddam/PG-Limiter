@@ -12,6 +12,7 @@ Topics:
 - Active Users: Active users log and reports
 - Backups: Automatic backup notifications
 - No Limit Found: Users without special limits
+- Mirza Bot Notifications: Customer notification delivery reports
 """
 
 import asyncio
@@ -20,6 +21,7 @@ import os
 import time
 from enum import Enum
 from typing import Optional
+from telegram.error import BadRequest, Forbidden
 from utils.logs import get_logger
 
 topics_logger = get_logger("topics")
@@ -45,6 +47,7 @@ class TopicType(Enum):
     BACKUPS = "backups"
     NO_LIMIT = "no_limit"
     DAILY_REPORT = "daily_report"
+    MIRZA_NOTIFICATIONS = "mirza_notifications"
 
 
 # Topic display configuration
@@ -79,7 +82,26 @@ TOPIC_CONFIG = {
         "icon_color": 0xFB6F5F,  # Orange-red
         "description": "Users without special limits",
     },
+    TopicType.MIRZA_NOTIFICATIONS: {
+        "name": "🔔 Mirza Bot Notifications",
+        "icon_color": 0xFFD67E,
+        "description": "Final customer notification delivery results",
+    },
 }
+
+
+class TopicSetupResult(dict[TopicType, int]):
+    """Newly persisted threads, with verification and failure details for setup UI."""
+
+    def __init__(self, group_id: Optional[int]):
+        super().__init__()
+        self.group_id = group_id
+        self.existing: dict[TopicType, int] = {}
+        self.unverified: set[TopicType] = set()
+        self.failed: set[TopicType] = set()
+        self.uncertain: set[TopicType] = set()
+        self.cancelled = False
+        self.permission_error: Optional[str] = None
 
 
 class TopicsManager:
@@ -93,6 +115,7 @@ class TopicsManager:
         self._destination_revision = 0
         self._message_cache: dict[str, dict] = {}
         self._write_lock = asyncio.Lock()
+        self._setup_lock = asyncio.Lock()
         self._load()
 
     def _load(self):
@@ -313,10 +336,20 @@ class TopicsManager:
             topics_logger.info(f"📌 Set {topic_type.value} topic to thread {thread_id}")
         return changed
 
-    async def remove_topic(self, topic_type: TopicType):
+    async def remove_topic(
+        self,
+        topic_type: TopicType,
+        *,
+        group_id: Optional[int] = None,
+        destination_revision: Optional[int] = None,
+    ) -> bool:
         """Remove a topic mapping and the receipts scoped to its thread."""
 
         def remove(candidate):
+            if group_id is not None and candidate["group_id"] != group_id:
+                return
+            if destination_revision is not None and candidate["destination_revision"] != destination_revision:
+                return
             if topic_type.value not in candidate["topics"]:
                 return
             candidate["topics"].pop(topic_type.value)
@@ -326,7 +359,7 @@ class TopicsManager:
             else:
                 candidate["message_cache"].pop(topic_type.value, None)
 
-        await self._update(remove)
+        return await self._update(remove)
 
     async def clear_all_topics(self):
         """Atomically clear thread mappings and their delivered keys."""
@@ -367,41 +400,105 @@ class TopicsManager:
         except Exception as error:
             return False, f"Failed to check permissions: {error}"
 
-    async def create_topics_for_group(self, bot) -> dict[TopicType, int]:
-        """Create topics for one captured group; never install another group's threads."""
-        group_id = self._group_id
-        destination_revision = self._destination_revision
+    async def create_topics_for_group(
+        self,
+        bot,
+        *,
+        group_id: Optional[int] = None,
+        destination_revision: Optional[int] = None,
+    ) -> TopicSetupResult:
+        """Verify saved threads and create only missing topics for one captured destination.
+
+        Telegram has no Bot API topic listing or creation idempotency key. An
+        uncertain probe preserves its saved mapping; an uncertain create cannot
+        prove whether Telegram created an unsaved thread.
+        """
+        group_id = self._group_id if group_id is None else group_id
+        destination_revision = self._destination_revision if destination_revision is None else destination_revision
+        result = TopicSetupResult(group_id)
+
+        def destination_matches():
+            return self._group_id == group_id and self._destination_revision == destination_revision
+
+        def cancel():
+            result.cancelled = True
+            # Preserve the original mapping-shaped API: an interrupted operation
+            # must not return threads belonging to an obsolete destination.
+            result.clear()
+            result.existing.clear()
+            return result
+
         if not group_id:
-            topics_logger.error("❌ No forum group configured")
-            return {}
-        success, message = await self.check_bot_permissions(bot, group_id=group_id)
-        if not success:
-            topics_logger.error(f"❌ Permission check failed: {message}")
-            return {}
-        if self._destination_revision != destination_revision:
-            return {}
-        created_topics = {}
-        for topic_type, config in TOPIC_CONFIG.items():
-            if self._group_id != group_id:
-                break
-            destination_revision = self._destination_revision
-            try:
-                forum_topic = await bot.create_forum_topic(
-                    chat_id=group_id, name=config["name"], icon_color=config["icon_color"]
-                )
-            except Exception as error:
-                topics_logger.error(f"❌ Failed to create topic '{config['name']}': {error}")
-                if self._destination_revision != destination_revision:
-                    return {}
-                continue
-            thread_id = forum_topic.message_thread_id
-            if not await self.set_topic_id(
-                topic_type, thread_id, group_id=group_id, destination_revision=destination_revision
-            ):
-                return {}
-            created_topics[topic_type] = thread_id
-            topics_logger.info(f"✅ Created topic '{config['name']}' (thread_id={thread_id})")
-        return created_topics if self._group_id == group_id else {}
+            result.permission_error = "No forum group configured. Please set a group ID first."
+            return result
+        async with self._setup_lock:
+            if not destination_matches():
+                return cancel()
+            success, message = await self.check_bot_permissions(bot, group_id=group_id)
+            if not destination_matches():
+                return cancel()
+            if not success:
+                result.permission_error = message
+                return result
+            for topic_type, config in TOPIC_CONFIG.items():
+                if not destination_matches():
+                    return cancel()
+                saved_id = self._topics.get(topic_type.value)
+                if saved_id is not None:
+                    missing = False
+                    try:
+                        verified = await bot.edit_forum_topic(chat_id=group_id, message_thread_id=saved_id)
+                    except BadRequest as error:
+                        reason = str(error).lower().replace("_", " ")
+                        reason = reason.removeprefix("bad request: ").strip()
+                        verified = reason == "topic not modified"
+                        missing = reason in {
+                            "topic id invalid",
+                            "topic deleted",
+                            "topic not found",
+                            "message thread not found",
+                        }
+                    except Exception:
+                        verified = False
+                    if not destination_matches():
+                        return cancel()
+                    if not missing:
+                        if verified is True:
+                            result.existing[topic_type] = saved_id
+                        else:
+                            result.unverified.add(topic_type)
+                        continue
+                    if not await self.remove_topic(
+                        topic_type, group_id=group_id, destination_revision=destination_revision
+                    ):
+                        return cancel()
+                    destination_revision += 1
+                    if not destination_matches():
+                        return cancel()
+                try:
+                    forum_topic = await bot.create_forum_topic(
+                        chat_id=group_id, name=config["name"], icon_color=config["icon_color"]
+                    )
+                except Exception as error:
+                    if not destination_matches():
+                        return cancel()
+                    if isinstance(error, (BadRequest, Forbidden)):
+                        result.failed.add(topic_type)
+                    else:
+                        result.uncertain.add(topic_type)
+                    topics_logger.warning(f"❌ Topic creation did not complete for '{config['name']}'")
+                    continue
+                if not destination_matches():
+                    return cancel()
+                thread_id = forum_topic.message_thread_id
+                if not await self.set_topic_id(
+                    topic_type, thread_id, group_id=group_id, destination_revision=destination_revision
+                ):
+                    return cancel()
+                destination_revision += 1
+                result[topic_type] = thread_id
+                topics_logger.info(f"✅ Created topic '{config['name']}' (thread_id={thread_id})")
+            return result if destination_matches() else cancel()
 
 
 # Global instance

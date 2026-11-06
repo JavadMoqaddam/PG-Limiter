@@ -316,6 +316,9 @@ async def init_db():
             from db.notification_message_schema import ensure_message_list_schema
 
             await conn.run_sync(ensure_message_list_schema)
+            from db.notification_report_schema import ensure_notification_report_schema
+
+            await conn.run_sync(ensure_notification_report_schema)
             await conn.run_sync(_sync_deprecated_legacy_tables_sync)
 
         _DB_INITIALIZED = True
