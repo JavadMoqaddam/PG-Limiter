@@ -43,6 +43,12 @@ class UserCRUD:
     """
 
     @staticmethod
+    async def get_sync_deletion_snapshots(db: AsyncSession) -> dict[str, tuple[object, ...]]:
+        """Keep every typed column for later edit detection without creating ORM users."""
+        result = await db.execute(select(*User.__table__.columns))
+        return {row.username: tuple(row) for row in result}
+
+    @staticmethod
     async def get_policy_facts(db: AsyncSession, usernames: Iterable[str]) -> dict[str, dict]:
         """Read current groups and owner from the caller's coherent snapshot."""
         names = sorted(set(usernames))

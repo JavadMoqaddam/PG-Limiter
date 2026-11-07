@@ -20,9 +20,22 @@ from utils.logs import get_logger
 db_logger = get_logger("database")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./data/pg_limiter.db")
+DEFAULT_SQLITE_CACHE_SIZE_KIB = 16384
 
 # Flag indicating database availability
 DB_AVAILABLE: bool = True
+
+
+def _sqlite_cache_size_kib() -> int:
+    """Read a per-connection budget without accepting SQLite's page-count units."""
+    try:
+        value = int(os.environ.get("SQLITE_CACHE_SIZE_KIB", str(DEFAULT_SQLITE_CACHE_SIZE_KIB)))
+        if 0 < value <= 2147483647:
+            return value
+    except ValueError:
+        pass
+    db_logger.warning("Invalid SQLITE_CACHE_SIZE_KIB; using %s KiB per connection", DEFAULT_SQLITE_CACHE_SIZE_KIB)
+    return DEFAULT_SQLITE_CACHE_SIZE_KIB
 
 
 def _get_db_path() -> str:
@@ -35,6 +48,9 @@ def _get_db_path() -> str:
 
 # For SQLite, use standard async engine without StaticPool to allow concurrent connections with WAL mode
 if DATABASE_URL.startswith("sqlite"):
+    # SQLite caches belong to physical connections and survive session close.
+    # A negative PRAGMA value selects KiB, rather than a number of pages.
+    _SQLITE_CACHE_SIZE_KIB = _sqlite_cache_size_kib()
     db_logger.debug(f"📦 Using SQLite database: {DATABASE_URL}")
     engine = create_async_engine(
         DATABASE_URL,
@@ -51,7 +67,7 @@ if DATABASE_URL.startswith("sqlite"):
         cursor.execute("PRAGMA journal_mode=WAL;")
         cursor.execute("PRAGMA synchronous=NORMAL;")
         cursor.execute("PRAGMA busy_timeout=30000;")
-        cursor.execute("PRAGMA cache_size=-64000;")
+        cursor.execute(f"PRAGMA cache_size=-{_SQLITE_CACHE_SIZE_KIB};")
         cursor.close()
 else:
     db_logger.debug(f"📦 Using external database: {DATABASE_URL}")

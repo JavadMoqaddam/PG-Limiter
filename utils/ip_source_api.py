@@ -1215,6 +1215,9 @@ async def _collect_api_cycle(
         live_node_ids=node_scope.live_nodes,
         validation_cache=validation_cache,
     )
+    # Only admission verdicts and diagnostics survive the first pass. Keeping
+    # its device graph would overlap membership I/O and the final user build.
+    del _initial_users
     # Confirm shared topology and paged memberships after the fan-out. No
     # per-user permission requests are added, and only affected users are retired.
     try:
