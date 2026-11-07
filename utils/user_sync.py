@@ -350,10 +350,7 @@ async def _sync_users_while_admitted(panel_data: PanelType) -> tuple[int, int, i
         batch_size = 500
         columns = tuple(User.__table__.columns.keys())
         async with get_db() as db:
-            result = await db.execute(select(User))
-            deletion_snapshots = {
-                user.username: tuple(getattr(user, column) for column in columns) for user in result.scalars()
-            }
+            deletion_snapshots = await UserCRUD.get_sync_deletion_snapshots(db)
 
         # Fetch ALL users from panel (all statuses) to avoid losing disabled users
         users = await get_all_users_with_details(panel_data, status=None)
@@ -374,6 +371,9 @@ async def _sync_users_while_admitted(panel_data: PanelType) -> tuple[int, int, i
         if errors:
             sync_logger.error(f"❌ User sync skipped: {errors} invalid panel records")
             return (0, errors, 0)
+        # Parsed facts own everything needed for writes; release unused panel
+        # fields before building SQL for the full population.
+        del users
         panel_usernames = {user["username"] for user in users_to_upsert}
         deletion_snapshots = {
             name: snapshot for name, snapshot in deletion_snapshots.items() if name not in panel_usernames
