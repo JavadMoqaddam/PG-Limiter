@@ -10,8 +10,10 @@ import utils.user_sync as sync
 from db.crud.users import UserCRUD
 from db.models import User
 from test_config_revisions import settings_db  # noqa: F401
-from test_api_evidence import api_cycle  # noqa: F401
+import test_api_evidence
 from utils.types import PanelType
+
+api_cycle = test_api_evidence.api_cycle
 
 
 async def test_sync_snapshot_preserves_all_typed_fields_for_concurrent_edit_detection(settings_db):

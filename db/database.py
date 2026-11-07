@@ -33,6 +33,7 @@ def _sqlite_cache_size_kib() -> int:
         if 0 < value <= 2147483647:
             return value
     except ValueError:
+        # Malformed input uses the same logged fallback as an out-of-range value.
         pass
     db_logger.warning("Invalid SQLITE_CACHE_SIZE_KIB; using %s KiB per connection", DEFAULT_SQLITE_CACHE_SIZE_KIB)
     return DEFAULT_SQLITE_CACHE_SIZE_KIB
